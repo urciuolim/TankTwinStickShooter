@@ -14,8 +14,9 @@ using Newtonsoft.Json;
 public class DriverController : MonoBehaviour
 {
     public static DriverController instance;
-    private bool running = false;
+    public bool running = false;
     private bool ingame = false;
+    private int stepsSinceLastAction = 0;
 
     Thread mThread;
     private string connectionIP = "127.0.0.1";
@@ -24,15 +25,12 @@ public class DriverController : MonoBehaviour
     TcpListener listener;
     TcpClient client;
     NetworkStream nwStream;
+    float timeScale = 1f;
+    bool aiAsync = false;
+    int actionFreq = 1;
 
-    [HideInInspector]
-    public JObject actions;
-    [HideInInspector]
-    public JObject state;
-    [HideInInspector]
-    public JObject config;
-    [HideInInspector]
-    public JObject arena;
+    [HideInInspector] 
+    public JObject actions, state, config, arena;
     [HideInInspector]
     public bool verbose = false;
 
@@ -42,6 +40,7 @@ public class DriverController : MonoBehaviour
         {
             if (instance.running)
             {
+                instance.stepsSinceLastAction = 0;
                 Reset();
             }
             else
@@ -66,6 +65,16 @@ public class DriverController : MonoBehaviour
                 connectionPort = config["connectionPort"].Value<int>();
             if (config["verbose"] != null)
                 verbose = config["verbose"].Value<bool>();
+            if (config["ai_async"] != null)
+                aiAsync = config["ai_async"].Value<bool>();
+            if (config["ai_actionFreq"] != null)
+                actionFreq = config["ai_actionFreq"].Value<int>();
+            if (config["timeScale"] != null)
+            {
+                timeScale = config["timeScale"].Value<float>();
+                Time.timeScale = timeScale;
+            }
+
 
             if (config["arena_path"] != null)
             {
@@ -79,6 +88,9 @@ public class DriverController : MonoBehaviour
                 Debug.Log("Running in 'verbose' mode");
                 Debug.Log("Connection IP set to " + connectionIP);
                 Debug.Log("Connection Port set to " + connectionPort);
+                Debug.Log("Time scale set to " + timeScale);
+                Debug.Log("AI Async set to " + aiAsync);
+                Debug.Log("AI action frequency set to " + actionFreq);
                 if (arena != null)
                     Debug.Log("Arena loaded from: " + config["arena_path"]);
             }
@@ -87,10 +99,56 @@ public class DriverController : MonoBehaviour
 
     private void Start()
     {
-        ThreadStart ts = new ThreadStart(PythonConnection);
-        mThread = new Thread(ts);
-        mThread.Start();
+        if (aiAsync)
+        {
+            instance.running = true;
+            ThreadStart ts = new ThreadStart(PythonConnection);
+            mThread = new Thread(ts);
+            mThread.Start();
+        } else
+        {
+            localAdd = IPAddress.Parse(connectionIP);
+            listener = new TcpListener(localAdd, connectionPort);
+            listener.Start();
+            Debug.Log("Started to listen on port " + connectionPort);
+
+            client = listener.AcceptTcpClient();
+            nwStream = client.GetStream();
+
+            instance.running = true;
+        }
         Reset();
+    }
+
+    private void FixedUpdate()
+    {
+        Time.timeScale = 0f;
+        if (!aiAsync)
+        {
+            if (instance.running)
+            {
+                if (ingame && state != null && GameController.instance != null)
+                {
+                    bool done = state["done"] != null ? true : false;
+                    stepsSinceLastAction++;
+                    if (stepsSinceLastAction >= actionFreq || done)
+                    {
+                        
+                        SendAndReceiveData();
+                        
+                        stepsSinceLastAction = 0;
+                    }
+                }
+                else if (!ingame)
+                    ReceiveAndSendData();
+            } else
+            {
+                listener.Stop();
+                Debug.Log("Closed listener on port " + connectionPort);
+                Application.Quit();
+            }
+        }
+        Time.timeScale = timeScale;
     }
 
     private void PythonConnection()
@@ -103,11 +161,17 @@ public class DriverController : MonoBehaviour
         client = listener.AcceptTcpClient();
         nwStream = client.GetStream();
 
-        instance.running = true;
         while (instance.running)
         {
             if (ingame && state != null)
-                SendAndReceiveData();
+            {
+                stepsSinceLastAction++;
+                if (stepsSinceLastAction >= actionFreq)
+                {
+                    SendAndReceiveData();
+                    stepsSinceLastAction = 0;
+                }
+            }
             else if (!ingame)
                 ReceiveAndSendData();
         }
@@ -118,7 +182,7 @@ public class DriverController : MonoBehaviour
 
     private void ReceiveAndSendData()
     {
-        Debug.Log("ReceiveAndSendData");
+        //Debug.Log("ReceiveAndSendData");
         byte[] readBuffer = new byte[client.ReceiveBufferSize];
         int bytesRead = nwStream.Read(readBuffer, 0, client.ReceiveBufferSize);
         JObject message = null;
@@ -144,15 +208,15 @@ public class DriverController : MonoBehaviour
                 JObject confirmation = JObject.Parse("{ending:true}");
                 byte[] writeBuffer = Encoding.ASCII.GetBytes(confirmation.ToString());
                 nwStream.Write(writeBuffer, 0, writeBuffer.Length);
-                running = false;
+                instance.running = false;
             }
         }
-        Debug.Log("Exited ReceiveAndSendData");
+        //Debug.Log("Exited ReceiveAndSendData");
     }
 
     private void SendAndReceiveData()
     {
-        Debug.Log("SendAndReceiveData");
+        //Debug.Log("SendAndReceiveData");
         bool done = state["done"] != null ? true : false;
         byte[] writeBuffer = Encoding.ASCII.GetBytes(state.ToString());
         nwStream.Write(writeBuffer, 0, writeBuffer.Length);

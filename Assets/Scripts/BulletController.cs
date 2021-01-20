@@ -5,12 +5,16 @@ using Newtonsoft.Json.Linq;
 
 public class BulletController : MonoBehaviour
 {
+    private static bool firstTime = true;
     private float speed = 15;
     private float timeToLive = 10;
-    private Vector3 velocity;
+    [HideInInspector]
+    public Vector3 velocity;
     private Rigidbody2D rb;
     [HideInInspector]
     public float damage = 1;
+    [HideInInspector]
+    public PlayerController shooter;
 
     private void Awake()
     {
@@ -22,8 +26,9 @@ public class BulletController : MonoBehaviour
         if (config["bullet_damage"] != null)
             damage = config["bullet_damage"].Value<float>();
 
-        if (DriverController.instance.verbose)
+        if (DriverController.instance.verbose || firstTime)
         {
+            firstTime = false;
             Debug.Log("Bullet speed set to " + speed);
             Debug.Log("Bullet ttl set to " + timeToLive);
             Debug.Log("Bullet damage set to " + damage);
@@ -46,12 +51,14 @@ public class BulletController : MonoBehaviour
 
     private void OnCollisionEnter2D(Collision2D collision)
     {
-        Destroy(gameObject);
+        shooter.DestroyBullet(this.gameObject);
+        //Destroy(gameObject);
     }
 
     IEnumerator DestroyBullet()
     {
         yield return new WaitForSeconds(timeToLive);
-        Destroy(gameObject);
+        shooter.DestroyBullet(this.gameObject);
+        //Destroy(gameObject);
     }
 }

@@ -113,7 +113,15 @@ public class GameController : MonoBehaviour
         } else
         {
             hudContainer.SetActive(false);
-            startGame();
+
+            if (DriverController.instance.running)
+            {
+                startGame();
+            }
+            else
+            {
+                SceneManager.LoadScene("Driver");
+            }
         }
     }
 
@@ -158,7 +166,9 @@ public class GameController : MonoBehaviour
     {
         if (tanks[0][0] == null || tanks[1][0] == null) return;
         JObject state = new JObject();
-        float[] s = new float[12];
+        float[] s = new float[52];
+        for (int i = 0; i < s.Length; i++)
+            s[i] = -10;
 
         s[0] = tanks[0][0].transform.position.x / 8f;
         s[1] = tanks[0][0].transform.position.y / 4f;
@@ -167,12 +177,33 @@ public class GameController : MonoBehaviour
         s[4] = tanks[0][0].aim.x;
         s[5] = tanks[0][0].aim.y;
 
-        s[6] = tanks[1][0].transform.position.x / 8f;
-        s[7] = tanks[1][0].transform.position.y / 4f;
-        s[8] = tanks[1][0].velocity.x;
-        s[9] = tanks[1][0].velocity.y;
-        s[10] = tanks[1][0].aim.x;
-        s[11] = tanks[1][0].aim.y;
+        int c = 6;
+        foreach (GameObject b in tanks[0][0].bullets)
+        {
+            var bc = b.GetComponent<BulletController>();
+            s[c] = b.transform.position.x / 8f;
+            s[c + 1] = b.transform.position.y / 4f;
+            s[c + 2] = bc.velocity.x;
+            s[c + 3] = bc.velocity.y;
+            c += 4;
+        }
+
+        s[26] = tanks[1][0].transform.position.x / 8f;
+        s[27] = tanks[1][0].transform.position.y / 4f;
+        s[28] = tanks[1][0].velocity.x;
+        s[29] = tanks[1][0].velocity.y;
+        s[30] = tanks[1][0].aim.x;
+        s[31] = tanks[1][0].aim.y;
+        c = 32;
+        foreach (GameObject b in tanks[1][0].bullets)
+        {
+            var bc = b.GetComponent<BulletController>();
+            s[c] = b.transform.position.x / 8f;
+            s[c + 1] = b.transform.position.y / 4f;
+            s[c + 2] = bc.velocity.x;
+            s[c + 3] = bc.velocity.y;
+            c += 4;
+        }
 
         state.Add("state", new JArray(s));
         DriverController.instance.state = state;

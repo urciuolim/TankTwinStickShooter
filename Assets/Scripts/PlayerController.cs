@@ -17,7 +17,7 @@ public class PlayerController : MonoBehaviour
     private float triggerThreshold = .5f;
     private float reloadTime = .33f;
     [HideInInspector]
-    public bool canShoot;
+    public bool canShoot = true;
 
     public Color myColor;
     [HideInInspector]
@@ -32,6 +32,9 @@ public class PlayerController : MonoBehaviour
 
     [HideInInspector]
     public bool playing = false;
+
+    [HideInInspector]
+    public List<GameObject> bullets;
 
     private void Awake()
     {
@@ -73,6 +76,8 @@ public class PlayerController : MonoBehaviour
         r_horizontal = "R_HorizontalJoy" + playerID;
         r_vertical = "R_VerticalJoy" + playerID;
         trigger = "TriggerJoy" + playerID;
+
+        bullets = new List<GameObject>();
     }
 
     // Update is called once per frame
@@ -118,7 +123,15 @@ public class PlayerController : MonoBehaviour
         GameController.instance.UpdateReloading(playerID, canShoot);
         GameObject b = Instantiate(bulletPrefab, firePoint.position, barrel.rotation);
         b.GetComponent<SpriteRenderer>().color = myColor;
+        b.GetComponent<BulletController>().shooter = this;
+        bullets.Add(b);
         StartCoroutine(Reload());
+    }
+
+    public void DestroyBullet(GameObject bullet)
+    {
+        bullets.Remove(bullet);
+        Destroy(bullet);
     }
 
     IEnumerator Reload()
