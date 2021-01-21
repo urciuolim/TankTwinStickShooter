@@ -28,9 +28,9 @@ parser.add_argument("--log_dir", type=str, default=".",
 parser.add_argument("--seed", type=int, default=None, help = "Seed to be used for np.random")
 parser.add_argument("--no_shoot", action="store_true",
                     help = "Flag that stops AI from shooting")
-'''
 parser.add_argument("--shoot", action="store_true",
                     help = "Flag that makes AI always shoot")
+'''
 parser.add_argument("--no_move", action="store_true",
                     help = "Flag that makes AI stay still (will still aim/shoot though)")
 parser.add_argument("--no_aim", action="store_true",
@@ -45,11 +45,13 @@ def Send(message):
     global sock
     data = json.dumps(message)
     sock.sendall(bytes(data, encoding="utf-8"))
+    #print("Sent:", data)
     
 def Receive():
     global sock
     received = sock.recv(1024)
     received = received.decode("utf-8")
+    #print("Received:", received)
     return json.loads(received)
     
 if __name__ == "__main__":
@@ -61,7 +63,7 @@ if __name__ == "__main__":
         agent = None
         if player == '1':
             agent = RandomAgent("RandomAgent" + str(i), (52,), np.array([[-1,-1,-1,-1,0], [1,1,1,1,1]]))
-        if args.log:
+        if args.log and player != '0':
             agent = AgentLogger(agent, args.log_dir)
         agents.append(agent)
 
@@ -92,9 +94,13 @@ if __name__ == "__main__":
                 
                 message = {}
                 for a,agent in enumerate(agents, start=1):
+                    if agent == None:
+                        continue
                     action = agent.get_action(np.array(received["state"]))
                     if args.no_shoot:
                         action[-1] = 0
+                    if args.shoot:
+                        action[-1] = 1
                     message[a] = action.tolist()
                 Send(message)
                 send_counter += 1

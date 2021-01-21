@@ -190,4 +190,12 @@ public class PlayerController : MonoBehaviour
         Destroy(gameObject);
         GameController.instance.CheckGameEnd();
     }
+
+    public void DeactivateBullets()
+    {
+        foreach (var bullet in bullets)
+        {
+            bullet.SetActive(false);
+        }
+    }
 }

@@ -2,7 +2,7 @@
 	"connectionIP": "127.0.0.1",
 	"connectionPort" :50000,
 	"game_maxTime": 60,
-	"timeScale": 1,
+	"timeScale": 20,
 	"verbose": false,
 	"arena_path": "Assets/Arenas/default.json",
 	"player1_ai": true,

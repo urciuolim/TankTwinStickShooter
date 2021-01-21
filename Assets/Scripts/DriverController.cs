@@ -105,30 +105,22 @@ public class DriverController : MonoBehaviour
     {
         if (aiAsync)
         {
-            instance.running = true;
+            //TODO: Async AI needs to be fixed, it is currently broken
             ThreadStart ts = new ThreadStart(PythonConnection);
             mThread = new Thread(ts);
             mThread.Start();
         } else
         {
-            localAdd = IPAddress.Parse(connectionIP);
-            listener = new TcpListener(localAdd, connectionPort);
-            listener.Start();
-            Debug.Log("Started to listen on port " + connectionPort);
-
-            client = listener.AcceptTcpClient();
-            nwStream = client.GetStream();
-
-            instance.running = true;
+            EstablishPythonConnection();
         }
         Reset();
     }
 
     private void FixedUpdate()
     {
-        Time.timeScale = 0f;
         if (!aiAsync)
         {
+            Time.timeScale = 0f;
             if (instance.running)
             {
                 if (ingame && state != null && GameController.instance != null)
@@ -137,25 +129,24 @@ public class DriverController : MonoBehaviour
                     stepsSinceLastAction++;
                     if (stepsSinceLastAction >= actionFreq || done)
                     {
-                        
                         SendAndReceiveData();
-                        
                         stepsSinceLastAction = 0;
                     }
                 }
                 else if (!ingame)
                     ReceiveAndSendData();
-            } else
+            }
+            else
             {
                 listener.Stop();
-                Debug.Log("Closed listener on port " + connectionPort);
+                //Debug.Log("Closed listener on port " + connectionPort);
                 Application.Quit();
             }
+            Time.timeScale = timeScale;
         }
-        Time.timeScale = timeScale;
     }
 
-    private void PythonConnection()
+    private void EstablishPythonConnection()
     {
         localAdd = IPAddress.Parse(connectionIP);
         listener = new TcpListener(localAdd, connectionPort);
@@ -164,7 +155,12 @@ public class DriverController : MonoBehaviour
 
         client = listener.AcceptTcpClient();
         nwStream = client.GetStream();
+        instance.running = true;
+    }
 
+    private void PythonConnection()
+    {
+        EstablishPythonConnection();
         while (instance.running)
         {
             if (ingame && state != null)
@@ -186,7 +182,6 @@ public class DriverController : MonoBehaviour
 
     private void ReceiveAndSendData()
     {
-        //Debug.Log("ReceiveAndSendData");
         byte[] readBuffer = new byte[client.ReceiveBufferSize];
         int bytesRead = nwStream.Read(readBuffer, 0, client.ReceiveBufferSize);
         JObject message = null;
@@ -215,7 +210,6 @@ public class DriverController : MonoBehaviour
                 instance.running = false;
             }
         }
-        //Debug.Log("Exited ReceiveAndSendData");
     }
 
     private void SendAndReceiveData()

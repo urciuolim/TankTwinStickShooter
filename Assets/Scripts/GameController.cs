@@ -11,7 +11,7 @@ using UnityEditor;
 public class GameController : MonoBehaviour
 {
     public static GameController instance;
-    bool gamePlaying;
+    bool gamePlaying = false;
 
     private PlayerController[][] tanks;
     private GameObject hudContainer;
@@ -27,7 +27,7 @@ public class GameController : MonoBehaviour
     private float healthBarMaxWidth = 200f;
     private GameObject redReloading, blueReloading;
 
-    private bool checkWinner;
+    private bool checkWinner = false;
     private bool humanPlayer;
 
     public TileBase[] tiles;
@@ -219,6 +219,7 @@ public class GameController : MonoBehaviour
         {
             if (humanPlayer)
             {
+                Debug.Log("UpdateGameTimer: humanPlayer");
                 elapsedTime = Time.time - startTime;
                 timeLeft = TimeSpan.FromSeconds(maxTime - elapsedTime);
                 timeLeftDisplay.text = "Time Remaining\n" + timeLeft.ToString("mm':'ss'.'ff");
@@ -231,6 +232,7 @@ public class GameController : MonoBehaviour
             }
             else if (stepsLeft <= 0)
             {
+                Debug.Log("UpdateGameTimer: stepsLeft");
                 gamePlaying = false;
                 updatePlaying(false);
                 checkWinner = true;
@@ -238,6 +240,7 @@ public class GameController : MonoBehaviour
         }
         if (checkWinner)
         {
+            Debug.Log("UpdateGameTimer: checkWinner");
             checkWinner = false;
             CheckWinner();
         }
@@ -280,6 +283,8 @@ public class GameController : MonoBehaviour
 
     private void EndGame(int winningTeam)
     {
+        tanks[0][0].DeactivateBullets();
+        tanks[1][0].DeactivateBullets();
         JObject lastState = JObject.Parse("{done:true}");
         lastState.Add("winner", new JValue(winningTeam));
         DriverController.instance.state = lastState;
