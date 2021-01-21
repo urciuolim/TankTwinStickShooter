@@ -26,9 +26,9 @@ parser.add_argument("--log", action="store_true",
 parser.add_argument("--log_dir", type=str, default=".",
                     help = "Directory to store log files in")
 parser.add_argument("--seed", type=int, default=None, help = "Seed to be used for np.random")
-'''
 parser.add_argument("--no_shoot", action="store_true",
                     help = "Flag that stops AI from shooting")
+'''
 parser.add_argument("--shoot", action="store_true",
                     help = "Flag that makes AI always shoot")
 parser.add_argument("--no_move", action="store_true",
@@ -92,7 +92,10 @@ if __name__ == "__main__":
                 
                 message = {}
                 for a,agent in enumerate(agents, start=1):
-                    message[a] = agent.get_action(np.array(received["state"])).tolist()
+                    action = agent.get_action(np.array(received["state"]))
+                    if args.no_shoot:
+                        action[-1] = 0
+                    message[a] = action.tolist()
                 Send(message)
                 send_counter += 1
                 

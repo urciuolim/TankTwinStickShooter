@@ -26,21 +26,22 @@ public class BulletController : MonoBehaviour
         if (config["bullet_damage"] != null)
             damage = config["bullet_damage"].Value<float>();
 
+        /**
         if (DriverController.instance.verbose || firstTime)
         {
             firstTime = false;
             Debug.Log("Bullet speed set to " + speed);
             Debug.Log("Bullet ttl set to " + timeToLive);
             Debug.Log("Bullet damage set to " + damage);
-        }
+        }**/
     }
 
     // Start is called before the first frame update
     private void Start()
     {
         rb = GetComponent<Rigidbody2D>();
-        velocity = transform.right * speed * Time.fixedDeltaTime;
-        StartCoroutine(DestroyBullet());
+        velocity = transform.right * speed * DriverController.instance.fixedDeltaTime;//Time.fixedDeltaTime;
+        //StartCoroutine(DestroyBullet());
     }
 
     // Update is called once per frame

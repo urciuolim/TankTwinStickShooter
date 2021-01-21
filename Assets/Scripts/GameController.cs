@@ -21,6 +21,7 @@ public class GameController : MonoBehaviour
     private float startTime, elapsedTime;
     private float maxTime = 60f;
     private TimeSpan timeLeft;
+    private int stepsLeft = 0;
 
     private GameObject redHealthBar, blueHealthBar;
     private float healthBarMaxWidth = 200f;
@@ -113,6 +114,7 @@ public class GameController : MonoBehaviour
         } else
         {
             hudContainer.SetActive(false);
+            stepsLeft = (int)Math.Ceiling(maxTime / DriverController.instance.fixedDeltaTime);
 
             if (DriverController.instance.running)
             {
@@ -160,6 +162,8 @@ public class GameController : MonoBehaviour
     private void FixedUpdate()
     {
         UpdateState();
+        stepsLeft--;
+        UpdateGameTimer();
     }
 
     private void UpdateState()
@@ -181,15 +185,15 @@ public class GameController : MonoBehaviour
         foreach (GameObject b in tanks[0][0].bullets)
         {
             var bc = b.GetComponent<BulletController>();
-            s[c] = b.transform.position.x / 8f;
-            s[c + 1] = b.transform.position.y / 4f;
+            s[c] = b.transform.position.x;
+            s[c + 1] = b.transform.position.y;
             s[c + 2] = bc.velocity.x;
             s[c + 3] = bc.velocity.y;
             c += 4;
         }
 
-        s[26] = tanks[1][0].transform.position.x / 8f;
-        s[27] = tanks[1][0].transform.position.y / 4f;
+        s[26] = tanks[1][0].transform.position.x;
+        s[27] = tanks[1][0].transform.position.y;
         s[28] = tanks[1][0].velocity.x;
         s[29] = tanks[1][0].velocity.y;
         s[30] = tanks[1][0].aim.x;
@@ -198,8 +202,8 @@ public class GameController : MonoBehaviour
         foreach (GameObject b in tanks[1][0].bullets)
         {
             var bc = b.GetComponent<BulletController>();
-            s[c] = b.transform.position.x / 8f;
-            s[c + 1] = b.transform.position.y / 4f;
+            s[c] = b.transform.position.x;
+            s[c + 1] = b.transform.position.y;
             s[c + 2] = bc.velocity.x;
             s[c + 3] = bc.velocity.y;
             c += 4;
@@ -209,15 +213,23 @@ public class GameController : MonoBehaviour
         DriverController.instance.state = state;
     }
 
-    private void Update()
+    private void UpdateGameTimer()
     {
         if (gamePlaying)
         {
-            elapsedTime = Time.time - startTime;
-            timeLeft = TimeSpan.FromSeconds(maxTime - elapsedTime);
             if (humanPlayer)
+            {
+                elapsedTime = Time.time - startTime;
+                timeLeft = TimeSpan.FromSeconds(maxTime - elapsedTime);
                 timeLeftDisplay.text = "Time Remaining\n" + timeLeft.ToString("mm':'ss'.'ff");
-            if (elapsedTime >= maxTime)
+                if (elapsedTime >= maxTime)
+                {
+                    gamePlaying = false;
+                    updatePlaying(false);
+                    checkWinner = true;
+                }
+            }
+            else if (stepsLeft <= 0)
             {
                 gamePlaying = false;
                 updatePlaying(false);

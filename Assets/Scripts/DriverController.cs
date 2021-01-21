@@ -33,6 +33,8 @@ public class DriverController : MonoBehaviour
     public JObject actions, state, config, arena;
     [HideInInspector]
     public bool verbose = false;
+    [HideInInspector]
+    public float fixedDeltaTime;
 
     private void Awake()
     {
@@ -74,7 +76,8 @@ public class DriverController : MonoBehaviour
                 timeScale = config["timeScale"].Value<float>();
                 Time.timeScale = timeScale;
             }
-
+            if (config["ai_fixedDeltaTime"] != null)
+                fixedDeltaTime = config["ai_fixedDeltaTime"].Value<float>();
 
             if (config["arena_path"] != null)
             {
@@ -91,6 +94,7 @@ public class DriverController : MonoBehaviour
                 Debug.Log("Time scale set to " + timeScale);
                 Debug.Log("AI Async set to " + aiAsync);
                 Debug.Log("AI action frequency set to " + actionFreq);
+                Debug.Log("Fixed delta time set to " + fixedDeltaTime);
                 if (arena != null)
                     Debug.Log("Arena loaded from: " + config["arena_path"]);
             }

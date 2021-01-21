@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using UnityEngine;
 using Newtonsoft.Json.Linq;
+using System;
 
 public class PlayerController : MonoBehaviour
 {
@@ -18,6 +19,8 @@ public class PlayerController : MonoBehaviour
     private float reloadTime = .33f;
     [HideInInspector]
     public bool canShoot = true;
+    private int reloadSteps;
+    private int reloadCountdown;
 
     public Color myColor;
     [HideInInspector]
@@ -78,12 +81,14 @@ public class PlayerController : MonoBehaviour
         trigger = "TriggerJoy" + playerID;
 
         bullets = new List<GameObject>();
+        reloadSteps = (int)Math.Ceiling(reloadTime / DriverController.instance.fixedDeltaTime);
+        reloadCountdown = 0;
     }
 
     // Update is called once per frame
     private void Update()
     {
-        GetInput();
+        //GetInput();
         //Debug.Log("Update FPS: " + (1 / Time.deltaTime));
     }
 
@@ -125,7 +130,8 @@ public class PlayerController : MonoBehaviour
         b.GetComponent<SpriteRenderer>().color = myColor;
         b.GetComponent<BulletController>().shooter = this;
         bullets.Add(b);
-        StartCoroutine(Reload());
+        reloadCountdown = reloadSteps;
+        //StartCoroutine(Reload());
     }
 
     public void DestroyBullet(GameObject bullet)
@@ -144,13 +150,23 @@ public class PlayerController : MonoBehaviour
     {
         if (velocity.magnitude > .1f)
         {
-            rb.MovePosition(rb.position + (velocity * speed * Time.fixedDeltaTime));
+            rb.MovePosition(rb.position + (velocity * speed * DriverController.instance.fixedDeltaTime));//Time.fixedDeltaTime));
             rb.SetRotation(Vector2.SignedAngle(Vector2.right, velocity));
         }
 
         if (aim.magnitude > .1f)
         {
             barrel.rotation = Quaternion.Euler(0, 0, Vector2.SignedAngle(Vector2.right, aim));
+        }
+        GetInput();
+        if (!canShoot)
+        {
+            reloadCountdown--;
+            if (reloadCountdown <= 0)
+            {
+                canShoot = true;
+                GameController.instance.UpdateReloading(playerID, canShoot);
+            }
         }
     }
 
@@ -163,6 +179,7 @@ public class PlayerController : MonoBehaviour
             GameController.instance.UpdateHealth(playerID);
             if (health <= 0)
             {
+                Debug.Log("Player " + playerID + " died");
                 Die();
             }
         }
