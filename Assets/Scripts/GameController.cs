@@ -286,8 +286,8 @@ public class GameController : MonoBehaviour
         tanks[0][0].DeactivateBullets();
         tanks[1][0].DeactivateBullets();
         JObject lastState = JObject.Parse("{done:true}");
-        lastState.Add("winner", new JValue(winningTeam));
-        DriverController.instance.state = lastState;
+        DriverController.instance.state.Add("done", new JValue(true));
+        DriverController.instance.state.Add("winner", new JValue(winningTeam));
         SceneManager.LoadScene("Driver");
     }
 
