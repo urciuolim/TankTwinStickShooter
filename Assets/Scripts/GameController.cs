@@ -174,8 +174,8 @@ public class GameController : MonoBehaviour
         for (int i = 0; i < s.Length; i++)
             s[i] = -10;
 
-        s[0] = tanks[0][0].transform.position.x / 8f;
-        s[1] = tanks[0][0].transform.position.y / 4f;
+        s[0] = tanks[0][0].transform.position.x;
+        s[1] = tanks[0][0].transform.position.y;
         s[2] = tanks[0][0].velocity.x;
         s[3] = tanks[0][0].velocity.y;
         s[4] = tanks[0][0].aim.x;
@@ -281,7 +281,7 @@ public class GameController : MonoBehaviour
         }
     }
 
-    private void EndGame(int winningTeam)
+    public void EndGame(int winningTeam)
     {
         tanks[0][0].DeactivateBullets();
         tanks[1][0].DeactivateBullets();

@@ -9,5 +9,6 @@
 	"player2_ai": true,
 	"ai_async": false,
 	"ai_actionFreq": 10,
-	"ai_fixedDeltaTime": .02
+	"ai_fixedDeltaTime": .02,
+	"player_maxHealth": 1
 }

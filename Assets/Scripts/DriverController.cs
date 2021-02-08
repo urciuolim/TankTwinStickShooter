@@ -194,20 +194,26 @@ public class DriverController : MonoBehaviour
 
         if (message != null)
         { 
-            if (message["start"] != null)
+            if (message["start"] != null && message["start"].Value<bool>())
             {
                 Debug.Log("Start received");
                 JObject confirmation = JObject.Parse("{starting:true}");
                 byte[] writeBuffer = Encoding.ASCII.GetBytes(confirmation.ToString());
                 nwStream.Write(writeBuffer, 0, writeBuffer.Length);
                 ingame = true;
-            } else if (message["end"] != null)
+            } else if (message["end"] != null && message["end"].Value<bool>())
             {
                 Debug.Log("End received");
                 JObject confirmation = JObject.Parse("{ending:true}");
                 byte[] writeBuffer = Encoding.ASCII.GetBytes(confirmation.ToString());
                 nwStream.Write(writeBuffer, 0, writeBuffer.Length);
                 instance.running = false;
+            } else if (message["restart"] != null && message["restart"].Value<bool>())
+            {
+                Debug.Log("Restart received");
+                JObject confirmation = JObject.Parse("{restarting:true}");
+                byte[] writeBuffer = Encoding.ASCII.GetBytes(confirmation.ToString());
+                nwStream.Write(writeBuffer, 0, writeBuffer.Length);
             }
         }
     }
@@ -232,11 +238,29 @@ public class DriverController : MonoBehaviour
         byte[] readBuffer = new byte[client.ReceiveBufferSize];
         int bytesRead = nwStream.Read(readBuffer, 0, client.ReceiveBufferSize);
 
+        JObject message = null;
+
         if (bytesRead > 0)
         {
             string dataReceived = Encoding.UTF8.GetString(readBuffer, 0, bytesRead);
-            actions = JObject.Parse(dataReceived);
+            message = JObject.Parse(dataReceived);
             //Debug.Log("Received: " + actions.ToString());
+        }
+
+        if (message != null)
+        {
+            if (message["restart"] != null && message["restart"].Value<bool>())
+            {
+                Debug.Log("Restart received");
+                JObject confirmation = JObject.Parse("{restarting:true}");
+                writeBuffer = Encoding.ASCII.GetBytes(confirmation.ToString());
+                nwStream.Write(writeBuffer, 0, writeBuffer.Length);
+                GameController.instance.EndGame(-1);
+                ingame = false;
+            } else
+            {
+                actions = message;
+            }
         }
     }
 
