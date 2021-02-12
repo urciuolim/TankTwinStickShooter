@@ -17,10 +17,11 @@ parser.add_argument("--num_trials", type=int, default=20,
 parser.add_argument("--selfp_model_update", type=int, default=10000,
                     help = "Number of trials to run during evaluation")
 parser.add_argument("--id", type=str, default="anon", help="ID to add to paths of saved files")
+parser.add_argument("--opp_buf_size", type=int, default=1, help="Size of opponent buffer used in self-play")
 args = parser.parse_args()
 print(args)
 
-env = IndvTankEnv(TankEnv(agent=-1, random_side=True))
+env = IndvTankEnv(TankEnv(agent=-1, old_policy_buffer_size=args.opp_buf_size))
 model = SAC('MlpPolicy', env, verbose=1)
 avg_reward = []
 avg_steps = []
@@ -58,6 +59,10 @@ for i in range(num_selfp_updates):
                 total_steps += 1
         avg_reward.append(total_reward/args.num_trials)
         avg_steps.append(total_steps/args.num_trials)
+        print("==========================================")
+        print("| Average Reward:", avg_reward[-5:])
+        print("| Average Steps:", avg_steps[-5:])
+        print("==========================================")
     gc.collect()
     env.reset()
     

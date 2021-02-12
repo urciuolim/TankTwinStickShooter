@@ -123,7 +123,7 @@ public class DriverController : MonoBehaviour
             Time.timeScale = 0f;
             if (instance.running)
             {
-                if (ingame && state != null && GameController.instance != null)
+                if (ingame && state != null) //&& GameController.instance != null)
                 {
                     bool done = state["done"] != null ? true : false;
                     stepsSinceLastAction++;

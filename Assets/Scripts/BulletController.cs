@@ -5,7 +5,6 @@ using Newtonsoft.Json.Linq;
 
 public class BulletController : MonoBehaviour
 {
-    private static bool firstTime = true;
     private float speed = 15;
     private float timeToLive = 10;
     [HideInInspector]

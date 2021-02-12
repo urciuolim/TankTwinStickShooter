@@ -11,28 +11,38 @@ import random
 class TankEnv(gym.Env):
     metadata = {'render.modes': None}
     
-    def __init__(self, num_agents=2, game_ip="127.0.0.1", game_port=50000, num_connection_attempts=60, agent=0, random_side=False):
+    def __init__(self, num_agents=2, 
+                        game_ip="127.0.0.1", 
+                        game_port=50000, 
+                        num_connection_attempts=60, 
+                        sock_timeout=60., 
+                        agent=0,
+                        old_policy_buffer_size=1):
         super(TankEnv, self).__init__()
         
         self.opponent = None
+        self.opp_buf_size = abs(old_policy_buffer_size)
+        self.opponent_buf = []
+        self.opp_num = 0
         
         self.num_agents = num_agents
         self.action_space = spaces.Box(low=-1., high=1., shape=(num_agents, 5), dtype=np.float32)
         self.observation_space = spaces.Box(low=-10., high=10., shape=(num_agents, 26), dtype=np.float32)
-        self.rs = random_side
-        self.p1 = 1
-        self.p2 = 2
         
         # Establish connection with Unity environment
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        for _ in range(num_connection_attempts):
+        for i in range(num_connection_attempts):
             try:
                 self.sock.connect((game_ip, game_port))
                 break
             except ConnectionRefusedError:
                 print("Could not connect to IP", game_ip, "on port", game_port, "...sleeping for one second")
                 time.sleep(1)
+        if i >= num_connection_attempts-1:
+            print("Problem connecting to game on IP", game_ip, "on port", game_port)
+            quit()
         print("Connected to IP", game_ip, "on port", game_port)
+        self.sock.settimeout(sock_timeout)
         
         ob = (num_agents*26,)
         ac = np.array([[-1., -1., -1., -1., 0], [1., 1., 1., 1., 1.]])       
@@ -52,11 +62,19 @@ class TankEnv(gym.Env):
         
     def send(self, message):
         data = json.dumps(message)
-        self.sock.sendall(bytes(data, encoding="utf-8"))
+        try:
+            self.sock.sendall(bytes(data, encoding="utf-8"))
+        except socket.timeout:
+            print("Timeout while sending data, quitting now.")
+            quit()
         #print("Sent:", data)
         
     def receive(self):
-        received = self.sock.recv(1024)
+        try:
+            received = self.sock.recv(1024)
+        except socket.timeout:
+            print("Timeout while receiving data, quitting now.")
+            quit()
         received = received.decode("utf-8")
         #print("Received:", received)
         return json.loads(received)
@@ -82,12 +100,9 @@ class TankEnv(gym.Env):
                 if self.opponent.name == "box_agent":
                     self.opponent.reset()
                     
-                if self.rs:
-                    self.p1 = random.randint(1,2)
-                    self.p2 = 2 if self.p1 == 1 else 1
-                    
-                if self.p1 == 2:
-                    self.state = np.concatenate([self.state[26:], self.state[:26]])
+                if self.agent == -1:
+                    self.opponent = random.choice(self.opponent_buf)
+                    print("I choose", self.opponent.name, "to play against")
                 
                 return self.state # TODO: Change this to handle multiple agents
             except json.decoder.JSONDecodeError:
@@ -99,13 +114,13 @@ class TankEnv(gym.Env):
         message = {}
         #for i,a in enumerate(action, start=1):
             #message[i] = a.tolist()
-        message[self.p1] = action.tolist()
+        message[1] = action.tolist()
         if self.agent != -1:
-            message[self.p2] = self.opponent.get_action(self.state).tolist()
+            message[2] = self.opponent.get_action(self.state).tolist()
         else:
             opp_state = np.concatenate([self.state[26:], self.state[:26]])
             old_action, _ = self.opponent.predict(opp_state)
-            message[self.p2] = old_action.tolist()
+            message[2] = old_action.tolist()
         
         # Step Unity environment
         self.send(message)
@@ -129,9 +144,6 @@ class TankEnv(gym.Env):
                 
         info = {}
         
-        if self.p1 == 2:
-            self.state = np.concatenate([self.state[26:], self.state[:26]])
-        
         return self.state, reward, done, info
         
     def render(self, mode='console'):
@@ -151,6 +163,9 @@ class TankEnv(gym.Env):
         
     def load_old_policy(self, oldname):
         print("Loading old policy named", oldname, "for selfplay")
-        del self.opponent
+        #del self.opponent
         self.opponent = SAC.load(oldname)
-        self.opponent.name = "selfplay_old_policy"
+        self.opponent.name = "selfplay_old_policy" + str(self.opp_num)
+        self.opp_num += 1
+        self.opponent_buf.append(self.opponent)
+        self.opponent_buf = self.opponent_buf[-self.opp_buf_size:]

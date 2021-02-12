@@ -1,14 +1,15 @@
 {
-	"connectionIP": "127.0.0.1",
-	"connectionPort" :50000,
-	"game_maxTime": 60,
-	"timeScale": 1,
-	"verbose": false,
-	"arena_path": "Assets/Arenas/default.json",
-	"player1_ai": true,
-	"player2_ai": true,
-	"ai_async": false,
-	"ai_actionFreq": 10,
-	"ai_fixedDeltaTime": .02,
-	"player_maxHealth": 1
+    "connectionIP": "127.0.0.1",
+    "connectionPort": 50000,
+    "game_maxTime": 60,
+    "timeScale": 1,
+    "verbose": false,
+    "arena_path": "Assets/Arenas/default.json",
+    "player1_ai": false,
+    "player2_ai": true,
+    "ai_async": false,
+    "ai_actionFreq": 10,
+    "ai_fixedDeltaTime": 0.02,
+    "player_maxHealth": 1,
+    "player_randomStart": false
 }

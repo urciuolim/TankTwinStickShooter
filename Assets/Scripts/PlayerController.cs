@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using UnityEngine;
 using Newtonsoft.Json.Linq;
 using System;
+using UnityEngine.Tilemaps;
 
 public class PlayerController : MonoBehaviour
 {
@@ -21,6 +22,7 @@ public class PlayerController : MonoBehaviour
     public bool canShoot = true;
     private int reloadSteps;
     private int reloadCountdown;
+    private bool randomStart = true;
 
     public Color myColor;
     [HideInInspector]
@@ -52,12 +54,15 @@ public class PlayerController : MonoBehaviour
             maxHealth = config["player_maxHealth"].Value<float>();
         if (config["player" + playerID + "_ai"] != null)
             AI = config["player" + playerID + "_ai"].Value<bool>();
+        if (config["player_randomStart"] != null)
+            randomStart = config["player_randomStart"].Value<bool>();
         if (DriverController.instance.verbose)
         {
             Debug.Log("Player " + playerID + " speed set to " + speed);
             Debug.Log("Player " + playerID + " trigger threshold set to " + triggerThreshold);
             Debug.Log("Player " + playerID + " reload time set to " + reloadTime);
             Debug.Log("Player " + playerID + " max health set to " + maxHealth);
+            Debug.Log("Player " + playerID + " random start set to " + randomStart);
         }
     }
 
@@ -83,6 +88,22 @@ public class PlayerController : MonoBehaviour
         bullets = new List<GameObject>();
         reloadSteps = (int)Math.Ceiling(reloadTime / DriverController.instance.fixedDeltaTime);
         reloadCountdown = 0;
+
+        if (randomStart) RandomStart();
+    }
+
+    private void RandomStart()
+    {
+        Tilemap floor = GameObject.Find("Floor").GetComponent<Tilemap>();
+        float minX = floor.cellBounds.xMin + .5f;
+        float maxX = floor.cellBounds.xMax - .5f;
+        float minY = floor.cellBounds.yMin + .5f;
+        float maxY = floor.cellBounds.yMax - .5f;
+
+        float newX = UnityEngine.Random.Range(minX, maxX);
+        float newY = UnityEngine.Random.Range(minY, maxY);
+
+        transform.position = new Vector3(newX, newY);
     }
 
     // Update is called once per frame

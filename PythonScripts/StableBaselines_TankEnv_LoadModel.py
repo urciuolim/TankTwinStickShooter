@@ -7,11 +7,10 @@ parser = argparse.ArgumentParser()
 parser.add_argument("model_file", type=str, help="Path to model to be used")
 parser.add_argument("--opp_model_file", type=str, default=None, help="Path to model to be used as opponent")
 parser.add_argument("--agent", type=int, default=0, help="Agent to play against RL agent")
-parser.add_argument("--rs", action="store_true", help="Random start for tank env")
 args = parser.parse_args()
 print(args)
 
-env = IndvTankEnv(TankEnv(agent=args.agent, random_side=args.rs))
+env = IndvTankEnv(TankEnv(agent=args.agent))
 if args.agent == -1:
     if not args.opp_model_file:
         print("Need to specify an opponent model file when setting agent = -1")

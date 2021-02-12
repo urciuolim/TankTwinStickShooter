@@ -285,9 +285,20 @@ public class GameController : MonoBehaviour
     {
         tanks[0][0].DeactivateBullets();
         tanks[1][0].DeactivateBullets();
-        JObject lastState = JObject.Parse("{done:true}");
-        DriverController.instance.state.Add("done", new JValue(true));
-        DriverController.instance.state.Add("winner", new JValue(winningTeam));
+        try
+        {
+            DriverController.instance.state.Add("done", new JValue(true));
+        } catch (ArgumentException)
+        {
+            Debug.Log("ArgumentException raised while trying to add done to state in EndGame, continuing...");
+        }
+        try
+        {
+            DriverController.instance.state.Add("winner", new JValue(winningTeam));
+        } catch (ArgumentException)
+        {
+            Debug.Log("ArgumentException raised while trying to add winner to state in EndGame, continuing...");
+        }
         SceneManager.LoadScene("Driver");
     }
 
