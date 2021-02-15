@@ -5,7 +5,7 @@
     "timeScale": 1,
     "verbose": false,
     "arena_path": "Assets/Arenas/default.json",
-    "player1_ai": false,
+    "player1_ai": true,
     "player2_ai": true,
     "ai_async": false,
     "ai_actionFreq": 10,

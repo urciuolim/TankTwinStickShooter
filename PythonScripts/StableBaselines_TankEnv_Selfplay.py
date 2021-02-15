@@ -15,13 +15,13 @@ parser.add_argument("--num_intervals", type=int, default = 10,
 parser.add_argument("--num_trials", type=int, default=20,
                     help = "Number of trials to run during evaluation")
 parser.add_argument("--selfp_model_update", type=int, default=10000,
-                    help = "Number of trials to run during evaluation")
+                    help = "How many steps until old policy is updated")
 parser.add_argument("--id", type=str, default="anon", help="ID to add to paths of saved files")
 parser.add_argument("--opp_buf_size", type=int, default=1, help="Size of opponent buffer used in self-play")
 args = parser.parse_args()
 print(args)
 
-env = IndvTankEnv(TankEnv(agent=-1, old_policy_buffer_size=args.opp_buf_size))
+env = IndvTankEnv(TankEnv(agent=-1, opp_buffer_size=args.opp_buf_size))
 model = SAC('MlpPolicy', env, verbose=1)
 avg_reward = []
 avg_steps = []
@@ -36,7 +36,7 @@ for i in range(num_selfp_updates):
     # Save over previous old policy (for self-play)
     print("Saving old policy at:", oldname)
     model.save(oldname)
-    env.load_old_policy(oldname)
+    env.load_opp_policy(oldname)
     # Learn
     model.learn(total_timesteps=args.selfp_model_update)
     # Checkpoint policy if at specified interval

@@ -17,13 +17,16 @@ class TankEnv(gym.Env):
                         num_connection_attempts=60, 
                         sock_timeout=60., 
                         agent=0,
-                        old_policy_buffer_size=1):
+                        opp_buffer_size=1,
+                        random_opp_sel=True):
         super(TankEnv, self).__init__()
         
         self.opponent = None
-        self.opp_buf_size = abs(old_policy_buffer_size)
+        self.opp_buf_size = abs(opp_buffer_size)
         self.opponent_buf = []
         self.opp_num = 0
+        self.opp_idx = 0
+        self.random_opp_sel = random_opp_sel
         
         self.num_agents = num_agents
         self.action_space = spaces.Box(low=-1., high=1., shape=(num_agents, 5), dtype=np.float32)
@@ -55,7 +58,7 @@ class TankEnv(gym.Env):
             elif agent == 3:
                 self.opponent = BoxAgent("box_agent", ob, ac)
         elif agent == -1:
-            print("Self play mode indicated, make sure to explicitly load old policy as opponent")
+            print("Deep Agent opponent play mode indicated, make sure to explicitly load opponent policy.")
         else:
             self.opponent = Agent("stationary_agent", ob, (self.action_space.shape[1],))
         self.agent = agent
@@ -101,8 +104,13 @@ class TankEnv(gym.Env):
                     self.opponent.reset()
                     
                 if self.agent == -1:
-                    self.opponent = random.choice(self.opponent_buf)
-                    print("I choose", self.opponent.name, "to play against")
+                    if self.random_opp_sel:
+                        self.opponent = random.choice(self.opponent_buf)
+                        print("I choose", self.opponent.name, "to play against")
+                    else:
+                        self.opponent = self.opponent_buf[self.opp_idx]
+                        self.opp_idx = (self.opp_idx + 1) % self.opp_num
+                        print("Next opponent to play against is", self.opponent.name)
                 
                 return self.state # TODO: Change this to handle multiple agents
             except json.decoder.JSONDecodeError:
@@ -161,11 +169,10 @@ class TankEnv(gym.Env):
             print("Something wrong with ending game")
         self.sock.close()
         
-    def load_old_policy(self, oldname):
-        print("Loading old policy named", oldname, "for selfplay")
-        #del self.opponent
-        self.opponent = SAC.load(oldname)
-        self.opponent.name = "selfplay_old_policy" + str(self.opp_num)
+    def load_opp_policy(self, opp_name):
+        print("Loading opponent policy named", opp_name)
+        self.opponent = SAC.load(opp_name)
+        self.opponent.name = "opp_policy" + str(self.opp_num)
         self.opp_num += 1
         self.opponent_buf.append(self.opponent)
         self.opponent_buf = self.opponent_buf[-self.opp_buf_size:]

@@ -15,7 +15,7 @@ if args.agent == -1:
     if not args.opp_model_file:
         print("Need to specify an opponent model file when setting agent = -1")
         exit()
-    env.load_old_policy(args.opp_model_file)
+    env.load_opp_policy(args.opp_model_file)
 
 model = SAC.load(args.model_file)
 
