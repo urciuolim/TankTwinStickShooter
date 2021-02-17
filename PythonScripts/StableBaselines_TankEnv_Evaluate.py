@@ -65,17 +65,29 @@ for i in range(args.num_trials):
         state, reward, done, info = env.step(action)
         total_reward += reward
         total_steps += 1
-    if (i+1) % (args.num_trials // 10) == 0:
+    if (i+1) % (args.num_trials / 10) == 0:
         print(((i+1)*100)//args.num_trials, "% trials completed", sep="")
 avg_reward = total_reward/args.num_trials
 avg_steps = total_steps/args.num_trials
 print("Average Reward:", avg_reward)
 print("Average Steps:", avg_steps)
 
-data_point = (model_stats["num_steps"], avg_reward, avg_steps)
-if "performance" in model_stats:
-    model_stats["performance"].append(data_point)
+PERF = "performance"
+TRAINED_STEPS = "trained_steps"
+AVG_REWARD = "avg_reward"
+AVG_STEPS = "avg_steps"
+if PERF in model_stats:
+    model_stats[PERF][TRAINED_STEPS].append(model_stats["num_steps"])
+    model_stats[PERF][AVG_REWARD].append(avg_reward)
+    model_stats[PERF][AVG_STEPS].append(avg_steps)
 else:
-    model_stats["avg_reward"] = [data_point]
+    model_stats[PERF] = {}
+    model_stats[PERF][TRAINED_STEPS] = [model_stats["num_steps"]]
+    model_stats[PERF][AVG_REWARD] = [avg_reward]
+    model_stats[PERF][AVG_STEPS] = [avg_steps]
+    
+with open(stats_file_path, 'w') as stats_file:
+    json.dump(model_stats, stats_file, indent=4)
+    print("Saved stats at:" + stats_file_path)   
 
 env.close()

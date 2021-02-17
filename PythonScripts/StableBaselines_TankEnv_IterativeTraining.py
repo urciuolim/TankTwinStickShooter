@@ -59,6 +59,7 @@ else:
 
 # Load opponents
 for opp in opponents:
+    opp = opp.strip('\n')
     opp_id = "_".join(opp.split('_')[0:-1])
     env.load_opp_policy(args.base_dir + opp_id + "/" + opp)
 
