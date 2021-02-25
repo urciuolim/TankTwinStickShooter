@@ -8,8 +8,9 @@ import json
 # Setup command line arguments
 parser = argparse.ArgumentParser()
 parser.add_argument("base_dir", type=str, help="Base directory for agent models")
-parser.add_argument("id", type=str, help="ID of agent model to be trained")
+parser.add_argument("id", type=str, help="ID of agent model to be evaluated")
 parser.add_argument("--num_trials", type=int, default=100, help = "Total number of trials to evaluate model for")
+parser.add_argument("--no_stats", action="store_true", help="Flag indicates not to record stats after evaluation")
 args = parser.parse_args()
 print(args)
 
@@ -72,22 +73,23 @@ avg_steps = total_steps/args.num_trials
 print("Average Reward:", avg_reward)
 print("Average Steps:", avg_steps)
 
-PERF = "performance"
-TRAINED_STEPS = "trained_steps"
-AVG_REWARD = "avg_reward"
-AVG_STEPS = "avg_steps"
-if PERF in model_stats:
-    model_stats[PERF][TRAINED_STEPS].append(model_stats["num_steps"])
-    model_stats[PERF][AVG_REWARD].append(avg_reward)
-    model_stats[PERF][AVG_STEPS].append(avg_steps)
-else:
-    model_stats[PERF] = {}
-    model_stats[PERF][TRAINED_STEPS] = [model_stats["num_steps"]]
-    model_stats[PERF][AVG_REWARD] = [avg_reward]
-    model_stats[PERF][AVG_STEPS] = [avg_steps]
-    
-with open(stats_file_path, 'w') as stats_file:
-    json.dump(model_stats, stats_file, indent=4)
-    print("Saved stats at:" + stats_file_path)   
+if not args.no_stats:
+    PERF = "performance"
+    TRAINED_STEPS = "trained_steps"
+    AVG_REWARD = "avg_reward"
+    AVG_STEPS = "avg_steps"
+    if PERF in model_stats:
+        model_stats[PERF][TRAINED_STEPS].append(model_stats["num_steps"])
+        model_stats[PERF][AVG_REWARD].append(avg_reward)
+        model_stats[PERF][AVG_STEPS].append(avg_steps)
+    else:
+        model_stats[PERF] = {}
+        model_stats[PERF][TRAINED_STEPS] = [model_stats["num_steps"]]
+        model_stats[PERF][AVG_REWARD] = [avg_reward]
+        model_stats[PERF][AVG_STEPS] = [avg_steps]
+        
+    with open(stats_file_path, 'w') as stats_file:
+        json.dump(model_stats, stats_file, indent=4)
+        print("Saved stats at:" + stats_file_path)   
 
 env.close()
