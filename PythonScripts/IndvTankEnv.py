@@ -25,5 +25,5 @@ class IndvTankEnv(gym.Env):
     def close(self):
         self.env.close()
         
-    def load_opp_policy(self, oldname):
-        self.env.load_opp_policy(oldname)
+    def load_opp_policy(self, oldname, elo=1000):
+        self.env.load_opp_policy(oldname, elo)

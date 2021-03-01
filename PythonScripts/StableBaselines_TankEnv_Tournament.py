@@ -16,11 +16,11 @@ def safe_get_elo(model_stats):
         model_stats["elo"]["steps"] = [model_stats["num_steps"]]
     return model_stats["elo"]["value"][-1]
     
-def get_reward_clear_eval(model_stats):
+def get_reward(model_stats):
     last_reward = model_stats["performance"]["avg_reward"][-1]
-    model_stats["performance"]["avg_reward"] = model_stats["performance"]["avg_reward"][:-1]
-    model_stats["performance"]["avg_steps"] = model_stats["performance"]["avg_steps"][:-1]
-    model_stats["performance"]["trained_steps"] = model_stats["performance"]["trained_steps"][:-1]
+    #model_stats["performance"]["avg_reward"] = model_stats["performance"]["avg_reward"][:-1]
+    #model_stats["performance"]["avg_steps"] = model_stats["performance"]["avg_steps"][:-1]
+    #model_stats["performance"]["trained_steps"] = model_stats["performance"]["trained_steps"][:-1]
     return (last_reward + 1.) / 2.
 
 # Setup command line arguments
@@ -97,7 +97,7 @@ for i,c in enumerate(competitors):
         with open(opp_stats_file_path, 'r') as opp_stats_file:
             opp_stats = json.load(opp_stats_file)
             
-        c_avg_reward = get_reward_clear_eval(c_stats)
+        c_avg_reward = get_reward(c_stats)
         c_elo = safe_get_elo(c_stats)
         opp_elo = safe_get_elo(opp_stats)
         K = 32
@@ -107,6 +107,8 @@ for i,c in enumerate(competitors):
         
         with open(c_stats_file_path, 'w') as c_stats_file:
             json.dump(c_stats, c_stats_file, indent=4)
+            
+print("elo_changes:", elo_changes)
             
 for elo_change,c in zip(elo_changes, competitors):
     c_stats_file_path = args.model_dir + c + "/stats.json"

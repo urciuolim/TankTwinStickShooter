@@ -10,6 +10,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("base_dir", type=str, help="Base directory for agent models")
 parser.add_argument("id", type=str, help="ID of agent model to be trained")
 parser.add_argument("--steps", type=int, default=100000, help = "Total number of steps to train for")
+parser.add_argument("--elo", type=int, default=1000, help = "ELO for training agent")
 args = parser.parse_args()
 print(args)
 
@@ -44,7 +45,7 @@ with open(opp_file_path, 'r') as opp_file:
     if len(opponents) <= 0:
         raise ValueError("No opponents listed in opponents.txt")
     
-env = IndvTankEnv(TankEnv(agent=-1, opp_buffer_size=len(opponents)))
+env = IndvTankEnv(TankEnv(agent=-1, opp_buffer_size=len(opponents), center_elo=args.elo))
 
 model_file_path = args.base_dir + args.id + "/" + args.id + "_" + str(model_stats["num_steps"])
 if os.path.exists(model_file_path + ".zip"):
@@ -60,8 +61,10 @@ else:
 # Load opponents
 for opp in opponents:
     opp = opp.strip('\n')
+    opp_elo = int(opp.split('\t')[-1])
+    opp = opp.split('\t')[0]
     opp_id = "_".join(opp.split('_')[0:-1])
-    env.load_opp_policy(args.base_dir + opp_id + "/" + opp)
+    env.load_opp_policy(args.base_dir + opp_id + "/" + opp, elo=opp_elo)
 
 # Learn
 model.learn(total_timesteps=args.steps)

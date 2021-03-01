@@ -7,6 +7,23 @@ import time
 from Agent import *
 from stable_baselines3 import SAC
 import random
+from numpy.random import choice
+import math
+
+def choice_with_normalization(elements, weights):
+    if sum(weights) == 0:
+        return choice(elements, p=[1 for x in weights])
+    return choice(elements, p=[x/sum(weights) for x in weights])
+
+# return 1. if x is within D of 0, else return 1/(x/D)^2
+def foo(x, D):
+    if x == 0: return 1.
+    x = 1. / math.pow(x/D, 2)
+    return x if x <= 1. else 1.
+    
+def elo_based_choice(agents, center_elo, D):
+    probs = [foo(e.elo-center_elo, D) for e in agents]
+    return choice_with_normalization(agents, probs)
 
 class TankEnv(gym.Env):
     metadata = {'render.modes': None}
@@ -18,7 +35,9 @@ class TankEnv(gym.Env):
                         sock_timeout=60., 
                         agent=0,
                         opp_buffer_size=1,
-                        random_opp_sel=True):
+                        random_opp_sel=True,
+                        center_elo=1000,
+                        D=35.):
         super(TankEnv, self).__init__()
         
         self.opponent = None
@@ -27,6 +46,8 @@ class TankEnv(gym.Env):
         self.opp_num = 0
         self.opp_idx = 0
         self.random_opp_sel = random_opp_sel
+        self.center_elo = center_elo
+        self.D = D
         
         self.num_agents = num_agents
         self.action_space = spaces.Box(low=-1., high=1., shape=(num_agents, 5), dtype=np.float32)
@@ -105,12 +126,12 @@ class TankEnv(gym.Env):
                     
                 if self.agent == -1:
                     if self.random_opp_sel:
-                        self.opponent = random.choice(self.opponent_buf)
-                        print("I choose", self.opponent.name, "to play against")
+                        self.opponent = elo_based_choice(self.opponent_buf, self.center_elo, self.D)
+                        print("I choose", self.opponent.name, "to play against with ELO", self.opponent.elo)
                     else:
                         self.opponent = self.opponent_buf[self.opp_idx]
                         self.opp_idx = (self.opp_idx + 1) % self.opp_num
-                        print("Next opponent to play against is", self.opponent.name)
+                        #print("Next opponent to play against is", self.opponent.name)
                 
                 return self.state # TODO: Change this to handle multiple agents
             except json.decoder.JSONDecodeError:
@@ -169,10 +190,11 @@ class TankEnv(gym.Env):
             print("Something wrong with ending game")
         self.sock.close()
         
-    def load_opp_policy(self, opp_name):
+    def load_opp_policy(self, opp_name, elo=1000):
         print("Loading opponent policy named", opp_name)
         self.opponent = SAC.load(opp_name)
         self.opponent.name = "opp_policy" + str(self.opp_num)
+        self.opponent.elo = elo
         self.opp_num += 1
         self.opponent_buf.append(self.opponent)
         self.opponent_buf = self.opponent_buf[-self.opp_buf_size:]
