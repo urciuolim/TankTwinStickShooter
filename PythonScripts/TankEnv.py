@@ -191,7 +191,7 @@ class TankEnv(gym.Env):
         self.sock.close()
         
     def load_opp_policy(self, opp_name, elo=1000):
-        print("Loading opponent policy named", opp_name)
+        print("Loading opponent policy named", opp_name, "with elo", elo)
         self.opponent = SAC.load(opp_name)
         self.opponent.name = "opp_policy" + str(self.opp_num)
         self.opponent.elo = elo

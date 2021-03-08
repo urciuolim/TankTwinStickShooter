@@ -1,6 +1,6 @@
 import os
+os.environ['MKL_THREADING_LAYER'] = 'GNU'
 import argparse
-import time
 from config_gen import config_gen
 import json
 from elo import *
@@ -30,8 +30,9 @@ parser.add_argument("game_config_file_path", type=str, help="File path of game c
 parser.add_argument("eval_script", type=str, help="Evaluation script path")
 parser.add_argument("model_dir", type=str, help="Base directory for agent models")
 parser.add_argument("comp_file_path", type=str, help="File listing all competitors for tournament")
-parser.add_argument("--num_trials", type=int, default=100, help="Number of trials for each pair of competitors to play out")
+parser.add_argument("--num_trials", type=int, default=50, help="Number of trials for each pair of competitors to play out")
 parser.add_argument("--gamelog", type=str, default="gamelog.txt", help="Log file to direct game logging to")
+parser.add_argument("--slurm", action="store_true", help="Indicates running on a SLURM cluster")
 args = parser.parse_args()
 print(args)
     
@@ -71,6 +72,7 @@ for i,c in enumerate(competitors):
         if c == opp: # Doesn't make sense to play itself as ELO scores are being adjusted
             continue
             
+        print("Competitors:", competitors)
         print("elo_changes:", elo_changes)
         c_stats_file_path = args.model_dir + c + "/stats.json"
         opp_stats_file_path = args.model_dir + opp + "/stats.json"
@@ -87,9 +89,15 @@ for i,c in enumerate(competitors):
             
         # Setup game for evaluation
         config_gen(args.game_config_file_path, random_start=False)
-        os.system(args.game_path + " > " + args.gamelog + " &")
+        game_command = args.game_path + " > " + args.gamelog + " &"
+        if args.slurm:
+            game_command = "srun -N 1 -n 1 " + game_command
+        os.system(game_command)
         # Execute evaluation script
-        os.system("python " + args.eval_script + " " + args.model_dir + " " + c + " --num_trials " + str(args.num_trials))
+        command = "python " + args.eval_script + " " + args.model_dir + " " + c + " --num_trials " + str(args.num_trials)
+        if args.slurm:
+            command = "srun -N 1 -n 1 --gres=gpu:1 " + command
+        os.system(command)
         
         with open(c_stats_file_path, 'r') as c_stats_file:
             c_stats = json.load(c_stats_file)
@@ -102,6 +110,7 @@ for i,c in enumerate(competitors):
         opp_elo = safe_get_elo(opp_stats)
         K = 32
         c_elo_change, opp_elo_change = elo_change(c_elo, opp_elo, K, c_avg_reward)
+        #NOTE: If ELO seems to continuously inflate during PBT, perhaps implement provisional ELO ratings for new agents?
         elo_changes[i] += c_elo_change
         elo_changes[j] += opp_elo_change
         
@@ -115,7 +124,7 @@ for elo_change,c in zip(elo_changes, competitors):
     with open(c_stats_file_path, 'r') as c_stats_file:
         c_stats = json.load(c_stats_file)
     c_stats["elo"]["value"].append(safe_get_elo(c_stats) + elo_change)
-    c_stats["elo"]["steps"] = [c_stats["num_steps"]]
+    c_stats["elo"]["steps"].append(int(c_stats["num_steps"]))
     with open(c_stats_file_path, 'w') as c_stats_file:
         json.dump(c_stats, c_stats_file, indent=4)
     

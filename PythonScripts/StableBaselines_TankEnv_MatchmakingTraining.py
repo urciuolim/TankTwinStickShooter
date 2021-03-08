@@ -1,6 +1,6 @@
 import os
+os.environ['MKL_THREADING_LAYER'] = 'GNU'
 import argparse
-import time
 from config_gen import config_gen
 import json
 
@@ -14,6 +14,7 @@ parser.add_argument("pop_file_path", type=str, help="Path to file that contains 
 parser.add_argument("--steps", type=int, default=100000, help = "Number of steps to train each agent for")
 parser.add_argument("--rs", action="store_true", help="Indicates random start locations to be used during training")
 parser.add_argument("--gamelog", type=str, default="gamelog.txt", help="Log file to direct game logging to")
+parser.add_argument("--slurm", action="store_true", help="Indicates running on a SLURM cluster")
 args = parser.parse_args()
 print(args)
     
@@ -58,12 +59,14 @@ for i,p in enumerate(population):
       
 print("Training population:", [x for x in zip(population, pop_elos)])
 
-
 for p,p_elo in zip(population, pop_elos):
     id = "".join(p.split('_')[:-1])
     # Setup game for training
     config_gen(args.game_config_file_path, random_start=args.rs)
-    os.system(args.game_path + " > " + args.gamelog + " &")
+    game_command = args.game_path + " > " + args.gamelog + " &"
+    if args.slurm:
+        game_command = "srun -N 1 -n 1 " + game_command
+    os.system(game_command)
     # Establish opponents for model to play against
     opp_file_path = args.model_dir + id + "/opponents.txt"
     with open(opp_file_path, 'w') as opp_file:
@@ -72,6 +75,10 @@ for p,p_elo in zip(population, pop_elos):
                 continue
             opp_file.write(opp + "\t" + str(opp_elo) + "\n")
     # Execute training script
-    os.system("python " + args.training_script + " " + args.model_dir + " " + id + " --steps " + str(args.steps) + " --elo " + str(p_elo))
+    rs = " --rs" if args.rs else ""
+    command = "python " + args.training_script + " " + args.model_dir + " " + id + " --steps " + str(args.steps) + " --elo " + str(p_elo) + rs
+    if args.slurm:
+        command = "srun -N 1 -n 1 --gres=gpu:1 " + command
+    os.system(command)
     
 print("Training complete")

@@ -1,8 +1,9 @@
+import os
+os.environ['MKL_THREADING_LAYER'] = 'GNU'
 from TankEnv import TankEnv
 from IndvTankEnv import IndvTankEnv
 from stable_baselines3 import SAC
 import argparse
-import os
 import json
 
 # Setup command line arguments
