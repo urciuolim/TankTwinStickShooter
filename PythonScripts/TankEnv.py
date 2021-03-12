@@ -5,7 +5,7 @@ import socket
 import json
 import time
 from Agent import *
-from stable_baselines3 import SAC
+from stable_baselines3 import PPO
 import random
 from numpy.random import choice
 import math
@@ -49,6 +49,11 @@ class TankEnv(gym.Env):
         self.center_elo = center_elo
         self.D = D
         
+        self.game_ip = game_ip
+        self.game_port = game_port
+        self.num_connection_attempts = num_connection_attempts
+        self.sock_timeout = sock_timeout
+        
         self.num_agents = num_agents
         self.action_space = spaces.Box(low=-1., high=1., shape=(num_agents, 5), dtype=np.float32)
         self.observation_space = spaces.Box(low=-10., high=10., shape=(num_agents, 26), dtype=np.float32)
@@ -64,7 +69,7 @@ class TankEnv(gym.Env):
                 time.sleep(1)
         if i >= num_connection_attempts-1:
             print("Problem connecting to game on IP", game_ip, "on port", game_port)
-            quit()
+            raise ConnectionError
         print("Connected to IP", game_ip, "on port", game_port)
         self.sock.settimeout(sock_timeout)
         
@@ -137,6 +142,23 @@ class TankEnv(gym.Env):
             except json.decoder.JSONDecodeError:
                 print("'Double JSON' error detected during reset, trying reset again...'")
                 continue
+            except ConnectionResetError:
+                print("ConnectionResetError detected during reset, attempting to reconnect")
+                # Establish connection with Unity environment
+                self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                for i in range(self.num_connection_attempts):
+                    try:
+                        self.sock.connect((self.game_ip, self.game_port))
+                        break
+                    except ConnectionRefusedError:
+                        print("Could not connect to IP", self.game_ip, "on port", self.game_port, "...sleeping for one second")
+                        time.sleep(1)
+                if i >= self.num_connection_attempts-1:
+                    print("Problem connecting to game on IP", self.game_ip, "on port", self.game_port)
+                    raise ConnectionError
+                print("Connected to IP", self.game_ip, "on port", self.game_port)
+                self.sock.settimeout(self.sock_timeout)
+                print("Connection reestablished")
         
     def step(self, action):
         # Format actions into message for Unity
@@ -192,7 +214,7 @@ class TankEnv(gym.Env):
         
     def load_opp_policy(self, opp_name, elo=1000):
         print("Loading opponent policy named", opp_name, "with elo", elo)
-        self.opponent = SAC.load(opp_name)
+        self.opponent = PPO.load(opp_name)
         self.opponent.name = "opp_policy" + str(self.opp_num)
         self.opponent.elo = elo
         self.opp_num += 1

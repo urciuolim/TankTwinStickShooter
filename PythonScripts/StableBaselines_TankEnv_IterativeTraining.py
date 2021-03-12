@@ -2,7 +2,7 @@ import os
 os.environ['MKL_THREADING_LAYER'] = 'GNU'
 from TankEnv import TankEnv
 from IndvTankEnv import IndvTankEnv
-from stable_baselines3 import SAC
+from stable_baselines3 import PPO
 import argparse
 import json
 
@@ -12,6 +12,7 @@ parser.add_argument("base_dir", type=str, help="Base directory for agent models"
 parser.add_argument("id", type=str, help="ID of agent model to be trained")
 parser.add_argument("--steps", type=int, default=100000, help = "Total number of steps to train for")
 parser.add_argument("--elo", type=int, default=1000, help = "ELO for training agent")
+parser.add_argument("--port", type=int, default=50000, help = "Port that environment will communicate on.")
 args = parser.parse_args()
 print(args)
 
@@ -46,23 +47,23 @@ with open(opp_file_path, 'r') as opp_file:
     if len(opponents) <= 0:
         raise ValueError("No opponents listed in opponents.txt")
     
-env = IndvTankEnv(TankEnv(agent=-1, opp_buffer_size=len(opponents), center_elo=args.elo))
+env = IndvTankEnv(TankEnv(agent=-1, opp_buffer_size=len(opponents), center_elo=args.elo, game_port=args.port))
 
 model_file_path = args.base_dir + args.id + "/" + args.id + "_" + str(model_stats["num_steps"])
 if os.path.exists(model_file_path + ".zip"):
     print("Model file found at", model_file_path + ".zip")
-    model = SAC.load(model_file_path, env=env, verbose=1)
+    model = PPO.load(model_file_path, env=env, verbose=1)
 elif model_stats["num_steps"] > 0:
     raise FileNotFoundError("Model file not found, but stats file indicates that one should exist")
 else:
     print("Model file not found, creating new one")
-    model = SAC('MlpPolicy', env, verbose=1)
+    model = PPO('MlpPolicy', env, verbose=1)
     model.save(model_file_path)
 
 # Load opponents
 for opp in opponents:
     opp = opp.strip('\n')
-    opp_elo = int(opp.split('\t')[-1])
+    opp_elo = int(opp.split('\t')[-1]) if len(opp.split('\t')) > 1 else args.elo
     opp = opp.split('\t')[0]
     opp_id = "_".join(opp.split('_')[0:-1])
     env.load_opp_policy(args.base_dir + opp_id + "/" + opp, elo=opp_elo)

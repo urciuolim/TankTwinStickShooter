@@ -12,6 +12,7 @@
 /PythonScripts/logs/
 /PythonScripts/__pycache__/
 /PythonScripts/saved_models/
+/PythonScripts/models_rs/
 /PythonScripts/models/
 /PythonScripts/old_models/
 /PythonScripts/Assets/

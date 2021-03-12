@@ -15,6 +15,8 @@ parser.add_argument("--steps", type=int, default=100000, help = "Number of steps
 parser.add_argument("--rs", action="store_true", help="Indicates random start locations to be used during training")
 parser.add_argument("--gamelog", type=str, default="gamelog.txt", help="Log file to direct game logging to")
 parser.add_argument("--slurm", action="store_true", help="Indicates running on a SLURM cluster")
+parser.add_argument("--idx", type=int, default=0, help="For parallel processing, portion of population this job will train (from 1 to {args.part} )")
+parser.add_argument("--part", type=int, default=0, help="For parallel processing, number of partitions population is being split into")
 args = parser.parse_args()
 print(args)
     
@@ -59,13 +61,24 @@ for i,p in enumerate(population):
       
 print("Training population:", [x for x in zip(population, pop_elos)])
 
-for p,p_elo in zip(population, pop_elos):
+if args.idx and args.part:
+    start = round((len(population)/args.part*(args.idx-1)))
+    end = round((len(population)/args.part*(args.idx)))
+    my_pop = population[start:end]
+    my_pop_elos = pop_elos[start:end]
+else:
+    my_pop = population
+    my_pop_elos = pop_elos
+    
+print("My population to train:", [x for x in zip(my_pop, my_pop_elos)])
+
+for p,p_elo in zip(my_pop, my_pop_elos):
     id = "".join(p.split('_')[:-1])
     # Setup game for training
-    config_gen(args.game_config_file_path, random_start=args.rs)
+    config_gen(args.game_config_file_path, random_start=args.rs, port=50000+args.idx)
     game_command = args.game_path + " > " + args.gamelog + " &"
-    if args.slurm:
-        game_command = "srun -N 1 -n 1 " + game_command
+    #if args.slurm:
+        #game_command = "srun -N 1 -n 1 -c 1 " + game_command
     os.system(game_command)
     # Establish opponents for model to play against
     opp_file_path = args.model_dir + id + "/opponents.txt"
@@ -75,10 +88,9 @@ for p,p_elo in zip(population, pop_elos):
                 continue
             opp_file.write(opp + "\t" + str(opp_elo) + "\n")
     # Execute training script
-    rs = " --rs" if args.rs else ""
-    command = "python " + args.training_script + " " + args.model_dir + " " + id + " --steps " + str(args.steps) + " --elo " + str(p_elo) + rs
+    command = "python " + args.training_script + " " + args.model_dir + " " + id + " --steps " + str(args.steps) + " --elo " + str(p_elo)
     if args.slurm:
-        command = "srun -N 1 -n 1 --gres=gpu:1 " + command
+        command = "srun -N 1 -n 1 -c 1 -G 1 " + command
     os.system(command)
     
 print("Training complete")

@@ -3,10 +3,9 @@ from IndvTankEnv import IndvTankEnv
 import os
 os.environ['MKL_THREADING_LAYER'] = 'GNU'
 import argparse
-from config_gen import config_gen
 import json
 from random import choice, randint
-from stable_baselines3 import SAC
+from stable_baselines3 import PPO
 
 # Setup command line arguments
 parser = argparse.ArgumentParser()
@@ -77,7 +76,7 @@ if args.start:
             if not os.path.isdir(args.model_dir + name):
                 break
         population.append(name)
-        model = SAC("MlpPolicy", env)
+        model = PPO("MlpPolicy", env)
         model.save(args.model_dir + name + "/" + name + "_0")
         model_stats = {
             "num_steps":0,

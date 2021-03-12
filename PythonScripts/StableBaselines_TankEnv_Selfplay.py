@@ -18,6 +18,7 @@ parser.add_argument("--num_trials", type=int, default=100, help="Number of trial
 parser.add_argument("--rs", action="store_true", help="Indicates random start locations to be used during training")
 parser.add_argument("--buf_size", type=int, default=1, help="Size of buffer used to draw old policies from")
 parser.add_argument("--gamelog", type=str, default="gamelog.txt", help="Log file to direct game logging to")
+parser.add_argument("--port", type=int, default=50000, help = "Port that environment will communicate on.")
 args = parser.parse_args()
 print(args)
     
@@ -54,19 +55,19 @@ opp_file_path = args.model_dir + args.id + "/opponents.txt"
 
 for _ in range(args.intervals):
     # Setup game for training
-    config_gen(args.game_config_file_path, random_start=args.rs)
+    config_gen(args.game_config_file_path, random_start=args.rs, port=args.port)
     os.system(args.game_path + " > " + args.gamelog + " &")
     # Establish opponents for model to play against
     with open(opp_file_path, 'w') as opp_file:
         for i in range(max(curr_step-(step*(args.buf_size-1)), 0), curr_step+1, step):
             opp_file.write(args.id + "_" + str(i) + "\n")
     # Execute training script
-    os.system("python " + args.training_script + " " + args.model_dir + " " + args.id + " --steps " + str(step))
+    os.system("python " + args.training_script + " " + args.model_dir + " " + args.id + " --steps " + str(step) + " --port " + str(args.port))
     curr_step += step
     # Setup game for evaluation
-    config_gen(args.game_config_file_path, random_start=False)
+    config_gen(args.game_config_file_path, random_start=False, port=args.port)
     os.system(args.game_path + " > " + args.gamelog + " &")
     # Execute evaluation script
-    os.system("python " + args.eval_script + " " + args.model_dir + " " + args.id + " --num_trials " + str(args.num_trials))
+    os.system("python " + args.eval_script + " " + args.model_dir + " " + args.id + " --num_trials " + str(args.num_trials) + " --port " + str(args.port))
     
 print("Training complete")

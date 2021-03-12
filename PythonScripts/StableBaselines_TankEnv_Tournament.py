@@ -33,6 +33,8 @@ parser.add_argument("comp_file_path", type=str, help="File listing all competito
 parser.add_argument("--num_trials", type=int, default=50, help="Number of trials for each pair of competitors to play out")
 parser.add_argument("--gamelog", type=str, default="gamelog.txt", help="Log file to direct game logging to")
 parser.add_argument("--slurm", action="store_true", help="Indicates running on a SLURM cluster")
+parser.add_argument("--idx", type=int, default=0, help="For parallel processing, portion of population this job will train (from 1 to {args.part} )")
+parser.add_argument("--part", type=int, default=0, help="For parallel processing, number of partitions population is being split into")
 args = parser.parse_args()
 print(args)
     
@@ -65,15 +67,23 @@ for c in competitors:
     if not os.path.exists(args.model_dir + c + "/stats.json"):
         raise FileNotFoundError("Competitor ID (" + c + ") does not have a stats file")
         
+if args.idx and args.part:
+    start = round((len(competitors)/args.part*(args.idx-1)))
+    end = round((len(competitors)/args.part*(args.idx)))
+    my_comps = competitors[start:end]
+else:
+    my_comps = competitors
+        
 elo_changes = [0 for _ in range(len(competitors))]
 # Each competitor will play each other <args.num_trials> times
-for i,c in enumerate(competitors):
+for i,c in enumerate(my_comps):
     for j,opp in enumerate(competitors):
         if c == opp: # Doesn't make sense to play itself as ELO scores are being adjusted
             continue
             
         print("Competitors:", competitors)
         print("elo_changes:", elo_changes)
+        print("My competitors:", my_comps)
         c_stats_file_path = args.model_dir + c + "/stats.json"
         opp_stats_file_path = args.model_dir + opp + "/stats.json"
         opp_file_path = args.model_dir + c + "/opponents.txt"
@@ -88,7 +98,7 @@ for i,c in enumerate(competitors):
             opp_file.write(opp + "_" + str(opp_steps))
             
         # Setup game for evaluation
-        config_gen(args.game_config_file_path, random_start=False)
+        config_gen(args.game_config_file_path, random_start=False, port=args.idx)
         game_command = args.game_path + " > " + args.gamelog + " &"
         if args.slurm:
             game_command = "srun -N 1 -n 1 " + game_command
@@ -114,18 +124,24 @@ for i,c in enumerate(competitors):
         elo_changes[i] += c_elo_change
         elo_changes[j] += opp_elo_change
         
-        with open(c_stats_file_path, 'w') as c_stats_file:
-            json.dump(c_stats, c_stats_file, indent=4)
+        #with open(c_stats_file_path, 'w') as c_stats_file:
+        #    json.dump(c_stats, c_stats_file, indent=4)
             
 print("elo_changes:", elo_changes)
             
-for elo_change,c in zip(elo_changes, competitors):
-    c_stats_file_path = args.model_dir + c + "/stats.json"
-    with open(c_stats_file_path, 'r') as c_stats_file:
-        c_stats = json.load(c_stats_file)
-    c_stats["elo"]["value"].append(safe_get_elo(c_stats) + elo_change)
-    c_stats["elo"]["steps"].append(int(c_stats["num_steps"]))
-    with open(c_stats_file_path, 'w') as c_stats_file:
-        json.dump(c_stats, c_stats_file, indent=4)
+if args.idx and args.part:
+    for elo_change,c in zip(elo_changes, competitors):
+        c_change_file_path = args.model_dir + c + "/elo_change-worker" + str(args.idx) + ".txt"
+        with open(c_change_file_path, 'w') as c_change_file:
+            c_change_file.write(str(elo_change))
+else:
+    for elo_change,c in zip(elo_changes, competitors):
+        c_stats_file_path = args.model_dir + c + "/stats.json"
+        with open(c_stats_file_path, 'r') as c_stats_file:
+            c_stats = json.load(c_stats_file)
+        c_stats["elo"]["value"].append(safe_get_elo(c_stats) + elo_change)
+        c_stats["elo"]["steps"].append(int(c_stats["num_steps"]))
+        with open(c_stats_file_path, 'w') as c_stats_file:
+            json.dump(c_stats, c_stats_file, indent=4)
     
 print("Tournament complete")

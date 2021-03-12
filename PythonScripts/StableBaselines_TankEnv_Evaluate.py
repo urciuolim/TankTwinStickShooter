@@ -2,7 +2,7 @@ import os
 os.environ['MKL_THREADING_LAYER'] = 'GNU'
 from TankEnv import TankEnv
 from IndvTankEnv import IndvTankEnv
-from stable_baselines3 import SAC
+from stable_baselines3 import PPO
 import argparse
 import json
 
@@ -12,6 +12,7 @@ parser.add_argument("base_dir", type=str, help="Base directory for agent models"
 parser.add_argument("id", type=str, help="ID of agent model to be evaluated")
 parser.add_argument("--num_trials", type=int, default=100, help = "Total number of trials to evaluate model for")
 parser.add_argument("--no_stats", action="store_true", help="Flag indicates not to record stats after evaluation")
+parser.add_argument("--port", type=int, default=50000, help = "Port that environment will communicate on.")
 args = parser.parse_args()
 print(args)
 
@@ -42,13 +43,13 @@ with open(opp_file_path, 'r') as opp_file:
 with open(stats_file_path, 'r') as stats_file:
     model_stats = json.load(stats_file)
     
-env = IndvTankEnv(TankEnv(agent=-1, opp_buffer_size=len(opponents), random_opp_sel=False))
+env = IndvTankEnv(TankEnv(agent=-1, opp_buffer_size=len(opponents), random_opp_sel=False, game_port=args.port))
 
 model_file_path = args.base_dir + args.id + "/" + args.id + "_" + str(model_stats["num_steps"])
 if not os.path.exists(model_file_path + ".zip"):
     raise FileNotFoundError("Model file not found, but stats file indicates that one should exist")
 
-model = SAC.load(model_file_path, env=env, verbose=1)
+model = PPO.load(model_file_path, env=env, verbose=1)
 print("Loaded model named", model_file_path)
 
 # Load opponents

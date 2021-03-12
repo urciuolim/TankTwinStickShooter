@@ -1,6 +1,6 @@
 from TankEnv import TankEnv
 from IndvTankEnv import IndvTankEnv
-from stable_baselines3 import SAC
+from stable_baselines3 import PPO
 import argparse
 
 parser = argparse.ArgumentParser()
@@ -17,7 +17,7 @@ if args.agent == -1:
         exit()
     env.load_opp_policy(args.opp_model_file)
 
-model = SAC.load(args.model_file)
+model = PPO.load(args.model_file)
 
 obs = env.reset()
 while True:
