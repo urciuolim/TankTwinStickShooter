@@ -15,6 +15,7 @@ public class DriverController : MonoBehaviour
 {
     public static DriverController instance;
     public bool running = false;
+    public bool flip = false;
     private bool ingame = false;
     private int stepsSinceLastAction = 0;
 
@@ -266,6 +267,7 @@ public class DriverController : MonoBehaviour
 
     private void Reset()
     {
+        instance.flip = Random.value >= .5f;
         SceneManager.LoadScene("Arena");
     }
 

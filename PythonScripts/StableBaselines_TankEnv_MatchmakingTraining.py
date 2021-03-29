@@ -3,6 +3,7 @@ os.environ['MKL_THREADING_LAYER'] = 'GNU'
 import argparse
 from config_gen import config_gen
 import json
+import subprocess
 
 # Setup command line arguments
 parser = argparse.ArgumentParser()
@@ -14,7 +15,6 @@ parser.add_argument("pop_file_path", type=str, help="Path to file that contains 
 parser.add_argument("--steps", type=int, default=100000, help = "Number of steps to train each agent for")
 parser.add_argument("--rs", action="store_true", help="Indicates random start locations to be used during training")
 parser.add_argument("--gamelog", type=str, default="gamelog.txt", help="Log file to direct game logging to")
-parser.add_argument("--slurm", action="store_true", help="Indicates running on a SLURM cluster")
 parser.add_argument("--idx", type=int, default=0, help="For parallel processing, portion of population this job will train (from 1 to {args.part} )")
 parser.add_argument("--part", type=int, default=0, help="For parallel processing, number of partitions population is being split into")
 args = parser.parse_args()
@@ -74,12 +74,8 @@ print("My population to train:", [x for x in zip(my_pop, my_pop_elos)])
 
 for p,p_elo in zip(my_pop, my_pop_elos):
     id = "".join(p.split('_')[:-1])
-    # Setup game for training
+    # Generate game config for training
     config_gen(args.game_config_file_path, random_start=args.rs, port=50000+args.idx)
-    game_command = args.game_path + " > " + args.gamelog + " &"
-    #if args.slurm:
-        #game_command = "srun -N 1 -n 1 -c 1 " + game_command
-    os.system(game_command)
     # Establish opponents for model to play against
     opp_file_path = args.model_dir + id + "/opponents.txt"
     with open(opp_file_path, 'w') as opp_file:
@@ -87,10 +83,27 @@ for p,p_elo in zip(my_pop, my_pop_elos):
             if p == opp:
                 continue
             opp_file.write(opp + "\t" + str(opp_elo) + "\n")
-    # Execute training script
-    command = "python " + args.training_script + " " + args.model_dir + " " + id + " --steps " + str(args.steps) + " --elo " + str(p_elo)
-    if args.slurm:
-        command = "srun -N 1 -n 1 -c 1 -G 1 " + command
-    os.system(command)
+    # Loop forever so that if system fails, that error will keep repeating (for debugging purposes)
+    # If that error only happens occasionaly, then this loop will be broken
+    while True:
+        # Run game
+        with open(os.path.expanduser(args.gamelog), 'w') as gl:
+            game_p = subprocess.Popen(args.game_path, stdout=gl, stderr=gl)
+            # Execute training script
+            cmd_list = ["python", args.training_script, 
+                        args.model_dir, id,
+                        "--steps", str(args.steps),
+                        "--elo", str(p_elo),
+                        "--port", str(50000+args.idx)]
+            with open(os.path.expanduser(args.model_dir + id + "/train_log.txt"), 'a') as tl:
+                tl.write("Starting training at " + p.split('_')[-1] + " steps by worker " + str(args.idx) + "\n")
+                train_p = subprocess.Popen(cmd_list, stdout=tl, stderr=tl)
+                train_return = train_p.wait()
+                tl.write("Ending training with exit code: " + str(train_return) + "\n")
+            game_p.kill()
+        if train_return in [0, -6, -7, -11]:
+            break
+        else:
+            print("Worker", args.idx, "had an exit code of", train_return, "so is redoing MT of", id)
     
 print("Training complete")

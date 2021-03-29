@@ -49,6 +49,9 @@ class TankEnv(gym.Env):
         self.center_elo = center_elo
         self.D = D
         
+        #self.action_trace = []
+        #self.state_trace = []
+        
         self.game_ip = game_ip
         self.game_port = game_port
         self.num_connection_attempts = num_connection_attempts
@@ -161,7 +164,10 @@ class TankEnv(gym.Env):
                 print("Connection reestablished")
         
     def step(self, action):
+        #self.action_trace.append(action)
+        #self.state_trace.append(self.state)
         # Format actions into message for Unity
+        #np.nan_to_num(action, copy=False)
         message = {}
         #for i,a in enumerate(action, start=1):
             #message[i] = a.tolist()
@@ -172,6 +178,9 @@ class TankEnv(gym.Env):
             opp_state = np.concatenate([self.state[26:], self.state[:26]])
             old_action, _ = self.opponent.predict(opp_state)
             message[2] = old_action.tolist()
+            
+        #self.action_trace = self.action_trace[-5:]
+        #self.state_trace = self.state_trace[-5:]
         
         # Step Unity environment
         self.send(message)
@@ -215,7 +224,7 @@ class TankEnv(gym.Env):
     def load_opp_policy(self, opp_name, elo=1000):
         print("Loading opponent policy named", opp_name, "with elo", elo)
         self.opponent = PPO.load(opp_name)
-        self.opponent.name = "opp_policy" + str(self.opp_num)
+        self.opponent.name = opp_name.split('/')[-1]
         self.opponent.elo = elo
         self.opp_num += 1
         self.opponent_buf.append(self.opponent)

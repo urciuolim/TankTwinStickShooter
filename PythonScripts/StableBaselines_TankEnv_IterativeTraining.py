@@ -46,8 +46,12 @@ with open(opp_file_path, 'r') as opp_file:
     opponents = opp_file.readlines()
     if len(opponents) <= 0:
         raise ValueError("No opponents listed in opponents.txt")
-    
-env = IndvTankEnv(TankEnv(agent=-1, opp_buffer_size=len(opponents), center_elo=args.elo, game_port=args.port))
+
+try:
+    env = IndvTankEnv(TankEnv(agent=-1, opp_buffer_size=len(opponents), center_elo=args.elo, game_port=args.port))
+except ConnectionError as e:
+    print(e)
+    os._exit(2)
 
 model_file_path = args.base_dir + args.id + "/" + args.id + "_" + str(model_stats["num_steps"])
 if os.path.exists(model_file_path + ".zip"):
@@ -69,7 +73,16 @@ for opp in opponents:
     env.load_opp_policy(args.base_dir + opp_id + "/" + opp, elo=opp_elo)
 
 # Learn
-model.learn(total_timesteps=args.steps)
+try:
+    model.learn(total_timesteps=args.steps)
+except TypeError as e:
+    print(e)
+    print("Despite this error, I'm saving the old policy as the newly trained one")
+    model = PPO.load(model_file_path, env=env, verbose=1)
+    model_stats["NaN"] = True
+except Exception as e:
+    print(e)
+    os._exit(1)
 model_stats["num_steps"] += args.steps
 # Save the model
 model_file_path = args.base_dir + args.id + "/" + args.id + "_" + str(model_stats["num_steps"])

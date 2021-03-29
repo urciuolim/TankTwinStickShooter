@@ -4,6 +4,7 @@ import argparse
 from config_gen import config_gen
 import json
 from elo import *
+import subprocess
 
 def get_steps(stats_file_path):
     with open(stats_file_path, 'r') as stats_file:
@@ -32,7 +33,6 @@ parser.add_argument("model_dir", type=str, help="Base directory for agent models
 parser.add_argument("comp_file_path", type=str, help="File listing all competitors for tournament")
 parser.add_argument("--num_trials", type=int, default=50, help="Number of trials for each pair of competitors to play out")
 parser.add_argument("--gamelog", type=str, default="gamelog.txt", help="Log file to direct game logging to")
-parser.add_argument("--slurm", action="store_true", help="Indicates running on a SLURM cluster")
 parser.add_argument("--idx", type=int, default=0, help="For parallel processing, portion of population this job will train (from 1 to {args.part} )")
 parser.add_argument("--part", type=int, default=0, help="For parallel processing, number of partitions population is being split into")
 args = parser.parse_args()
@@ -76,7 +76,7 @@ else:
         
 elo_changes = [0 for _ in range(len(competitors))]
 # Each competitor will play each other <args.num_trials> times
-for i,c in enumerate(my_comps):
+for c in my_comps:
     for j,opp in enumerate(competitors):
         if c == opp: # Doesn't make sense to play itself as ELO scores are being adjusted
             continue
@@ -98,16 +98,28 @@ for i,c in enumerate(my_comps):
             opp_file.write(opp + "_" + str(opp_steps))
             
         # Setup game for evaluation
-        config_gen(args.game_config_file_path, random_start=False, port=args.idx)
-        game_command = args.game_path + " > " + args.gamelog + " &"
-        if args.slurm:
-            game_command = "srun -N 1 -n 1 " + game_command
-        os.system(game_command)
-        # Execute evaluation script
-        command = "python " + args.eval_script + " " + args.model_dir + " " + c + " --num_trials " + str(args.num_trials)
-        if args.slurm:
-            command = "srun -N 1 -n 1 --gres=gpu:1 " + command
-        os.system(command)
+        config_gen(args.game_config_file_path, random_start=False, port=50000+args.idx)
+        # Loop forever so that if system fails, that error will keep repeating (for debugging purposes)
+        # If that error only happens occasionaly, then this loop will be broken
+        while True:
+            # Run game
+            with open(os.path.expanduser(args.gamelog), 'w') as gl:
+                game_p = subprocess.Popen(args.game_path, stdout=gl, stderr=gl)
+                # Execute evaluation script
+                cmd_list = ["python", args.eval_script,
+                            args.model_dir, c,
+                            "--num_trials", str(args.num_trials),
+                            "--port", str(50000+args.idx)]
+                with open(os.path.expanduser(args.model_dir + c + "/tournament_log.txt"), 'a') as tl:
+                    tl.write("Starting tournament: " + c + "_" + str(c_steps) + " vs " + opp + "_" + str(opp_steps) + " by worker " + str(args.idx) + "\n")
+                    eval_p = subprocess.Popen(cmd_list, stdout=tl, stderr=tl)
+                    eval_return = eval_p.wait()
+                    tl.write("Ending tournament with exit code: " + str(eval_return) + "\n")
+                game_p.kill()
+            if eval_return in [0, -6, -7, -11]:
+                break
+            else:
+                print("Worker", args.idx, "had an exit code of", eval_return, "so is redoing Tourn of", c + "_" + str(c_steps) + " vs " + opp + "_" + str(opp_steps))
         
         with open(c_stats_file_path, 'r') as c_stats_file:
             c_stats = json.load(c_stats_file)
@@ -121,7 +133,7 @@ for i,c in enumerate(my_comps):
         K = 32
         c_elo_change, opp_elo_change = elo_change(c_elo, opp_elo, K, c_avg_reward)
         #NOTE: If ELO seems to continuously inflate during PBT, perhaps implement provisional ELO ratings for new agents?
-        elo_changes[i] += c_elo_change
+        elo_changes[competitors.index(c)] += c_elo_change
         elo_changes[j] += opp_elo_change
         
         #with open(c_stats_file_path, 'w') as c_stats_file:
@@ -139,6 +151,8 @@ else:
         c_stats_file_path = args.model_dir + c + "/stats.json"
         with open(c_stats_file_path, 'r') as c_stats_file:
             c_stats = json.load(c_stats_file)
+        if not "elo" in c_stats:
+            c_stats["elo"] = {"value":[1000], "steps":[c_stats["num_steps"]]}
         c_stats["elo"]["value"].append(safe_get_elo(c_stats) + elo_change)
         c_stats["elo"]["steps"].append(int(c_stats["num_steps"]))
         with open(c_stats_file_path, 'w') as c_stats_file:

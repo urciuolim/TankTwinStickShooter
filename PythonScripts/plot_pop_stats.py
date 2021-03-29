@@ -33,6 +33,7 @@ for subdir, dirs, files in os.walk(args.model_dir):
         #ax[1].plot(xs, smooth_avg_steps, color=color)
         xs = model_stats["elo"]["steps"]
         elos = model_stats["elo"]["value"]
+        xs = [i for i in range(len(xs))]
         ax[2].plot(xs, elos, marker='.', linestyle="None", color=color, label=dir.split('/')[-2])
         smooth_elos = [None for _ in range(args.smooth_len)]
         for i in range(args.smooth_len, len(elos)):

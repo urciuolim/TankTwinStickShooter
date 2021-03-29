@@ -19,6 +19,9 @@
 /PythonScripts/competitors.txt
 /PythonScripts/gamelog.txt
 /PythonScripts/*.zip
+/PythonScripts/models_pbt*
+/PythonScripts/*.png
+/PythonScripts/*.jpg
 
 # Asset meta data should only be ignored when the corresponding asset is also ignored
 !/[Aa]ssets/**/*.meta

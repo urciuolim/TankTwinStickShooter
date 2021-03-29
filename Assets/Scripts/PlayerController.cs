@@ -89,7 +89,19 @@ public class PlayerController : MonoBehaviour
         reloadSteps = (int)Math.Ceiling(reloadTime / DriverController.instance.fixedDeltaTime);
         reloadCountdown = 0;
 
-        if (randomStart) RandomStart();
+        if (randomStart)
+        {
+            RandomStart();
+        }
+        else
+        {
+            if (DriverController.instance.flip)
+            {
+                transform.position = new Vector3(-transform.position.x, -transform.position.y);
+            }
+            transform.position = new Vector3(transform.position.x + UnityEngine.Random.Range(-.5f, .5f),
+                                            transform.position.y + UnityEngine.Random.Range(-3f, 3f));
+        }
     }
 
     private void RandomStart()

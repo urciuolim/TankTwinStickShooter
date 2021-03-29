@@ -2,10 +2,12 @@ from TankEnv import TankEnv
 from IndvTankEnv import IndvTankEnv
 import os
 os.environ['MKL_THREADING_LAYER'] = 'GNU'
+import subprocess
 import argparse
 import json
 from random import choice, randint
 from stable_baselines3 import PPO
+from config_gen import config_gen
 
 # Setup command line arguments
 parser = argparse.ArgumentParser()
@@ -58,7 +60,9 @@ def gen_name():
             if not os.path.isdir(args.model_dir + name):
                 return name
     
-os.system(args.game_path + " > " + args.gamelog + " &")
+config_gen(args.game_config_file_path, port=50000)
+with open(os.path.expanduser(args.gamelog), 'w') as gl:
+    game_p = subprocess.Popen(args.game_path, stdout=gl, stderr=gl)
 env = IndvTankEnv(TankEnv())
 population = []
 for i in range(args.start):
@@ -86,6 +90,7 @@ for i in range(args.start):
         json.dump(model_stats, model_stats_file, indent=4)
     print("Created", name)
 env.close()
+game_p.kill()
 
 with open(args.pop_file_path, 'w') as pop_file:
     for p in population:

@@ -43,7 +43,11 @@ with open(opp_file_path, 'r') as opp_file:
 with open(stats_file_path, 'r') as stats_file:
     model_stats = json.load(stats_file)
     
-env = IndvTankEnv(TankEnv(agent=-1, opp_buffer_size=len(opponents), random_opp_sel=False, game_port=args.port))
+try:
+    env = IndvTankEnv(TankEnv(agent=-1, opp_buffer_size=len(opponents), random_opp_sel=False, game_port=args.port))
+except ConnectionError as e:
+    print(e)
+    os._exit(2)
 
 model_file_path = args.base_dir + args.id + "/" + args.id + "_" + str(model_stats["num_steps"])
 if not os.path.exists(model_file_path + ".zip"):
