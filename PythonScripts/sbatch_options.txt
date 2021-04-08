@@ -1,0 +1,50 @@
+--cpus-per-gpu=<ncpus>
+	Advise Slurm that ensuing job steps will require ncpus processors per allocated GPU. 
+	Not compatible with the --cpus-per-task option.
+-c, --cpus-per-task=<ncpus>
+	Advise the Slurm controller that ensuing job steps will require ncpus number of processors per task. 
+	Without this option, the controller will just try to allocate one processor per task.
+-G, --gpus=[<type>:]<number>
+	Specify the total number of GPUs required for the job. 
+	An optional GPU type specification can be supplied. 
+	For example "--gpus=volta:3". 
+	Multiple options can be requested in a comma separated list, for example: "--gpus=volta:3,kepler:1". See also the --gpus-per-node, --gpus-per-socket and --gpus-per-task options.
+--gpus-per-node=[<type>:]<number>
+	Specify the number of GPUs required for the job on each node included in the job's resource allocation. 
+	An optional GPU type specification can be supplied. 
+	For example "--gpus-per-node=volta:3". 
+	Multiple options can be requested in a comma separated list, for example: "--gpus-per-node=volta:3,kepler:1". 
+	See also the --gpus, --gpus-per-socket and --gpus-per-task options.
+--gpus-per-task=[<type>:]<number>
+	Specify the number of GPUs required for the job on each task to be spawned in the job's resource allocation. 
+	An optional GPU type specification can be supplied. For example "--gpus-per-task=volta:1". 
+	Multiple options can be requested in a comma separated list, for example: "--gpus-per-task=volta:3,kepler:1". 
+	See also the --gpus, --gpus-per-socket and --gpus-per-node options. 
+	This option requires an explicit task count, e.g. -n, --ntasks or "--gpus=X --gpus-per-task=Y" rather than an ambiguous range of nodes with -N, --nodes.
+--gres=<list>
+	Specifies a comma delimited list of generic consumable resources. 
+	The format of each entry on the list is "name[[:type]:count]". 
+	The specified resources will be allocated to the job on each node.
+--mem=<size[units]>
+	Specify the real memory required per node.
+--mem-per-cpu=<size[units]>
+	Minimum memory required per allocated CPU. 
+-N, --nodes=<minnodes[-maxnodes]>
+	Request that a minimum of minnodes nodes be allocated to this job. A maximum node count may also be specified with maxnodes.
+-n, --ntasks=<number>
+	sbatch does not launch tasks, it requests an allocation of resources and submits a batch script. 
+	This option advises the Slurm controller that job steps run within the allocation will launch a maximum of number tasks and to provide for sufficient resources. 
+	The default is one task per node, but note that the --cpus-per-task option will change this default.
+--ntasks-per-gpu=<ntasks>
+	Request that there are ntasks tasks invoked for every GPU. 
+	This option can work in two ways: 
+		1) either specify --ntasks in addition, in which case a type-less GPU specification will be automatically determined to satisfy --ntasks-per-gpu
+		2) specify the GPUs wanted (e.g. via --gpus or --gres) without specifying --ntasks, and the total task count will be automatically determined. 
+	The number of CPUs needed will be automatically increased if necessary to allow for any calculated task count. 
+	This option will implicitly set --gpu-bind=single:<ntasks>, but that can be overridden with an explicit --gpu-bind specification. 
+	This option is not compatible with a node range (i.e. -N<minnodes-maxnodes>). This option is not compatible with --gpus-per-task, --gpus-per-socket, or --ntasks-per-node. 
+	This option is not supported unless SelectType=cons_tres is configured (either directly or indirectly on Cray systems).
+--ntasks-per-node=<ntasks>
+	Request that ntasks be invoked on each node. 
+	If used with the --ntasks option, the --ntasks option will take precedence and the --ntasks-per-node will be treated as a maximum count of tasks per node. 
+	Meant to be used with the --nodes option.

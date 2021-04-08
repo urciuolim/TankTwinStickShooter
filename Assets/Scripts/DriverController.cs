@@ -39,6 +39,14 @@ public class DriverController : MonoBehaviour
 
     private void Awake()
     {
+        string[] args = System.Environment.GetCommandLineArgs();
+        try { 
+            connectionPort = int.Parse(args[1]);
+        } catch (System.FormatException e)
+        {
+            connectionPort = 50000;
+        }
+
         if (instance != null)
         {
             if (instance.running)
@@ -64,8 +72,8 @@ public class DriverController : MonoBehaviour
             config = (JObject)JToken.ReadFrom(reader);
             if (config["connectionIP"] != null)
                 connectionIP = config["connectionIP"].Value<string>();
-            if (config["connectionPort"] != null)
-                connectionPort = config["connectionPort"].Value<int>();
+            //if (config["connectionPort"] != null)
+                //connectionPort = config["connectionPort"].Value<int>();
             if (config["verbose"] != null)
                 verbose = config["verbose"].Value<bool>();
             if (config["ai_async"] != null)

@@ -19,7 +19,7 @@
 /PythonScripts/competitors.txt
 /PythonScripts/gamelog.txt
 /PythonScripts/*.zip
-/PythonScripts/models_pbt*
+/PythonScripts/models*
 /PythonScripts/*.png
 /PythonScripts/*.jpg
 

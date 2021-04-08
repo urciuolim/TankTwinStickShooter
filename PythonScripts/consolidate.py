@@ -32,30 +32,31 @@ for p in population:
     stats_file_path = base_path + "stats.json"
     with open(stats_file_path, 'r') as stats_file:
         model_stats = json.load(stats_file)
-        
-    # Consolidate performance stats generated from tournament
-    avg_reward = model_stats["performance"]["avg_reward"]
-    avg_steps = model_stats["performance"]["avg_steps"]
-    trained_steps = model_stats["performance"]["trained_steps"]
     
-    end = len(trained_steps) - 1
-    last_steps = trained_steps[-1]
-    while end > 0:
-        if trained_steps[end-1] != last_steps:
-            break
-        end -= 1
+    if not ("-nemesis" in p or "-survivor" in p):
+        # Consolidate performance stats generated from tournament
+        avg_reward = model_stats["performance"]["avg_reward"]
+        avg_steps = model_stats["performance"]["avg_steps"]
+        trained_steps = model_stats["performance"]["trained_steps"]
         
-    trained_steps = trained_steps[0:end+1]
-    consol_reward = sum(avg_reward[end:])/len(avg_reward[end:])
-    avg_reward = avg_reward[0:end]
-    avg_reward.append(consol_reward)
-    consol_steps = sum(avg_steps[end:])/len(avg_steps[end:])
-    avg_steps = avg_steps[0:end]
-    avg_steps.append(consol_steps)
-    
-    model_stats["performance"]["avg_reward"] = avg_reward
-    model_stats["performance"]["avg_steps"] = avg_steps
-    model_stats["performance"]["trained_steps"] = trained_steps
+        end = len(trained_steps) - 1
+        last_steps = model_stats["num_steps"]
+        while end > 0:
+            if trained_steps[end-1] != last_steps:
+                break
+            end -= 1
+            
+        trained_steps = trained_steps[0:end+1]
+        consol_reward = sum(avg_reward[end:])/len(avg_reward[end:])
+        avg_reward = avg_reward[0:end]
+        avg_reward.append(consol_reward)
+        consol_steps = sum(avg_steps[end:])/len(avg_steps[end:])
+        avg_steps = avg_steps[0:end]
+        avg_steps.append(consol_steps)
+        
+        model_stats["performance"]["avg_reward"] = avg_reward
+        model_stats["performance"]["avg_steps"] = avg_steps
+        model_stats["performance"]["trained_steps"] = trained_steps
     
     # Consolidate ELO changes and record them at current num_steps
     elo_change = 0

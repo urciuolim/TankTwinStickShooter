@@ -37,7 +37,9 @@ class TankEnv(gym.Env):
                         opp_buffer_size=1,
                         random_opp_sel=True,
                         center_elo=1000,
-                        D=35.):
+                        D=35.,
+                        survivor=False,
+                        max_steps=300):
         super(TankEnv, self).__init__()
         
         self.opponent = None
@@ -48,6 +50,10 @@ class TankEnv(gym.Env):
         self.random_opp_sel = random_opp_sel
         self.center_elo = center_elo
         self.D = D
+        
+        self.survivor = survivor
+        self.step_counter = 0
+        self.max_steps = max_steps
         
         #self.action_trace = []
         #self.state_trace = []
@@ -91,6 +97,7 @@ class TankEnv(gym.Env):
         else:
             self.opponent = Agent("stationary_agent", ob, (self.action_space.shape[1],))
         self.agent = agent
+        #print("Port", game_port, "setup")
         
     def send(self, message):
         data = json.dumps(message)
@@ -112,6 +119,7 @@ class TankEnv(gym.Env):
         return json.loads(received)
         
     def reset(self):
+        #print("Port", self.game_port, "reset")
         while True:
             try:
                 # Send restart message
@@ -127,6 +135,7 @@ class TankEnv(gym.Env):
                 # Receive first state
                 received = self.receive()
                 self.state = np.array(received["state"])
+                self.step_counter = 0
                 #return state.reshape((self.num_agents, 26))
                 
                 if self.opponent.name == "box_agent":
@@ -135,7 +144,7 @@ class TankEnv(gym.Env):
                 if self.agent == -1:
                     if self.random_opp_sel:
                         self.opponent = elo_based_choice(self.opponent_buf, self.center_elo, self.D)
-                        print("I choose", self.opponent.name, "to play against with ELO", self.opponent.elo)
+                        print("Game", self.game_port, ": I choose", self.opponent.name, "to play against with ELO", self.opponent.elo)
                     else:
                         self.opponent = self.opponent_buf[self.opp_idx]
                         self.opp_idx = (self.opp_idx + 1) % self.opp_num
@@ -187,20 +196,19 @@ class TankEnv(gym.Env):
         received = self.receive()
         
         self.state = np.array(received["state"])
+        self.step_counter += 1
         #state = state.reshape((self.num_agents, 26))
         
         done = bool("done" in received)
         
-        reward = 0#np.zeros(self.num_agents)
-        if "winner" in received:
-            winner = int(received["winner"])
-            if winner != -1:
-                reward = 1 if winner == 0 else -1
-            '''
-            if winner = -1:
-                for i in range(self.num_agents):
-                    reward[i] = 1 if winner == i else -1
-            '''
+        reward = 0
+        if not self.survivor:
+            if "winner" in received:
+                winner = int(received["winner"])
+                if winner != -1:
+                    reward = 1 if winner == 0 else -1
+        elif done:
+            reward = self.step_counter / self.max_steps
                 
         info = {}
         
@@ -220,6 +228,7 @@ class TankEnv(gym.Env):
         if not "ending" in received:
             print("Something wrong with ending game")
         self.sock.close()
+        print("Game", self.game_port, "closed port")
         
     def load_opp_policy(self, opp_name, elo=1000):
         print("Loading opponent policy named", opp_name, "with elo", elo)

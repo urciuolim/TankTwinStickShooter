@@ -34,7 +34,7 @@ for subdir, dirs, files in os.walk(args.model_dir):
         all_model_stats[str(dir.strip('/'))] = model_stats
 
 steps_stats = {}
-fig,ax = plt.subplots()
+fig,ax = plt.subplots(1,2)
 for m in sorted(all_model_stats.keys(), key=lambda k: -all_model_stats[k]["elo"]["value"][-1]):
         model_stats = all_model_stats[m]
         color = (random(), random(), random(), 1)
@@ -53,24 +53,24 @@ for m in sorted(all_model_stats.keys(), key=lambda k: -all_model_stats[k]["elo"]
         #End steps stats gathering
         
         if not args.no_dots:
-            ax.plot(xs, elos, marker='.', linestyle="None", color=color, label=m)
+            ax[0].plot(xs, elos, marker='.', linestyle="None", color=color, label=m)
         smooth_elos = smooth(elos, args.smooth_len)
         if not args.no_avg:
             if args.no_dots:
-                ax.plot(xs, smooth_elos, color=color, marker='None', linestyle='--', label=m)
+                ax[0].plot(xs, smooth_elos, color=color, marker='None', linestyle='--', label=m)
             else:
-                ax.plot(xs, smooth_elos, color=color, marker='None', linestyle='--')
+                ax[0].plot(xs, smooth_elos, color=color, marker='None', linestyle='--')
                 
 avg_len = [len(steps_stats[key]) for key in steps_stats]
 print(avg(avg_len))
 avg_elo = [avg(steps_stats[step]) for step in sorted(steps_stats.keys())]
-ax.plot(sorted(steps_stats.keys()), smooth(avg_elo, args.smooth_len), marker='None', linestyle='-', color='r')
+ax[0].plot(sorted(steps_stats.keys()), smooth(avg_elo, args.smooth_len), marker='None', linestyle='-', color='r')
 
-ax.set_title("ELOs throughout training")
-ax.set_xlabel("Total steps")
-ax.set_ylabel("ELO")
-ax.grid(True)
-leg = ax.legend()
+ax[0].set_title("ELOs throughout training")
+ax[0].set_xlabel("Total steps")
+ax[0].set_ylabel("ELO")
+ax[0].grid(True)
+leg = ax[0].legend()
 if not args.show_legend: 
     leg.remove()
 plt.show()

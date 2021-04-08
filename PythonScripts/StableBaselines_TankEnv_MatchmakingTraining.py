@@ -4,6 +4,7 @@ import argparse
 from config_gen import config_gen
 import json
 import subprocess
+import time
 
 # Setup command line arguments
 parser = argparse.ArgumentParser()
@@ -16,7 +17,8 @@ parser.add_argument("--steps", type=int, default=100000, help = "Number of steps
 parser.add_argument("--rs", action="store_true", help="Indicates random start locations to be used during training")
 parser.add_argument("--gamelog", type=str, default="gamelog.txt", help="Log file to direct game logging to")
 parser.add_argument("--idx", type=int, default=0, help="For parallel processing, portion of population this job will train (from 1 to {args.part} )")
-parser.add_argument("--part", type=int, default=0, help="For parallel processing, number of partitions population is being split into")
+parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to run concurrently")
+parser.add_argument("--part", type=int, default=1, help="For parallel processing, number of partitions population is being split into")
 args = parser.parse_args()
 print(args)
     
@@ -61,7 +63,7 @@ for i,p in enumerate(population):
       
 print("Training population:", [x for x in zip(population, pop_elos)])
 
-if args.idx and args.part:
+if args.idx and args.part > 1:
     start = round((len(population)/args.part*(args.idx-1)))
     end = round((len(population)/args.part*(args.idx)))
     my_pop = population[start:end]
@@ -74,36 +76,48 @@ print("My population to train:", [x for x in zip(my_pop, my_pop_elos)])
 
 for p,p_elo in zip(my_pop, my_pop_elos):
     id = "".join(p.split('_')[:-1])
-    # Generate game config for training
-    config_gen(args.game_config_file_path, random_start=args.rs, port=50000+args.idx)
+    p_stats_path = args.model_dir + id + "/stats.json"
+    with open(p_stats_path, 'r') as p_stats_file:
+        p_stats = json.load(p_stats_file)
     # Establish opponents for model to play against
     opp_file_path = args.model_dir + id + "/opponents.txt"
     with open(opp_file_path, 'w') as opp_file:
-        for opp,opp_elo in zip(population, pop_elos):
-            if p == opp:
-                continue
-            opp_file.write(opp + "\t" + str(opp_elo) + "\n")
+        if p_stats["nemesis"] or p_stats["survivor"]:
+            opp_file.write(p_stats["matching_agent"] + "_" + str(p_stats["num_steps"]))
+        else:
+            for opp,opp_elo in zip(population, pop_elos):
+                if p == opp:
+                    continue
+                opp_file.write(opp + "\t" + str(opp_elo) + "\n")
     # Loop forever so that if system fails, that error will keep repeating (for debugging purposes)
     # If that error only happens occasionaly, then this loop will be broken
     while True:
         # Run game
         with open(os.path.expanduser(args.gamelog), 'w') as gl:
-            game_p = subprocess.Popen(args.game_path, stdout=gl, stderr=gl)
+            # Generate game config for training
+            game_ps = []
+            for i in range(args.num_envs):
+                game_cmd_list = [args.game_path, str((50000+args.idx)+(i*args.part))]
+                #config_gen(args.game_config_file_path, random_start=args.rs, port=(50000+args.idx)+(i*args.part))
+                game_p = subprocess.Popen(game_cmd_list, stdout=gl, stderr=gl)
+                game_ps.append(game_p)
+                #time.sleep(1)
             # Execute training script
             cmd_list = ["python", args.training_script, 
                         args.model_dir, id,
                         "--steps", str(args.steps),
                         "--elo", str(p_elo),
-                        "--port", str(50000+args.idx)]
+                        "--port", str(50000+args.idx),
+                        "--num_envs", str(args.num_envs),
+                        "--part", str(args.part)]
             with open(os.path.expanduser(args.model_dir + id + "/train_log.txt"), 'a') as tl:
                 tl.write("Starting training at " + p.split('_')[-1] + " steps by worker " + str(args.idx) + "\n")
                 train_p = subprocess.Popen(cmd_list, stdout=tl, stderr=tl)
                 train_return = train_p.wait()
                 tl.write("Ending training with exit code: " + str(train_return) + "\n")
-            game_p.kill()
+            for game_p in game_ps:
+                game_p.wait()
         if train_return in [0, -6, -7, -11]:
             break
         else:
             print("Worker", args.idx, "had an exit code of", train_return, "so is redoing MT of", id)
-    
-print("Training complete")

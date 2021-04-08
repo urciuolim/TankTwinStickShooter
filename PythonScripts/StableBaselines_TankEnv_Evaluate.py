@@ -5,6 +5,7 @@ from IndvTankEnv import IndvTankEnv
 from stable_baselines3 import PPO
 import argparse
 import json
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 
 # Setup command line arguments
 parser = argparse.ArgumentParser()
@@ -13,6 +14,8 @@ parser.add_argument("id", type=str, help="ID of agent model to be evaluated")
 parser.add_argument("--num_trials", type=int, default=100, help = "Total number of trials to evaluate model for")
 parser.add_argument("--no_stats", action="store_true", help="Flag indicates not to record stats after evaluation")
 parser.add_argument("--port", type=int, default=50000, help = "Port that environment will communicate on.")
+parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to run concurrently")
+parser.add_argument("--part", type=int, default=1, help="For parallel processing, number of partitions population is being split into")
 args = parser.parse_args()
 print(args)
 
@@ -43,8 +46,17 @@ with open(opp_file_path, 'r') as opp_file:
 with open(stats_file_path, 'r') as stats_file:
     model_stats = json.load(stats_file)
     
+envs = []
 try:
-    env = IndvTankEnv(TankEnv(agent=-1, opp_buffer_size=len(opponents), random_opp_sel=False, game_port=args.port))
+    for i in range(args.num_envs):
+        envs.append(
+            lambda a=len(opponents), c=args.port+(i*args.part): 
+                    IndvTankEnv(TankEnv(agent=-1,
+                                        opp_buffer_size=a,
+                                        game_port=c
+                    ))
+        )
+    env_stack = SubprocVecEnv(envs, start_method="fork")#[lambda: env for env in envs])
 except ConnectionError as e:
     print(e)
     os._exit(2)
@@ -53,25 +65,37 @@ model_file_path = args.base_dir + args.id + "/" + args.id + "_" + str(model_stat
 if not os.path.exists(model_file_path + ".zip"):
     raise FileNotFoundError("Model file not found, but stats file indicates that one should exist")
 
-model = PPO.load(model_file_path, env=env, verbose=1)
+model = PPO.load(model_file_path, env=env_stack, verbose=1)
 print("Loaded model named", model_file_path)
 
 # Load opponents
 for opp in opponents:
     opp = opp.strip('\n')
     opp_id = "_".join(opp.split('_')[0:-1])
-    env.load_opp_policy(args.base_dir + opp_id + "/" + opp)
+    env_stack.env_method("load_opp_policy", args.base_dir + opp_id + "/" + opp)
 
 total_reward = 0
 total_steps = 0
-for i in range(args.num_trials):
-    state = env.reset()
-    done = False
-    while not done:
-        action, _state = model.predict(state)
-        state, reward, done, info = env.step(action)
-        total_reward += reward
-        total_steps += 1
+states = env_stack.reset()
+envs_done = []
+i = 0
+while i < args.num_trials:
+    reset_states = env_stack.env_method("reset", indices = envs_done)
+    for state,env_idx in zip(reset_states, envs_done):
+        states[env_idx] = state
+    envs_done = []
+    while len(envs_done) < 1:
+        actions, _states = model.predict(states)
+        states, rewards, dones, infos = env_stack.step(actions)
+        total_reward += sum(rewards)
+        total_steps += args.num_envs
+        if any(dones):
+            for j,done in enumerate(dones):
+                if i >= args.num_trials:
+                    break
+                elif done:
+                    i += 1
+                    envs_done.append(j)
     if (i+1) % (args.num_trials / 10) == 0:
         print(((i+1)*100)//args.num_trials, "% trials completed", sep="")
 avg_reward = total_reward/args.num_trials
@@ -98,4 +122,4 @@ if not args.no_stats:
         json.dump(model_stats, stats_file, indent=4)
         print("Saved stats at:" + stats_file_path)   
 
-env.close()
+env_stack.env_method("close")

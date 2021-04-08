@@ -7,9 +7,10 @@ import argparse
 import json
 from random import choice, randint
 from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import DummyVecEnv
 from config_gen import config_gen
+import time
 
-# Setup command line arguments
 parser = argparse.ArgumentParser()
 parser.add_argument("game_path", type=str, help="File path of game executable")
 parser.add_argument("game_config_file_path", type=str, help="File path of game config file")
@@ -24,6 +25,9 @@ parser.add_argument("noun_file_path", type=str, help="Path to noun file used to 
 parser.add_argument("adj_file_path", type=str, help="Path to adj file used to generate names")
 parser.add_argument("--gamelog", type=str, default="gamelog.txt", help="Log file to direct game logging to")
 parser.add_argument("--start", type=int, default=8, help="Number of starting agents to start population with")
+parser.add_argument("--nem", action="store_true", help="Train with nemeses")
+parser.add_argument("--surv", action="store_true", help="Train with survivors")
+parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to run concurrently")
 args = parser.parse_args()
 print(args)
     
@@ -59,20 +63,8 @@ def gen_name():
                 choice(noun_file.readlines()).strip('\n').capitalize()+str(randint(0,100))
             if not os.path.isdir(args.model_dir + name):
                 return name
-    
-config_gen(args.game_config_file_path, port=50000)
-with open(os.path.expanduser(args.gamelog), 'w') as gl:
-    game_p = subprocess.Popen(args.game_path, stdout=gl, stderr=gl)
-env = IndvTankEnv(TankEnv())
-population = []
-for i in range(args.start):
-    while True:
-        name = gen_name()
-        if not os.path.isdir(args.model_dir + name):
-            break
-    population.append(name)
-    model = PPO("MlpPolicy", env)
-    model.save(args.model_dir + name + "/" + name + "_0")
+                
+def init_stats():
     model_stats = {
         "num_steps":0,
         "performance": {
@@ -84,13 +76,78 @@ for i in range(args.start):
             "value": [1000],
             "steps": [0]
         },
-        "parent": None
+        "parent": None,
+        "matching_agent": None,
+        "nemesis": False,
+        "survivor": False
     }
+    return model_stats
+    
+def gen_agent(my_env):
+    while True:
+        name = gen_name()
+        if not os.path.isdir(args.model_dir + name):
+            break
+    model = PPO("MlpPolicy", my_env, batch_size=4096, n_steps=4096//args.num_envs)
+    model.save(args.model_dir + name + "/" + name + "_0")
+    model_stats = init_stats()
     with open(args.model_dir + name + "/stats.json", 'w') as model_stats_file:
         json.dump(model_stats, model_stats_file, indent=4)
     print("Created", name)
-env.close()
-game_p.kill()
+    return name
+    
+def gen_nemisis(agent_name, my_env):
+    nemisis_name = agent_name + "-nemesis"
+    nemesis = PPO("MlpPolicy", my_env, batch_size=4096, n_steps=4096//args.num_envs)
+    nemesis.save(args.model_dir + nemisis_name + "/" + nemisis_name + "_0")
+    nemisis_stats = init_stats()
+    nemisis_stats["nemesis"] = True
+    nemisis_stats["matching_agent"] = agent_name
+    with open(args.model_dir + nemisis_name + "/stats.json", 'w') as nemisis_stats_file:
+        json.dump(nemisis_stats, nemisis_stats_file, indent=4)
+    print("Created", nemisis_name)
+    return nemisis_name
+    
+def gen_survivor(agent_name, my_env):
+    survivor_name = agent_name + "-survivor"
+    survivor = PPO("MlpPolicy", my_env, batch_size=4096, n_steps=4096//args.num_envs)
+    survivor.save(args.model_dir + survivor_name + "/" + survivor_name + "_0")
+    survivor_stats = init_stats()
+    survivor_stats["survivor"] = True
+    survivor_stats["matching_agent"] = agent_name
+    with open(args.model_dir + survivor_name + "/stats.json", 'w') as survivor_stats_file:
+        json.dump(survivor_stats, survivor_stats_file, indent=4)
+    print("Created", survivor_name)
+    return survivor_name
+            
+game_ps = []
+envs = []
+with open(os.path.expanduser(args.gamelog), 'w') as gl:
+    for i in range(args.num_envs):
+        game_cmd_list = [args.game_path, str(50000+i)]
+        #config_gen(args.game_config_file_path, port=50000+i)
+        game_p = subprocess.Popen(game_cmd_list, stdout=gl, stderr=gl)
+        game_ps.append(game_p)
+        #time.sleep(1)
+        env = IndvTankEnv(TankEnv(game_port=50000+i))
+        envs.append(env)
+        #input("Press enter")
+        
+    d = DummyVecEnv([lambda: x for x in envs])
+
+    population = []
+    for i in range(args.start):
+        agent_name = gen_agent(d)
+        population.append(agent_name)
+        if args.nem:
+            population.append(gen_nemisis(agent_name, d))
+        if args.surv:
+            population.append(gen_survivor(agent_name, d))
+        
+    for env in envs:
+        env.close()
+    for game_p in game_ps:
+        game_p.kill()
 
 with open(args.pop_file_path, 'w') as pop_file:
     for p in population:
