@@ -86,7 +86,7 @@ Rigidbody2D:
   m_Material: {fileID: 0}
   m_Interpolate: 0
   m_SleepingMode: 1
-  m_CollisionDetection: 0
+  m_CollisionDetection: 1
   m_Constraints: 4
 --- !u!114 &4662895290302496672
 MonoBehaviour:
@@ -100,17 +100,18 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 85996ebf75e04814a9392ee806fa736d, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  speed: 3
+  velocity: {x: 0, y: 0}
+  aim: {x: 0, y: 0}
   bulletPrefab: {fileID: 5508837464826449269, guid: ed30eeb35c0ad7947ab468367e318385,
     type: 3}
-  triggerThreshold: 0.5
-  reloadTime: 0.33
   canShoot: 0
   myColor: {r: 0, g: 0, b: 0, a: 0}
   maxHealth: 0
   health: 1
   playerID: 0
+  AI: 1
   playing: 0
+  bullets: []
 --- !u!60 &4662895290302496674
 PolygonCollider2D:
   m_ObjectHideFlags: 0

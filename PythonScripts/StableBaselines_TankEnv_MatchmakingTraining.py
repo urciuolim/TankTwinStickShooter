@@ -19,6 +19,7 @@ parser.add_argument("--gamelog", type=str, default="gamelog.txt", help="Log file
 parser.add_argument("--idx", type=int, default=0, help="For parallel processing, portion of population this job will train (from 1 to {args.part} )")
 parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to run concurrently")
 parser.add_argument("--part", type=int, default=1, help="For parallel processing, number of partitions population is being split into")
+parser.add_argument("--base_port", type=int, default=51000, help="Base port to run game env on.")
 args = parser.parse_args()
 print(args)
     
@@ -97,7 +98,7 @@ for p,p_elo in zip(my_pop, my_pop_elos):
             # Generate game config for training
             game_ps = []
             for i in range(args.num_envs):
-                game_cmd_list = [args.game_path, str((50000+args.idx)+(i*args.part))]
+                game_cmd_list = [args.game_path, str((args.base_port+args.idx)+(i*args.part))]
                 #config_gen(args.game_config_file_path, random_start=args.rs, port=(50000+args.idx)+(i*args.part))
                 game_p = subprocess.Popen(game_cmd_list, stdout=gl, stderr=gl)
                 game_ps.append(game_p)
@@ -107,17 +108,19 @@ for p,p_elo in zip(my_pop, my_pop_elos):
                         args.model_dir, id,
                         "--steps", str(args.steps),
                         "--elo", str(p_elo),
-                        "--port", str(50000+args.idx),
+                        "--port", str(args.base_port+args.idx),
                         "--num_envs", str(args.num_envs),
                         "--part", str(args.part)]
             with open(os.path.expanduser(args.model_dir + id + "/train_log.txt"), 'a') as tl:
                 tl.write("Starting training at " + p.split('_')[-1] + " steps by worker " + str(args.idx) + "\n")
                 train_p = subprocess.Popen(cmd_list, stdout=tl, stderr=tl)
                 train_return = train_p.wait()
-                tl.write("Ending training with exit code: " + str(train_return) + "\n")
+                #tl.write("Ending training with exit code: " + str(train_return) + "\n")
             for game_p in game_ps:
                 game_p.wait()
-        if train_return in [0, -6, -7, -11]:
+        if os.path.exists(args.model_dir + id + "/done.txt"):
+            print("Worker", args.idx, "has completed the training of", id)
+            os.remove(args.model_dir + id + "/done.txt")
             break
         else:
-            print("Worker", args.idx, "had an exit code of", train_return, "so is redoing MT of", id)
+            print("Worker", args.idx, "did not complete the training of", id, "so trying again...")

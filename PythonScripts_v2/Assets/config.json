@@ -1,6 +1,5 @@
 {
     "connectionIP": "127.0.0.1",
-    "connectionPort": 50000,
     "game_maxTime": 60,
     "timeScale": 5,
     "verbose": false,
@@ -11,7 +10,5 @@
     "ai_actionFreq": 10,
     "ai_fixedDeltaTime": 0.02,
     "player_maxHealth": 1,
-    "player_randomStart": false,
-	"player_x_spawn_lim": .5,
-	"player_y_spawn_lim": 1.0
+    "player_randomStart": false
 }

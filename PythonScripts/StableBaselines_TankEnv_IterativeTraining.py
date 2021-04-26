@@ -51,21 +51,17 @@ with open(opp_file_path, 'r') as opp_file:
         raise ValueError("No opponents listed in opponents.txt")
 
 envs = []
-try:
-    for i in range(args.num_envs):
-        envs.append(
-            lambda a=len(opponents), b=args.elo, c=args.port+(i*args.part), d=model_stats["survivor"]: 
-                    IndvTankEnv(TankEnv(agent=-1,
-                                        opp_buffer_size=a,
-                                        center_elo=b,
-                                        game_port=c,
-                                        survivor=d
-                    ))
-        )
-    env_stack = SubprocVecEnv(envs, start_method="fork")#[lambda: env for env in envs])
-except ConnectionError as e:
-    print(e)
-    os._exit(2)
+for i in range(args.num_envs):
+    envs.append(
+        lambda a=len(opponents), b=args.elo, c=args.port+(i*args.part), d=model_stats["survivor"]: 
+                IndvTankEnv(TankEnv(agent=-1,
+                                    opp_buffer_size=a,
+                                    center_elo=b,
+                                    game_port=c,
+                                    survivor=d
+                ))
+    )
+env_stack = SubprocVecEnv(envs, start_method="fork")#[lambda: env for env in envs])
 
 model_file_path = args.base_dir + args.id + "/" + args.id + "_" + str(model_stats["num_steps"])
 if os.path.exists(model_file_path + ".zip"):
@@ -98,10 +94,6 @@ except TypeError as e:
     print("Despite this error, I'm saving the old policy as the newly trained one")
     model = PPO.load(model_file_path, env=env_stack, verbose=1)
     model_stats["NaN"] = True
-except Exception as e:
-    print(e)
-    #raise(e)
-    os._exit(1)
 model_stats["num_steps"] += args.steps
 # Save the model
 model_file_path = args.base_dir + args.id + "/" + args.id + "_" + str(model_stats["num_steps"])
@@ -111,4 +103,7 @@ with open(stats_file_path, 'w') as stats_file:
     json.dump(model_stats, stats_file, indent=4)
     print("Saved stats at:" + stats_file_path)    
 
-env_stack.env_method("close")
+env_stack.close()
+with open(args.base_dir + args.id + "/done.txt", 'w') as done_file:
+    done_file.write("done")
+    print("Wrote done file to", done_file, '\n', args.base_dir + args.id + "/done.txt")

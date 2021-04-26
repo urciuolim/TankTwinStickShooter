@@ -28,6 +28,7 @@ parser.add_argument("--start", type=int, default=8, help="Number of starting age
 parser.add_argument("--nem", action="store_true", help="Train with nemeses")
 parser.add_argument("--surv", action="store_true", help="Train with survivors")
 parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to run concurrently")
+parser.add_argument("--batch_size", type=int, default=64, help="Batch size for all agents")
 args = parser.parse_args()
 print(args)
     
@@ -88,7 +89,7 @@ def gen_agent(my_env):
         name = gen_name()
         if not os.path.isdir(args.model_dir + name):
             break
-    model = PPO("MlpPolicy", my_env, batch_size=4096, n_steps=4096//args.num_envs)
+    model = PPO("MlpPolicy", my_env, batch_size=args.batch_size, n_steps=args.batch_size//args.num_envs)
     model.save(args.model_dir + name + "/" + name + "_0")
     model_stats = init_stats()
     with open(args.model_dir + name + "/stats.json", 'w') as model_stats_file:
@@ -98,7 +99,7 @@ def gen_agent(my_env):
     
 def gen_nemisis(agent_name, my_env):
     nemisis_name = agent_name + "-nemesis"
-    nemesis = PPO("MlpPolicy", my_env, batch_size=4096, n_steps=4096//args.num_envs)
+    nemesis = PPO("MlpPolicy", my_env, batch_size=args.batch_size, n_steps=args.batch_size//args.num_envs)
     nemesis.save(args.model_dir + nemisis_name + "/" + nemisis_name + "_0")
     nemisis_stats = init_stats()
     nemisis_stats["nemesis"] = True
@@ -110,7 +111,7 @@ def gen_nemisis(agent_name, my_env):
     
 def gen_survivor(agent_name, my_env):
     survivor_name = agent_name + "-survivor"
-    survivor = PPO("MlpPolicy", my_env, batch_size=4096, n_steps=4096//args.num_envs)
+    survivor = PPO("MlpPolicy", my_env, batch_size=args.batch_size, n_steps=args.batch_size//args.num_envs)
     survivor.save(args.model_dir + survivor_name + "/" + survivor_name + "_0")
     survivor_stats = init_stats()
     survivor_stats["survivor"] = True
@@ -143,14 +144,13 @@ with open(os.path.expanduser(args.gamelog), 'w') as gl:
             population.append(gen_nemisis(agent_name, d))
         if args.surv:
             population.append(gen_survivor(agent_name, d))
+    with open(args.pop_file_path, 'w') as pop_file:
+        for p in population:
+            pop_file.write(p + '\n')
         
     for env in envs:
         env.close()
     for game_p in game_ps:
         game_p.kill()
-
-with open(args.pop_file_path, 'w') as pop_file:
-    for p in population:
-        pop_file.write(p + '\n')
     
 print("PBT Preamble complete")

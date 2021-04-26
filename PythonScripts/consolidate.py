@@ -28,11 +28,11 @@ print("Consolidating training population:", population)
 for p in population:
     print("Consolidating", p)
     base_path = args.model_dir + p + '/'
-    
+
     stats_file_path = base_path + "stats.json"
     with open(stats_file_path, 'r') as stats_file:
         model_stats = json.load(stats_file)
-    
+    '''
     if not ("-nemesis" in p or "-survivor" in p):
         # Consolidate performance stats generated from tournament
         avg_reward = model_stats["performance"]["avg_reward"]
@@ -57,12 +57,14 @@ for p in population:
         model_stats["performance"]["avg_reward"] = avg_reward
         model_stats["performance"]["avg_steps"] = avg_steps
         model_stats["performance"]["trained_steps"] = trained_steps
-    
+    '''
     # Consolidate ELO changes and record them at current num_steps
     elo_change = 0
     for i in range(1, args.N+1):
-        with open(base_path + "elo_change-worker" + str(i) + ".txt") as change_file:
+        change_file_path = base_path + "elo_change-worker" + str(i) + ".txt"
+        with open(change_file_path) as change_file:
             elo_change += int(change_file.readline().strip('\n'))
+        os.remove(change_file_path)
     model_stats["elo"]["value"].append(model_stats["elo"]["value"][-1] + elo_change)
     model_stats["elo"]["steps"].append(model_stats["num_steps"])
     

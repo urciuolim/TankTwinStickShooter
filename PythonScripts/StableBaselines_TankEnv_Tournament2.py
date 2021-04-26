@@ -5,6 +5,11 @@ from config_gen import config_gen
 import json
 from elo import *
 import subprocess
+from StableBaselines_TankEnv_Evaluate2 import evaluate
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
+from TankEnv import TankEnv
+from IndvTankEnv import IndvTankEnv
+import sys
 
 def get_steps(stats_file_path):
     with open(stats_file_path, 'r') as stats_file:
@@ -39,7 +44,6 @@ def apply_elo_change(agent, elo_change):
 parser = argparse.ArgumentParser()
 parser.add_argument("game_path", type=str, help="File path of game executable")
 parser.add_argument("game_config_file_path", type=str, help="File path of game config file")
-parser.add_argument("eval_script", type=str, help="Evaluation script path")
 parser.add_argument("model_dir", type=str, help="Base directory for agent models")
 parser.add_argument("comp_file_path", type=str, help="File listing all competitors for tournament")
 parser.add_argument("--num_trials", type=int, default=50, help="Number of trials for each pair of competitors to play out")
@@ -49,7 +53,7 @@ parser.add_argument("--part", type=int, default=1, help="For parallel processing
 parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to run concurrently")
 parser.add_argument("--base_port", type=int, default=52000, help="Base port to run game env on.")
 args = parser.parse_args()
-print(args)
+print(args, flush=True)
     
 if not (args.model_dir[-1] == '/' or args.model_dir[-1] == '\\'):
     args.model_dir = args.model_dir + "/"
@@ -60,14 +64,13 @@ if not os.path.exists(args.game_path):
 if not os.path.exists(args.game_config_file_path):
     raise FileNotFoundError("Game config file not found")
     
-if not os.path.exists(args.eval_script):
-    raise FileNotFoundError("Python evaluation file not found")
-    
 if not os.path.isdir(args.model_dir):
     raise FileNotFoundError("Base directory for agent models is not a folder")
     
 if not os.path.exists(args.comp_file_path):
     raise FileNotFoundError("Competitors file not found")
+    
+original_stdout = sys.stdout
     
 competitors = []
 HAS_NEM = False
@@ -96,81 +99,89 @@ else:
     my_comps = competitors
         
 elo_changes = [0 for _ in range(len(competitors))]
-# Each competitor will play each other <args.num_trials> times
-for c in my_comps:
-    for j,opp in enumerate(competitors):
-        if c == opp: # Doesn't make sense to play itself as ELO scores are being adjusted
-            continue
-            
-        print("Competitors:", competitors)
-        print("elo_changes:", elo_changes)
-        print("My competitors:", my_comps)
-        c_stats_file_path = args.model_dir + c + "/stats.json"
-        opp_stats_file_path = args.model_dir + opp + "/stats.json"
-        opp_file_path = args.model_dir + c + "/opponents.txt"
-        
-        c_steps = get_steps(c_stats_file_path)
-        opp_steps = get_steps(opp_stats_file_path)
-                
-        print(c+ "_" + str(c_steps), "vs", opp + "_" + str(opp_steps))
 
-        # Establish opponents for model to play against
-        with open(opp_file_path, 'w') as opp_file:
-            opp_file.write(opp + "_" + str(opp_steps))
+with open(os.path.expanduser(args.gamelog), 'w') as gl:
+    game_ps = []
+    for i in range(args.num_envs):
+        game_cmd_list = [args.game_path, str((args.base_port+args.idx)+(i*args.part))]
+        #config_gen(args.game_config_file_path, random_start=args.rs, port=(50000+args.idx)+(i*args.part))
+        game_p = subprocess.Popen(game_cmd_list, stdout=gl, stderr=gl)
+        game_ps.append(game_p)
+        
+    envs = []
+    for i in range(args.num_envs):
+        envs.append(
+            lambda c=(args.base_port+args.idx)+(i*args.part): 
+                    IndvTankEnv(TankEnv(agent=-1,
+                                        opp_buffer_size=1,
+                                        game_port=c
+                    ))
+        )
+    env_stack = SubprocVecEnv(envs, start_method="fork")#[lambda: env for env in envs])
+    # Each competitor will play each other <args.num_trials> times
+    for c in my_comps:
+        sys.stdout = open(args.model_dir + c + "/tourn_log.txt", 'a')
+        for j,opp in enumerate(competitors):
+            if c == opp: # Doesn't make sense to play itself as ELO scores are being adjusted
+                continue
+            env_stack.env_method("unload_opp_policies")
+                
+            print("Competitors:", competitors, flush=True)
+            print("elo_changes:", elo_changes, flush=True)
+            print("My competitors:", my_comps, flush=True)
+            print((j/len(competitors))*100, "% complete with tournament", sep="", flush=True)
+            c_stats_file_path = args.model_dir + c + "/stats.json"
+            opp_stats_file_path = args.model_dir + opp + "/stats.json"
+            opp_file_path = args.model_dir + c + "/opponents.txt"
             
-        # Setup game for evaluation
-        #config_gen(args.game_config_file_path, random_start=False, port=50000+args.idx)
-        # Loop forever so that if system fails, that error will keep repeating (for debugging purposes)
-        # If that error only happens occasionaly, then this loop will be broken
-        while True:
-            # Run game
-            with open(os.path.expanduser(args.gamelog), 'w') as gl:
-                game_ps = []
-                for i in range(args.num_envs):
-                    game_cmd_list = [args.game_path, str((args.base_port+args.idx)+(i*args.part))]
-                    #config_gen(args.game_config_file_path, random_start=args.rs, port=(50000+args.idx)+(i*args.part))
-                    game_p = subprocess.Popen(game_cmd_list, stdout=gl, stderr=gl)
-                    game_ps.append(game_p)
-                # Execute evaluation script
-                cmd_list = ["python", args.eval_script,
-                            args.model_dir, c,
-                            "--num_trials", str(args.num_trials),
-                            "--port", str(args.base_port+args.idx),
-                            "--num_envs", str(args.num_envs),
-                            "--part", str(args.part)]
-                with open(os.path.expanduser(args.model_dir + c + "/tournament_log.txt"), 'a') as tl:
-                    tl.write("Starting tournament eval: " + c + "_" + str(c_steps) + " vs " + opp + "_" + str(opp_steps) + " by worker " + str(args.idx) + "\n")
-                    eval_p = subprocess.Popen(cmd_list, stdout=tl, stderr=tl)
-                    eval_return = eval_p.wait()
-                    tl.write("Ending tournament eval with exit code: " + str(eval_return) + "\n")
-                for game_p in game_ps:
-                    game_p.wait()
+            c_steps = get_steps(c_stats_file_path)
+            opp_steps = get_steps(opp_stats_file_path)
+                    
+            print(c+ "_" + str(c_steps), "vs", opp + "_" + str(opp_steps), flush=True)
+
+            # Establish opponents for model to play against
+            #with open(opp_file_path, 'w') as opp_file:
+                #opp_file.write(opp + "_" + str(opp_steps))
+            env_stack.env_method("load_opp_policy", args.model_dir + opp + '/' + opp + '_' + str(opp_steps))
+                
+            # Execute evaluation
+            print("Starting tournament eval:", c + "_" + str(c_steps), "vs", opp + "_" + str(opp_steps), "by worker", args.idx, flush=True)
+            (avg_reward, _) = evaluate(args.model_dir, c, env_stack, args.num_envs, args.num_trials, no_stats=True)
+            c_win_rate = (avg_reward + 1.) / 2.
+            print("Ending tournament eval", flush=True)
+
+            '''
             if os.path.exists(args.model_dir + c + "/done.txt"):
                 print("Worker", args.idx, "has completed the tournament eval of", c)
                 os.remove(args.model_dir + c + "/done.txt")
-                break
             else:
-                print("Worker", args.idx, "did not complete the tournament eval of", c, "so trying again...")
+                print("Worker", args.idx, "did not complete the tournament eval of", c, "so ...")
+            '''
+            
+            with open(c_stats_file_path, 'r') as c_stats_file:
+                c_stats = json.load(c_stats_file)
+                
+            with open(opp_stats_file_path, 'r') as opp_stats_file:
+                opp_stats = json.load(opp_stats_file)
+                
+            #c_avg_reward = get_reward(c_stats)
+            c_elo = safe_get_elo(c_stats)
+            opp_elo = safe_get_elo(opp_stats)
+            K = 32
+            c_elo_change, opp_elo_change = elo_change(c_elo, opp_elo, K, c_win_rate)
+            #NOTE: If ELO seems to continuously inflate during PBT, perhaps implement provisional ELO ratings for new agents?
+            elo_changes[competitors.index(c)] += c_elo_change
+            elo_changes[j] += opp_elo_change
+    # end for c in my_comps:
+            
+    env_stack.close()
+    for game_p in game_ps:
+        game_p.wait()
         
-        with open(c_stats_file_path, 'r') as c_stats_file:
-            c_stats = json.load(c_stats_file)
+sys.stdout.close()
+sys.stdout = original_stdout
             
-        with open(opp_stats_file_path, 'r') as opp_stats_file:
-            opp_stats = json.load(opp_stats_file)
-            
-        c_avg_reward = get_reward(c_stats)
-        c_elo = safe_get_elo(c_stats)
-        opp_elo = safe_get_elo(opp_stats)
-        K = 32
-        c_elo_change, opp_elo_change = elo_change(c_elo, opp_elo, K, c_avg_reward)
-        #NOTE: If ELO seems to continuously inflate during PBT, perhaps implement provisional ELO ratings for new agents?
-        elo_changes[competitors.index(c)] += c_elo_change
-        elo_changes[j] += opp_elo_change
-        
-        #with open(c_stats_file_path, 'w') as c_stats_file:
-        #    json.dump(c_stats, c_stats_file, indent=4)
-            
-print("elo_changes:", elo_changes)
+print("elo_changes:", elo_changes, flush=True)
             
 exploiters = []
 if HAS_NEM:

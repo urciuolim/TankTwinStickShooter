@@ -22,6 +22,10 @@
 /PythonScripts/models*
 /PythonScripts/*.png
 /PythonScripts/*.jpg
+/PythonScripts/*_models*/
+/PythonScripts/test/
+/PythonScripts_v2/*test*/
+/PythonScripts_v2/gamelog*
 
 # Asset meta data should only be ignored when the corresponding asset is also ignored
 !/[Aa]ssets/**/*.meta

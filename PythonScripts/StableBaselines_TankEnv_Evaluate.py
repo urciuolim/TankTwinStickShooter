@@ -47,19 +47,15 @@ with open(stats_file_path, 'r') as stats_file:
     model_stats = json.load(stats_file)
     
 envs = []
-try:
-    for i in range(args.num_envs):
-        envs.append(
-            lambda a=len(opponents), c=args.port+(i*args.part): 
-                    IndvTankEnv(TankEnv(agent=-1,
-                                        opp_buffer_size=a,
-                                        game_port=c
-                    ))
-        )
-    env_stack = SubprocVecEnv(envs, start_method="fork")#[lambda: env for env in envs])
-except ConnectionError as e:
-    print(e)
-    os._exit(2)
+for i in range(args.num_envs):
+    envs.append(
+        lambda a=len(opponents), c=args.port+(i*args.part): 
+                IndvTankEnv(TankEnv(agent=-1,
+                                    opp_buffer_size=a,
+                                    game_port=c
+                ))
+    )
+env_stack = SubprocVecEnv(envs, start_method="fork")#[lambda: env for env in envs])
 
 model_file_path = args.base_dir + args.id + "/" + args.id + "_" + str(model_stats["num_steps"])
 if not os.path.exists(model_file_path + ".zip"):
@@ -91,15 +87,13 @@ while i < args.num_trials:
         total_steps += args.num_envs
         if any(dones):
             for j,done in enumerate(dones):
-                if i >= args.num_trials:
-                    break
-                elif done:
+                if done:
                     i += 1
                     envs_done.append(j)
     if (i+1) % (args.num_trials / 10) == 0:
         print(((i+1)*100)//args.num_trials, "% trials completed", sep="")
-avg_reward = total_reward/args.num_trials
-avg_steps = total_steps/args.num_trials
+avg_reward = total_reward/i
+avg_steps = total_steps/i
 print("Average Reward:", avg_reward)
 print("Average Steps:", avg_steps)
 
@@ -122,4 +116,7 @@ if not args.no_stats:
         json.dump(model_stats, stats_file, indent=4)
         print("Saved stats at:" + stats_file_path)   
 
-env_stack.env_method("close")
+env_stack.close()
+with open(args.base_dir + args.id + "/done.txt", 'w') as done_file:
+    done_file.write("done")
+    print("Wrote done file to", done_file, '\n', args.base_dir + args.id + "/done.txt")

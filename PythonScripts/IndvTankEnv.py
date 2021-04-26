@@ -27,3 +27,6 @@ class IndvTankEnv(gym.Env):
         
     def load_opp_policy(self, oldname, elo=1000):
         self.env.load_opp_policy(oldname, elo)
+        
+    def unload_opp_policies(self):
+        self.env.unload_opp_policies()

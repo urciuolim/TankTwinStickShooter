@@ -23,6 +23,8 @@ public class PlayerController : MonoBehaviour
     private int reloadSteps;
     private int reloadCountdown;
     private bool randomStart = true;
+    private float xSpawnLim = .5f;
+    private float ySpawnLim = 3f;
 
     public Color myColor;
     [HideInInspector]
@@ -56,6 +58,10 @@ public class PlayerController : MonoBehaviour
             AI = config["player" + playerID + "_ai"].Value<bool>();
         if (config["player_randomStart"] != null)
             randomStart = config["player_randomStart"].Value<bool>();
+        if (config["player_x_spawn_lim"] != null)
+            xSpawnLim = config["player_x_spawn_lim"].Value<float>();
+        if (config["player_y_spawn_lim"] != null)
+            ySpawnLim = config["player_y_spawn_lim"].Value<float>();
         if (DriverController.instance.verbose)
         {
             Debug.Log("Player " + playerID + " speed set to " + speed);
@@ -99,8 +105,8 @@ public class PlayerController : MonoBehaviour
             {
                 transform.position = new Vector3(-transform.position.x, -transform.position.y);
             }
-            transform.position = new Vector3(transform.position.x + UnityEngine.Random.Range(-.5f, .5f),
-                                            transform.position.y + UnityEngine.Random.Range(-3f, 3f));
+            transform.position = new Vector3(transform.position.x + UnityEngine.Random.Range(-xSpawnLim, xSpawnLim),
+                                            transform.position.y + UnityEngine.Random.Range(-ySpawnLim, ySpawnLim));
         }
     }
 
