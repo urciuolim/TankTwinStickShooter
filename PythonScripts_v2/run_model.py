@@ -1,9 +1,10 @@
-from tank_env import TankEnv
+from tank_env2 import TankEnv
 from stable_baselines3 import PPO
 import numpy as np
 import argparse
 
 parser = argparse.ArgumentParser()
+parser.add_argument("game_path", type=str, help="Path to game executible")
 parser.add_argument("opp", type=str, help="Path to model to be used as opponent")
 parser.add_argument("--p1", type=str, default=None, help="Path to model for player 1")
 parser.add_argument("--p1same", action="store_true", help="Indicates that opp model should be used as p1")
@@ -12,7 +13,7 @@ parser.add_argument("--my_port", type=int, default=50500, help="Port to be used 
 args = parser.parse_args()
 print(args)
 
-env = TankEnv(None, opp_fp_and_elo=[(args.opp, 1000)], game_port=args.base_port, my_port=args.my_port)
+env = TankEnv(args.game_path, opp_fp_and_elo=[(args.opp, 1000)])#, game_port=args.base_port, my_port=args.my_port)
 model = None
 if args.p1:
     model = PPO.load(args.p1)

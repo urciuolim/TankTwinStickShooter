@@ -19,6 +19,7 @@ public class DriverController : MonoBehaviour
     private bool ingame = false;
     private int stepsSinceLastAction = 0;
 
+    /**
     Thread mThread;
     private string connectionIP = "127.0.0.1";
     private int connectionPort = 50000;
@@ -26,8 +27,10 @@ public class DriverController : MonoBehaviour
     TcpListener listener;
     TcpClient client;
     NetworkStream nwStream;
+    **/
+    StreamReader stdin;
+    
     float timeScale = 1f;
-    bool aiAsync = false;
     int actionFreq = 1;
 
     [HideInInspector] 
@@ -39,6 +42,7 @@ public class DriverController : MonoBehaviour
 
     private void Awake()
     {
+        /**
         string[] args = System.Environment.GetCommandLineArgs();
         try { 
             connectionPort = int.Parse(args[1]);
@@ -46,6 +50,7 @@ public class DriverController : MonoBehaviour
         {
             connectionPort = 50000;
         }
+        **/
 
         if (instance != null)
         {
@@ -70,14 +75,14 @@ public class DriverController : MonoBehaviour
         using (JsonTextReader reader = new JsonTextReader(file))
         {
             config = (JObject)JToken.ReadFrom(reader);
+            /**
             if (config["connectionIP"] != null)
                 connectionIP = config["connectionIP"].Value<string>();
             //if (config["connectionPort"] != null)
                 //connectionPort = config["connectionPort"].Value<int>();
+            **/
             if (config["verbose"] != null)
                 verbose = config["verbose"].Value<bool>();
-            if (config["ai_async"] != null)
-                aiAsync = config["ai_async"].Value<bool>();
             if (config["ai_actionFreq"] != null)
                 actionFreq = config["ai_actionFreq"].Value<int>();
             if (config["timeScale"] != null)
@@ -98,10 +103,9 @@ public class DriverController : MonoBehaviour
             if (verbose)
             {
                 Debug.Log("Running in 'verbose' mode");
-                Debug.Log("Connection IP set to " + connectionIP);
-                Debug.Log("Connection Port set to " + connectionPort);
+                //Debug.Log("Connection IP set to " + connectionIP);
+                //Debug.Log("Connection Port set to " + connectionPort);
                 Debug.Log("Time scale set to " + timeScale);
-                Debug.Log("AI Async set to " + aiAsync);
                 Debug.Log("AI action frequency set to " + actionFreq);
                 Debug.Log("Fixed delta time set to " + fixedDeltaTime);
                 if (arena != null)
@@ -112,51 +116,40 @@ public class DriverController : MonoBehaviour
 
     private void Start()
     {
-        if (aiAsync)
-        {
-            //TODO: Async AI needs to be fixed, it is currently broken
-            ThreadStart ts = new ThreadStart(PythonConnection);
-            mThread = new Thread(ts);
-            mThread.Start();
-        } else
-        {
-            EstablishPythonConnection();
-        }
+        EstablishPythonConnection();
         Reset();
     }
 
     private void FixedUpdate()
     {
-        if (!aiAsync)
+        Time.timeScale = 0f;
+        if (instance.running)
         {
-            Time.timeScale = 0f;
-            if (instance.running)
+            if (ingame && state != null) //&& GameController.instance != null)
             {
-                if (ingame && state != null) //&& GameController.instance != null)
+                bool done = state["done"] != null ? true : false;
+                stepsSinceLastAction++;
+                if (stepsSinceLastAction >= actionFreq || done)
                 {
-                    bool done = state["done"] != null ? true : false;
-                    stepsSinceLastAction++;
-                    if (stepsSinceLastAction >= actionFreq || done)
-                    {
-                        SendAndReceiveData();
-                        stepsSinceLastAction = 0;
-                    }
+                    SendAndReceiveData();
+                    stepsSinceLastAction = 0;
                 }
-                else if (!ingame)
-                    ReceiveAndSendData();
             }
-            else
-            {
-                listener.Stop();
-                //Debug.Log("Closed listener on port " + connectionPort);
-                Application.Quit();
-            }
-            Time.timeScale = timeScale;
+            else if (!ingame)
+                ReceiveAndSendData();
         }
+        else
+        {
+            //listener.Stop();
+            //Debug.Log("Closed listener on port " + connectionPort);
+            Application.Quit();
+        }
+        Time.timeScale = timeScale;
     }
 
     private void EstablishPythonConnection()
     {
+        /**
         localAdd = IPAddress.Parse(connectionIP);
         listener = new TcpListener(localAdd, connectionPort);
         listener.Start();
@@ -164,6 +157,8 @@ public class DriverController : MonoBehaviour
 
         client = listener.AcceptTcpClient();
         nwStream = client.GetStream();
+        **/
+        stdin = new StreamReader(System.Console.OpenStandardInput());
         instance.running = true;
     }
 
@@ -185,12 +180,31 @@ public class DriverController : MonoBehaviour
                 ReceiveAndSendData();
         }
         
+        /**
         listener.Stop();
         Debug.Log("Closed listener on port " + connectionPort);
+        **/
+    }
+    
+    private void Send(JObject message)
+    {
+        System.Console.WriteLine("FOR_PYTHON|" + message.ToString());
+    }
+
+    private JObject Receive()
+    {
+        string message = stdin.ReadLine();
+        while (message == null)
+        {
+            message = stdin.ReadLine();
+        }
+        Debug.Log(message);
+        return JObject.Parse(message);
     }
 
     private void ReceiveAndSendData()
     {
+        /**
         byte[] readBuffer = new byte[client.ReceiveBufferSize];
         int bytesRead = nwStream.Read(readBuffer, 0, client.ReceiveBufferSize);
         JObject message = null;
@@ -200,40 +214,49 @@ public class DriverController : MonoBehaviour
             string dataReceived = Encoding.UTF8.GetString(readBuffer, 0, bytesRead);
             message = JObject.Parse(dataReceived);
         }
+        **/
+        JObject message = Receive();
 
-        if (message != null)
-        { 
-            if (message["start"] != null && message["start"].Value<bool>())
-            {
-                Debug.Log("Start received");
-                JObject confirmation = JObject.Parse("{starting:true}");
-                byte[] writeBuffer = Encoding.ASCII.GetBytes(confirmation.ToString());
-                nwStream.Write(writeBuffer, 0, writeBuffer.Length);
-                ingame = true;
-            } else if (message["end"] != null && message["end"].Value<bool>())
-            {
-                Debug.Log("End received");
-                JObject confirmation = JObject.Parse("{ending:true}");
-                byte[] writeBuffer = Encoding.ASCII.GetBytes(confirmation.ToString());
-                nwStream.Write(writeBuffer, 0, writeBuffer.Length);
-                instance.running = false;
-            } else if (message["restart"] != null && message["restart"].Value<bool>())
-            {
-                Debug.Log("Restart received");
-                JObject confirmation = JObject.Parse("{restarting:true}");
-                byte[] writeBuffer = Encoding.ASCII.GetBytes(confirmation.ToString());
-                nwStream.Write(writeBuffer, 0, writeBuffer.Length);
-            }
+        //if (message != null)
+        //{ 
+        if (message["start"] != null && message["start"].Value<bool>())
+        {
+            Debug.Log("Start received");
+            JObject confirmation = JObject.Parse("{starting:true}");
+            //byte[] writeBuffer = Encoding.ASCII.GetBytes(confirmation.ToString());
+            //nwStream.Write(writeBuffer, 0, writeBuffer.Length);
+            Send(confirmation);
+            ingame = true;
+        } else if (message["end"] != null && message["end"].Value<bool>())
+        {
+            Debug.Log("End received");
+            JObject confirmation = JObject.Parse("{ending:true}");
+            //byte[] writeBuffer = Encoding.ASCII.GetBytes(confirmation.ToString());
+            //nwStream.Write(writeBuffer, 0, writeBuffer.Length);
+            Send(confirmation);
+            instance.running = false;
+        } else if (message["restart"] != null && message["restart"].Value<bool>())
+        {
+            Debug.Log("Restart received");
+            JObject confirmation = JObject.Parse("{restarting:true}");
+            //byte[] writeBuffer = Encoding.ASCII.GetBytes(confirmation.ToString());
+            //nwStream.Write(writeBuffer, 0, writeBuffer.Length);
+            Send(confirmation);
         }
+        //}
     }
 
     private void SendAndReceiveData()
     {
+        
         //Debug.Log("SendAndReceiveData");
         bool done = state["done"] != null ? true : false;
+        /**
         byte[] writeBuffer = Encoding.ASCII.GetBytes(state.ToString());
         nwStream.Write(writeBuffer, 0, writeBuffer.Length);
         //Debug.Log("Sent: " + state.ToString());
+        **/
+        Send(state);
 
         if (done)
         {
@@ -244,8 +267,10 @@ public class DriverController : MonoBehaviour
             return;
         }
 
+        /**
         byte[] readBuffer = new byte[client.ReceiveBufferSize];
         int bytesRead = nwStream.Read(readBuffer, 0, client.ReceiveBufferSize);
+        
 
         JObject message = null;
 
@@ -255,22 +280,26 @@ public class DriverController : MonoBehaviour
             message = JObject.Parse(dataReceived);
             //Debug.Log("Received: " + actions.ToString());
         }
+        **/
 
-        if (message != null)
+        JObject message = Receive();
+
+        //if (message != null)
+        //{
+        if (message["restart"] != null && message["restart"].Value<bool>())
         {
-            if (message["restart"] != null && message["restart"].Value<bool>())
-            {
-                Debug.Log("Restart received");
-                JObject confirmation = JObject.Parse("{restarting:true}");
-                writeBuffer = Encoding.ASCII.GetBytes(confirmation.ToString());
-                nwStream.Write(writeBuffer, 0, writeBuffer.Length);
-                GameController.instance.EndGame(-1);
-                ingame = false;
-            } else
-            {
-                actions = message;
-            }
+            Debug.Log("Restart received");
+            JObject confirmation = JObject.Parse("{restarting:true}");
+            //writeBuffer = Encoding.ASCII.GetBytes(confirmation.ToString());
+            //nwStream.Write(writeBuffer, 0, writeBuffer.Length);
+            Send(confirmation);
+            GameController.instance.EndGame(-1);
+            ingame = false;
+        } else
+        {
+            actions = message;
         }
+        //}
     }
 
     private void Reset()
@@ -281,6 +310,7 @@ public class DriverController : MonoBehaviour
 
     private void OnApplicationQuit()
     {
+        stdin.Close();
         instance.running = false;
     }
 }
