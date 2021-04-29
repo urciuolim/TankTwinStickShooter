@@ -233,6 +233,10 @@ class TankEnv(gym.Env):
         self.curr_opp += 1
         if self.verbose:
             print("Next opponent is", self.opponents[self.curr_opp][FP], flush=True)
+            
+    def kill_env(self):
+        if self.game_path:
+            self.game_p.kill()
         
     def step(self, action):
         POLICY=0

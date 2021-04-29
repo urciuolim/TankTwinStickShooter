@@ -23,18 +23,22 @@ def tournament(model_dir, game_path, base_port, num_envs, num_trials, worker_idx
                 p_results = eval.evaluate_agent(model_dir, p, game_path, p_base_port, num_envs, num_trials)
                 break
             except ConnectionError as e:
-                print("ConnectionError detected, trying a higher port range")
+                print("ConnectionError detected during tournament, trying a higher port range")
                 j += 1
-                last_error = each
+                last_error = e
+            except ConnectionResetError as e2:
+                print("ConnectionResetError detected during tournament, trying a higher port range")
+                j += 1
+                last_error = e2
+        sys.stdout.close()
+        sys.stderr.close()
+        sys.stdout = org_stdout
+        sys.stderr = org_stderr
         if p_base_port+(j*num_envs*2) >= 65000:
             if last_error:
                 raise last_error
             else:
                 raise ValueError("So there's no last_error, but we got here...?")
-        sys.stdout.close()
-        sys.stderr.close()
-        sys.stdout = org_stdout
-        sys.stderr = org_stderr
         results.append((p,p_results))
         print("Worker", worker_idx, "has completed the evaluation of", p, flush=True)
     return results

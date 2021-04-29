@@ -72,10 +72,14 @@ def train_agent(model_dir, agent_id, game_path, base_port, num_envs, num_steps):
     agent_model_path = last_model_path(model_dir, agent_id, agent_stats)
     agent = PPO.load(agent_model_path, env=env_stack)
     print("Loaded model saved at", agent_model_path, flush=True)
-    # Learn
-    agent.learn(total_timesteps=num_steps)
-    # Save and cleanup
-    env_stack.close()
+    try:
+        # Learn
+        agent.learn(total_timesteps=num_steps)
+        # Save and cleanup
+        env_stack.close()
+    except ConnectionError as e:
+        env_stack.env_method("kill_env")
+        raise e
     agent_stats["num_steps"] += num_steps
     new_agent_save_path = model_dir+agent_id+'/'+agent_id+'_'+str(agent_stats["num_steps"])
     agent.save(new_agent_save_path)

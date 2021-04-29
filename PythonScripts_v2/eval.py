@@ -37,52 +37,56 @@ def evaluate_agent(model_dir, agent_id, game_path, base_port, num_envs, num_tria
     agent_model_path = curr_model_path(model_dir, agent_id, agent_stats)
     agent = PPO.load(agent_model_path, env=env_stack)
     print("Loaded model saved at", agent_model_path, flush=True)
+    try:
     # Evaluate
-    results = []
-    for i,(opp_fp, _) in enumerate(opp_fp_and_elo):
-        print("Starting evaluation of", agent_id, "vs", opp_fp, flush=True)
-        print(i*100/len(opp_fp_and_elo), "% complete", sep="", flush=True)
-        total_reward = 0
-        total_steps = 0
-        total_wins = 0
-        total_losses = 0
-        states = env_stack.reset()
-        envs_done = []
-        running_reward = [0 for _ in range(num_envs)]
-        running_steps = [0 for _ in range(num_envs)]
-        i = 0
-        while i < num_trials:
-            reset_states = env_stack.env_method("reset", indices = envs_done)
-            for state,env_idx in zip(reset_states, envs_done):
-                states[env_idx] = state
+        results = []
+        for i,(opp_fp, _) in enumerate(opp_fp_and_elo):
+            print("Starting evaluation of", agent_id, "vs", opp_fp, flush=True)
+            print(i*100/len(opp_fp_and_elo), "% complete", sep="", flush=True)
+            total_reward = 0
+            total_steps = 0
+            total_wins = 0
+            total_losses = 0
+            states = env_stack.reset()
             envs_done = []
-            while len(envs_done) < 1:
-                actions, _ = agent.predict(states)
-                states, rewards, dones, infos = env_stack.step(actions)
-                for k in range(num_envs):
-                    running_reward[k] += rewards[k]
-                    running_steps[k] += 1
-                if any(dones):
-                    for j,done in enumerate(dones):
-                        if done:
-                            i += 1
-                            envs_done.append(j)
-                            total_reward += running_reward[j]
-                            running_reward[j] = 0
-                            total_steps += running_steps[j]
-                            running_steps[j] = 0
-                            if "winner" in infos[j]:
-                                if infos[j]["winner"] == PLAYER_1:
-                                    total_wins += 1
-                                elif infos[j]["winner"] == PLAYER_2:
-                                    total_losses += 1
-        avg_reward = total_reward/i
-        avg_steps = total_steps/i
-        results.append((opp_fp.split('/')[-1], total_wins, total_losses, i, avg_reward, avg_steps))
-        if opp_fp != opp_fp_and_elo[-1][FP]:
-            env_stack.env_method("next_opp")
-    # Cleanup and return
-    env_stack.close()
+            running_reward = [0 for _ in range(num_envs)]
+            running_steps = [0 for _ in range(num_envs)]
+            i = 0
+            while i < num_trials:
+                reset_states = env_stack.env_method("reset", indices = envs_done)
+                for state,env_idx in zip(reset_states, envs_done):
+                    states[env_idx] = state
+                envs_done = []
+                while len(envs_done) < 1:
+                    actions, _ = agent.predict(states)
+                    states, rewards, dones, infos = env_stack.step(actions)
+                    for k in range(num_envs):
+                        running_reward[k] += rewards[k]
+                        running_steps[k] += 1
+                    if any(dones):
+                        for j,done in enumerate(dones):
+                            if done:
+                                i += 1
+                                envs_done.append(j)
+                                total_reward += running_reward[j]
+                                running_reward[j] = 0
+                                total_steps += running_steps[j]
+                                running_steps[j] = 0
+                                if "winner" in infos[j]:
+                                    if infos[j]["winner"] == PLAYER_1:
+                                        total_wins += 1
+                                    elif infos[j]["winner"] == PLAYER_2:
+                                        total_losses += 1
+            avg_reward = total_reward/i
+            avg_steps = total_steps/i
+            results.append((opp_fp.split('/')[-1], total_wins, total_losses, i, avg_reward, avg_steps))
+            if opp_fp != opp_fp_and_elo[-1][FP]:
+                env_stack.env_method("next_opp")
+        # Cleanup and return
+        env_stack.close()
+    except ConnectionError as e:
+        env_stack.env_method("kill_env")
+        raise e
     return results
     
 def print_summary(agent_id, results):
