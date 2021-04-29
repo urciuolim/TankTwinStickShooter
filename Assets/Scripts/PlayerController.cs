@@ -211,7 +211,7 @@ public class PlayerController : MonoBehaviour
 
     private void OnCollisionEnter2D(Collision2D collision)
     {
-        if (collision.gameObject.tag == "Bullet")// && collision.gameObject.GetComponent<BulletController>().shooter != this)
+        if (collision.gameObject.tag == "Bullet" && collision.gameObject.GetComponent<BulletController>().shooter != this)
         {
             //Debug.Log(playerID + " got shot");
             health -= collision.gameObject.GetComponent<BulletController>().damage;

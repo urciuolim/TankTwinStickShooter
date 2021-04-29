@@ -53,10 +53,10 @@ public class BulletController : MonoBehaviour
 
     private void OnCollisionEnter2D(Collision2D collision)
     {
-        //if (!(collision.otherCollider.Equals(shooterCollider) || collision.collider.Equals(shooterCollider)))
-        //{
+        if (!(collision.otherCollider.Equals(shooterCollider) || collision.collider.Equals(shooterCollider)))
+        {
             shooter.DestroyBullet(this.gameObject);
-        //}
+        }
         //Destroy(gameObject);
     }
 
