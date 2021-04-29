@@ -87,6 +87,9 @@ def evaluate_agent(model_dir, agent_id, game_path, base_port, num_envs, num_tria
     except ConnectionError as e:
         env_stack.env_method("kill_env")
         raise e
+    except ConnectionResetError as e2:
+        env_stack.env_method("kill_env")
+        raise e2
     return results
     
 def print_summary(agent_id, results):

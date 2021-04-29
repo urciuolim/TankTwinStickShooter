@@ -80,6 +80,9 @@ def train_agent(model_dir, agent_id, game_path, base_port, num_envs, num_steps):
     except ConnectionError as e:
         env_stack.env_method("kill_env")
         raise e
+    except ConnectionResetError as e2:
+        env_stack.env_method("kill_env")
+        raise e2
     agent_stats["num_steps"] += num_steps
     new_agent_save_path = model_dir+agent_id+'/'+agent_id+'_'+str(agent_stats["num_steps"])
     agent.save(new_agent_save_path)
