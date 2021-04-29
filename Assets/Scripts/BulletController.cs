@@ -14,6 +14,7 @@ public class BulletController : MonoBehaviour
     public float damage = 1;
     [HideInInspector]
     public PlayerController shooter;
+    public Collider2D shooterCollider;
 
     private void Awake()
     {
@@ -40,6 +41,7 @@ public class BulletController : MonoBehaviour
     {
         rb = GetComponent<Rigidbody2D>();
         velocity = transform.right * speed * DriverController.instance.fixedDeltaTime;//Time.fixedDeltaTime;
+        shooterCollider = shooter.GetComponent<Collider2D>();
         //StartCoroutine(DestroyBullet());
     }
 
@@ -51,7 +53,10 @@ public class BulletController : MonoBehaviour
 
     private void OnCollisionEnter2D(Collision2D collision)
     {
-        shooter.DestroyBullet(this.gameObject);
+        //if (!(collision.otherCollider.Equals(shooterCollider) || collision.collider.Equals(shooterCollider)))
+        //{
+            shooter.DestroyBullet(this.gameObject);
+        //}
         //Destroy(gameObject);
     }
 
