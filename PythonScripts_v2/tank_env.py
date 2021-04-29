@@ -9,6 +9,7 @@ import time
 import random
 import math
 import subprocess
+import sys
 
 def choice_with_normalization(elements, weights):
     if sum(weights) == 0:
@@ -35,24 +36,35 @@ class TankEnv(gym.Env):
                         game_port=50000,
                         my_port=None,
                         num_connection_attempts=60, 
-                        sock_timeout=60., 
+                        sock_timeout=10., 
                         elo_match=True,
                         center_elo=1000,
                         D=35.,
                         survivor=False,
-                        max_steps=300
+                        max_steps=300,
+                        stdout_path=None,
+                        verbose=False
                 ):
         super(TankEnv, self).__init__()
+        
+        self.verbose=verbose
+        self.stdout_path = None
+        if stdout_path and self.verbose:
+            self.stdout_path = stdout_path
+            sys.stdout = open(stdout_path, 'a')
         
         #TODO: save opponent models and elos separately
         # opp_fp_and_elo = [] allows starting of env without loading opponents
         if len(opp_fp_and_elo) > 0:
-            print("Env", game_port, "is starting to load opponents...", flush=True)
+            if self.verbose:
+                print("Env", game_port, "is starting to load opponents...", flush=True)
             self.opponents = []
             for (opp_fp, elo) in opp_fp_and_elo:
                 self.opponents.append((PPO.load(opp_fp), elo, opp_fp))
-                print("Env", game_port, "loaded", opp_fp, "with elo", elo, flush=True)
-            print("Env", game_port, "has finished loading", len(self.opponents), "opponents", flush=True)
+                if self.verbose:
+                    print("Env", game_port, "loaded", opp_fp, "with elo", elo, flush=True)
+            if self.verbose:
+                print("Env", game_port, "has finished loading", len(self.opponents), "opponents", flush=True)
 
         self.curr_opp = 0
         self.elo_match=elo_match
@@ -89,14 +101,16 @@ class TankEnv(gym.Env):
         try:
             self.sock.sendall(bytes(data, encoding="utf-8"))
         except socket.timeout:
-            print("Timeout while sending data, quitting now.", flush=True)
+            if self.verbose:
+                print("Timeout while sending data, quitting now.", flush=True)
             raise ConnectionError
         
     def receive(self):
         try:
             received = self.sock.recv(1024)
         except socket.timeout:
-            print("Timeout while receiving data, quitting now.", flush=True)
+            if self.verbose:
+                print("Timeout while receiving data, quitting now.", flush=True)
             raise ConnectionError
         received = received.decode("utf-8")
         return json.loads(received)
@@ -120,25 +134,31 @@ class TankEnv(gym.Env):
                 sock.bind(("", self.my_port))
                 break
             except OSError as os_error:
-                print("OSError during binding, trying again...", flush=True)
+                if self.verbose:
+                    print("OSError during binding, trying again...", flush=True)
                 time.sleep(1)
             except BrokenPipeError:
-                print("BrokenPipeError during binding, trying again...", flush=True)
+                if self.verbose:
+                    print("BrokenPipeError during binding, trying again...", flush=True)
                 time.sleep(1)
         if i >= self.num_connection_attempts-1:
-            print("Problem binding on port", self.my_port, ", trying random ports", flush=True)
+            if self.verbose:
+                print("Problem binding on port", self.my_port, ", trying random ports", flush=True)
             for k in range(self.num_connection_attempts):
                 try:
                     sock.bind(("", random.randint(33000, 60000)))
                     break
                 except OSError as os_error:
-                    print("OSError during binding, trying again...", flush=True)
+                    if self.verbose:
+                        print("OSError during binding, trying again...", flush=True)
                     time.sleep(1)
                 except BrokenPipeError:
-                    print("BrokenPipeError during binding, trying again...", flush=True)
+                    if self.verbose:
+                        print("BrokenPipeError during binding, trying again...", flush=True)
                     time.sleep(1)
             if k >= self.num_connection_attempts-1:
-                print("Still problem binding on ports, I give up now :(", flush=True)
+                if self.verbose:
+                    print("Still problem binding on ports, I give up now :(", flush=True)
                 raise os_error if os_error else OSError
             
         # Attempt to connect to Unity game instance
@@ -147,19 +167,24 @@ class TankEnv(gym.Env):
                 sock.connect((self.game_ip, self.game_port))
                 break
             except ConnectionRefusedError:
-                print("Could not connect to IP", self.game_ip, "on port", self.game_port, "...sleeping for one second", flush=True)
+                if self.verbose:
+                    print("Could not connect to IP", self.game_ip, "on port", self.game_port, "...sleeping for one second", flush=True)
                 time.sleep(1)
             except OSError:
-                print("OSError during connect, trying again...", flush=True)
+                if self.verbose:
+                    print("OSError during connect, trying again...", flush=True)
                 time.sleep(1)
             except BrokenPipeError:
-                print("BrokenPipeError during connect, trying again...", flush=True)
+                if self.verbose:
+                    print("BrokenPipeError during connect, trying again...", flush=True)
                 time.sleep(1)
         if j >= self.num_connection_attempts-1:
-            print("Problem connecting to game on IP", self.game_ip, "on port", self.game_port, flush=True)
+            if self.verbose:
+                print("Problem connecting to game on IP", self.game_ip, "on port", self.game_port, flush=True)
             raise ConnectionError
         
-        print("Connected to IP", self.game_ip, "on port", self.game_port, "with my_port = ", self.my_port, flush=True)
+        if self.verbose:
+            print("Connected to IP", self.game_ip, "on port", self.game_port, "with my_port = ", self.my_port, flush=True)
         # Set socket timeout
         sock.settimeout(self.sock_timeout)
         return sock
@@ -188,21 +213,26 @@ class TankEnv(gym.Env):
                 
                 return self.state
             except json.decoder.JSONDecodeError:
-                print("'Double JSON' error detected during reset, trying reset again...'", flush=True)
+                if self.verbose:
+                    print("'Double JSON' error detected during reset, trying reset again...'", flush=True)
                 continue
             except ConnectionResetError:
-                print("ConnectionResetError detected during reset, attempting to reconnect", flush=True)
+                if self.verbose:
+                    print("ConnectionResetError detected during reset, attempting to reconnect", flush=True)
                 # Retry connection with Unity environment
                 self.sock = self.connect_to_unity()
-                print("Connection reestablished", flush=True)
+                if self.verbose:
+                    print("Connection reestablished", flush=True)
             except ConnectionError:
-                print("ConnectionError during reset, attempting to reconnect...", flush=True)
+                if self.verbose:
+                    print("ConnectionError during reset, attempting to reconnect...", flush=True)
                 self.fix_connection()
                 
     def next_opp(self):
         FP=2
         self.curr_opp += 1
-        print("Next opponent is", self.opponents[self.curr_opp][FP], flush=True)
+        if self.verbose:
+            print("Next opponent is", self.opponents[self.curr_opp][FP], flush=True)
         
     def step(self, action):
         POLICY=0
@@ -221,7 +251,8 @@ class TankEnv(gym.Env):
             self.send(message)
             received = self.receive()
         except ConnectionError:
-            print("ConnectionError during step, counting this game as ending with no winner and then reconnecting...", flush=True)
+            if self.verbose:
+                print("ConnectionError during step, counting this game as ending with no winner and then reconnecting...", flush=True)
             self.fix_connection()
             return self.state, 0, True, {"lost_connection":True}
         
@@ -256,10 +287,13 @@ class TankEnv(gym.Env):
         # Send end message
         self.send( {"end":True} )
         received = self.receive()
-        if not "ending" in received:
+        if not "ending" in received and self.verbose:
             print("Something wrong with ending game", flush=True)
         self.sock.close()
         if self.game_path:
             self.game_p.wait()
         self.game_log.close()
-        print("Game", self.game_port, "closed port", flush=True)
+        if self.verbose:
+            print("Game", self.game_port, "closed port", flush=True)
+        if self.stdout_path and self.verbose:
+            sys.stdout.close()

@@ -19,7 +19,21 @@ def train_multiple_agents(model_dir, game_path, base_port, num_envs, num_steps, 
         sys.stdout = open(model_dir+p+"/train_log.txt", 'a')
         sys.stderr = sys.stdout
         p_base_port = base_port if reuse_ports else base_port+(num_envs*i*2)
-        train.train_agent(model_dir, p, game_path, p_base_port, num_envs, num_steps)
+        j = 0
+        last_error = None
+        while p_base_port+(j*num_envs*2) < 65000:
+            try:
+                train.train_agent(model_dir, p, game_path, p_base_port, num_envs, num_steps)
+                break
+            except ConnectionError as e:
+                print("ConnectionError detected, trying a higher port range")
+                j += 1
+                last_error = each
+        if p_base_port+(j*num_envs*2) >= 65000:
+            if last_error:
+                raise last_error
+            else:
+                raise ValueError("So there's no last_error, but we got here...?")
         sys.stdout.close()
         sys.stderr.close()
         sys.stdout = org_stdout

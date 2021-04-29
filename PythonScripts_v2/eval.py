@@ -2,7 +2,6 @@ import os
 os.environ['MKL_THREADING_LAYER'] = 'GNU'
 from tank_env import TankEnv
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import SubprocVecEnv
 import argparse
 import json
 import train
@@ -33,7 +32,8 @@ def evaluate_agent(model_dir, agent_id, game_path, base_port, num_envs, num_tria
     #else:
         #opp_fp_and_elo = [(curr_model_path(model_dir, agent_stats["matching_agent"], train.load_stats(model_dir, agent_stats["matching_agent"])), DUMMY_ELO)]
         
-    env_stack = train.make_env_stack(num_envs, game_path, base_port, model_dir+agent_id+"/gamelog.txt", opp_fp_and_elo, DUMMY_ELO, elo_match=False, survivor=agent_stats["survivor"])
+    env_stdout_path=model_dir+agent_id+"/env_log.txt"
+    env_stack = train.make_env_stack(num_envs, game_path, base_port, model_dir+agent_id+"/gamelog.txt", opp_fp_and_elo, DUMMY_ELO, elo_match=False, survivor=agent_stats["survivor"], stdout_path=env_stdout_path)
     agent_model_path = curr_model_path(model_dir, agent_id, agent_stats)
     agent = PPO.load(agent_model_path, env=env_stack)
     print("Loaded model saved at", agent_model_path, flush=True)

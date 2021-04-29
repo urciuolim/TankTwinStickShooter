@@ -27,21 +27,23 @@ def last_model_path(model_dir, agent_id, agent_stats):
 def last_elo(agent_stats):
     return agent_stats["elo"][str(agent_stats["last_eval_steps"])]
 
-def make_env_stack(num_envs, game_path, base_port, game_log_path, opp_fp_and_elo, trainee_elo, elo_match=True, survivor=False):
+def make_env_stack(num_envs, game_path, base_port, game_log_path, opp_fp_and_elo, trainee_elo, elo_match=True, survivor=False, stdout_path=None):
     envs = []
     for i in range(num_envs):
         envs.append(
-            lambda game_path=game_path, b=base_port+(i*2), c=game_log_path.replace(".txt", "-"+str(i)+".txt"), d=opp_fp_and_elo, e=elo_match, f=trainee_elo, g=survivor: 
+            lambda game_path=game_path, b=base_port+(i*2), c=game_log_path.replace(".txt", "-"+str(i)+".txt"), d=opp_fp_and_elo, e=elo_match, f=trainee_elo, g=survivor, h=stdout_path.replace(".txt", "-"+str(i)+".txt"): 
                     TankEnv(game_path,
                             game_port=b,
                             game_log_path=c,
                             opp_fp_and_elo=d,
                             elo_match=e,
                             center_elo=f,
-                            survivor=g
+                            survivor=g,
+                            stdout_path=h,
+                            verbose=True
                     )
         )
-    env_stack = SubprocVecEnv(envs, start_method="fork")
+    env_stack = SubprocVecEnv(envs, start_method="forkserver")
     env_stack.reset()
     return env_stack
     
@@ -65,7 +67,8 @@ def train_agent(model_dir, agent_id, game_path, base_port, num_envs, num_steps):
     else:
         opp_fp_and_elo = [(last_model_path(model_dir, agent_stats["matching_agent"], load_stats(model_dir, agent_stats["matching_agent"])), last_elo(agent_stats))]
         
-    env_stack = make_env_stack(num_envs, game_path, base_port, model_dir+agent_id+"/gamelog.txt", opp_fp_and_elo, last_elo(agent_stats), survivor=agent_stats["survivor"])
+    env_stdout_path=model_dir+agent_id+"/env_log.txt"
+    env_stack = make_env_stack(num_envs, game_path, base_port, model_dir+agent_id+"/gamelog.txt", opp_fp_and_elo, last_elo(agent_stats), survivor=agent_stats["survivor"], stdout_path=env_stdout_path)
     agent_model_path = last_model_path(model_dir, agent_id, agent_stats)
     agent = PPO.load(agent_model_path, env=env_stack)
     print("Loaded model saved at", agent_model_path, flush=True)

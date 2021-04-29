@@ -37,10 +37,10 @@ for subdir, dirs, files in os.walk(args.model_dir):
 
 steps_stats = {}
 fig,ax = plt.subplots(1,1)
-for m in sorted(all_model_stats.keys(), key=lambda k: -all_model_stats[k]["elo"][str(all_model_stats[k]["last_elo_change_steps"])]):
+for m in sorted(all_model_stats.keys(), key=lambda k: -int(all_model_stats[k]["elo"][str(all_model_stats[k]["last_elo_change_steps"])])):
         model_stats = all_model_stats[m]
         color = (random(), random(), random(), 1)
-        xs = [int(x) for x in sorted(model_stats["elo"].keys())]
+        xs = [x for x in sorted([int(y) for y in model_stats["elo"].keys()])]
         parent = model_stats["parent"]
         while parent:
             xs = [x + int(parent.split('_')[-1]) for x in xs]
