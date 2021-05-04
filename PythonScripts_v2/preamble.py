@@ -7,12 +7,13 @@ from random import choice, randint
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 import time
+import numpy as np
 
 # https://medium.com/aureliantactics/ppo-hyperparameters-and-ranges-6fc2d29bccbe#:~:text=PPO%20is%20a%20policy%20gradients%20method%20that%20makes,box%20on%20a%20wide%20variety%20of%20RL%20tasks.
 HYPERPARAM_RANGES = {
     "n_steps": [4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768],
     "batch_size": [4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192],
-    "n_epochs": [3, 6, 9, 12, 15, 18, 21, 24, 27, 30],
+    "n_epochs": [3, 6, 10, 12, 15, 18, 21, 24, 27, 30],
     "clip_range": [0.1, 0.2, 0.3],
     "gamma": [.8, .9, .99, .999, .9999],
     "gae_lambda": [.9, .95, 1.],
@@ -45,27 +46,35 @@ def init_stats():
     }
     return model_stats
     
+def choose_hyperp(hyperp, default_idx):
+    idx = default_idx + np.random.choice([-1, 0, 1], p=[.1, .8, .1])
+    if idx < 0:
+        idx = 0
+    elif idx >= len(HYPERPARAM_RANGES[hyperp]):
+        idx = len(HYPERPARAM_RANGES[hyperp])-1
+    return HYPERPARAM_RANGES[hyperp][idx]
+    
 def save_new_model(name, env, num_envs, model_dir, batch_size=None, n_steps=None,
         n_epochs=None, clip_range=None, gamma=None, gae_lambda=None, vf_coef=None,
         ent_coef=None, learning_rate=None):
     if not batch_size:
-        batch_size = choice(HYPERPARAM_RANGES["batch_size"])
+        batch_size = choose_hyperp("batch_size", 10)
     if not n_steps:
-        n_steps = max(batch_size, choice(HYPERPARAM_RANGES["n_steps"]))//num_envs
+        n_steps = max(batch_size, choose_hyperp("n_steps", 10))//num_envs
     if not n_epochs:
-        n_epochs = choice(HYPERPARAM_RANGES["n_epochs"])
+        n_epochs = choose_hyperp("n_epochs", 2)
     if not clip_range:
-        clip_range = choice(HYPERPARAM_RANGES["clip_range"])
+        clip_range = choose_hyperp("clip_range", 1)
     if not gamma:
-        gamma = choice(HYPERPARAM_RANGES["gamma"])
+        gamma = choose_hyperp("gamma", 2)
     if not gae_lambda:
-        gae_lambda = choice(HYPERPARAM_RANGES["gae_lambda"])
+        gae_lambda = choose_hyperp("gae_lambda", 1)
     if not vf_coef:
-        vf_coef = choice(HYPERPARAM_RANGES["vf_coef"])
+        vf_coef = choose_hyperp("vf_coef", 0)
     if not ent_coef:
-        ent_coef = choice(HYPERPARAM_RANGES["ent_coef"])
+        ent_coef = choose_hyperp("ent_coef", 0)
     if not learning_rate:
-        learning_rate = choice(HYPERPARAM_RANGES["learning_rate"])
+        learning_rate = choose_hyperp("learning_rate", 5)
     
     model = PPO("MlpPolicy", env, batch_size=batch_size, n_steps=n_steps, 
                 n_epochs=n_epochs, clip_range=clip_range, gamma=gamma, gae_lambda=gae_lambda,

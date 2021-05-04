@@ -82,14 +82,19 @@ def evaluate_agent(model_dir, agent_id, game_path, base_port, num_envs, num_tria
             results.append((opp_fp.split('/')[-1], total_wins, total_losses, i, avg_reward, avg_steps))
             if opp_fp != opp_fp_and_elo[-1][FP]:
                 env_stack.env_method("next_opp")
-        # Cleanup and return
-        env_stack.close()
     except ConnectionError as e:
         env_stack.env_method("kill_env")
         raise e
     except ConnectionResetError as e2:
         env_stack.env_method("kill_env")
         raise e2
+    except EOFError as e3:
+        env_stack.env_method("kill_env")
+        raise e3
+    finally:
+        # Cleanup and return
+        env_stack.close()
+        del env_stack
     return results
     
 def print_summary(agent_id, results):

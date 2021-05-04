@@ -33,6 +33,10 @@ def train_multiple_agents(model_dir, game_path, base_port, num_envs, num_steps, 
                 print("ConnectionResetError detected during training, trying a higher port range")
                 j += 1
                 last_error = e2
+            except EOFError as e3:
+                print("EOFError detected during training, trying higher port range")
+                j += 1
+                last_error = e3
         sys.stdout.close()
         sys.stderr.close()
         sys.stdout = org_stdout

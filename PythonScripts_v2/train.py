@@ -76,13 +76,18 @@ def train_agent(model_dir, agent_id, game_path, base_port, num_envs, num_steps):
         # Learn
         agent.learn(total_timesteps=num_steps)
         # Save and cleanup
-        env_stack.close()
     except ConnectionError as e:
         env_stack.env_method("kill_env")
         raise e
     except ConnectionResetError as e2:
         env_stack.env_method("kill_env")
         raise e2
+    except EOFError as e3:
+        env_stack.env_method("kill_env")
+        raise e3
+    finally:
+        env_stack.close()
+        del env_stack
     agent_stats["num_steps"] += num_steps
     new_agent_save_path = model_dir+agent_id+'/'+agent_id+'_'+str(agent_stats["num_steps"])
     agent.save(new_agent_save_path)
