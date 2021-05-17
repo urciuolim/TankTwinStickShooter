@@ -10,7 +10,7 @@ def subset_pop(pop, idx, total):
     end = round((len(pop)/total*(idx)))
     return pop[start:end]
 
-def train_multiple_agents(model_dir, game_path, base_port, num_envs, num_steps, worker_idx, total_workers, reuse_ports=True):
+def train_multiple_agents(model_dir, game_path, base_port, num_envs, num_steps, worker_idx, total_workers, reuse_ports=True, level_path=None, time_reward=0.):
     org_stdout = sys.stdout
     org_stderr = sys.stderr
     my_pop = subset_pop(train.load_pop(model_dir), worker_idx, total_workers)
@@ -21,9 +21,9 @@ def train_multiple_agents(model_dir, game_path, base_port, num_envs, num_steps, 
         p_base_port = base_port if reuse_ports else base_port+(num_envs*i*2)
         j = 0
         last_error = None
-        while p_base_port+(j*num_envs*2) < 65000:
+        while p_base_port+(j*num_envs*2) < 60000:
             try:
-                train.train_agent(model_dir, p, game_path, p_base_port, num_envs, num_steps)
+                train.train_agent(model_dir, p, game_path, p_base_port+(j*num_envs*2), num_envs, num_steps, level_path=level_path, time_reward=time_reward)
                 break
             except ConnectionError as e:
                 print("ConnectionError detected during training, trying a higher port range")
@@ -41,7 +41,7 @@ def train_multiple_agents(model_dir, game_path, base_port, num_envs, num_steps, 
         sys.stderr.close()
         sys.stdout = org_stdout
         sys.stderr = org_stderr
-        if p_base_port+(j*num_envs*2) >= 65000:
+        if p_base_port+(j*num_envs*2) >= 60000:
             if last_error:
                 raise last_error
             else:
@@ -59,9 +59,12 @@ if __name__ == "__main__":
     parser.add_argument("--worker_idx", type=int, default=1, help="Index of worker (for parallel training)")
     parser.add_argument("--total_workers", type=int, default=1, help="Total number of workers (for parallel training)")
     parser.add_argument("--dont_reuse_ports", action="store_false", help="Flag indicates that python-side ports should not be reused (for example, because the socket.SO_REUSEADDR option is not supported by OS)")
+    parser.add_argument("--level_path", type=str, default=None, help="Path to level file")
+    parser.add_argument("--time_reward", type=float, default=0., help="Reward (or penalty) to give agent at each timestep")
     args = parser.parse_args()
     print(args, flush=True)
     train.validate_args(args)
     print("Worker", args.worker_idx, "is starting multiple trainings", flush=True)
-    train_multiple_agents(args.model_dir, args.game_path, args.base_port, args.num_envs, args.num_steps, args.worker_idx, args.total_workers, reuse_ports=args.dont_reuse_ports)
+    train_multiple_agents(args.model_dir, args.game_path, args.base_port, args.num_envs, args.num_steps, args.worker_idx, args.total_workers, 
+        reuse_ports=args.dont_reuse_ports, level_path=args.level_path, time_reward=args.time_reward)
     print("Worker", args.worker_idx, "has completed multiple trainings", flush=True)

@@ -10,6 +10,7 @@ using System.Text;
 using System.IO;
 using Newtonsoft.Json.Linq;
 using Newtonsoft.Json;
+using Unity.Jobs.LowLevel.Unsafe;
 
 public class DriverController : MonoBehaviour
 {
@@ -39,6 +40,8 @@ public class DriverController : MonoBehaviour
 
     private void Awake()
     {
+        JobsUtility.JobWorkerCount = 2;
+
         string[] args = System.Environment.GetCommandLineArgs();
         try { 
             connectionPort = int.Parse(args[1]);
@@ -84,6 +87,7 @@ public class DriverController : MonoBehaviour
             {
                 timeScale = config["timeScale"].Value<float>();
                 Time.timeScale = timeScale;
+                //Application.targetFrameRate = (int)(60*timeScale);
             }
             if (config["ai_fixedDeltaTime"] != null)
                 fixedDeltaTime = config["ai_fixedDeltaTime"].Value<float>();

@@ -172,7 +172,7 @@ public class GameController : MonoBehaviour
         JObject state = new JObject();
         float[] s = new float[52];
         for (int i = 0; i < s.Length; i++)
-            s[i] = -10;
+            s[i] = -100;
 
         s[0] = tanks[0][0].transform.position.x;
         s[1] = tanks[0][0].transform.position.y;
@@ -187,8 +187,8 @@ public class GameController : MonoBehaviour
             var bc = b.GetComponent<BulletController>();
             s[c] = b.transform.position.x;
             s[c + 1] = b.transform.position.y;
-            s[c + 2] = bc.velocity.x;
-            s[c + 3] = bc.velocity.y;
+            s[c + 2] = bc.velocity.x * bc.speed;
+            s[c + 3] = bc.velocity.y * bc.speed;
             c += 4;
         }
 
@@ -204,8 +204,8 @@ public class GameController : MonoBehaviour
             var bc = b.GetComponent<BulletController>();
             s[c] = b.transform.position.x;
             s[c + 1] = b.transform.position.y;
-            s[c + 2] = bc.velocity.x;
-            s[c + 3] = bc.velocity.y;
+            s[c + 2] = bc.velocity.x * bc.speed;
+            s[c + 3] = bc.velocity.y * bc.speed;
             c += 4;
         }
 
@@ -219,7 +219,7 @@ public class GameController : MonoBehaviour
         {
             if (humanPlayer)
             {
-                Debug.Log("UpdateGameTimer: humanPlayer");
+                //Debug.Log("UpdateGameTimer: humanPlayer");
                 elapsedTime = Time.time - startTime;
                 timeLeft = TimeSpan.FromSeconds(maxTime - elapsedTime);
                 timeLeftDisplay.text = "Time Remaining\n" + timeLeft.ToString("mm':'ss'.'ff");

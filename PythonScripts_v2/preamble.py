@@ -6,7 +6,6 @@ import json
 from random import choice, randint
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
-import time
 import numpy as np
 
 # https://medium.com/aureliantactics/ppo-hyperparameters-and-ranges-6fc2d29bccbe#:~:text=PPO%20is%20a%20policy%20gradients%20method%20that%20makes,box%20on%20a%20wide%20variety%20of%20RL%20tasks.
@@ -56,7 +55,7 @@ def choose_hyperp(hyperp, default_idx):
     
 def save_new_model(name, env, num_envs, model_dir, batch_size=None, n_steps=None,
         n_epochs=None, clip_range=None, gamma=None, gae_lambda=None, vf_coef=None,
-        ent_coef=None, learning_rate=None):
+        ent_coef=None, learning_rate=None, image_based=False):
     if not batch_size:
         batch_size = choose_hyperp("batch_size", 10)
     if not n_steps:
@@ -75,8 +74,12 @@ def save_new_model(name, env, num_envs, model_dir, batch_size=None, n_steps=None
         ent_coef = choose_hyperp("ent_coef", 0)
     if not learning_rate:
         learning_rate = choose_hyperp("learning_rate", 5)
+        
+    feature_extractor = "MlpPolicy"
+    if image_based:
+        feature_extractor = "CnnPolicy"
     
-    model = PPO("MlpPolicy", env, batch_size=batch_size, n_steps=n_steps, 
+    model = PPO(feature_extractor, env, batch_size=batch_size, n_steps=n_steps, 
                 n_epochs=n_epochs, clip_range=clip_range, gamma=gamma, gae_lambda=gae_lambda,
                 vf_coef=vf_coef, ent_coef=ent_coef, learning_rate=learning_rate)
     model.save(model_dir + name + '/' + name + "_0")
@@ -91,28 +94,28 @@ def save_new_stats_file(path, *extras, starting_elo=None):
     with open(path, 'w') as stats_file:
         json.dump(model_stats, stats_file, indent=4)
     
-def gen_agent(my_env, num_envs, model_dir, noun_file_path, adj_file_path, batch_size=None):
+def gen_agent(my_env, num_envs, model_dir, noun_file_path, adj_file_path, batch_size=None, image_based=False):
     name = gen_name(noun_file_path, adj_file_path, model_dir)
-    agent = save_new_model(name, my_env, num_envs, model_dir, batch_size=batch_size)
-    save_new_stats_file(args.model_dir + name + "/stats.json")
+    agent = save_new_model(name, my_env, num_envs, model_dir, batch_size=batch_size, image_based=image_based)
+    save_new_stats_file(args.model_dir + name + "/stats.json", ("image_based", image_based))
     print("Created", name, flush=True)
     return (name, agent)
     
-def gen_nemesis(agent_name, agent, my_env, num_envs, model_dir):
+def gen_nemesis(agent_name, agent, my_env, num_envs, model_dir, image_based=False):
     nemesis_name = agent_name + "-nemesis"
     save_new_model(nemesis_name, my_env, num_envs, model_dir, batch_size=agent.batch_size, n_steps=agent.n_steps,
         n_epochs=agent.n_epochs, clip_range=agent.clip_range(0), gamma=agent.gamma, gae_lambda=agent.gae_lambda,
-        vf_coef=agent.vf_coef, ent_coef=agent.ent_coef, learning_rate=agent.learning_rate)
-    save_new_stats_file(model_dir + nemesis_name + "/stats.json", ("nemesis", True), ("matching_agent", agent_name))
+        vf_coef=agent.vf_coef, ent_coef=agent.ent_coef, learning_rate=agent.learning_rate, image_based=image_based)
+    save_new_stats_file(model_dir + nemesis_name + "/stats.json", ("nemesis", True), ("matching_agent", agent_name), ("image_based", image_based))
     print("Created", nemesis_name, flush=True)
     return nemesis_name
     
-def gen_survivor(agent_name, agent, my_env, num_envs, model_dir):
+def gen_survivor(agent_name, agent, my_env, num_envs, model_dir, image_based=False):
     survivor_name = agent_name + "-survivor"
     save_new_model(survivor_name, my_env, num_envs, model_dir, batch_size=agent.batch_size, n_steps=agent.n_steps,
         n_epochs=agent.n_epochs, clip_range=agent.clip_range(0), gamma=agent.gamma, gae_lambda=agent.gae_lambda,
-        vf_coef=agent.vf_coef, ent_coef=agent.ent_coef, learning_rate=agent.learning_rate)
-    save_new_stats_file(model_dir + survivor_name + "/stats.json", ("survivor", True), ("matching_agent", agent_name))
+        vf_coef=agent.vf_coef, ent_coef=agent.ent_coef, learning_rate=agent.learning_rate, image_based=image_based)
+    save_new_stats_file(model_dir + survivor_name + "/stats.json", ("survivor", True), ("matching_agent", agent_name), ("image_based", image_based))
     print("Created", survivor_name, flush=True)
     return survivor_name
     
@@ -121,7 +124,7 @@ if __name__ == "__main__":
     parser.add_argument("game_path", type=str, help="File path of game executable")
     parser.add_argument("pop_training_script", type=str, help="Training script path that trains entire population")
     parser.add_argument("tournament_script", type=str, help="Tournament script path")
-    #parser.add_argument("replace_script", type=str, help="Agent replacement script path")
+    parser.add_argument("replace_script", type=str, help="Agent replacement script path")
     parser.add_argument("model_dir", type=str, help="Base directory for agent models")
     parser.add_argument("noun_file_path", type=str, help="Path to noun file used to generate names")
     parser.add_argument("adj_file_path", type=str, help="Path to adj file used to generate names")
@@ -132,6 +135,8 @@ if __name__ == "__main__":
     parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to run concurrently")
     parser.add_argument("--batch_size", type=int, default=None, help="Indicates same batch size for all agents")
     parser.add_argument("--base_port", type=int, default=50000, help="Base port for environments")
+    parser.add_argument("--image_based", action="store_true", help="Indicates that agents will train on image version of environment")
+    parser.add_argument("--level_path", type=str, default=None, help="Path to level for game")
     args = parser.parse_args()
     print(args, flush=True)
         
@@ -146,8 +151,8 @@ if __name__ == "__main__":
         raise FileNotFoundError("Python population training script not found")
     if not os.path.exists(args.tournament_script):
         raise FileNotFoundError("Python tournament script not found")
-    #if not os.path.exists(args.replace_script):
-        #raise FileNotFoundError("Python agent replacement script not found")
+    if not os.path.exists(args.replace_script):
+        raise FileNotFoundError("Python agent replacement script not found")
     if not os.path.isdir(args.model_dir):
         raise FileNotFoundError("Base directory for agent models is not a folder")
     if not os.path.exists(args.noun_file_path):
@@ -158,22 +163,25 @@ if __name__ == "__main__":
     envs = []
     for i in range(args.num_envs):
         envs.append(
-            lambda game_path=args.game_path, b=args.base_port+(i*2), c="gamelog-"+str(i)+".txt": 
+            lambda game_path=args.game_path, b=args.base_port+(i*2), c="gamelog-"+str(i)+".txt", d=args.level_path, e=args.image_based: 
                     TankEnv(game_path,
                             game_port=b,
-                            game_log_path=c
+                            game_log_path=c,
+                            level_path=d,
+                            image_based=e
                     )
         )
     env_stack = DummyVecEnv(envs)
+    print(env_stack.observation_space)
 
     population = []
     for i in range(args.start):
-        agent_name, agent = gen_agent(env_stack, args.num_envs, args.model_dir, args.noun_file_path, args.adj_file_path, batch_size=args.batch_size)
+        agent_name, agent = gen_agent(env_stack, args.num_envs, args.model_dir, args.noun_file_path, args.adj_file_path, batch_size=args.batch_size, image_based=args.image_based)
         population.append(agent_name)
         if args.nem:
-            population.append(gen_nemesis(agent_name, agent, env_stack, args.num_envs, args.model_dir))
+            population.append(gen_nemesis(agent_name, agent, env_stack, args.num_envs, args.model_dir, image_based=args.image_based))
         if args.surv:
-            population.append(gen_survivor(agent_name, agent, env_stack, args.num_envs, args.model_dir))
+            population.append(gen_survivor(agent_name, agent, env_stack, args.num_envs, args.model_dir, image_based=args.image_based))
     if args.start:
         with open(args.model_dir + "/population.txt", 'w') as pop_file:
             for p in population:

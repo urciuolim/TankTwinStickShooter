@@ -21,7 +21,7 @@ def get_opps_and_elos(model_dir, agent_id):
         pop_fps.append(curr_model_path(model_dir, p, p_stats))
     return list(zip(pop_fps, [DUMMY_ELO for _ in pop_fps]))
 
-def evaluate_agent(model_dir, agent_id, game_path, base_port, num_envs, num_trials):
+def evaluate_agent(model_dir, agent_id, game_path, base_port, num_envs, num_trials, level_path=None):
     PLAYER_1=0
     PLAYER_2=1
     FP=0
@@ -33,7 +33,8 @@ def evaluate_agent(model_dir, agent_id, game_path, base_port, num_envs, num_tria
         #opp_fp_and_elo = [(curr_model_path(model_dir, agent_stats["matching_agent"], train.load_stats(model_dir, agent_stats["matching_agent"])), DUMMY_ELO)]
         
     env_stdout_path=model_dir+agent_id+"/env_log.txt"
-    env_stack = train.make_env_stack(num_envs, game_path, base_port, model_dir+agent_id+"/gamelog.txt", opp_fp_and_elo, DUMMY_ELO, elo_match=False, survivor=agent_stats["survivor"], stdout_path=env_stdout_path)
+    env_stack = train.make_env_stack(num_envs, game_path, base_port, model_dir+agent_id+"/gamelog.txt", opp_fp_and_elo, DUMMY_ELO, 
+        elo_match=False, survivor=agent_stats["survivor"], stdout_path=env_stdout_path, level_path=level_path, image_based=agent_stats["image_based"])
     agent_model_path = curr_model_path(model_dir, agent_id, agent_stats)
     agent = PPO.load(agent_model_path, env=env_stack)
     print("Loaded model saved at", agent_model_path, flush=True)
@@ -117,6 +118,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_trials", type=int, default=50, help = "Total number of trials to evaluate model for")
     parser.add_argument("--base_port", type=int, default=52000, help = "Base port that environments will communicate on.")
     parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to run concurrently")
+    parser.add_argument("--level_path", type=str, default=None, help="Path to level file")
     args = parser.parse_args()
     print(args, flush=True)
     train.validate_args(args)

@@ -6,7 +6,7 @@ from train_pop import subset_pop
 import eval
 import train
 
-def tournament(model_dir, game_path, base_port, num_envs, num_trials, worker_idx, total_workers, reuse_ports=True):
+def tournament(model_dir, game_path, base_port, num_envs, num_trials, worker_idx, total_workers, reuse_ports=True, level_path=False):
     org_stdout = sys.stdout
     org_stderr = sys.stderr
     my_pop = subset_pop(train.load_pop(model_dir), worker_idx, total_workers)
@@ -18,9 +18,9 @@ def tournament(model_dir, game_path, base_port, num_envs, num_trials, worker_idx
         p_base_port = base_port if reuse_ports else base_port+(num_envs*i*2)
         j = 0
         last_error = None
-        while p_base_port+(j*num_envs*2) < 65000:
+        while p_base_port+(j*num_envs*2) < 60000:
             try:
-                p_results = eval.evaluate_agent(model_dir, p, game_path, p_base_port, num_envs, num_trials)
+                p_results = eval.evaluate_agent(model_dir, p, game_path, p_base_port+(j*num_envs*2), num_envs, num_trials, level_path=level_path)
                 break
             except ConnectionError as e:
                 print("ConnectionError detected during tournament, trying a higher port range")
@@ -38,7 +38,7 @@ def tournament(model_dir, game_path, base_port, num_envs, num_trials, worker_idx
         sys.stderr.close()
         sys.stdout = org_stdout
         sys.stderr = org_stderr
-        if p_base_port+(j*num_envs*2) >= 65000:
+        if p_base_port+(j*num_envs*2) >= 60000:
             if last_error:
                 raise last_error
             else:
@@ -65,6 +65,7 @@ if __name__ == "__main__":
     parser.add_argument("--total_workers", type=int, default=1, help="Total number of workers (for parallel training)")
     parser.add_argument("--dont_reuse_ports", action="store_false", help="Flag indicates that python-side ports should not be reused (for example, because the socket.SO_REUSEADDR option is not supported by OS)")
     parser.add_argument("--summary", action="store_true", help="Flag indicates that summary of tournament should be printed out to stdout")
+    parser.add_argument("--level_path", type=str, default=None, help="Path to level file")
     args = parser.parse_args()
     print(args, flush=True)
     train.validate_args(args)
