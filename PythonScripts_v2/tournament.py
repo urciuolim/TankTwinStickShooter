@@ -6,7 +6,7 @@ from train_pop import subset_pop
 import eval
 import train
 
-def tournament(model_dir, game_path, base_port, num_envs, num_trials, worker_idx, total_workers, reuse_ports=True, level_path=False):
+def tournament(model_dir, game_path, base_port, num_envs, num_trials, worker_idx, total_workers, reuse_ports=True, level_path=None):
     org_stdout = sys.stdout
     org_stderr = sys.stderr
     my_pop = subset_pop(train.load_pop(model_dir), worker_idx, total_workers)
@@ -70,7 +70,8 @@ if __name__ == "__main__":
     print(args, flush=True)
     train.validate_args(args)
     print("Worker", args.worker_idx, "is starting a portion of a tournament", flush=True)
-    results = tournament(args.model_dir, args.game_path, args.base_port, args.num_envs, args.num_trials, args.worker_idx, args.total_workers, reuse_ports=args.dont_reuse_ports)
+    results = tournament(args.model_dir, args.game_path, args.base_port, args.num_envs, args.num_trials, args.worker_idx, args.total_workers, 
+        reuse_ports=args.dont_reuse_ports, level_path=args.level_path)
     print("Worker", args.worker_idx, "has completed a portion of a tournament", flush=True)
     
     for p,p_results in results:

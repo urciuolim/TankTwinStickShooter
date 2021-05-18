@@ -28,27 +28,33 @@ def last_elo(agent_stats):
     return agent_stats["elo"][str(agent_stats["last_eval_steps"])]
 
 def make_env_stack(num_envs, game_path, base_port, game_log_path, opp_fp_and_elo, trainee_elo, elo_match=True, survivor=False, stdout_path=None, level_path=None, image_based=False, time_reward=0.):
-    envs = []
-    for i in range(num_envs):
-        envs.append(
-            lambda game_path=game_path, b=base_port+(i*2), c=game_log_path.replace(".txt", "-"+str(i)+".txt"), d=opp_fp_and_elo, e=elo_match, f=trainee_elo, g=survivor, h=stdout_path.replace(".txt", "-"+str(i)+".txt"), i=level_path, j=image_based, k=time_reward: 
-                    TankEnv(game_path,
-                            game_port=b,
-                            game_log_path=c,
-                            opp_fp_and_elo=d,
-                            elo_match=e,
-                            center_elo=f,
-                            survivor=g,
-                            stdout_path=h,
-                            verbose=True,
-                            level_path=i,
-                            image_based=j,
-                            time_reward=k
-                    )
-        )
-    env_stack = SubprocVecEnv(envs, start_method="forkserver")
-    env_stack.reset()
-    return env_stack
+    if num_envs > 1:
+        envs = []
+        for i in range(num_envs):
+            envs.append(
+                lambda game_path=game_path, b=base_port+(i*2), c=game_log_path.replace(".txt", "-"+str(i)+".txt"), d=opp_fp_and_elo, e=elo_match, f=trainee_elo, g=survivor, h=stdout_path.replace(".txt", "-"+str(i)+".txt"), i=level_path, j=image_based, k=time_reward: 
+                        TankEnv(game_path,
+                                game_port=b,
+                                game_log_path=c,
+                                opp_fp_and_elo=d,
+                                elo_match=e,
+                                center_elo=f,
+                                survivor=g,
+                                stdout_path=h,
+                                verbose=True,
+                                level_path=i,
+                                image_based=j,
+                                time_reward=k
+                        )
+            )
+        env_stack = SubprocVecEnv(envs, start_method="forkserver")
+        env_stack.reset()
+        return env_stack
+    else:
+        env = TankEnv(game_path, game_port=base_port, game_log_path=game_log_path, opp_fp_and_elo=opp_fp_and_elo, elo_match=elo_match,
+            center_elo=trainee_elo, survivor=survivor, stdout_path=stdout_path, level_path=level_path, image_based=image_based, time_reward=time_reward)
+        env.reset()
+        return env
     
 def get_opps_and_elos(model_dir, agent_id):
     pop = load_pop(model_dir)

@@ -160,19 +160,21 @@ if __name__ == "__main__":
     if not os.path.exists(args.adj_file_path):
         raise FileNotFoundError("Inputted path does not lead to adjective file")
             
-    envs = []
-    for i in range(args.num_envs):
-        envs.append(
-            lambda game_path=args.game_path, b=args.base_port+(i*2), c="gamelog-"+str(i)+".txt", d=args.level_path, e=args.image_based: 
-                    TankEnv(game_path,
-                            game_port=b,
-                            game_log_path=c,
-                            level_path=d,
-                            image_based=e
-                    )
-        )
-    env_stack = DummyVecEnv(envs)
-    print(env_stack.observation_space)
+    if args.num_envs > 1:
+        envs = []
+        for i in range(args.num_envs):
+            envs.append(
+                lambda game_path=args.game_path, b=args.base_port+(i*2), c="gamelog-"+str(i)+".txt", d=args.level_path, e=args.image_based: 
+                        TankEnv(game_path,
+                                game_port=b,
+                                game_log_path=c,
+                                level_path=d,
+                                image_based=e
+                        )
+            )
+        env_stack = DummyVecEnv(envs)
+    else:
+        env_stack = TankEnv(args.game_path, game_port=args.base_port, game_log_path="gamelog.txt", level_path=args.level_path, image_based=args.image_based)
 
     population = []
     for i in range(args.start):
