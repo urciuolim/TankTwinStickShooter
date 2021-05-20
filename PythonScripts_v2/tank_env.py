@@ -47,7 +47,8 @@ class TankEnv(gym.Env):
                         verbose=False,
                         level_path=False,
                         image_based=False,
-                        time_reward=0.
+                        time_reward=0.,
+                        rand_opp=False
                 ):
         super(TankEnv, self).__init__()
         
@@ -59,9 +60,10 @@ class TankEnv(gym.Env):
             self.stdout_path = stdout_path
             sys.stdout = open(stdout_path, 'a')
         
+        self.rand_opp = rand_opp
         #TODO: save opponent models and elos separately
         # opp_fp_and_elo = [] allows starting of env without loading opponents
-        if len(opp_fp_and_elo) > 0:
+        if len(opp_fp_and_elo) > 0 and not rand_opp:
             if self.verbose:
                 print("Env", game_port, "is starting to load opponents...", flush=True)
             self.opponents = []
@@ -249,7 +251,7 @@ class TankEnv(gym.Env):
                     self.draw_state(np.array(received["state"]))
                 self.step_counter = 0
                     
-                if self.elo_match:
+                if self.elo_match and not self.rand_opp:
                     self.curr_opp = elo_based_choice([opp[ELO] for opp in self.opponents], self.center_elo, self.D)
                 
                 return self.state
@@ -350,7 +352,10 @@ class TankEnv(gym.Env):
             opp_state = self.state.copy()
             opp_state[1] = self.state[2].copy()
             opp_state[2] = self.state[1].copy()
-        opp_action, _ = self.opponents[self.curr_opp][POLICY].predict(opp_state)
+        if self.rand_opp:
+            opp_action = (np.random.rand(5) * 2) - 1
+        else:
+            opp_action, _ = self.opponents[self.curr_opp][POLICY].predict(opp_state)
         message[2] = opp_action.tolist()
         
         # Step Unity game environment

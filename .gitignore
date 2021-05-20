@@ -28,6 +28,7 @@
 /PythonScripts_v2/gamelog*
 /PythonScripts_v2/*env*
 /PythonScripts_v2/__pycache__/
+/PythonScripts_v2/*.npz
 
 # Asset meta data should only be ignored when the corresponding asset is also ignored
 !/[Aa]ssets/**/*.meta
