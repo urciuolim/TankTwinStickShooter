@@ -11,8 +11,9 @@ def load_stats(model_dir, agent_id):
         return json.load(agent_stats_file)
         
 def save_stats(model_dir, agent_id, agent_stats):
-    with open(model_dir+agent_id+"/stats.json", 'w') as agent_stats_file:
-        json.dump(agent_stats, agent_stats_file, indent=4)
+    agent_stats_file = open(model_dir+agent_id+"/stats.json", 'w')
+    json.dump(agent_stats, agent_stats_file, indent=4)
+    agent_stats_file.close()
         
 def load_pop(model_dir):
     pop = []
@@ -99,7 +100,10 @@ def train_agent(model_dir, agent_id, game_path, base_port, num_envs, num_steps, 
         env_stack.close()
         del env_stack
     agent_stats["num_steps"] += num_steps
-    new_agent_save_path = model_dir+agent_id+'/'+agent_id+'_'+str(agent_stats["num_steps"])
+    agent_base = model_dir+agent_id+'/'
+    new_agent_save_path = agent_base+agent_id+'_'+str(agent_stats["num_steps"])
+    os.system("zip " + agent_base+"archive.zip " + agent_base+"*_*.zip")
+    os.system("rm " + agent_base+"*_*.zip")
     agent.save(new_agent_save_path)
     print("Saved model at", new_agent_save_path, flush=True)
     save_stats(model_dir, agent_id, agent_stats)
