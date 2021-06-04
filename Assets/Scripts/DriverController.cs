@@ -40,7 +40,7 @@ public class DriverController : MonoBehaviour
 
     private void Awake()
     {
-        JobsUtility.JobWorkerCount = 2;
+        //JobsUtility.JobWorkerCount = 2;
 
         string[] args = System.Environment.GetCommandLineArgs();
         try { 

@@ -77,6 +77,7 @@ for subdir, dirs, files in os.walk(args.model_dir):
         if dir[-1] != '/' or dir[-1] != '\\':
             dir += '/'
         with open(subdir + dir + "stats.json", 'r') as stats_file:
+            print("Loading", dir, "stats")
             model_stats = json.load(stats_file)
         all_model_stats[str(dir.strip('/'))] = model_stats
 
