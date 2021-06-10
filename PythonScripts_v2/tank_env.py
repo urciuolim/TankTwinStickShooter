@@ -108,7 +108,9 @@ class TankEnv(gym.Env):
         self.sock = self.connect_to_unity()
         
     def load_level(self, level_path):
+        R=0
         G=1
+        B=2
         with open(level_path, 'r') as level_file:
             level_json = json.load(level_file)
         dims = level_json["Walls"]["dims"]
@@ -127,6 +129,9 @@ class TankEnv(gym.Env):
                
         self.dims = dims
         self.p = p
+        self.opp_state = self.state.copy()
+        self.opp_state[:,:,R] = self.state[:,:,B].copy()
+        self.opp_state[:,:,B] = self.state[:,:,R].copy()
             
         return spaces.Box(low=0, high=255, shape=self.state.shape, dtype=np.uint8)
         
@@ -339,6 +344,9 @@ class TankEnv(gym.Env):
                 self.state[p2_bullet_vec_y, p2_bullet_vec_x, B] = min(self.state[p2_bullet_vec_y, p2_bullet_vec_x, B] + VEC, 255)
         
     def step(self, action):
+        R=0
+        G=1
+        B=2
         POLICY=0
         PLAYER_1=0
         # Format actions into message for Unity
@@ -350,8 +358,9 @@ class TankEnv(gym.Env):
             opp_state = np.concatenate([self.state[26:], self.state[:26]])
         else:
             opp_state = self.state.copy()
-            opp_state[1] = self.state[2].copy()
-            opp_state[2] = self.state[1].copy()
+            opp_state[:,:,R] = self.state[:,:,B].copy()
+            opp_state[:,:,B] = self.state[:,:,R].copy()
+            self.opp_state = opp_state.copy()
         if self.rand_opp:
             opp_action = (np.random.rand(5) * 2) - 1
         else:
