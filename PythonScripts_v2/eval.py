@@ -21,19 +21,19 @@ def get_opps_and_elos(model_dir, agent_id):
         pop_fps.append(curr_model_path(model_dir, p, p_stats))
     return list(zip(pop_fps, [DUMMY_ELO for _ in pop_fps]))
 
-def evaluate_agent(model_dir, agent_id, game_path, base_port, num_envs, num_trials, level_path=None):
+def evaluate_agent(model_dir, local_pop_dir, agent_id, game_path, base_port, num_envs, num_trials, level_path=None):
     PLAYER_1=0
     PLAYER_2=1
     FP=0
     # Load agent and env
     agent_stats = train.load_stats(model_dir, agent_id)
     #if not (agent_stats["nemesis"] or agent_stats["survivor"]):
-    opp_fp_and_elo = get_opps_and_elos(model_dir, agent_id)
+    opp_fp_and_elo = get_opps_and_elos(local_pop_dir, agent_id)
     #else:
         #opp_fp_and_elo = [(curr_model_path(model_dir, agent_stats["matching_agent"], train.load_stats(model_dir, agent_stats["matching_agent"])), DUMMY_ELO)]
         
-    env_stdout_path=model_dir+agent_id+"/env_log.txt"
-    env_stack = train.make_env_stack(num_envs, game_path, base_port, model_dir+agent_id+"/gamelog.txt", opp_fp_and_elo, DUMMY_ELO, 
+    env_stdout_path=local_pop_dir+agent_id+"/env_log.txt"
+    env_stack = train.make_env_stack(num_envs, game_path, base_port, local_pop_dir+agent_id+"/gamelog.txt", opp_fp_and_elo, DUMMY_ELO, 
         elo_match=False, survivor=agent_stats["survivor"], stdout_path=env_stdout_path, level_path=level_path, image_based=agent_stats["image_based"])
     agent_model_path = curr_model_path(model_dir, agent_id, agent_stats)
     agent = PPO.load(agent_model_path, env=env_stack)
@@ -114,6 +114,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("game_path", type=str, help="File path of game executable")
     parser.add_argument("model_dir", type=str, help="Base directory for agent models")
+    parser.add_argument("local_pop_dir", type=str, help="Base directory for agent models (saved on local host)")
     parser.add_argument("agent_id", type=str, help="ID of agent model to be evaluated")
     parser.add_argument("--num_trials", type=int, default=50, help = "Total number of trials to evaluate model for")
     parser.add_argument("--base_port", type=int, default=52000, help = "Base port that environments will communicate on.")
@@ -123,6 +124,6 @@ if __name__ == "__main__":
     print(args, flush=True)
     train.validate_args(args)
     print("Starting evaluation of", args.agent_id, "with", args.num_trials, "trials against each opponent in population", flush=True)
-    results = evaluate_agent(args.model_dir, args.agent_id, args.game_path, args.base_port, args.num_envs, args.num_trials)
+    results = evaluate_agent(args.model_dir, args.local_pop_dir, args.agent_id, args.game_path, args.base_port, args.num_envs, args.num_trials)
     print("Evaluation of", args.agent_id, "complete", flush=True)
     print_summary(results)

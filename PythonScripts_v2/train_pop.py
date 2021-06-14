@@ -10,7 +10,7 @@ def subset_pop(pop, idx, total):
     end = round((len(pop)/total*(idx)))
     return pop[start:end]
 
-def train_multiple_agents(model_dir, game_path, base_port, num_envs, num_steps, worker_idx, total_workers, reuse_ports=True, level_path=None, time_reward=0.):
+def train_multiple_agents(model_dir, local_pop_dir, game_path, base_port, num_envs, num_steps, worker_idx, total_workers, reuse_ports=True, level_path=None, time_reward=0.):
     org_stdout = sys.stdout
     org_stderr = sys.stderr
     my_pop = subset_pop(train.load_pop(model_dir), worker_idx, total_workers)
@@ -23,7 +23,7 @@ def train_multiple_agents(model_dir, game_path, base_port, num_envs, num_steps, 
         last_error = None
         while p_base_port+(j*num_envs*2) < 60000:
             try:
-                train.train_agent(model_dir, p, game_path, p_base_port+(j*num_envs*2), num_envs, num_steps, level_path=level_path, time_reward=time_reward)
+                train.train_agent(model_dir, local_pop_dir, p, game_path, p_base_port+(j*num_envs*2), num_envs, num_steps, level_path=level_path, time_reward=time_reward)
                 break
             except ConnectionError as e:
                 print("ConnectionError detected during training, trying a higher port range")
@@ -53,6 +53,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("game_path", type=str, help="File path of game executable")
     parser.add_argument("model_dir", type=str, help="Base directory for agent models")
+    parser.add_argument("local_pop_dir", type=str, help="Base directory for agent models (saved on local host)")
     parser.add_argument("--num_steps", type=int, default=100000, help = "Number of steps to train each agent for")
     parser.add_argument("--base_port", type=int, default=51000, help="Base port to run game env on.")
     parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to run concurrently")
@@ -65,6 +66,6 @@ if __name__ == "__main__":
     print(args, flush=True)
     train.validate_args(args)
     print("Worker", args.worker_idx, "is starting multiple trainings", flush=True)
-    train_multiple_agents(args.model_dir, args.game_path, args.base_port, args.num_envs, args.num_steps, args.worker_idx, args.total_workers, 
+    train_multiple_agents(args.model_dir, args.local_pop_dir, args.game_path, args.base_port, args.num_envs, args.num_steps, args.worker_idx, args.total_workers, 
         reuse_ports=args.dont_reuse_ports, level_path=args.level_path, time_reward=args.time_reward)
     print("Worker", args.worker_idx, "has completed multiple trainings", flush=True)

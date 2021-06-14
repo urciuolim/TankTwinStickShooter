@@ -6,7 +6,7 @@ from train_pop import subset_pop
 import eval
 import train
 
-def tournament(model_dir, game_path, base_port, num_envs, num_trials, worker_idx, total_workers, reuse_ports=True, level_path=None):
+def tournament(model_dir, local_pop_dir, game_path, base_port, num_envs, num_trials, worker_idx, total_workers, reuse_ports=True, level_path=None):
     org_stdout = sys.stdout
     org_stderr = sys.stderr
     my_pop = subset_pop(train.load_pop(model_dir), worker_idx, total_workers)
@@ -20,7 +20,7 @@ def tournament(model_dir, game_path, base_port, num_envs, num_trials, worker_idx
         last_error = None
         while p_base_port+(j*num_envs*2) < 60000:
             try:
-                p_results = eval.evaluate_agent(model_dir, p, game_path, p_base_port+(j*num_envs*2), num_envs, num_trials, level_path=level_path)
+                p_results = eval.evaluate_agent(model_dir, local_pop_dir, p, game_path, p_base_port+(j*num_envs*2), num_envs, num_trials, level_path=level_path)
                 break
             except ConnectionError as e:
                 print("ConnectionError detected during tournament, trying a higher port range")
@@ -58,6 +58,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("game_path", type=str, help="File path of game executable")
     parser.add_argument("model_dir", type=str, help="Base directory for agent models")
+    parser.add_argument("local_pop_dir", type=str, help="Base directory for agent models (saved on local host)")
     parser.add_argument("--num_trials", type=int, default=50, help = "Number of steps to train each agent for")
     parser.add_argument("--base_port", type=int, default=52000, help="Base port to run game env on.")
     parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to run concurrently")
@@ -70,7 +71,7 @@ if __name__ == "__main__":
     print(args, flush=True)
     train.validate_args(args)
     print("Worker", args.worker_idx, "is starting a portion of a tournament", flush=True)
-    results = tournament(args.model_dir, args.game_path, args.base_port, args.num_envs, args.num_trials, args.worker_idx, args.total_workers, 
+    results = tournament(args.model_dir, args.local_pop_dir, args.game_path, args.base_port, args.num_envs, args.num_trials, args.worker_idx, args.total_workers, 
         reuse_ports=args.dont_reuse_ports, level_path=args.level_path)
     print("Worker", args.worker_idx, "has completed a portion of a tournament", flush=True)
     

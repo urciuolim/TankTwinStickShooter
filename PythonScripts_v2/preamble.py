@@ -4,6 +4,7 @@ os.environ['MKL_THREADING_LAYER'] = 'GNU'
 import argparse
 import json
 from random import choice, randint
+import torch as T
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 import numpy as np
@@ -55,7 +56,7 @@ def choose_hyperp(hyperp, default_idx):
     
 def save_new_model(name, env, num_envs, model_dir, batch_size=None, n_steps=None,
         n_epochs=None, clip_range=None, gamma=None, gae_lambda=None, vf_coef=None,
-        ent_coef=None, learning_rate=None, image_based=False):
+        ent_coef=None, learning_rate=None, image_based=False, image_pretrain=None):
     if not batch_size:
         batch_size = choose_hyperp("batch_size", 10)
     if not n_steps:
@@ -82,6 +83,9 @@ def save_new_model(name, env, num_envs, model_dir, batch_size=None, n_steps=None
     model = PPO(feature_extractor, env, batch_size=batch_size, n_steps=n_steps, 
                 n_epochs=n_epochs, clip_range=clip_range, gamma=gamma, gae_lambda=gae_lambda,
                 vf_coef=vf_coef, ent_coef=ent_coef, learning_rate=learning_rate)
+    if image_based and image_pretrain:
+        model.policy.features_extractor.cnn.load_state_dict(T.load(image_pretrain+"_cnn.pth"))
+        model.policy.features_extractor.linear.load_state_dict(T.load(image_pretrain+"_linear.pth"))
     model.save(model_dir + name + '/' + name + "_0")
     return model
     
@@ -94,27 +98,27 @@ def save_new_stats_file(path, *extras, starting_elo=None):
     with open(path, 'w') as stats_file:
         json.dump(model_stats, stats_file, indent=4)
     
-def gen_agent(my_env, num_envs, model_dir, noun_file_path, adj_file_path, batch_size=None, image_based=False):
+def gen_agent(my_env, num_envs, model_dir, noun_file_path, adj_file_path, batch_size=None, image_based=False, image_pretrain=None):
     name = gen_name(noun_file_path, adj_file_path, model_dir)
-    agent = save_new_model(name, my_env, num_envs, model_dir, batch_size=batch_size, image_based=image_based)
+    agent = save_new_model(name, my_env, num_envs, model_dir, batch_size=batch_size, image_based=image_based, image_pretrain=image_pretrain)
     save_new_stats_file(args.model_dir + name + "/stats.json", ("image_based", image_based))
     print("Created", name, flush=True)
     return (name, agent)
     
-def gen_nemesis(agent_name, agent, my_env, num_envs, model_dir, image_based=False):
+def gen_nemesis(agent_name, agent, my_env, num_envs, model_dir, image_based=False, image_pretrain=None):
     nemesis_name = agent_name + "-nemesis"
     save_new_model(nemesis_name, my_env, num_envs, model_dir, batch_size=agent.batch_size, n_steps=agent.n_steps,
         n_epochs=agent.n_epochs, clip_range=agent.clip_range(0), gamma=agent.gamma, gae_lambda=agent.gae_lambda,
-        vf_coef=agent.vf_coef, ent_coef=agent.ent_coef, learning_rate=agent.learning_rate, image_based=image_based)
+        vf_coef=agent.vf_coef, ent_coef=agent.ent_coef, learning_rate=agent.learning_rate, image_based=image_based, image_pretrain=image_pretrain)
     save_new_stats_file(model_dir + nemesis_name + "/stats.json", ("nemesis", True), ("matching_agent", agent_name), ("image_based", image_based))
     print("Created", nemesis_name, flush=True)
     return nemesis_name
     
-def gen_survivor(agent_name, agent, my_env, num_envs, model_dir, image_based=False):
+def gen_survivor(agent_name, agent, my_env, num_envs, model_dir, image_based=False, image_pretrain=None):
     survivor_name = agent_name + "-survivor"
     save_new_model(survivor_name, my_env, num_envs, model_dir, batch_size=agent.batch_size, n_steps=agent.n_steps,
         n_epochs=agent.n_epochs, clip_range=agent.clip_range(0), gamma=agent.gamma, gae_lambda=agent.gae_lambda,
-        vf_coef=agent.vf_coef, ent_coef=agent.ent_coef, learning_rate=agent.learning_rate, image_based=image_based)
+        vf_coef=agent.vf_coef, ent_coef=agent.ent_coef, learning_rate=agent.learning_rate, image_based=image_based, image_pretrain=image_pretrain)
     save_new_stats_file(model_dir + survivor_name + "/stats.json", ("survivor", True), ("matching_agent", agent_name), ("image_based", image_based))
     print("Created", survivor_name, flush=True)
     return survivor_name
@@ -129,7 +133,6 @@ if __name__ == "__main__":
     parser.add_argument("noun_file_path", type=str, help="Path to noun file used to generate names")
     parser.add_argument("adj_file_path", type=str, help="Path to adj file used to generate names")
     parser.add_argument("--start", type=int, default=8, help="Number of starting agents to start population with")
-    #parser.add_argument("--gamelog", type=str, default="gamelog.txt", help="Log file to direct game logging to")
     parser.add_argument("--nem", action="store_true", help="Train with nemeses")
     parser.add_argument("--surv", action="store_true", help="Train with survivors")
     parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to run concurrently")
@@ -137,6 +140,7 @@ if __name__ == "__main__":
     parser.add_argument("--base_port", type=int, default=50000, help="Base port for environments")
     parser.add_argument("--image_based", action="store_true", help="Indicates that agents will train on image version of environment")
     parser.add_argument("--level_path", type=str, default=None, help="Path to level for game")
+    parser.add_argument("--image_pretrain", type=str, default=None, help="Path to pretrained weights for cnn (without _cnn.pth or _linear.pth). Example, ./example be the path used for files saved at ./example_cnn.pth and ./example_linear.pth")
     args = parser.parse_args()
     print(args, flush=True)
         
@@ -159,7 +163,7 @@ if __name__ == "__main__":
         raise FileNotFoundError("Inputted path does not lead to noun file")
     if not os.path.exists(args.adj_file_path):
         raise FileNotFoundError("Inputted path does not lead to adjective file")
-            
+
     if args.num_envs > 1:
         envs = []
         for i in range(args.num_envs):
@@ -176,19 +180,21 @@ if __name__ == "__main__":
     else:
         env_stack = TankEnv(args.game_path, game_port=args.base_port, game_log_path="gamelog.txt", level_path=args.level_path, image_based=args.image_based)
 
-    population = []
-    for i in range(args.start):
-        agent_name, agent = gen_agent(env_stack, args.num_envs, args.model_dir, args.noun_file_path, args.adj_file_path, batch_size=args.batch_size, image_based=args.image_based)
-        population.append(agent_name)
-        if args.nem:
-            population.append(gen_nemesis(agent_name, agent, env_stack, args.num_envs, args.model_dir, image_based=args.image_based))
-        if args.surv:
-            population.append(gen_survivor(agent_name, agent, env_stack, args.num_envs, args.model_dir, image_based=args.image_based))
-    if args.start:
-        with open(args.model_dir + "/population.txt", 'w') as pop_file:
-            for p in population:
-                pop_file.write(p + '\n')
-        
-    env_stack.close()
+    try:
+        population = []
+        for i in range(args.start):
+            agent_name, agent = gen_agent(env_stack, args.num_envs, args.model_dir, args.noun_file_path, args.adj_file_path, 
+                batch_size=args.batch_size, image_based=args.image_based, image_pretrain=args.image_pretrain)
+            population.append(agent_name)
+            if args.nem:
+                population.append(gen_nemesis(agent_name, agent, env_stack, args.num_envs, args.model_dir, image_based=args.image_based, image_pretrain=args.image_pretrain))
+            if args.surv:
+                population.append(gen_survivor(agent_name, agent, env_stack, args.num_envs, args.model_dir, image_based=args.image_based, image_pretrain=args.image_pretrain))
+        if args.start:
+            with open(args.model_dir + "/population.txt", 'w') as pop_file:
+                for p in population:
+                    pop_file.write(p + '\n')
+    finally:
+        env_stack.close()
     
     print("PBT Preamble complete", flush=True)

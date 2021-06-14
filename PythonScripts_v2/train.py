@@ -69,16 +69,16 @@ def get_opps_and_elos(model_dir, agent_id):
         elos.append(last_elo(p_stats))
     return list(zip(pop_fps, elos))
     
-def train_agent(model_dir, agent_id, game_path, base_port, num_envs, num_steps, level_path=None, time_reward=0.):
+def train_agent(model_dir, local_pop_dir, agent_id, game_path, base_port, num_envs, num_steps, level_path=None, time_reward=0.):
     # Load agent and env
     agent_stats = load_stats(model_dir, agent_id)
     if not (agent_stats["nemesis"] or agent_stats["survivor"]):
-        opp_fp_and_elo = get_opps_and_elos(model_dir, agent_id)
+        opp_fp_and_elo = get_opps_and_elos(local_pop_dir, agent_id)
     else:
-        opp_fp_and_elo = [(last_model_path(model_dir, agent_stats["matching_agent"], load_stats(model_dir, agent_stats["matching_agent"])), last_elo(agent_stats))]
+        opp_fp_and_elo = [(last_model_path(local_pop_dir, agent_stats["matching_agent"], load_stats(local_pop_dir, agent_stats["matching_agent"])), last_elo(agent_stats))]
         
-    env_stdout_path=model_dir+agent_id+"/env_log.txt"
-    env_stack = make_env_stack(num_envs, game_path, base_port, model_dir+agent_id+"/gamelog.txt", opp_fp_and_elo, last_elo(agent_stats), 
+    env_stdout_path=local_pop_dir+agent_id+"/env_log.txt"
+    env_stack = make_env_stack(num_envs, game_path, base_port, local_pop_dir+agent_id+"/gamelog.txt", opp_fp_and_elo, last_elo(agent_stats), 
         survivor=agent_stats["survivor"], stdout_path=env_stdout_path, level_path=level_path, image_based=agent_stats["image_based"], time_reward=time_reward)
     agent_model_path = last_model_path(model_dir, agent_id, agent_stats)
     agent = PPO.load(agent_model_path, env=env_stack)
@@ -115,9 +115,15 @@ def validate_args(args):
     if not os.path.isdir(args.model_dir):
         raise FileNotFoundError("Base directory input is not a folder")
         
+    if not (args.local_pop_dir[-1] == '/' or args.local_pop_dir[-1] == '\\'):
+        args.local_pop_dir = args.local_pop_dir + "/"
+    if not os.path.isdir(args.local_pop_dir):
+        raise FileNotFoundError("Base directory input is not a folder")
+        
     pop = load_pop(args.model_dir)
     if "agent_id" in args and not args.agent_id in pop:
         raise ValueError("Given agent ID is not in population")
+    pop = load_pop(args.local_pop_dir)
     if len(pop) <= 0:
         raise ValueError("Population in given base directory does not have any IDs")
     for p in pop:
@@ -135,6 +141,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("game_path", type=str, help="File path of game executable")
     parser.add_argument("model_dir", type=str, help="Base directory for agent models")
+    parser.add_argument("local_pop_dir", type=str, help="Base directory for agent models (saved on local host)")
     parser.add_argument("agent_id", type=str, help="ID of agent model to be trained")
     parser.add_argument("--num_steps", type=int, default=100000, help = "Total number of steps to train for")
     parser.add_argument("--base_port", type=int, default=50000, help = "Port that environment will communicate on")
@@ -145,5 +152,5 @@ if __name__ == "__main__":
     print(args, flush=True)
     validate_args(args)
     print("Starting training of", args.agent_id, "for", args.num_steps, "steps", flush=True)
-    train_agent(args.model_dir, args.agent_id, args.game_path, args.base_port, args.num_envs, args.num_steps, level_path=args.level_path, time_reward=args.time_reward)
+    train_agent(args.model_dir, args.local_pop_dir, args.agent_id, args.game_path, args.base_port, args.num_envs, args.num_steps, level_path=args.level_path, time_reward=args.time_reward)
     print("Training of", args.agent_id, "complete", flush=True)
