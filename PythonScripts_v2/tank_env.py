@@ -48,7 +48,8 @@ class TankEnv(gym.Env):
                         level_path=False,
                         image_based=False,
                         time_reward=0.,
-                        rand_opp=False
+                        rand_opp=False,
+                        p=3
                 ):
         super(TankEnv, self).__init__()
         
@@ -89,7 +90,7 @@ class TankEnv(gym.Env):
             self.observation_space = spaces.Box(low=-100., high=10., shape=(52,), dtype=np.float32)
         else:
             if level_path:
-                self.observation_space = self.load_level(level_path)
+                self.observation_space = self.load_level(level_path, p)
             else:
                 self.observation_space = spaces.Box(low=0, high=255, shape=(12*3,20*3,3), dtype=np.uint8)
         # Reward (or penalty) given at each time step
@@ -107,7 +108,7 @@ class TankEnv(gym.Env):
         # Establish connection with Unity environment
         self.sock = self.connect_to_unity()
         
-    def load_level(self, level_path):
+    def load_level(self, level_path, p = 3):
         R=0
         G=1
         B=2
@@ -115,7 +116,6 @@ class TankEnv(gym.Env):
             level_json = json.load(level_file)
         dims = level_json["Walls"]["dims"]
         # p^2 = number of pixels to represent one grid square in game
-        p = 3
         width = (dims["maxX"] - dims["minX"] + 1) * p
         height = (dims["maxY"] - dims["minY"] + 1) * p
         

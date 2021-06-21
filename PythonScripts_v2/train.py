@@ -29,7 +29,7 @@ def last_elo(agent_stats):
     return agent_stats["elo"][str(agent_stats["last_eval_steps"])]
 
 def make_env_stack(num_envs, game_path, base_port, game_log_path, opp_fp_and_elo, trainee_elo, elo_match=True, survivor=False, stdout_path=None, level_path=None, image_based=False, time_reward=0.):
-    if num_envs > 1:
+    if num_envs >= 1:
         envs = []
         for i in range(num_envs):
             envs.append(
@@ -48,7 +48,10 @@ def make_env_stack(num_envs, game_path, base_port, game_log_path, opp_fp_and_elo
                                 time_reward=k
                         )
             )
-        env_stack = SubprocVecEnv(envs, start_method="forkserver")
+        if num_envs == 1:
+            env_stack = SubprocVecEnv(envs, start_method="fork")
+        else:
+            env_stack = SubprocVecEnv(envs, start_method="forkserver")
         env_stack.reset()
         return env_stack
     else:

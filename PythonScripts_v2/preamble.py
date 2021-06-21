@@ -141,6 +141,7 @@ if __name__ == "__main__":
     parser.add_argument("--image_based", action="store_true", help="Indicates that agents will train on image version of environment")
     parser.add_argument("--level_path", type=str, default=None, help="Path to level for game")
     parser.add_argument("--image_pretrain", type=str, default=None, help="Path to pretrained weights for cnn (without _cnn.pth or _linear.pth). Example, ./example be the path used for files saved at ./example_cnn.pth and ./example_linear.pth")
+    parser.add_argument("--env_p", type=int, default=3, help="Image-based environment will draw one in-game grid square as p^2 pixels")
     args = parser.parse_args()
     print(args, flush=True)
         
@@ -168,12 +169,13 @@ if __name__ == "__main__":
         envs = []
         for i in range(args.num_envs):
             envs.append(
-                lambda game_path=args.game_path, b=args.base_port+(i*2), c="gamelog-"+str(i)+".txt", d=args.level_path, e=args.image_based: 
+                lambda game_path=args.game_path, b=args.base_port+(i*2), c="gamelog-"+str(i)+".txt", d=args.level_path, e=args.image_based, f=args.env_p: 
                         TankEnv(game_path,
                                 game_port=b,
                                 game_log_path=c,
                                 level_path=d,
-                                image_based=e
+                                image_based=e,
+                                p=f
                         )
             )
         env_stack = DummyVecEnv(envs)

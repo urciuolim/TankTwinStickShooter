@@ -12,11 +12,12 @@ parser.add_argument("level_path", type=str, help="File path of game level")
 parser.add_argument("--base_port", type=int, default=50000, help="Base port to be used for game environment")
 parser.add_argument("--my_port", type=int, default=50500, help="Port to be used on Python side of network socket connection")
 parser.add_argument("--save_loc", type=str, default="dataset.npz", help="File path to save data to")
+parser.add_argument("--env_p", type=int, default=3, help="Image-based environment will draw one in-game grid square as p^2 pixels")
 args = parser.parse_args()
 print(args)
 
 obs_set = np.zeros((args.num_obs, 52), dtype=np.float32)
-img_set = np.zeros((args.num_obs, 36, 60, 3), dtype=np.uint8)
+img_set = np.zeros((args.num_obs, 12*args.env_p, 20*args.env_p, 3), dtype=np.uint8)
 try:
     env = TankEnv(args.desktop_game_path, 
         opp_fp_and_elo=[], 
@@ -30,7 +31,8 @@ try:
         my_port=args.my_port+1, 
         image_based=True,
         level_path=args.level_path,
-        rand_opp=True
+        rand_opp=True,
+        p=args.env_p
         )
         
     obs = env.reset()

@@ -34,7 +34,7 @@ def evaluate_agent(model_dir, local_pop_dir, agent_id, game_path, base_port, num
         
     env_stdout_path=local_pop_dir+agent_id+"/env_log.txt"
     env_stack = train.make_env_stack(num_envs, game_path, base_port, local_pop_dir+agent_id+"/gamelog.txt", opp_fp_and_elo, DUMMY_ELO, 
-        elo_match=False, survivor=agent_stats["survivor"], stdout_path=env_stdout_path, level_path=level_path, image_based=agent_stats["image_based"])
+        elo_match=False, survivor=agent_stats["survivor"] if "survivor" in agent_stats else False, stdout_path=env_stdout_path, level_path=level_path, image_based=agent_stats["image_based"])
     agent_model_path = curr_model_path(model_dir, agent_id, agent_stats)
     agent = PPO.load(agent_model_path, env=env_stack)
     print("Loaded model saved at", agent_model_path, flush=True)
