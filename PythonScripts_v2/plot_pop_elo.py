@@ -95,6 +95,8 @@ if __name__ == "__main__":
             parent = all_model_stats[parent.split('_')[0]]["parent"]
         elos = get_elo_values(model_stats)
         
+        print(m, ":", elos[-1])
+        
         if not args.no_dots:
             ax[0][0].plot(xs, elos, marker='.', linestyle="None", color=colors[m], label=m)
         

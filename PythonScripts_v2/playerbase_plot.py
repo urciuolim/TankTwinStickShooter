@@ -42,7 +42,10 @@ def get_win_rate_color(all_stats, agent_m, agent_n):
                 break
                 
     tie_rate = ((total_wins + total_losses) / total_games)
-    if total_wins > total_losses:
+    if total_wins == total_losses:
+        intensity = 0.
+        return np.array([intensity, 0., 0., tie_rate])
+    elif total_wins > total_losses:
         intensity = safe_div(total_wins-total_losses, total_wins+total_losses)
         return np.array([intensity, 0., 0., tie_rate])
     intensity = safe_div(total_losses-total_wins, total_wins+total_losses)

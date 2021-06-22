@@ -28,7 +28,7 @@ def last_model_path(model_dir, agent_id, agent_stats):
 def last_elo(agent_stats):
     return agent_stats["elo"][str(agent_stats["last_eval_steps"])]
 
-def make_env_stack(num_envs, game_path, base_port, game_log_path, opp_fp_and_elo, trainee_elo, elo_match=True, survivor=False, stdout_path=None, level_path=None, image_based=False, time_reward=0.):
+def make_env_stack(num_envs, game_path, base_port, game_log_path, opp_fp_and_elo, trainee_elo, elo_match=True, survivor=False, stdout_path=None, level_path=None, image_based=False, time_reward=0., env_p=3):
     if num_envs >= 1:
         envs = []
         for i in range(num_envs):
@@ -45,7 +45,8 @@ def make_env_stack(num_envs, game_path, base_port, game_log_path, opp_fp_and_elo
                                 verbose=True,
                                 level_path=i,
                                 image_based=j,
-                                time_reward=k
+                                time_reward=k,
+                                p=env_p
                         )
             )
         if num_envs == 1:
@@ -56,7 +57,7 @@ def make_env_stack(num_envs, game_path, base_port, game_log_path, opp_fp_and_elo
         return env_stack
     else:
         env = TankEnv(game_path, game_port=base_port, game_log_path=game_log_path, opp_fp_and_elo=opp_fp_and_elo, elo_match=elo_match,
-            center_elo=trainee_elo, survivor=survivor, stdout_path=stdout_path, level_path=level_path, image_based=image_based, time_reward=time_reward)
+            center_elo=trainee_elo, survivor=survivor, stdout_path=stdout_path, level_path=level_path, image_based=image_based, time_reward=time_reward, p=env_p)
         env.reset()
         return env
     
@@ -80,9 +81,11 @@ def train_agent(model_dir, local_pop_dir, agent_id, game_path, base_port, num_en
     else:
         opp_fp_and_elo = [(last_model_path(local_pop_dir, agent_stats["matching_agent"], load_stats(local_pop_dir, agent_stats["matching_agent"])), last_elo(agent_stats))]
         
+    env_p = agent_stats["env_p"] if "env_p" in agent_stats else 3
+        
     env_stdout_path=local_pop_dir+agent_id+"/env_log.txt"
     env_stack = make_env_stack(num_envs, game_path, base_port, local_pop_dir+agent_id+"/gamelog.txt", opp_fp_and_elo, last_elo(agent_stats), 
-        survivor=agent_stats["survivor"], stdout_path=env_stdout_path, level_path=level_path, image_based=agent_stats["image_based"], time_reward=time_reward)
+        survivor=agent_stats["survivor"], stdout_path=env_stdout_path, level_path=level_path, image_based=agent_stats["image_based"], time_reward=time_reward, env_p=env_p)
     agent_model_path = last_model_path(model_dir, agent_id, agent_stats)
     agent = PPO.load(agent_model_path, env=env_stack)
     print("Loaded model saved at", agent_model_path, flush=True)

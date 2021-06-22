@@ -92,34 +92,35 @@ def save_new_model(name, env, num_envs, model_dir, batch_size=None, n_steps=None
 def save_new_stats_file(path, *extras, starting_elo=None):
     model_stats = init_stats()
     for extra in extras:
-        model_stats[extra[0]] = extra[1]
+        if extra:
+            model_stats[extra[0]] = extra[1]
     if starting_elo:
         model_stats["elo"][0] = starting_elo
     with open(path, 'w') as stats_file:
         json.dump(model_stats, stats_file, indent=4)
     
-def gen_agent(my_env, num_envs, model_dir, noun_file_path, adj_file_path, batch_size=None, image_based=False, image_pretrain=None):
+def gen_agent(my_env, num_envs, model_dir, noun_file_path, adj_file_path, batch_size=None, image_based=False, image_pretrain=None, env_p=3):
     name = gen_name(noun_file_path, adj_file_path, model_dir)
     agent = save_new_model(name, my_env, num_envs, model_dir, batch_size=batch_size, image_based=image_based, image_pretrain=image_pretrain)
-    save_new_stats_file(args.model_dir + name + "/stats.json", ("image_based", image_based))
+    save_new_stats_file(args.model_dir + name + "/stats.json", ("image_based", image_based), ("env_p", env_p) if image_based else None)
     print("Created", name, flush=True)
     return (name, agent)
     
-def gen_nemesis(agent_name, agent, my_env, num_envs, model_dir, image_based=False, image_pretrain=None):
+def gen_nemesis(agent_name, agent, my_env, num_envs, model_dir, image_based=False, image_pretrain=None, env_p=3):
     nemesis_name = agent_name + "-nemesis"
     save_new_model(nemesis_name, my_env, num_envs, model_dir, batch_size=agent.batch_size, n_steps=agent.n_steps,
         n_epochs=agent.n_epochs, clip_range=agent.clip_range(0), gamma=agent.gamma, gae_lambda=agent.gae_lambda,
         vf_coef=agent.vf_coef, ent_coef=agent.ent_coef, learning_rate=agent.learning_rate, image_based=image_based, image_pretrain=image_pretrain)
-    save_new_stats_file(model_dir + nemesis_name + "/stats.json", ("nemesis", True), ("matching_agent", agent_name), ("image_based", image_based))
+    save_new_stats_file(model_dir + nemesis_name + "/stats.json", ("nemesis", True), ("matching_agent", agent_name), ("image_based", image_based), ("env_p", env_p) if image_based else None)
     print("Created", nemesis_name, flush=True)
     return nemesis_name
     
-def gen_survivor(agent_name, agent, my_env, num_envs, model_dir, image_based=False, image_pretrain=None):
+def gen_survivor(agent_name, agent, my_env, num_envs, model_dir, image_based=False, image_pretrain=None, env_p=3):
     survivor_name = agent_name + "-survivor"
     save_new_model(survivor_name, my_env, num_envs, model_dir, batch_size=agent.batch_size, n_steps=agent.n_steps,
         n_epochs=agent.n_epochs, clip_range=agent.clip_range(0), gamma=agent.gamma, gae_lambda=agent.gae_lambda,
         vf_coef=agent.vf_coef, ent_coef=agent.ent_coef, learning_rate=agent.learning_rate, image_based=image_based, image_pretrain=image_pretrain)
-    save_new_stats_file(model_dir + survivor_name + "/stats.json", ("survivor", True), ("matching_agent", agent_name), ("image_based", image_based))
+    save_new_stats_file(model_dir + survivor_name + "/stats.json", ("survivor", True), ("matching_agent", agent_name), ("image_based", image_based), ("env_p", env_p) if image_based else None)
     print("Created", survivor_name, flush=True)
     return survivor_name
     
@@ -180,18 +181,18 @@ if __name__ == "__main__":
             )
         env_stack = DummyVecEnv(envs)
     else:
-        env_stack = TankEnv(args.game_path, game_port=args.base_port, game_log_path="gamelog.txt", level_path=args.level_path, image_based=args.image_based)
+        env_stack = TankEnv(args.game_path, game_port=args.base_port, game_log_path="gamelog.txt", level_path=args.level_path, image_based=args.image_based, p=args.env_p)
 
     try:
         population = []
         for i in range(args.start):
             agent_name, agent = gen_agent(env_stack, args.num_envs, args.model_dir, args.noun_file_path, args.adj_file_path, 
-                batch_size=args.batch_size, image_based=args.image_based, image_pretrain=args.image_pretrain)
+                batch_size=args.batch_size, image_based=args.image_based, image_pretrain=args.image_pretrain, env_p=args.env_p)
             population.append(agent_name)
             if args.nem:
-                population.append(gen_nemesis(agent_name, agent, env_stack, args.num_envs, args.model_dir, image_based=args.image_based, image_pretrain=args.image_pretrain))
+                population.append(gen_nemesis(agent_name, agent, env_stack, args.num_envs, args.model_dir, image_based=args.image_based, image_pretrain=args.image_pretrain, env_p=args.env_p))
             if args.surv:
-                population.append(gen_survivor(agent_name, agent, env_stack, args.num_envs, args.model_dir, image_based=args.image_based, image_pretrain=args.image_pretrain))
+                population.append(gen_survivor(agent_name, agent, env_stack, args.num_envs, args.model_dir, image_based=args.image_based, image_pretrain=args.image_pretrain, env_p=args.env_p))
         if args.start:
             with open(args.model_dir + "/population.txt", 'w') as pop_file:
                 for p in population:

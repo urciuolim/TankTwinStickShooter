@@ -32,9 +32,11 @@ def evaluate_agent(model_dir, local_pop_dir, agent_id, game_path, base_port, num
     #else:
         #opp_fp_and_elo = [(curr_model_path(model_dir, agent_stats["matching_agent"], train.load_stats(model_dir, agent_stats["matching_agent"])), DUMMY_ELO)]
         
+    env_p = agent_stats["env_p"] if "env_p" in agent_stats else 3
+        
     env_stdout_path=local_pop_dir+agent_id+"/env_log.txt"
     env_stack = train.make_env_stack(num_envs, game_path, base_port, local_pop_dir+agent_id+"/gamelog.txt", opp_fp_and_elo, DUMMY_ELO, 
-        elo_match=False, survivor=agent_stats["survivor"] if "survivor" in agent_stats else False, stdout_path=env_stdout_path, level_path=level_path, image_based=agent_stats["image_based"])
+        elo_match=False, survivor=agent_stats["survivor"] if "survivor" in agent_stats else False, stdout_path=env_stdout_path, level_path=level_path, image_based=agent_stats["image_based"], env_p=env_p)
     agent_model_path = curr_model_path(model_dir, agent_id, agent_stats)
     agent = PPO.load(agent_model_path, env=env_stack)
     print("Loaded model saved at", agent_model_path, flush=True)
@@ -124,6 +126,6 @@ if __name__ == "__main__":
     print(args, flush=True)
     train.validate_args(args)
     print("Starting evaluation of", args.agent_id, "with", args.num_trials, "trials against each opponent in population", flush=True)
-    results = evaluate_agent(args.model_dir, args.local_pop_dir, args.agent_id, args.game_path, args.base_port, args.num_envs, args.num_trials)
+    results = evaluate_agent(args.model_dir, args.local_pop_dir, args.agent_id, args.game_path, args.base_port, args.num_envs, args.num_trials, level_path=args.level_path)
     print("Evaluation of", args.agent_id, "complete", flush=True)
     print_summary(results)
