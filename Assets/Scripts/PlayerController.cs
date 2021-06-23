@@ -26,6 +26,8 @@ public class PlayerController : MonoBehaviour
     private float xSpawnLim = .5f;
     private float ySpawnLim = 3f;
 
+    private bool keyboard = false;
+
     public Color myColor;
     [HideInInspector]
     public float maxHealth = 1;
@@ -56,6 +58,8 @@ public class PlayerController : MonoBehaviour
             maxHealth = config["player_maxHealth"].Value<float>();
         if (config["player" + playerID + "_ai"] != null)
             AI = config["player" + playerID + "_ai"].Value<bool>();
+        if (config["player" + playerID + "_keyboard"] != null)
+            keyboard = config["player" + playerID + "_keyboard"].Value<bool>();
         if (config["player_randomStart"] != null)
             randomStart = config["player_randomStart"].Value<bool>();
         if (config["player_x_spawn_lim"] != null)
@@ -150,10 +154,70 @@ public class PlayerController : MonoBehaviour
             }
             else
             {
-                velocity.Set(Input.GetAxis(horizontal), Input.GetAxis(vertical));
-                aim.Set(Input.GetAxis(r_horizontal), Input.GetAxis(r_vertical));
+                float vX = 0f;
+                float vY = 0f;
+                if (keyboard)
+                {
+                    if (Input.GetKey(KeyCode.D) && !Input.GetKey(KeyCode.A))
+                    {
+                        vX = 1f;
+                    }
+                    else if (!Input.GetKey(KeyCode.D) && Input.GetKey(KeyCode.A))
+                    {
+                        vX = -1f;
+                    }
+                    else if (Input.GetKey(KeyCode.D) && Input.GetKey(KeyCode.A))
+                    {
+                        vX = 0f;
+                    }
+                    if (Input.GetKey(KeyCode.W) && !Input.GetKey(KeyCode.S))
+                    {
+                        vY = 1f;
+                    }
+                    else if (!Input.GetKey(KeyCode.W) && Input.GetKey(KeyCode.S))
+                    {
+                        vY = -1f;
+                    }
+                    else if (Input.GetKey(KeyCode.W) && Input.GetKey(KeyCode.S))
+                    {
+                        vY = 0f;
+                    }
+                }
+                else
+                {
+                    vX = Input.GetAxis(horizontal);
+                    vY = Input.GetAxis(vertical);
+                }
+                velocity.Set(vX, vY);
 
-                if (Input.GetAxis(trigger) > triggerThreshold && canShoot)
+                float aX = 0f;
+                float aY = 0f;
+                if (keyboard)
+                {
+                    Vector2 mousePos = Vector2.zero;
+                    if (Camera.main != null)
+                        mousePos = Camera.main.ScreenToWorldPoint(Input.mousePosition);
+                    aX = mousePos.x - transform.position.x;
+                    aY = mousePos.y - transform.position.y;
+                }
+                else
+                {
+                    aX = Input.GetAxis(r_horizontal);
+                    aY = Input.GetAxis(r_vertical);
+                }
+                aim.Set(aX, aY);
+
+                bool triggerPressed = false;
+                if (keyboard)
+                {
+                    triggerPressed = Input.GetMouseButton(0);
+                }
+                else
+                {
+                    triggerPressed = Input.GetAxis(trigger) > triggerThreshold;
+                }
+
+                if (triggerPressed && canShoot)
                 {
                     Shoot();
                 }
