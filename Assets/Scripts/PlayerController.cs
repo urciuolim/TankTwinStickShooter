@@ -137,6 +137,9 @@ public class PlayerController : MonoBehaviour
 
     private void GetInput()
     {
+        if (Input.GetKeyDown(KeyCode.Escape))
+            Application.Quit();
+
         if (playing)
         {
             if (AI)

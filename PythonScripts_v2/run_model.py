@@ -18,6 +18,9 @@ def run_model(args):
     elif args.p1same:
         model = PPO.load(args.opp)
         
+    score = [0,0,0]
+    print("Score: [Player1 Wins, Player2 Wins, Ties]")
+        
     obs = env.reset()
     if args.image_based and (args.ai_view or args.rev_ai_view):
         fig = plt.gcf()
@@ -38,6 +41,8 @@ def run_model(args):
             action = np.zeros(5, dtype=np.float32)
         obs, reward, done, info = env.step(action)
         if done:
+            score[info["winner"]] += 1
+            print("Score:", score)
             obs = env.reset()
             
 if __name__ == "__main__":
