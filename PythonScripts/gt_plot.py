@@ -6,8 +6,25 @@ from random import random
 from plot_pop_elo import get_elo_steps, get_elo_values
 import numpy as np
 
-def sorted_keys(all_stats):
-    return sorted(all_stats.keys(), key=lambda k: -int(all_stats[k]["elo"][str(all_stats[k]["curr_iter"])]))
+def avg(l):
+    return sum(l) / len(l)
+
+def sorted_keys(all_stats, avg_len=5):
+    #return sorted(all_stats.keys(), key=lambda k: -int(all_stats[k]["elo"][str(all_stats[k]["curr_iter"])]))
+    return sorted(all_stats.keys(), key=lambda k: -avg_elo(all_stats[k], avg_len=avg_len))
+    
+def avg_elo(stats, avg_len=5):
+    return avg(dict_to_list(stats["elo"])[-avg_len:])
+    
+def dict_to_list(d):
+    keys = []
+    for k in d.keys():
+        keys.append(int(k))
+    keys = sorted(keys)
+    new_list = []
+    for k in keys:
+        new_list.append(d[str(k)])
+    return new_list
     
 def get_total_steps(agent_id, anc={}):
     total_steps = int(agent_id.split('_')[-1])
@@ -57,6 +74,7 @@ if __name__ == "__main__":
     parser.add_argument("--show_legend", action="store_true", help = "Shows legend with IDs of agents in population.")
     parser.add_argument("--anc", type=str, default=None, help = "Ancestor steps file path, which will adjust ordering of agents in 'who beats who' plot")
     parser.add_argument("--pop_size", type=int, default=24, help = "Size of population at any point in time")
+    parser.add_argument("--avg_len", type=int, default=5, help = "How far back to average when sorted by ELO")
     args = parser.parse_args()
     print(args)
 
@@ -73,7 +91,8 @@ if __name__ == "__main__":
     fig,ax = plt.subplots(1,3)
     # Plot main agents elos, also avg reward at each # of trained steps
     colors = {}
-    for m in sorted_keys(all_model_stats):
+    for m in sorted_keys(all_model_stats, avg_len=args.avg_len):
+        print(m, "has avg elo", avg_elo(all_model_stats[m], avg_len=args.avg_len))
         model_stats = all_model_stats[m]
         colors[m] = (random(), random(), random(), 1)
         # Plot elos

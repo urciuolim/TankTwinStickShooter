@@ -9,26 +9,11 @@
 /[Bb]uilds/
 /[Ll]ogs/
 /[Mm]emoryCaptures/
-/PythonScripts/logs/
+/PythonScripts/*test*/
+/PythonScripts/gamelog*
+/PythonScripts/*env*
 /PythonScripts/__pycache__/
-/PythonScripts/saved_models/
-/PythonScripts/models_rs/
-/PythonScripts/models/
-/PythonScripts/old_models/
-/PythonScripts/Assets/
-/PythonScripts/competitors.txt
-/PythonScripts/gamelog.txt
-/PythonScripts/*.zip
-/PythonScripts/models*
-/PythonScripts/*.png
-/PythonScripts/*.jpg
-/PythonScripts/*_models*/
-/PythonScripts/test/
-/PythonScripts_v2/*test*/
-/PythonScripts_v2/gamelog*
-/PythonScripts_v2/*env*
-/PythonScripts_v2/__pycache__/
-/PythonScripts_v2/*.npz
+/PythonScripts/*.npz
 
 # Asset meta data should only be ignored when the corresponding asset is also ignored
 !/[Aa]ssets/**/*.meta

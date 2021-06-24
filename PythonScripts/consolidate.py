@@ -2,74 +2,115 @@ import os
 os.environ['MKL_THREADING_LAYER'] = 'GNU'
 import argparse
 import json
+import train
+from elo import elo_change
 
-# Setup command line arguments
-parser = argparse.ArgumentParser()
-parser.add_argument("model_dir", type=str, help="Base directory for agent models")
-parser.add_argument("pop_file_path", type=str, help="Path to file that contains IDs of agents in population to train")
-parser.add_argument("N", type=int, help="Number of partitions to consolidate, from 1 to N")
-args = parser.parse_args()
-print(args)
-    
-if not (args.model_dir[-1] == '/' or args.model_dir[-1] == '\\'):
-    args.model_dir = args.model_dir + "/"
-if not os.path.isdir(args.model_dir):
-    raise FileNotFoundError("Base directory for agent models is not a folder")
-if not os.path.exists(args.pop_file_path):
-    raise FileNotFoundError("Inputted path does not lead to population file")
-    
-population = []
-with open(args.pop_file_path, 'r') as pop_file:
-    for line in pop_file.readlines():
-        population.append(line.strip('\n'))
-      
-print("Consolidating training population:", population)
-
-for p in population:
-    print("Consolidating", p)
-    base_path = args.model_dir + p + '/'
-
-    stats_file_path = base_path + "stats.json"
-    with open(stats_file_path, 'r') as stats_file:
-        model_stats = json.load(stats_file)
-    '''
-    if not ("-nemesis" in p or "-survivor" in p):
-        # Consolidate performance stats generated from tournament
-        avg_reward = model_stats["performance"]["avg_reward"]
-        avg_steps = model_stats["performance"]["avg_steps"]
-        trained_steps = model_stats["performance"]["trained_steps"]
-        
-        end = len(trained_steps) - 1
-        last_steps = model_stats["num_steps"]
-        while end > 0:
-            if trained_steps[end-1] != last_steps:
-                break
-            end -= 1
+def get_idx_in_results(ID, results):
+    ID_STEPS=0
+    for i in range(len(results)):
+        if ID == results[i][ID_STEPS].split('_')[0]:
+            return i
             
-        trained_steps = trained_steps[0:end+1]
-        consol_reward = sum(avg_reward[end:])/len(avg_reward[end:])
-        avg_reward = avg_reward[0:end]
-        avg_reward.append(consol_reward)
-        consol_steps = sum(avg_steps[end:])/len(avg_steps[end:])
-        avg_steps = avg_steps[0:end]
-        avg_steps.append(consol_steps)
-        
-        model_stats["performance"]["avg_reward"] = avg_reward
-        model_stats["performance"]["avg_steps"] = avg_steps
-        model_stats["performance"]["trained_steps"] = trained_steps
-    '''
-    # Consolidate ELO changes and record them at current num_steps
-    elo_change = 0
-    for i in range(1, args.N+1):
-        change_file_path = base_path + "elo_change-worker" + str(i) + ".txt"
-        with open(change_file_path) as change_file:
-            elo_change += int(change_file.readline().strip('\n'))
-        os.remove(change_file_path)
-    model_stats["elo"]["value"].append(model_stats["elo"]["value"][-1] + elo_change)
-    model_stats["elo"]["steps"].append(model_stats["num_steps"])
+def get_last_perf_results(stats):
+    return stats["performance"][str(stats["last_eval_steps"])]
     
-    # Write consolidated stats file back
-    with open(stats_file_path, 'w') as stats_file:
-        json.dump(model_stats, stats_file, indent=4)
+def recalc_avg_reward(record, is_survivor):
+    WINS=1
+    LOSSES=2
+    GAMES=3
+    AVG_REWARD = 4
+    AVG_STEPS = 5
+    if is_survivor:
+        record[AVG_REWARD] = record[AVG_STEPS] / 300
+    else:
+        record[AVG_REWARD] = (record[WINS] - record[LOSSES])/record[GAMES]
+            
+def combine_records(record1, record2, survivor_1=False, survivor_2=False):
+    WINS=1
+    LOSSES=2
+    GAMES=3
+    AVG_STEPS=5
     
-print("Consolidation complete")
+    record1[AVG_STEPS] = (record1[AVG_STEPS]*record1[GAMES] + record2[AVG_STEPS]*record2[GAMES])/(record1[GAMES]+record2[GAMES])
+    record2[AVG_STEPS] = record1[AVG_STEPS]
+    
+    record1_wins = record1[WINS]
+    record2_wins = record2[WINS]
+    
+    record1[WINS] += record2[LOSSES]
+    record2[WINS] += record1[LOSSES]
+    
+    record1[LOSSES] += record2_wins
+    record2[LOSSES] += record1_wins
+    
+    tmp = record1[GAMES]
+    record1[GAMES] += record2[GAMES]
+    record2[GAMES] += tmp
+    
+    recalc_avg_reward(record1, survivor_1)
+    recalc_avg_reward(record2, survivor_2)
+
+def consolidate_results(pop, all_stats):
+    for i in range(len(pop)):
+        #print("Consolidating", pop[i])
+        i_results = get_last_perf_results(all_stats[i])
+        for j in range(i+1, len(pop)):
+            j_results = get_last_perf_results(all_stats[j])
+            x = get_idx_in_results(pop[j], i_results)
+            y = get_idx_in_results(pop[i], j_results)
+            combine_records(i_results[x], j_results[y], survivor_1=all_stats[i]["survivor"], survivor_2=all_stats[j]["survivor"])
+            
+def last_elo(stats):
+    return stats["elo"][str(stats["last_elo_change_steps"])]
+            
+def make_elo_changes(pop, all_stats):
+    elo_changes = [0 for _ in pop]
+    # Calculate ELO changes for non-exploiters
+    for i in range(len(pop)):
+        #print("Calculating elo changes for ", pop[i])
+        if all_stats[i]["nemesis"] or all_stats[i]["survivor"]:
+            continue
+        i_results = get_last_perf_results(all_stats[i])
+        for (Id_steps, wins, losses, games, avg_reward, avg_steps) in i_results:
+            if "-nemesis" in Id_steps or "-survivor" in Id_steps:
+                continue
+            other_elo = last_elo(all_stats[pop.index(Id_steps.split('_')[0])])
+            K=32
+            (change, _) = elo_change(last_elo(all_stats[i]), other_elo, K, (avg_reward+1)/2)
+            elo_changes[i] += change
+            
+    print("ELO Changes:", elo_changes)
+            
+    # Apply ELO changes, using matching agent ELO changes for exploiters
+    for i in range(len(pop)):
+        i_stats = all_stats[i]
+        #print("Making elo changes for ", pop[i])
+        if i_stats["nemesis"] or i_stats["survivor"]:
+            idx = pop.index(i_stats["matching_agent"])
+            i_stats["elo"][str(i_stats["last_eval_steps"])] = last_elo(i_stats) + elo_changes[idx]
+        else:
+            #print(i_stats)
+            i_stats["elo"][str(i_stats["last_eval_steps"])] = last_elo(i_stats) + elo_changes[i]
+        i_stats["last_elo_change_steps"] = i_stats["num_steps"]
+
+if __name__ == "__main__":
+    # Setup command line arguments
+    parser = argparse.ArgumentParser()
+    parser.add_argument("model_dir", type=str, help="Base directory for agent models")
+    args = parser.parse_args()
+    print(args, flush=True)
+
+    if not (args.model_dir[-1] == '/' or args.model_dir[-1] == '\\'):
+        args.model_dir = args.model_dir + "/"
+    if not os.path.isdir(args.model_dir):
+        raise FileNotFoundError("Base directory for agent models is not a folder")
+    
+    pop = train.load_pop(args.model_dir)
+    print("Consolidating training population:", pop, flush=True)
+    all_stats = []
+    for p in pop:
+        all_stats.append(train.load_stats(args.model_dir, p))
+    consolidate_results(pop, all_stats)
+    make_elo_changes(pop, all_stats)
+    for p,s in zip(pop, all_stats):
+        train.save_stats(args.model_dir, p, s)
