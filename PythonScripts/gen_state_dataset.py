@@ -6,9 +6,9 @@ from tqdm import tqdm
 
 parser = argparse.ArgumentParser()
 parser.add_argument("num_obs", type=int, help="Number of observations to generate")
-parser.add_argument("desktop_game_path", type=str, help="File path of desktop game executable")
-parser.add_argument("server_game_path", type=str, help="File path of server game executable")
+parser.add_argument("game_path", type=str, help="File path of game executable")
 parser.add_argument("level_path", type=str, help="File path of game level")
+parser.add_argument("--canvas_game_path", type=str, help="File path of seperate game executable to be used in canvas env")
 parser.add_argument("--base_port", type=int, default=50000, help="Base port to be used for game environment")
 parser.add_argument("--my_port", type=int, default=50500, help="Port to be used on Python side of network socket connection")
 parser.add_argument("--save_loc", type=str, default="dataset.npz", help="File path to save data to")
@@ -19,13 +19,16 @@ print(args)
 obs_set = np.zeros((args.num_obs, 52), dtype=np.float32)
 img_set = np.zeros((args.num_obs, 12*args.env_p, 20*args.env_p, 3), dtype=np.uint8)
 try:
-    env = TankEnv(args.desktop_game_path, 
+    env = TankEnv(args.game_path, 
         opp_fp_and_elo=[], 
         game_port=args.base_port, 
         my_port=args.my_port,
         rand_opp=True
         )
-    canvas = TankEnv(args.server_game_path,
+        
+    if not args.canvas_game_path:
+        args.canvas_game_path = args.game_path
+    canvas = TankEnv(args.canvas_game_path,
         opp_fp_and_elo=[], 
         game_port=args.base_port+1, 
         my_port=args.my_port+1, 
@@ -37,6 +40,8 @@ try:
         
     obs = env.reset()
     for i in tqdm(range(args.num_obs)):
+        if i % (args.num_obs // 10) == 0:
+            print(i/(args.num_obs//10), "% complete", sep="", flush=True)
         # Save states
         obs_set[i] = obs.copy()
         canvas.draw_state(obs)

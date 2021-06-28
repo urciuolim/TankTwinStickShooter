@@ -1,10 +1,10 @@
 {
     "connectionIP": "127.0.0.1",
     "game_maxTime": 60,
-    "timeScale": 1,
+    "timeScale": 5,
     "verbose": false,
     "arena_path": "Assets/Arenas/custom1.json",
-    "player1_ai": false,
+    "player1_ai": true,
 	"player1_keyboard": false,
     "player2_ai": true,
 	"player2_keyboard": false,

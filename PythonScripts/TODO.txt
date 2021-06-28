@@ -1,0 +1,5 @@
+Instead of legend, have labels appear in population plots when mouse hovers over datapoint
+Current iteration of agents play against history of agents (more than just last iteration)
+Application where player plays against trained agents, using ELO/Graph/Both to matchmake
+Varying weights for rewards during hyperparameter assignment in preamble/replacement
+LSTM/Auxilary tasks in feature extractor (dictionary observations)
