@@ -8,30 +8,40 @@ import argparse
 import matplotlib.pyplot as plt
 from torchvision import utils
 from tqdm import tqdm
+import sys
 
 device = T.device('cuda') if T.cuda.is_available() else T.device('cpu')
 
-def make_net(env_p=3):
-    if env_p == 3:
-        cnn_out_dim = 256
-    elif env_p == 4:
-        cnn_out_dim = 768
+def make_net(env_w=20, env_h=12, env_p=3):
+    width = env_w*env_p
+    height = env_h*env_p
+    
+    cnn = nn.Sequential(
+        nn.Conv2d(3, 32, kernel_size=8, stride=4, padding=0),
+        nn.ReLU(),
+        nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=0),
+        nn.ReLU(),
+        nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=0),
+        nn.ReLU(),
+        nn.Flatten(start_dim=1, end_dim=-1)
+    )
+    
+    test_tensor = T.zeros(1,3,height,width)
+    with T.no_grad():
+        cnn_out_dim = cnn(test_tensor).size()[-1]
+        
+    linear = nn.Sequential(
+        nn.Linear(cnn_out_dim, 512),
+        nn.ReLU()
+    )
+    
+    mapping = nn.Linear(512, 52)
+    
     return nn.Sequential(
-            nn.Sequential(
-                nn.Conv2d(3, 32, kernel_size=8, stride=4, padding=0),
-                nn.ReLU(),
-                nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=0),
-                nn.ReLU(),
-                nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=0),
-                nn.ReLU(),
-                nn.Flatten(start_dim=1, end_dim=-1)
-            ),
-            nn.Sequential(
-                nn.Linear(cnn_out_dim, 512),
-                nn.ReLU()
-            ),
-            nn.Linear(512, 52)
-        )
+            cnn,
+            linear,
+            mapping
+    )
         
 def make_dataloader(dataset, split=.9, batch_size=64, random_split=False):
     dataset_images = T.from_numpy(dataset["img"]).transpose(1,-1)#T.from_numpy(dataset["img"].astype(np.float32)/255.).transpose(1,-1)#.to(device)
@@ -62,9 +72,11 @@ def train_model(dataset, epochs, loss_save_loc="loss.png", batch_size=1024, lr=0
     optimizer = optim.Adam(net.parameters(), lr=lr)
     training_losses = []
     eval_losses = []
-    for e in tqdm(range(epochs)):
-        if e % (epochs // 10) == 0:
-            print("Epoch:", e, flush=True)
+    gen = tqdm(range(epochs), file=sys.stdout)
+    for e in gen:
+        if not epochs // 10 == 0:
+            if e % (epochs // 10) == 0:
+                print("Epoch:", e, flush=True)
         net.train()
         training_loss = 0.
         for batch_idx, (data, target) in enumerate(train_loader):
@@ -89,6 +101,7 @@ def train_model(dataset, epochs, loss_save_loc="loss.png", batch_size=1024, lr=0
         if verbose:
             print("Average loss during eval epoch ", e, ": ", eval_loss/num_test, sep="")
         eval_losses.append(eval_loss/num_test)
+        gen.refresh()
     plt.title("Average loss per epoch")
     plt.plot(training_losses, label="Train")
     plt.plot(eval_losses, label="Eval")

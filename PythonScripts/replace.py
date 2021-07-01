@@ -72,30 +72,30 @@ def save_descendent_model(ancestor_name, ancestor_steps, new_name, model_dir, ba
     descendent.save(model_dir + new_name + '/' + new_name + "_0")
     return descendent
         
-def descendent_agent(ancestor_name, ancestor_steps, new_name, model_dir, starting_elo, batch_size=None, image_based=False):
+def descendent_agent(ancestor_name, ancestor_steps, new_name, model_dir, starting_elo, batch_size=None, image_based=False, env_p=3):
     new_agent = save_descendent_model(ancestor_name, ancestor_steps, new_name, model_dir, batch_size=batch_size, image_based=image_based)
-    save_new_stats_file(args.model_dir + new_name + "/stats.json", ("image_based", image_based), ("parent", ancestor_name+"_"+str(ancestor_steps)), starting_elo=starting_elo)
+    save_new_stats_file(args.model_dir + new_name + "/stats.json", ("image_based", image_based), ("parent", ancestor_name+"_"+str(ancestor_steps)), ("env_p", env_p), starting_elo=starting_elo)
     print("Created", new_name, flush=True)
     return new_agent
     
-def descendent_nemesis(ancestor_name, ancestor_steps, new_name, matching_agent, model_dir, starting_elo, batch_size=None, image_based=False):
+def descendent_nemesis(ancestor_name, ancestor_steps, new_name, matching_agent, model_dir, starting_elo, batch_size=None, image_based=False, env_p=3):
     ancestor_nemesis = ancestor_name+"-nemesis"
     new_nemesis = new_name+"-nemesis"
     new_agent = save_descendent_model(ancestor_nemesis, ancestor_steps, new_nemesis, model_dir, 
         batch_size=matching_agent.batch_size, n_steps=matching_agent.n_steps, n_epochs=matching_agent.n_epochs, clip_range=matching_agent.clip_range(0),
         gamma=matching_agent.gamma, gae_lambda=matching_agent.gae_lambda, vf_coef=matching_agent.vf_coef, ent_coef=matching_agent.ent_coef,
         learning_rate=matching_agent.learning_rate, image_based=image_based)
-    save_new_stats_file(args.model_dir + new_nemesis + "/stats.json", ("image_based", image_based), ("parent", ancestor_nemesis+"_"+str(ancestor_steps)), ("matching_agent", new_name), ("nemesis", True), starting_elo=starting_elo)
+    save_new_stats_file(args.model_dir + new_nemesis + "/stats.json", ("image_based", image_based), ("parent", ancestor_nemesis+"_"+str(ancestor_steps)), ("matching_agent", new_name), ("nemesis", True), ("env_p", env_p), starting_elo=starting_elo)
     print("Created", new_nemesis, flush=True)
     
-def descendent_survivor(ancestor_name, ancestor_steps, new_name, matching_agent, model_dir, starting_elo, batch_size=None, image_based=False):
+def descendent_survivor(ancestor_name, ancestor_steps, new_name, matching_agent, model_dir, starting_elo, batch_size=None, image_based=False, env_p=3):
     ancestor_survivor = ancestor_name+"-survivor"
     new_survivor = new_name+"-survivor"
     new_agent = save_descendent_model(ancestor_survivor, ancestor_steps, new_survivor, model_dir, 
         batch_size=matching_agent.batch_size, n_steps=matching_agent.n_steps, n_epochs=matching_agent.n_epochs, clip_range=matching_agent.clip_range(0),
         gamma=matching_agent.gamma, gae_lambda=matching_agent.gae_lambda, vf_coef=matching_agent.vf_coef, ent_coef=matching_agent.ent_coef,
         learning_rate=matching_agent.learning_rate, image_based=image_based)
-    save_new_stats_file(args.model_dir + new_survivor + "/stats.json", ("image_based", image_based), ("parent", ancestor_survivor+"_"+str(ancestor_steps)), ("matching_agent", new_name), ("survivor", True), starting_elo=starting_elo)
+    save_new_stats_file(args.model_dir + new_survivor + "/stats.json", ("image_based", image_based), ("parent", ancestor_survivor+"_"+str(ancestor_steps)), ("matching_agent", new_name), ("survivor", True), ("env_p", env_p), starting_elo=starting_elo)
     print("Created", new_survivor, flush=True)
     
 def replace_algorithm(pop_elos_agents_stats, flags, model_dir, noun_fp, adj_fp, batch_size=None, win_thresh=.7, min_steps=10000000):
@@ -117,15 +117,16 @@ def replace_algorithm(pop_elos_agents_stats, flags, model_dir, noun_fp, adj_fp, 
             removed.append(b_id)
             new_name = gen_name(noun_fp, adj_fp, model_dir)
             img_bsd = a_stat["image_based"] if "image_based" in a_stat else False
-            new_agent = descendent_agent(a_id, a_stat["num_steps"], new_name, model_dir, last_elo(a_stat), batch_size=batch_size, image_based=img_bsd)
+            env_p = a_stat["env_p"] if "env_p" in a_stat else 3
+            new_agent = descendent_agent(a_id, a_stat["num_steps"], new_name, model_dir, last_elo(a_stat), batch_size=batch_size, image_based=img_bsd, env_p=env_p)
             new_pop.append(new_name)
             if flags["has_nemesis"]:
                 removed.append(b_id + "-nemesis")
-                descendent_nemesis(a_id, a_stat["num_steps"], new_name, new_agent, model_dir, last_elo(a_stat), image_based=img_bsd)
+                descendent_nemesis(a_id, a_stat["num_steps"], new_name, new_agent, model_dir, last_elo(a_stat), image_based=img_bsd, env_p=env_p)
                 new_pop.append(new_name+"-nemesis")
             if flags["has_survivor"]:
                 removed.append(b_id + "-survivor")
-                descendent_survivor(a_id, a_stat["num_steps"], new_name, new_agent, model_dir, last_elo(a_stat), image_based=img_bsd)
+                descendent_survivor(a_id, a_stat["num_steps"], new_name, new_agent, model_dir, last_elo(a_stat), image_based=img_bsd, env_p=env_p)
                 new_pop.append(new_name+"-survivor")
     if len(new_pop) <= 0:
         print("No viable replacements at this time", flush=True)
