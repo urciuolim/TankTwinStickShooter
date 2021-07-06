@@ -56,7 +56,8 @@ def choose_hyperp(hyperp, default_idx):
     
 def save_new_model(name, env, num_envs, model_dir, batch_size=None, n_steps=None,
         n_epochs=None, clip_range=None, gamma=None, gae_lambda=None, vf_coef=None,
-        ent_coef=None, learning_rate=None, image_based=False, image_pretrain=None):
+        ent_coef=None, learning_rate=None, image_based=False, image_pretrain=None,
+        verbose=0):
     if not batch_size:
         batch_size = choose_hyperp("batch_size", 10)
     if not n_steps:
@@ -82,7 +83,7 @@ def save_new_model(name, env, num_envs, model_dir, batch_size=None, n_steps=None
     
     model = PPO(feature_extractor, env, batch_size=batch_size, n_steps=n_steps, 
                 n_epochs=n_epochs, clip_range=clip_range, gamma=gamma, gae_lambda=gae_lambda,
-                vf_coef=vf_coef, ent_coef=ent_coef, learning_rate=learning_rate)
+                vf_coef=vf_coef, ent_coef=ent_coef, learning_rate=learning_rate, verbose=verbose)
     if image_based and image_pretrain:
         model.policy.features_extractor.cnn.load_state_dict(T.load(image_pretrain+"_cnn.pth"))
         model.policy.features_extractor.linear.load_state_dict(T.load(image_pretrain+"_linear.pth"))

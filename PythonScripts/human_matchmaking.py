@@ -13,7 +13,7 @@ from tank_env import elo_based_choice
 def new_human_stats():
     return {
         "elo":[],
-        "win_rate":[]
+        "win_rate":{}
     }
 
 def play_match(env, num_games):  
@@ -54,6 +54,7 @@ def opp_fp(model_dir, opp):
 def human_matchmaking(args):
     WINS=0
     LOSSES=1
+    GAMES=2
     
     pop = load_pop(args.model_dir)
     all_stats = {}
@@ -95,6 +96,13 @@ def human_matchmaking(args):
             K=16
             human_elo_change, _ = elo_change(human_elo, current_opp_elo, K, human_win_rate)
             human_elo += int(human_elo_change)
+            
+            human_stats["elo"].append(human_elo)
+            if not current_opp in human_stats["win_rate"]:
+                human_stats["win_rate"][current_opp] = [0,0,0]
+            human_stats["win_rate"][current_opp][WINS] += score[WINS]
+            human_stats["win_rate"][current_opp][LOSSES] += score[LOSSES]
+            human_stats["win_rate"][current_opp][GAMES] += sum(score)
             
             D=5.
             current_opp_idx = elo_based_choice(all_elos, human_elo, D)

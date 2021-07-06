@@ -32,6 +32,7 @@ def agent_specific_win_rate(agent1_id, agent1_stat, agent2_id):
     ID = 0
     WINS=1
     GAMES=3
+    print(agent1_id)
     agent1_perf = agent1_stat["performance"][str(agent1_stat["last_elo_change_steps"])]
     for record in agent1_perf:
         if "nemesis" in record[ID] or "survivor" in record[ID] or not agent2_id in record[ID]:
@@ -112,7 +113,7 @@ def replace_algorithm(pop_elos_agents_stats, flags, model_dir, noun_fp, adj_fp, 
         b_id, b_elo, b_agent, b_stat = tuple_b
         if a_id in removed or b_id in removed or a_stat["num_steps"] < min_steps or b_stat["num_steps"] < min_steps:
             continue
-        if elo_prob(a_elo, b_elo) > .7 and agent_specific_win_rate(a_id, a_stat, b_id) > .7:
+        if elo_prob(a_elo, b_elo) > win_thresh and agent_specific_win_rate(a_id, a_stat, b_id) > win_thresh:
             print("Replacing", (b_id, b_elo), "with", (a_id, a_elo), flush=True)
             removed.append(b_id)
             new_name = gen_name(noun_fp, adj_fp, model_dir)
