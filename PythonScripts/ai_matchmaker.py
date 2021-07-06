@@ -63,7 +63,7 @@ class AIMatchmaker(gym.Env):
         self.current_opp_idx = elo_based_choice(self.all_elos, self.agent_elo, self.D)
         self.current_opp = self.all_opps[self.current_opp_idx]
         self.current_opp_elo = self.all_elos[self.current_opp_idx]
-        print("thread", self.my_port, "current opp elo:", self.current_opp_elo)
+        #print("thread", self.my_port, "current opp elo:", self.current_opp_elo, flush=True)
         self.env.load_new_opp(0, opp_fp(self.model_dir, self.current_opp), self.current_opp_elo)
         
     def get_agent_elo(self):
@@ -81,7 +81,7 @@ class AIMatchmaker(gym.Env):
                 
             agent_elo_change, _ = elo_change(self.agent_elo, self.current_opp_elo, self.K, win_rate)
             self.agent_elo += int(agent_elo_change)
-            print("THREAD", self.my_port, "CURRENT AGENT ELO:", self.agent_elo)
+            #print("THREAD", self.my_port, "CURRENT AGENT ELO:", self.agent_elo, flush=True)
         else:
             self.started = True
         

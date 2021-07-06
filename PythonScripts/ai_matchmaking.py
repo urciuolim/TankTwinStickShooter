@@ -30,6 +30,8 @@ def make_ai_matchmaker_stack(all_stats, all_opps, all_elos, game_path, model_dir
         return env_stack
 
 def ai_matchmaking(args):
+    if args.model_dir != '/':
+        args.model_dir += '/'
     pop = load_pop(args.model_dir)
     all_stats = {}
     for p in pop:
@@ -74,8 +76,8 @@ def ai_matchmaking(args):
         avg_agent_elo = env_stack.env_method("get_agent_elo")
         avg_agent_elo = sum(avg_agent_elo) / len(avg_agent_elo)
         
-        print("STARTNG AGENT ELO:", all_elos[-1])
-        print("AVG AGENT ELO:", avg_agent_elo)
+        print("STARTNG AGENT ELO:", all_elos[0], flush=True)
+        print("AVG AGENT ELO:", avg_agent_elo, flush=True)
             
     finally:
         env_stack.close()
