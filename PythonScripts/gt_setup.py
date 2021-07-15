@@ -71,6 +71,7 @@ if __name__ == "__main__":
             agent_new_dir = args.pb_dir + agent
             os.mkdir(agent_new_dir)
             os.system("cp " + agent_fp + ' ' + agent_new_dir + "/" + agent + "_0.zip")
+            agent_stats = all_model_stats[agent.split('_')[0]]
             starting_stats = {
                 "num_steps":0,
                 "curr_iter":0,
@@ -78,8 +79,10 @@ if __name__ == "__main__":
                     '0':1000
                 },
                 "win_rates": {},
-                "image_based":all_model_stats[agent.split('_')[0]]["image_based"]
+                "image_based":agent_stats["image_based"],
+                "env_p":agent_stats["env_p"] if "env_p" in agent_stats else 3
             }
+            
             with open(agent_new_dir + "/stats.json", 'w') as stats_file:
                 json.dump(starting_stats, stats_file, indent=4)
     

@@ -65,7 +65,7 @@ def consolidate_results(pop, all_stats):
 def last_elo(stats):
     return stats["elo"][str(stats["curr_iter"]-1)]
             
-def make_elo_changes(pop, all_stats):
+def make_elo_changes(pop, all_stats, k=32):
     elo_changes = [0 for _ in pop]
     # Calculate ELO changes for non-exploiters
     for i in range(len(pop)):
@@ -73,8 +73,7 @@ def make_elo_changes(pop, all_stats):
         i_results = get_last_iter_results(all_stats[i])
         for (Id_steps, wins, losses, games, avg_reward, avg_steps) in i_results:
             other_elo = last_elo(all_stats[pop.index(Id_steps[:-2])])
-            K=32
-            (change, _) = elo_change(last_elo(all_stats[i]), other_elo, K, (avg_reward+1)/2)
+            (change, _) = elo_change(last_elo(all_stats[i]), other_elo, k, (avg_reward+1)/2)
             elo_changes[i] += change
             
     print("ELO Changes:", elo_changes)
@@ -88,6 +87,7 @@ if __name__ == "__main__":
     # Setup command line arguments
     parser = argparse.ArgumentParser()
     parser.add_argument("model_dir", type=str, help="Base directory for agent models")
+    parser.add_argument("--elo_k", type=int, help="K value to use for elo change calculations")
     args = parser.parse_args()
     print(args, flush=True)
 
@@ -102,6 +102,6 @@ if __name__ == "__main__":
     for p in pop:
         all_stats.append(train.load_stats(args.model_dir, p))
     consolidate_results(pop, all_stats)
-    make_elo_changes(pop, all_stats)
+    make_elo_changes(pop, all_stats, k=args.elo_k)
     for p,s in zip(pop, all_stats):
         train.save_stats(args.model_dir, p, s)
