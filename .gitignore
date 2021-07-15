@@ -16,6 +16,7 @@
 /PythonScripts/*.npz
 /PythonScripts/old_image_based/*
 /PythonScripts/agent_db/*
+!/PythonScripts/*.py
 *.rar
 
 # Asset meta data should only be ignored when the corresponding asset is also ignored

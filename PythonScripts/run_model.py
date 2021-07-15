@@ -12,7 +12,8 @@ def run_model(args):
         image_based=args.image_based,
         level_path=args.level_path,
         rand_opp=args.rand_opp,
-        p=args.env_p)
+        p=args.env_p,
+        opp_p=args.opp_env_p)
     model = None
     if args.p1:
         model = PPO.load(args.p1)
@@ -61,6 +62,7 @@ if __name__ == "__main__":
     parser.add_argument("--rand_p1", action="store_true", help="Indicates that player should be random")
     parser.add_argument("--game_path", type=str, default=None, help="File path of game executable")
     parser.add_argument("--env_p", type=int, default=3, help="Image-based environment will draw one in-game grid square as p^2 pixels")
+    parser.add_argument("--opp_env_p", type=int, default=None, help="Env_p for opponent")
     
     args = parser.parse_args()
     print(args)
