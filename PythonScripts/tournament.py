@@ -31,9 +31,13 @@ def tournament(model_dir, local_pop_dir, game_path, base_port, num_envs, num_tri
                 j += 1
                 last_error = e2
             except EOFError as e3:
-                print("EOFError detected during training, trying higher port range")
+                print("EOFError detected during tournament, trying higher port range")
                 j += 1
                 last_error = e3
+            except json.decoder.JSONDecodeError as e4:
+                print("JSONDecodeError detected during tournament, trying higher port range")
+                j += 1
+                last_error = e4
         sys.stdout.close()
         sys.stderr.close()
         sys.stdout = org_stdout

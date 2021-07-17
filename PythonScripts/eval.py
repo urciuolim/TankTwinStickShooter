@@ -94,6 +94,9 @@ def evaluate_agent(model_dir, local_pop_dir, agent_id, game_path, base_port, num
     except EOFError as e3:
         env_stack.env_method("kill_env")
         raise e3
+    except json.decoder.JSONDecodeError as e4:
+        env_stack.env_method("kill_env")
+        raise e4
     finally:
         # Cleanup and return
         env_stack.close()

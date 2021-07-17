@@ -1,7 +1,7 @@
 {
     "connectionIP": "127.0.0.1",
     "game_maxTime": 60,
-    "timeScale": 3,
+    "timeScale": 5,
     "verbose": false,
     "arena_path": "Assets/Arenas/custom1.json",
     "player1_ai": true,
@@ -12,5 +12,5 @@
     "ai_actionFreq": 10,
     "ai_fixedDeltaTime": 0.02,
     "player_maxHealth": 1,
-    "player_randomStart": false
+    "player_randomStart": true
 }

@@ -37,6 +37,10 @@ def train_multiple_agents(model_dir, local_pop_dir, game_path, base_port, num_en
                 print("EOFError detected during training, trying higher port range")
                 j += 1
                 last_error = e3
+            except json.decoder.JSONDecodeError as e4:
+                print("JSONDecodeError detected during training, trying higher port range")
+                j += 1
+                last_error = e4
         sys.stdout.close()
         sys.stderr.close()
         sys.stdout = org_stdout
