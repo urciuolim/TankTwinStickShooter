@@ -234,9 +234,10 @@ class TankEnv(gym.Env):
                 if self.verbose:
                     print("Could not connect to IP", self.game_ip, "on port", self.game_port, "...sleeping for one second", flush=True)
                 time.sleep(1)
-            except OSError:
+            except OSError as e:
                 if self.verbose:
                     print("OSError during connect, trying again...", flush=True)
+                    print(e)
                 time.sleep(1)
             except BrokenPipeError:
                 if self.verbose:

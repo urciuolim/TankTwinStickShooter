@@ -127,7 +127,7 @@ def validate_args(args):
     if not (args.local_pop_dir[-1] == '/' or args.local_pop_dir[-1] == '\\'):
         args.local_pop_dir = args.local_pop_dir + "/"
     if not os.path.isdir(args.local_pop_dir):
-        raise FileNotFoundError("Base directory input is not a folder")
+        raise FileNotFoundError("Local directory input is not a folder")
         
     pop = load_pop(args.model_dir)
     if "agent_id" in args and not args.agent_id in pop:

@@ -12,5 +12,5 @@
     "ai_actionFreq": 10,
     "ai_fixedDeltaTime": 0.02,
     "player_maxHealth": 1,
-    "player_randomStart": true
+    "player_randomStart": false
 }

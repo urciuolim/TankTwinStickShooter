@@ -99,7 +99,7 @@ if __name__ == "__main__":
         xs = get_elo_steps(model_stats)
         elos = get_elo_values(model_stats)
         
-        ax[0].plot(xs, elos, marker='.', linestyle="None", color=colors[m], label=m)  
+        ax[0].plot(xs, elos, marker='.', linestyle="--", color=colors[m], label=m)  
             
     ax[0].set_title("Agent ELOs")
     ax[0].set_xlabel("Tournament Iterations")
