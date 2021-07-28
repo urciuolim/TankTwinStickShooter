@@ -16,6 +16,8 @@
 /PythonScripts/*.npz
 /PythonScripts/old_image_based/*
 /PythonScripts/agent_db/*
+/PythonScripts/*agent_db*/*
+/PythonScripts/*.png
 !/PythonScripts/*.py
 *.rar
 

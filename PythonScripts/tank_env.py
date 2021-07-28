@@ -14,7 +14,7 @@ import os
 
 def choice_with_normalization(elements, weights):
     if sum(weights) == 0:
-        return choice(elements, p=[1 for x in weights])
+        return choice(elements, p=[1/len(elements) for _ in elements])
     return choice(elements, p=[x/sum(weights) for x in weights])
 
 # return 1. if x is within D of 0, else return 1/(x/D)^2

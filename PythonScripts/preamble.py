@@ -24,9 +24,10 @@ HYPERPARAM_RANGES = {
     
 def gen_name(noun_file_path, adj_file_path, model_dir):
     with open(noun_file_path, 'r') as noun_file, open(adj_file_path, 'r') as adj_file:
+        adjs = adj_file.readlines()
+        nouns = noun_file.readlines()
         while True:
-            name = choice(adj_file.readlines()).strip('\n').capitalize()+\
-                choice(noun_file.readlines()).strip('\n').capitalize()+str(randint(0,100))
+            name = choice(adjs).strip('\n').capitalize()+choice(nouns).strip('\n').capitalize()+str(randint(0,100))
             if not os.path.isdir(model_dir + name):
                 return name
                 
@@ -46,8 +47,8 @@ def init_stats():
     }
     return model_stats
     
-def choose_hyperp(hyperp, default_idx):
-    idx = default_idx + np.random.choice([-1, 0, 1], p=[.1, .8, .1])
+def choose_hyperp(hyperp, default_idx, w=.1):
+    idx = default_idx + np.random.choice([-1, 0, 1], p=[w, 1.0-(2*w), w])
     if idx < 0:
         idx = 0
     elif idx >= len(HYPERPARAM_RANGES[hyperp]):
@@ -57,25 +58,25 @@ def choose_hyperp(hyperp, default_idx):
 def save_new_model(name, env, num_envs, model_dir, batch_size=None, n_steps=None,
         n_epochs=None, clip_range=None, gamma=None, gae_lambda=None, vf_coef=None,
         ent_coef=None, learning_rate=None, image_based=False, image_pretrain=None,
-        verbose=0):
+        verbose=0, w=.1):
     if not batch_size:
-        batch_size = choose_hyperp("batch_size", 10)
+        batch_size = choose_hyperp("batch_size", 10, w=w)
     if not n_steps:
-        n_steps = max(batch_size, choose_hyperp("n_steps", 10))//num_envs
+        n_steps = max(batch_size, choose_hyperp("n_steps", 10, w=w))//num_envs
     if not n_epochs:
-        n_epochs = choose_hyperp("n_epochs", 2)
+        n_epochs = choose_hyperp("n_epochs", 2, w=w)
     if not clip_range:
-        clip_range = choose_hyperp("clip_range", 1)
+        clip_range = choose_hyperp("clip_range", 1, w=w)
     if not gamma:
-        gamma = choose_hyperp("gamma", 2)
+        gamma = choose_hyperp("gamma", 2, w=w)
     if not gae_lambda:
-        gae_lambda = choose_hyperp("gae_lambda", 1)
+        gae_lambda = choose_hyperp("gae_lambda", 1, w=w)
     if not vf_coef:
-        vf_coef = choose_hyperp("vf_coef", 0)
+        vf_coef = choose_hyperp("vf_coef", 0, w=w)
     if not ent_coef:
-        ent_coef = choose_hyperp("ent_coef", 0)
+        ent_coef = choose_hyperp("ent_coef", 0, w=w)
     if not learning_rate:
-        learning_rate = choose_hyperp("learning_rate", 5)
+        learning_rate = choose_hyperp("learning_rate", 5, w=w)
         
     feature_extractor = "MlpPolicy"
     if image_based:
