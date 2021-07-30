@@ -1,8 +1,4 @@
 import gym
-from gym import spaces
-from train import load_pop, load_stats
-from gt_plot import sorted_keys, avg_elo
-from preamble import gen_name
 from human_matchmaking import opp_fp
 from elo import elo_change
 from tank_env import choice_with_normalization, weight_func, TankEnv
@@ -136,26 +132,11 @@ class AIMatchmaker(gym.Env):
         self.current_opp_idx = choice_with_normalization([i for i in range(len(self.all_elos))], weights)
         self.current_opp = self.all_opps[self.current_opp_idx]
         self.current_opp_elo = self.all_elos[self.current_opp_idx]
-        print("thread", self.my_port, "current opp elo:", self.current_opp_elo, "agent elo:", self.agent_elo, flush=True)
+        #print("thread", self.my_port, "current opp elo:", self.current_opp_elo, "agent elo:", self.agent_elo, flush=True)
         self.env.load_new_opp(0, opp_fp(self.model_dir, self.current_opp), self.current_opp_elo)
         
     def get_agent_elo(self):
         return self.agent_elo
-        
-    def get_elo_log(self):
-        return self.elo_log
-
-    def get_num_steps(self):
-        return self.num_steps
-        
-    def get_uncounted_games(self):
-        return self.uncounted_games
-        
-    def get_win_loss_ratio(self):
-        return self.win_loss_ratio
-        
-    def get_counted_game_sets(self):
-        return self.counted_game_sets
 
     def reset(self):
         if self.started:
