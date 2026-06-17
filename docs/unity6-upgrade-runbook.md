@@ -15,8 +15,31 @@ Everything around that — pre-fixes, package analysis, this runbook, and the M0
 
 ## Before opening in Unity 6
 
-- [ ] **Git checkpoint** so the upgrade is reversible (the director can create a `pre-unity6-backup` branch / commit on request — say the word).
+- [x] **Git checkpoint** so the upgrade is reversible. Checkpoint commit: `ace347d "Pre-Unity-6.5 upgrade checkpoint"` on `revival-2026`. A backup branch pointer `pre-unity6-backup` was created at that commit (`git update-ref refs/heads/pre-unity6-backup ace347d`) so the pre-upgrade state survives even if `revival-2026` advances.
 - [ ] Expect a slow first reimport: this is a 6-major-version jump and it WILL surface the package issues below.
+
+## Repeatable batchmode upgrade (headless)
+
+This is the exact, repeatable invocation used to drive the reimport/API-update from the command line (git-bash on Windows). Run from any directory — `-projectPath` is absolute. It opens the project, lets the editor reimport assets, runs the API auto-updater (`-accept-apiupdate`), then quits.
+
+```bash
+"/c/Program Files/Unity/Hub/Editor/6000.5.0f1/Editor/Unity.exe" \
+  -batchmode -quit -accept-apiupdate \
+  -projectPath "C:/src/TankTwinStickShooter" \
+  -logFile "C:/src/TankTwinStickShooter/Logs/unity6-upgrade.log"
+```
+
+- **Editor path:** `C:\Program Files\Unity\Hub\Editor\6000.5.0f1\Editor\Unity.exe`
+- **Flags:** `-batchmode -quit -accept-apiupdate` (`-accept-apiupdate` lets the API updater rewrite obsolete API calls non-interactively; `-quit` exits after the import completes).
+- **Log path:** `Logs/unity6-upgrade.log` (under the repo; `Logs/` is git-ignored). The eng-lead's reference invocation used `-logFile -` to stream to stdout; either works. Inspect the tail of the log for `error CS`, `Missing`, or licensing failures.
+- **First-run note:** the first reimport is slow (full asset DB rebuild) and may appear to hang for several minutes — that is expected for a 6-major-version jump, not a failure. A second clean run (used for verification) is much faster.
+- **If batchmode fails on licensing or hangs indefinitely:** STOP and open the project in the GUI editor instead; batchmode needs an activated license.
+
+### Rollback (one line)
+
+```bash
+git checkout pre-unity6-backup    # or: git reset --hard ace347d   (then delete Library/ to force a clean reimport on next open)
+```
 
 ## Package manifest issues to resolve (`Packages/manifest.json`)
 
