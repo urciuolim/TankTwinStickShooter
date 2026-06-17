@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Board session 02 — research findings & the plan to M0</title>
+<style>
+  :root{
+    --bg:#f7f6f3; --surface:#ffffff; --surface2:#f1efe8; --text:#1d1d1b; --muted:#5f5e5a;
+    --faint:#888780; --border:rgba(0,0,0,0.12); --border2:rgba(0,0,0,0.22);
+    --accent:#378add; --accent-bg:#e6f1fb; --accent-text:#0c447c;
+    --ok:#3b6d11; --ok-bg:#eaf3de; --ok-text:#27500a;
+    --warn:#ba7517; --warn-bg:#faeeda; --warn-text:#854f0b;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --bg:#1c1b19; --surface:#262522; --surface2:#302f2c; --text:#ededeb; --muted:#b4b2a9;
+      --faint:#888780; --border:rgba(255,255,255,0.13); --border2:rgba(255,255,255,0.26);
+      --accent:#85b7eb; --accent-bg:#103252; --accent-text:#b5d4f4;
+      --ok:#97c459; --ok-bg:#1f3409; --ok-text:#c0dd97;
+      --warn:#ef9f27; --warn-bg:#3a2406; --warn-text:#fac775;
+    }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    line-height:1.55;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:920px;margin:0 auto;padding:40px 24px 80px}
+  .eyebrow{display:inline-block;font-size:12px;letter-spacing:.04em;padding:3px 10px;border-radius:8px;
+    background:var(--accent-bg);color:var(--accent-text);margin-bottom:14px}
+  h1{font-size:28px;font-weight:600;margin:0 0 8px;letter-spacing:-0.01em}
+  h2{font-size:18px;font-weight:600;margin:36px 0 6px}
+  .lead{font-size:16px;color:var(--muted);margin:0 0 8px;max-width:72ch}
+  .chips{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:22px 0 8px}
+  .chip{background:var(--surface2);border-radius:10px;padding:12px 14px}
+  .chip .k{font-size:12px;color:var(--muted);margin-bottom:3px}
+  .chip .v{font-size:17px;font-weight:600}
+  .chip .s{font-size:12px;color:var(--faint)}
+  .chip.go .v{color:var(--ok-text)}
+  .sub{font-size:14px;color:var(--muted);margin:2px 0 14px;max-width:74ch}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:16px 18px}
+  .cols3{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;align-items:start}
+  .ch{font-size:14px;font-weight:600;margin-bottom:4px}
+  .cd{font-size:13px;color:var(--muted)}
+  .cx{color:var(--faint)}
+  .steps{display:grid;grid-template-columns:1fr;gap:10px}
+  .step{display:flex;gap:13px;align-items:flex-start;background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:14px 16px}
+  .snum{width:26px;height:26px;border-radius:50%;background:var(--accent-bg);color:var(--accent-text);
+    display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:600;flex:0 0 auto;margin-top:1px}
+  .st{font-size:14px;font-weight:600;margin-bottom:2px}
+  .sd{font-size:13px;color:var(--muted)}
+  .accept{display:flex;align-items:flex-start;gap:9px;background:var(--ok-bg);border-radius:10px;padding:12px 14px;margin-top:12px;font-size:13px;color:var(--ok-text)}
+  .accept b{color:var(--ok-text);font-weight:600}
+  .qlabel{font-size:13px;color:var(--muted);margin:8px 0 8px;font-weight:600}
+  .opts{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:9px}
+  .opt{position:relative;text-align:left;background:var(--surface);border:1px solid var(--border2);border-radius:10px;
+    padding:13px 15px;font:inherit;color:var(--text);cursor:pointer;transition:.12s}
+  .opt:hover{background:var(--surface2)}
+  .opt.sel{border-color:var(--accent);background:var(--accent-bg);color:var(--accent-text);box-shadow:inset 0 0 0 1px var(--accent)}
+  .opt .ot{font-size:14px;font-weight:600;margin-bottom:2px}
+  .opt .os{font-size:12px;color:var(--muted)}
+  .opt.sel .os{color:var(--accent-text)}
+  .rec{position:absolute;top:11px;right:12px;font-size:10px;letter-spacing:.03em;padding:2px 7px;border-radius:6px;background:var(--ok-bg);color:var(--ok-text)}
+  textarea{width:100%;min-height:74px;margin-top:8px;padding:11px 13px;border-radius:10px;
+    border:1px solid var(--border2);background:var(--surface);color:var(--text);font:inherit;resize:vertical}
+  .footer{display:flex;align-items:center;gap:14px;margin-top:26px;flex-wrap:wrap}
+  .submit{font:inherit;font-weight:600;font-size:15px;border:none;border-radius:10px;padding:13px 22px;cursor:pointer;
+    background:var(--accent);color:#fff}
+  .submit:disabled{opacity:.4;cursor:not-allowed}
+  .hint{font-size:13px;color:var(--faint)}
+  .docnote{font-size:13px;color:var(--faint);margin-top:8px}
+  .overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;align-items:center;justify-content:center;padding:24px}
+  .overlay.on{display:flex}
+  .done{background:var(--surface);border-radius:14px;padding:30px 32px;max-width:460px;text-align:center}
+  .done .ok{width:48px;height:48px;border-radius:50%;background:var(--ok-bg);color:var(--ok-text);
+    display:flex;align-items:center;justify-content:center;font-size:26px;margin:0 auto 14px}
+  .done h3{margin:0 0 8px;font-size:19px}
+  .done p{margin:0;color:var(--muted);font-size:14px}
+  .done pre{text-align:left;background:var(--surface2);border-radius:8px;padding:12px;margin-top:16px;
+    font-size:12px;color:var(--muted);overflow:auto;max-height:200px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <span class="eyebrow">Board session 02 · director → CTO</span>
+  <h1>Research findings &amp; the plan to reach M0</h1>
+  <p class="lead">Four research lanes are back. Headline: your hard constraint passed — Unity can deploy headless to a GCP cluster — but the research points to a smarter architecture than naive engine-in-the-loop. Full write-up lives in <code>docs/revival-research-2026.md</code>.</p>
+
+  <div class="chips">
+    <div class="chip go"><div class="k">Hard constraint</div><div class="v">GO</div><div class="s">Unity headless → GCP works</div></div>
+    <div class="chip"><div class="k">Training sim</div><div class="v">52-float vector</div><div class="s">no rendering needed</div></div>
+    <div class="chip"><div class="k">Engine target</div><div class="v">Unity 6</div><div class="s">ML-Agents 4.x needs it</div></div>
+    <div class="chip"><div class="k">Est. cost</div><div class="v">~$100–230/mo</div><div class="s">part-time, mostly Spot</div></div>
+  </div>
+
+  <h2>What the research found</h2>
+  <div class="cols3">
+    <div class="card">
+      <div class="ch">Constraint: GO (conditional we already meet)</div>
+      <div class="cd">Vector-observation headless builds need no GPU, display, Xvfb, or runtime license. Our env is vector, so we're on the easy path. <span class="cx">Visual/camera obs would force Xvfb — we avoid that.</span></div>
+    </div>
+    <div class="card">
+      <div class="ch">Stack: SB3 + PettingZoo + bespoke league</div>
+      <div class="cd">Stable-Baselines3 2.9 (PPO) + PettingZoo, with our own PFSP/ELO self-play league (our 2021 scripts, modernized). <span class="cx">Ray Tune PBT is hyperparameter tuning, not self-play — not a substitute.</span></div>
+    </div>
+    <div class="card">
+      <div class="ch">GCP: crawl → managed Ray</div>
+      <div class="cd">Containerize → Artifact Registry → single-GPU job → managed Ray on Vertex AI later. Cheap CPU Spot sim-workers + one GPU learner. <span class="cx">GPU quota starts at 0 — request early.</span></div>
+    </div>
+  </div>
+
+  <h2>Decision 1 · Target architecture</h2>
+  <p class="sub">Naive engine-in-the-loop is 100–1000× slower than a decoupled sim, so it shouldn't be the training workhorse. The fork:</p>
+  <div class="opts" data-group-wrap="architecture">
+    <button class="opt" data-group="architecture" data-value="two_core" data-label="Two-core (recommended)">
+      <span class="rec">recommended</span>
+      <div class="ot">B · Two-core</div>
+      <div class="os">Unity 6 stays the playable engine + a headless ML-Agents build proves the signal; a fast pure-Python/JAX sim is the training workhorse. Fast &amp; cluster-trivial. Cost: logic authored twice + parity tests.</div></button>
+    <button class="opt" data-group="architecture" data-value="single_core" data-label="Single-core Unity-headless">
+      <div class="ot">A · Single-core</div>
+      <div class="os">One codebase: a headless ML-Agents build trains on GCP. Simpler to maintain, but slower and costlier training at population scale.</div></button>
+    <button class="opt" data-group="architecture" data-value="defer" data-label="Defer to M1 gate">
+      <div class="ot">C · Defer</div>
+      <div class="os">M0 is identical either way — get the game running first, lock the architecture at the M1 gate.</div></button>
+  </div>
+
+  <h2>The plan to reach M0</h2>
+  <p class="sub">M0 = the game runs and two humans can play, via <b>both</b> Xbox controllers and a shared keyboard.</p>
+  <div class="steps">
+    <div class="step"><div class="snum">1</div><div><div class="st">Proof of life on Unity 2019.4</div><div class="sd">Open the project in its native editor; remove the build-blocking <code>using UnityEditor;</code>; fix the config-key + fixedDeltaTime bugs; enable both players as human; verify two-Xbox-pad play (Joy1/Joy2 already wired, re-map axes). Deliverable: a recorded 2-human match on pads.</div></div></div>
+    <div class="step"><div class="snum">2</div><div><div class="st">Upgrade to Unity 6</div><div class="sd">On the critical path for ML-Agents, headless Dedicated Server builds, and the New Input System. Verify scenes/prefabs/tilemaps reimport; editor play works; produce a Windows build.</div></div></div>
+    <div class="step"><div class="snum">3</div><div><div class="st">New Input System: both input methods</div><div class="sd">Re-implement input with control schemes + device pairing: robust two Xbox controllers AND shared keyboard (split bindings; key-aim so the mouse isn't shared). This hits the full M0 bar.</div></div></div>
+  </div>
+  <div class="accept"><span>&#10003;</span><span><b>M0 acceptance:</b> two humans play a full match from documented steps, in a standalone build, via (a) two Xbox controllers and (b) a shared keyboard.</span></div>
+
+  <h2>Decision 2 · M0 sequencing</h2>
+  <div class="opts" data-group-wrap="m0_sequencing">
+    <button class="opt" data-group="m0_sequencing" data-value="proof_then_upgrade" data-label="Proof-of-life on 2019.4, then upgrade">
+      <span class="rec">recommended</span>
+      <div class="ot">Proof of life first, then upgrade</div>
+      <div class="os">Quick playable win on the current editor (de-risks "does it even open"), then Unity 6 + New Input System for the full M0 bar.</div></button>
+    <button class="opt" data-group="m0_sequencing" data-value="upgrade_first" data-label="Upgrade to Unity 6 first">
+      <div class="ot">Upgrade to Unity 6 first</div>
+      <div class="os">Do all input work once on the modern stack. Cleaner, no throwaway input work — but the first playable demo comes later.</div></button>
+  </div>
+
+  <h2>Decision 3 · Approve &amp; start</h2>
+  <div class="opts" data-group-wrap="m0_approval">
+    <button class="opt" data-group="m0_approval" data-value="approve_start" data-label="Approve M0 plan & start the squad">
+      <div class="ot">Approve &amp; start</div>
+      <div class="os">Kick off the Game &amp; sim squad on Step 1.</div></button>
+    <button class="opt" data-group="m0_approval" data-value="changes_first" data-label="Changes before starting">
+      <div class="ot">Changes first</div>
+      <div class="os">I want to adjust the plan before the squad starts.</div></button>
+  </div>
+
+  <div class="qlabel" style="margin-top:24px">Notes to the director (optional)</div>
+  <textarea id="notes" placeholder="Disagreements on the stack, the architecture call, the M0 plan, anything to weigh..."></textarea>
+
+  <div class="footer">
+    <button class="submit" id="submit" disabled>Submit decision</button>
+    <span class="hint" id="hint">Pick a Decision 3 option to enable submit.</span>
+  </div>
+
+</div>
+
+<div class="overlay" id="overlay">
+  <div class="done">
+    <div class="ok">&#10003;</div>
+    <h3>Decision recorded</h3>
+    <p>Head back to chat — the director is notified automatically. Feel free to ping in chat too.</p>
+    <pre id="echo"></pre>
+  </div>
+</div>
+
+<script>
+  const picks = {};
+  document.querySelectorAll('.opt').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const g = btn.dataset.group;
+      document.querySelectorAll('.opt[data-group="'+g+'"]').forEach(b => b.classList.remove('sel'));
+      btn.classList.add('sel');
+      picks[g] = { value: btn.dataset.value, label: btn.dataset.label };
+      const ok = !!picks['m0_approval'];
+      document.getElementById('submit').disabled = !ok;
+      document.getElementById('hint').textContent = ok ? 'Ready when you are.' : 'Pick a Decision 3 option to enable submit.';
+    });
+  });
+  document.getElementById('submit').addEventListener('click', async () => {
+    const payload = {
+      session: 2,
+      architecture: picks.architecture ? picks.architecture.value : null,
+      architecture_label: picks.architecture ? picks.architecture.label : null,
+      m0_sequencing: picks.m0_sequencing ? picks.m0_sequencing.value : null,
+      m0_sequencing_label: picks.m0_sequencing ? picks.m0_sequencing.label : null,
+      m0_approval: picks.m0_approval ? picks.m0_approval.value : null,
+      m0_approval_label: picks.m0_approval ? picks.m0_approval.label : null,
+      notes: document.getElementById('notes').value.trim()
+    };
+    const submit = document.getElementById('submit');
+    submit.disabled = true; submit.textContent = 'Sending...';
+    try {
+      const res = await fetch('/submit', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload) });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      document.getElementById('echo').textContent = JSON.stringify(payload, null, 2);
+      document.getElementById('overlay').classList.add('on');
+    } catch (e) {
+      submit.disabled = false; submit.textContent = 'Submit decision';
+      document.getElementById('hint').textContent = 'Could not reach the server (' + e.message + '). Is it still running?';
+    }
+  });
+</script>
+</body>
+</html>

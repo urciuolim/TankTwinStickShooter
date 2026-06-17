@@ -6,7 +6,6 @@ using UnityEngine.SceneManagement;
 using UnityEngine.UI;
 using UnityEngine.Tilemaps;
 using Newtonsoft.Json.Linq;
-using UnityEditor;
 
 public class GameController : MonoBehaviour
 {
@@ -39,11 +38,11 @@ public class GameController : MonoBehaviour
         checkWinner = false;
         JObject config = DriverController.instance.config;
         if (config["game_countdownStart"] != null)
-            countdownStart = config["coutndownStart"].Value<int>();
+            countdownStart = config["game_countdownStart"].Value<int>();
         if (config["game_maxTime"] != null)
             maxTime = config["game_maxTime"].Value<float>();
         if (config["game_healthBarMaxWidth"] != null)
-            healthBarMaxWidth = config["healthBarMaxWidth"].Value<float>();
+            healthBarMaxWidth = config["game_healthBarMaxWidth"].Value<float>();
         
         if (DriverController.instance.verbose)
         {
