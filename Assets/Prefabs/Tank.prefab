@@ -109,6 +109,8 @@ MonoBehaviour:
   maxHealth: 0
   health: 1
   playerID: 0
+  tankControls: {fileID: -944628639613478452, guid: 7a9c1e2b4d6f48a3b8c0d1e2f3a4b5c6,
+    type: 3}
   AI: 1
   playing: 0
   bullets: []

@@ -4,6 +4,8 @@ using UnityEngine;
 using Newtonsoft.Json.Linq;
 using System;
 using UnityEngine.Tilemaps;
+using UnityEngine.InputSystem;
+using UnityEngine.InputSystem.Users;
 
 public class PlayerController : MonoBehaviour
 {
@@ -35,6 +37,14 @@ public class PlayerController : MonoBehaviour
     public float health;
     public int playerID;
     private string horizontal, vertical, r_horizontal, r_vertical, trigger;
+
+    // New Input System (human branch only). The asset is a template; each human tank
+    // gets its OWN clone with explicit device pairing + a binding-group mask so two
+    // identical pads (or the two shared-keyboard clusters) never cross-assign.
+    [SerializeField]
+    private InputActionAsset tankControls;
+    private InputActionAsset humanControls;
+    private InputAction moveAction, aimAction, fireAction;
 
     [HideInInspector]
     public bool AI = true;
@@ -95,6 +105,11 @@ public class PlayerController : MonoBehaviour
         r_vertical = "R_VerticalJoy" + playerID;
         trigger = "TriggerJoy" + playerID;
 
+        if (!AI)
+        {
+            SetupHumanInput();
+        }
+
         bullets = new List<GameObject>();
         reloadSteps = (int)Math.Ceiling(reloadTime / DriverController.instance.fixedDeltaTime);
         reloadCountdown = 0;
@@ -135,6 +150,63 @@ public class PlayerController : MonoBehaviour
         //Debug.Log("Update FPS: " + (1 / Time.deltaTime));
     }
 
+    // Build this human tank's input from the New Input System: clone the shared
+    // InputActions template, pin it to ONE device, and mask it to ONE binding group.
+    // The "keyboard" config flag selects keyboard-scheme vs pad for this tank; playerID
+    // both picks which pad (1 -> first pad, 2 -> second pad, mirroring the legacy
+    // JoyN axes) and which shared-keyboard cluster (1 -> left/WASD, 2 -> right/arrows).
+    private void SetupHumanInput()
+    {
+        if (tankControls == null)
+        {
+            Debug.LogError("Player " + playerID + " is human but no InputActionAsset is assigned; falling back to no input.");
+            return;
+        }
+
+        // A per-player clone so device pairing / binding masks don't leak between tanks.
+        humanControls = Instantiate(tankControls);
+        InputActionMap tankMap = humanControls.FindActionMap("Tank", true);
+
+        if (keyboard)
+        {
+            // Both keyboard players share the SAME physical keyboard; they are kept
+            // disjoint by binding group, not by device. playerID 1 -> left cluster,
+            // playerID 2 -> right cluster.
+            string scheme = (playerID == 1) ? "KeyboardLeft" : "KeyboardRight";
+            tankMap.bindingMask = InputBinding.MaskByGroup(scheme);
+            if (Keyboard.current != null)
+                tankMap.devices = new InputDevice[] { Keyboard.current };
+        }
+        else
+        {
+            // Pin this tank to a specific pad so two identical pads don't cross-assign:
+            // playerID 1 -> Gamepad.all[0], playerID 2 -> Gamepad.all[1] (matches the
+            // legacy Joy1/Joy2 mapping). If the expected pad isn't present we leave the
+            // map device-unrestricted as a graceful fallback (any pad drives the tank).
+            tankMap.bindingMask = InputBinding.MaskByGroup("Gamepad");
+            int padIndex = playerID - 1;
+            if (Gamepad.all.Count > padIndex)
+                tankMap.devices = new InputDevice[] { Gamepad.all[padIndex] };
+            else
+                Debug.LogWarning("Player " + playerID + " expected pad index " + padIndex +
+                                 " but only " + Gamepad.all.Count + " pad(s) present; using any pad.");
+        }
+
+        moveAction = tankMap.FindAction("Move", true);
+        aimAction = tankMap.FindAction("Aim", true);
+        fireAction = tankMap.FindAction("Fire", true);
+        tankMap.Enable();
+    }
+
+    private void OnDestroy()
+    {
+        if (humanControls != null)
+        {
+            humanControls.Disable();
+            Destroy(humanControls);
+        }
+    }
+
     private void GetInput()
     {
         if (Input.GetKeyDown(KeyCode.Escape))
@@ -157,69 +229,25 @@ public class PlayerController : MonoBehaviour
             }
             else
             {
-                float vX = 0f;
-                float vY = 0f;
-                if (keyboard)
-                {
-                    if (Input.GetKey(KeyCode.D) && !Input.GetKey(KeyCode.A))
-                    {
-                        vX = 1f;
-                    }
-                    else if (!Input.GetKey(KeyCode.D) && Input.GetKey(KeyCode.A))
-                    {
-                        vX = -1f;
-                    }
-                    else if (Input.GetKey(KeyCode.D) && Input.GetKey(KeyCode.A))
-                    {
-                        vX = 0f;
-                    }
-                    if (Input.GetKey(KeyCode.W) && !Input.GetKey(KeyCode.S))
-                    {
-                        vY = 1f;
-                    }
-                    else if (!Input.GetKey(KeyCode.W) && Input.GetKey(KeyCode.S))
-                    {
-                        vY = -1f;
-                    }
-                    else if (Input.GetKey(KeyCode.W) && Input.GetKey(KeyCode.S))
-                    {
-                        vY = 0f;
-                    }
-                }
-                else
-                {
-                    vX = Input.GetAxis(horizontal);
-                    vY = Input.GetAxis(vertical);
-                }
-                velocity.Set(vX, vY);
+                // Human input via the New Input System. Move/Aim/Fire come from this
+                // tank's per-player action clone (one paired device, one binding-group
+                // mask: pad left/right sticks + right trigger, OR a shared-keyboard
+                // cluster with key-aim). Velocity/aim/trigger are applied exactly as
+                // before; only the source of the values changed.
+                Vector2 move = Vector2.zero;
+                Vector2 aimInput = Vector2.zero;
+                float triggerValue = 0f;
+                if (moveAction != null)
+                    move = moveAction.ReadValue<Vector2>();
+                if (aimAction != null)
+                    aimInput = aimAction.ReadValue<Vector2>();
+                if (fireAction != null)
+                    triggerValue = fireAction.ReadValue<float>();
 
-                float aX = 0f;
-                float aY = 0f;
-                if (keyboard)
-                {
-                    Vector2 mousePos = Vector2.zero;
-                    if (Camera.main != null)
-                        mousePos = Camera.main.ScreenToWorldPoint(Input.mousePosition);
-                    aX = mousePos.x - transform.position.x;
-                    aY = mousePos.y - transform.position.y;
-                }
-                else
-                {
-                    aX = Input.GetAxis(r_horizontal);
-                    aY = Input.GetAxis(r_vertical);
-                }
-                aim.Set(aX, aY);
+                velocity.Set(move.x, move.y);
+                aim.Set(aimInput.x, aimInput.y);
 
-                bool triggerPressed = false;
-                if (keyboard)
-                {
-                    triggerPressed = Input.GetMouseButton(0);
-                }
-                else
-                {
-                    triggerPressed = Input.GetAxis(trigger) > triggerThreshold;
-                }
-
+                bool triggerPressed = triggerValue > triggerThreshold;
                 if (triggerPressed && canShoot)
                 {
                     Shoot();
