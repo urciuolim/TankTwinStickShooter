@@ -184,6 +184,63 @@ def test_step_terminates_on_winner_with_plus_one_reward():
     assert info["winner"] == 0
 
 
+def test_info_outcome_win_on_player1_winner():
+    # winner == P1 (0): terminal step reports info["outcome"] == "win" (the M1 metric seam).
+    env = make_env(win_after=2, winner=0)
+    env.reset(seed=0)
+    env.step(np.zeros(5, dtype=np.float32))  # ongoing
+    _obs, _reward, terminated, _truncated, info = env.step(np.zeros(5, dtype=np.float32))
+    assert terminated is True
+    assert info["outcome"] == "win"
+
+
+def test_info_outcome_loss_on_opponent_winner():
+    # winner == 1 (opponent): info["outcome"] == "loss", independent of reward sign.
+    env = make_env(win_after=2, winner=1)
+    env.reset(seed=0)
+    env.step(np.zeros(5, dtype=np.float32))  # ongoing
+    _obs, _reward, terminated, _truncated, info = env.step(np.zeros(5, dtype=np.float32))
+    assert terminated is True
+    assert info["outcome"] == "loss"
+
+
+def test_info_outcome_draw_on_explicit_draw_winner():
+    # winner == -1 (explicit draw): info["outcome"] == "draw".
+    env = make_env(win_after=2, winner=-1)
+    env.reset(seed=0)
+    env.step(np.zeros(5, dtype=np.float32))  # ongoing
+    _obs, _reward, terminated, _truncated, info = env.step(np.zeros(5, dtype=np.float32))
+    assert terminated is True
+    assert info["outcome"] == "draw"
+
+
+def test_no_outcome_key_on_non_terminal_step():
+    # An ongoing step is not a decided game: no "outcome" key in info.
+    env = make_env(win_after=5)
+    env.reset(seed=0)
+    _obs, _reward, terminated, _truncated, info = env.step(np.zeros(5, dtype=np.float32))
+    assert terminated is False
+    assert "outcome" not in info
+
+
+def test_no_outcome_key_on_truncation():
+    # A max_steps truncation is NOT a decided game -> no "outcome" key (won't inflate winrate).
+    class NeverWins(ScriptedUnity):
+        def _respond(self, msg):
+            if "1" in msg and "2" in msg:
+                self._pending.append(_frame({"state": list(STEP_STATE)}))
+            else:
+                super()._respond(msg)
+
+    env = TankEnv(game_path=None, transport=NeverWins(), max_steps=2)
+    env.reset(seed=0)
+    env.step(np.zeros(5, dtype=np.float32))
+    _obs, _reward, terminated, truncated, info = env.step(np.zeros(5, dtype=np.float32))
+    assert terminated is False
+    assert truncated is True
+    assert "outcome" not in info
+
+
 def test_truncates_on_max_steps_without_winner():
     # A scripted transport that NEVER reports a winner; env max_steps cap truncates.
     class NeverWins(ScriptedUnity):

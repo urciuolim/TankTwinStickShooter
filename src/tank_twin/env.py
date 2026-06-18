@@ -286,6 +286,21 @@ class TankEnv(gymnasium.Env):
             info["winner"] = winner
             self.last_winner = winner
 
+        # Enrich info on terminal steps so the evaluator can read the game result
+        # UNAMBIGUOUSLY without inspecting the reward sign (M1 Wave 3). This only adds
+        # free-form gymnasium ``info`` keys — it does NOT touch the wire bytes, the
+        # 52-float layout, the obs, or the reward value. ``terminated`` is a real game
+        # result (win/loss/draw); ``truncated`` (max_steps / lost connection) is NOT a
+        # decided game and gets no outcome.
+        if terminated:
+            if winner == PLAYER_1:
+                info["outcome"] = "win"
+            elif winner is not None and winner != -1:
+                info["outcome"] = "loss"
+            else:
+                # An explicit draw (winner == -1) or a winner-less ``done`` terminal.
+                info["outcome"] = "draw"
+
         return self.state, reward, terminated, truncated, info
 
     def render(self):

@@ -81,4 +81,5 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 testpaths = ["tests"]
 markers = [
     "integration: tests requiring a live Unity build or socket (opt-in; deselect with -m 'not integration')",
+    "e2e: end-to-end pipeline tests that import torch/sb3 (no Unity; run with -m e2e, skip with -m 'not e2e')",
 ]
