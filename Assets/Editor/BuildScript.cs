@@ -9,7 +9,8 @@ using UnityEngine;
 //   Unity.exe -batchmode -quit -projectPath <proj> \
 //     -executeMethod BuildScript.BuildWindows -logFile -
 //
-// Output goes to <project>/Builds/Windows/TankTwinStickShooter.exe (git-ignored).
+// Output goes to <project>/build/TankTwinStickShooter.exe (git-ignored). This is the
+// game_path the Python env launches via subprocess.Popen([game_path, str(port)]).
 // StreamingAssets (config.json + Arenas/*.json) ships automatically with the player.
 public static class BuildScript
 {
@@ -19,7 +20,7 @@ public static class BuildScript
     public static void BuildWindows()
     {
         string projectRoot = Directory.GetParent(Application.dataPath).FullName;
-        string outputDir = Path.Combine(projectRoot, "Builds", "Windows");
+        string outputDir = Path.Combine(projectRoot, "build");
         string locationPathName = Path.Combine(outputDir, ProductExe);
 
         Directory.CreateDirectory(outputDir);
