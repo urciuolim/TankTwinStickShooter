@@ -43,12 +43,14 @@ public class DriverController : MonoBehaviour
         //JobsUtility.JobWorkerCount = 2;
 
         string[] args = System.Environment.GetCommandLineArgs();
-        try { 
+        try {
             connectionPort = int.Parse(args[1]);
         } catch (System.FormatException e)
         {
             connectionPort = 50000;
         }
+
+        string configPath = ResolveConfigPath(args);
 
         if (instance != null)
         {
@@ -69,7 +71,7 @@ public class DriverController : MonoBehaviour
             DontDestroyOnLoad(gameObject);
         }
 
-        using (StreamReader file = File.OpenText("Assets/config.json"))
+        using (StreamReader file = File.OpenText(configPath))
         using (JsonTextReader reader = new JsonTextReader(file))
         {
             config = (JObject)JToken.ReadFrom(reader);
@@ -94,7 +96,8 @@ public class DriverController : MonoBehaviour
 
             if (config["arena_path"] != null)
             {
-                StreamReader arenaFile = File.OpenText(config["arena_path"].Value<string>());
+                string arenaPath = ResolveArenaPath(configPath, config["arena_path"].Value<string>());
+                StreamReader arenaFile = File.OpenText(arenaPath);
                 JsonTextReader arenaReader = new JsonTextReader(arenaFile);
                 arena = (JObject)JToken.ReadFrom(arenaReader);
             }
@@ -112,6 +115,40 @@ public class DriverController : MonoBehaviour
                     Debug.Log("Arena loaded from: " + config["arena_path"]);
             }
         }
+    }
+
+    // Resolve the config.json path so it works both in-editor and next to a built player.
+    // Precedence: explicit "--config <path>" / "-config <path>" CLI arg, then StreamingAssets,
+    // then the legacy "Assets/config.json" working-dir path as a last-resort fallback.
+    // Note: args[1] is the legacy tank_env port (parsed above), so we only honor named args here.
+    private string ResolveConfigPath(string[] args)
+    {
+        for (int i = 0; i < args.Length - 1; i++)
+        {
+            if (args[i] == "--config" || args[i] == "-config")
+                return args[i + 1];
+        }
+
+        string streamingPath = Path.Combine(Application.streamingAssetsPath, "config.json");
+        if (File.Exists(streamingPath))
+            return streamingPath;
+
+        return "Assets/config.json";
+    }
+
+    // Resolve arena_path so it ships portably. Absolute paths are used as-is. A relative path is
+    // resolved against the directory of the resolved config file (so config + arenas travel together).
+    // The legacy "Assets/Arenas/..." form is also honored relative to the working dir if that file exists.
+    private string ResolveArenaPath(string configPath, string arenaPath)
+    {
+        if (Path.IsPathRooted(arenaPath))
+            return arenaPath;
+
+        if (File.Exists(arenaPath))
+            return arenaPath;
+
+        string configDir = Path.GetDirectoryName(Path.GetFullPath(configPath));
+        return Path.Combine(configDir, arenaPath);
     }
 
     private void Start()
