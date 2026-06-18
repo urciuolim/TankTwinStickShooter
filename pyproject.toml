@@ -4,12 +4,26 @@ version = "0.0.0"
 description = "Python RL driver for the Tank Twin Stick Shooter revival (self-play PPO over TCP-JSON)."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
-# M0 pure-function migration (A6): numpy is the ONLY runtime dep — the
-# state-flip / opponent-selection functions are numpy-native (dtype-exact array
-# ops, np.random.choice). Standards explicitly allow numpy on pure-logic modules.
-# torch / stable-baselines3 / gymnasium remain deferred to M1 (see docs/engineering-standards.md).
+# numpy underpins the M0 pure-logic modules (state-flip / opponent-selection:
+# dtype-exact array ops, np.random.choice). Standards allow numpy on pure-logic.
+#
+# M1 Wave 0 (board session 05): the RL stack lands here — torch (PPO backbone),
+# stable-baselines3 (PPO + NatureCNN feature extractor), gymnasium (env API).
+# These are NOT in the pure-logic import path: only the trainer / feature-extractor
+# code (not yet written) imports them, so the existing pure modules + tests run
+# without torch/sb3/gymnasium present. SB3 2.9 pins gymnasium<2 / torch<3 / numpy<3
+# — the bounds below are compatible. torch's CUDA wheel is sourced via the cu130
+# index wired below (see [tool.uv.sources] / [[tool.uv.index]]).
 dependencies = [
     "numpy>=2.0,<3",
+    # torch pinned to the 2.9 line: that is the version the board (session 05)
+    # approved and the version against which the SB3 2.9 NatureCNN (.cnn / .linear)
+    # pretrained-load contract was validated. The literal `>=2.9,<3` bound the task
+    # named would let the resolver float to the latest (2.12.x); we hold the minor
+    # so the locked artifact matches what was reviewed. Widen deliberately later.
+    "torch>=2.9,<2.10",
+    "stable-baselines3>=2.9,<3",
+    "gymnasium>=1.3,<2",
 ]
 
 [build-system]
@@ -18,6 +32,22 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/tank_twin"]
+
+# --- torch CUDA wheel sourcing (the one fiddly step; see engineering-standards) ---
+# Local dev box: Windows + NVIDIA RTX 3080, driver 610.62 / CUDA UMD 13.3 (CUDA 13.x).
+# torch 2.9 ships cu130 cp312 win_amd64 wheels at the index below — that matches the
+# installed CUDA 13.x runtime, so we source the GPU wheel from cu130 on win32.
+# On other platforms (e.g. a Linux CI runner) torch resolves from the default PyPI
+# index (CPU wheel), keeping the project resolvable off this box without a GPU.
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true  # only used by packages that name it in [tool.uv.sources]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu130", marker = "sys_platform == 'win32'" },
+]
 
 # Dev tooling only. Route any new dependency to the human (slopsquatting guard).
 [dependency-groups]
