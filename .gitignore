@@ -67,6 +67,9 @@ sysinfo.txt
 *.apk
 *.unitypackage
 
+# Unity API Updater report (regenerated on each upgrade; transient)
+UpgradeLog.htm
+
 # Crashlytics generated file
 crashlytics-build.properties
 
