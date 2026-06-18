@@ -69,3 +69,14 @@ sysinfo.txt
 
 # Crashlytics generated file
 crashlytics-build.properties
+
+# Unity (additional)
+mono_crash.*
+/[Rr]ecordings/
+*.app
+*.slnx
+
+# RL run artifacts (generated)
+/runs/
+/models/
+/datasets/

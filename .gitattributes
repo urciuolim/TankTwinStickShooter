@@ -1,0 +1,11 @@
+# Unity YAML smart-merge — register the driver once with:
+#   git config merge.unityyamlmerge.name "Unity SmartMerge"
+#   git config merge.unityyamlmerge.driver '"<UnityEditor>/Data/Tools/UnityYAMLMerge.exe" merge -p %O %B %A %A'
+*.unity   merge=unityyamlmerge eol=lf
+*.prefab  merge=unityyamlmerge eol=lf
+*.asset   merge=unityyamlmerge eol=lf
+
+# Treat large binary asset types as binary
+*.anim -text
+*.mat  -text
+*.png  binary
