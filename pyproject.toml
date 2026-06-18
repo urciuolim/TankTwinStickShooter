@@ -1,0 +1,50 @@
+[project]
+name = "tank-twin"
+version = "0.0.0"
+description = "Python RL driver for the Tank Twin Stick Shooter revival (self-play PPO over TCP-JSON)."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+# Runtime deps stay EMPTY through M0: pure-function migration only (stdlib).
+# torch / stable-baselines3 / gymnasium land in M1 (see docs/engineering-standards.md).
+dependencies = []
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tank_twin"]
+
+# Dev tooling only. Route any new dependency to the human (slopsquatting guard).
+[dependency-groups]
+dev = [
+    "ruff>=0.12,<0.13",
+    "pytest>=8.4,<9",
+]
+
+[tool.ruff]
+line-length = 100
+# First-party roots for import sorting (I).
+src = ["src", "tests"]
+# Scope ruff to the new package + tests. Keeps unrelated tooling (boardroom/)
+# and the un-migrated 2021 scripts out of BOTH the lint and format gates.
+# The legacy scripts migrate in A6/A7; the per-file-ignores below are staged
+# for that (ruff format ignores per-file-ignores, so excluding the dir is the
+# only way to keep `ruff format --check` green until those files are ported).
+include = ["src/**/*.py", "tests/**/*.py", "pyproject.toml"]
+extend-exclude = ["PythonScripts"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests may use assert-heavy / fixture patterns; relax bugbear-style nags.
+"tests/**" = ["B", "SIM"]
+# Legacy 2021 scripts are NOT migrated yet — exempt them entirely until A6/A7.
+"PythonScripts/*.py" = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: tests requiring a live Unity build or socket (opt-in; deselect with -m 'not integration')",
+]
