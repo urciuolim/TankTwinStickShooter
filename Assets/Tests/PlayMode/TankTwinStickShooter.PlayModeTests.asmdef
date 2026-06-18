@@ -1,0 +1,22 @@
+{
+    "name": "TankTwinStickShooter.PlayModeTests",
+    "rootNamespace": "",
+    "references": [
+        "GUID:a290e8e44c8d43909f0333b6e227f49e",
+        "UnityEngine.TestRunner",
+        "UnityEditor.TestRunner"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": true,
+    "precompiledReferences": [
+        "nunit.framework.dll"
+    ],
+    "autoReferenced": false,
+    "defineConstraints": [
+        "UNITY_INCLUDE_TESTS"
+    ],
+    "versionDefines": [],
+    "noEngineReferences": false
+}
