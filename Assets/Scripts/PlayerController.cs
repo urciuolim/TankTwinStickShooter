@@ -335,12 +335,24 @@ public class PlayerController : MonoBehaviour
         // old `aim.magnitude > .1f` gate, so no aim input doesn't drag toward angle 0).
         if (desiredAim.magnitude > .1f)
         {
+            // Actively aiming: smooth the independent barrel heading toward the
+            // commanded world target and force the barrel's world rotation.
             float targetAngle = Vector2.SignedAngle(Vector2.right, desiredAim);
             currentAimAngle = Mathf.MoveTowardsAngle(currentAimAngle, targetAngle, turnSpeedDegPerSec * dt);
+            barrel.rotation = Quaternion.Euler(0, 0, currentAimAngle);
         }
-        barrel.rotation = Quaternion.Euler(0, 0, currentAimAngle);
-        // Report the ACTUAL (smoothed) heading as a unit vector so UpdateState's
-        // `aim.x/aim.y` is the real heading, not the raw command.
+        else
+        {
+            // Not aiming: leave the barrel's world rotation alone so it rides with
+            // the body (the body's SetRotation above carries this child transform).
+            // Sync currentAimAngle to the barrel's ACTUAL heading so (a) smoothing
+            // resumes from the right angle next time we aim and (b) the reported
+            // `aim` below reflects the barrel's true world heading.
+            currentAimAngle = barrel.rotation.eulerAngles.z;
+        }
+        // Report the ACTUAL heading as a unit vector so UpdateState's `aim.x/aim.y`
+        // is the real barrel world heading (smoothed aim, or the body when idle),
+        // not the raw command.
         float rad = currentAimAngle * Mathf.Deg2Rad;
         aim.Set(Mathf.Cos(rad), Mathf.Sin(rad));
 
