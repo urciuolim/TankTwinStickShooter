@@ -4,9 +4,13 @@ version = "0.0.0"
 description = "Python RL driver for the Tank Twin Stick Shooter revival (self-play PPO over TCP-JSON)."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
-# Runtime deps stay EMPTY through M0: pure-function migration only (stdlib).
-# torch / stable-baselines3 / gymnasium land in M1 (see docs/engineering-standards.md).
-dependencies = []
+# M0 pure-function migration (A6): numpy is the ONLY runtime dep — the
+# state-flip / opponent-selection functions are numpy-native (dtype-exact array
+# ops, np.random.choice). Standards explicitly allow numpy on pure-logic modules.
+# torch / stable-baselines3 / gymnasium remain deferred to M1 (see docs/engineering-standards.md).
+dependencies = [
+    "numpy>=2.0,<3",
+]
 
 [build-system]
 requires = ["hatchling"]

@@ -1,5 +1,4 @@
 import numpy as np
-from numpy.random import choice
 import gym
 from gym import spaces
 from stable_baselines3 import PPO
@@ -7,33 +6,16 @@ import socket
 import json
 import time
 import random
-import math
 import subprocess
 import sys
 import os
 
-def choice_with_normalization(elements, weights):
-    if sum(weights) == 0:
-        return choice(elements, p=[1/len(elements) for _ in elements])
-    return choice(elements, p=[x/sum(weights) for x in weights])
-
-# return 1. if x is within D of 0, else return 1/(x/D)^2
-def weight_func(x, D):
-    if x == 0: return 1.
-    x = 1. / math.pow(x/D, 2)
-    return x if x <= 1. else 1.
-    
-def elo_based_choice(opponent_elos, center_elo, D):
-    weights = [weight_func(elo-center_elo, D) for elo in opponent_elos]
-    return choice_with_normalization([i for i in range(len(opponent_elos))], weights)
-    
-def flip_state(state):
-    R,G,B = (0,1,2)
-    new_state = np.zeros(state.shape, dtype=state.dtype)
-    new_state[:,:,R] = state[:,:,B].copy()
-    new_state[:,:,G] = state[:,:,G].copy()
-    new_state[:,:,B] = state[:,:,R].copy()
-    return new_state
+# M0 A6: these pure functions moved into the `tank_twin` package. They are
+# imported back here so TankEnv behavior is byte-identical and legacy importers
+# (`from tank_env import choice_with_normalization, weight_func, elo_based_choice`)
+# keep working. `split_state_for_opponent` backs the 26/26 opponent state split.
+from tank_twin.opponents import choice_with_normalization, weight_func, elo_based_choice
+from tank_twin.state import flip_state, split_state_for_opponent
 
 class TankEnv(gym.Env):
     metadata = {'render.modes': None}
@@ -372,7 +354,7 @@ class TankEnv(gym.Env):
         message[1] = action.tolist()
         # Opponent action, reversing the order of the state to the perspective of the opponent
         if not self.image_based:
-            self.opp_state = np.concatenate([self.state[26:], self.state[:26]])
+            self.opp_state = split_state_for_opponent(self.state)
         else:
             if self.opp_p == self.p:
                 self.opp_state = flip_state(self.state)
