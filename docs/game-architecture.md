@@ -3,7 +3,7 @@
 How the existing game actually runs, traced from code (game-sim-engineer + training-engineer, 2026-06-17). Load-bearing for M0/M1 decisions.
 
 ## The game is a Python-clocked simulator — there is no standalone human mode
-- The build boots the **Driver** scene (scene 0). `DriverController` (a `DontDestroyOnLoad` singleton, present only in Driver) reads `Assets/config.json`, opens a `TcpListener`, and **blocks on `AcceptTcpClient()`** (`DriverController.cs:169`) until a Python client connects. `running` flips true only after the accept returns.
+- The build boots the **Driver** scene (scene 0). `DriverController` (a `DontDestroyOnLoad` singleton, present only in Driver) reads the resolved `config.json` (see source-of-truth map below), opens a `TcpListener`, and **blocks on `AcceptTcpClient()`** (`DriverController.cs:169`) until a Python client connects. `running` flips true only after the accept returns.
 - The socket is the **clock**: `FixedUpdate` holds `Time.timeScale = 0` between socket exchanges (`DriverController.cs:136,158`); the sim only advances on each Python send/receive round-trip. Python is the **client** (`tank_env.py:231`) and **launches** the Unity exe (`subprocess.Popen`, `tank_env.py:184`).
 - **No config flag, CLI arg, or code branch bypasses the accept.** Every mode (human-vs-human, human-vs-AI, AI-vs-AI) requires Python connected. A standalone double-click hangs at the listener.
 
@@ -23,3 +23,16 @@ How the existing game actually runs, traced from code (game-sim-engineer + train
 **CTO decision (2026-06-17):** keep Python in the loop for human play — a lightweight Python "local-play host" drives the clock and stubs the human action slots (humans control locally in Unity); do NOT build a no-Python native mode. Forward-looking: use this connection to **record human play for imitation learning / behavioral cloning**. Recording the state stream is natural (Python already sees it); recording the human's *actual* action needs Unity to expose it back over the protocol — a sign-off-gated addition to the RL seam, design-for-it but not an M0 deliverable.
 
 Known latent bug for later: `human_matchmaking.get_human_stats` passes a path string to `json.load` (`human_matchmaking.py:43`), so the "existing human" branch is broken as written.
+
+## Config / arena source-of-truth map (consolidated 2026-06-18, cleanup A4)
+
+There is ONE canonical location for the shipped config + arenas; the rest are explicit fallbacks. The duplicate `PythonScripts/Assets/` tree (stale 2021 copy) was DELETED — its only consumer was a dead `os.path.exists("./Assets/config.json")` pre-flight in `preamble.py` that never read the file; that check is now removed.
+
+`DriverController.ResolveConfigPath` (`DriverController.cs:124-137`) precedence, highest first:
+1. **`--config <path>` / `-config <path>` CLI arg** — explicit override. The Python local-play host (`play_local.launch_build`) passes this when a config is selected; otherwise omits it and lets the build fall back.
+2. **`Assets/StreamingAssets/config.json` — CANONICAL.** Ships inside every build (StreamingAssets is copied into the player), so a built player resolves here by default. This is the file to edit. Sibling presets `config_2p.json` / `config_2p_keyboard.json` live here too (selected via the `--config` arg above).
+3. **`Assets/config.json` — legacy last-resort fallback.** Used only in-editor / when no StreamingAssets copy exists (the working-dir relative path). KEPT intentionally; do not delete.
+
+Arena resolution (`DriverController.ResolveArenaPath`, `DriverController.cs:142-152`): the config's `arena_path` is taken as-is if absolute or if it exists relative to the working dir (legacy `Assets/Arenas/...` form), else resolved **relative to the directory of the resolved config file** — so config + its `Arenas/` travel together. Canonical arenas live in `Assets/StreamingAssets/Arenas/` (`default.json`, `custom1.json`, `nowin_test.json`).
+
+Net: edit configs/arenas under `Assets/StreamingAssets/`. `Assets/config.json` is a deliberate fallback, not a duplicate.

@@ -153,8 +153,6 @@ if __name__ == "__main__":
         args.model_dir = args.model_dir + "/"
     if not os.path.exists(args.game_path):
         raise FileNotFoundError("Inputted game path does not lead to an existing file")
-    if not os.path.exists("./Assets/config.json"):
-        raise FileNotFoundError("Game config file not found at ./Assets/config.json")
     if not os.path.exists(args.pop_training_script):
         raise FileNotFoundError("Python population training script not found")
     if not os.path.exists(args.tournament_script):
