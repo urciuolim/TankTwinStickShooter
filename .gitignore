@@ -80,3 +80,9 @@ mono_crash.*
 /runs/
 /models/
 /datasets/
+
+# Python environment (isolated venv via uv) and caches
+/.venv/
+.python-version
+__pycache__/
+*.py[cod]
