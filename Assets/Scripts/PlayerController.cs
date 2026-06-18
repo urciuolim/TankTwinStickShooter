@@ -15,6 +15,27 @@ public class PlayerController : MonoBehaviour
     public Vector2 velocity;
     [HideInInspector]
     public Vector2 aim;
+
+    // Smooth-movement tuning (CTO play-test dials these in the Inspector).
+    // The action [velX, velY, aimX, aimY] is the DESIRED direction; these control how
+    // fast the tank's ACTUAL velocity (`velocity`) and heading (`aim`) ramp toward it.
+    [Header("Smooth movement (tune for feel)")]
+    [Tooltip("How fast actual velocity ramps toward desired, in direction-units/sec " +
+             "(velocity is the normalized stick/action direction, ~0..1). Lower = more " +
+             "inertia/slide; higher = snappier. ~999 reproduces the old instant snap.")]
+    [SerializeField]
+    private float moveAcceleration = 6f;
+    [Tooltip("Max turn rate of the tank body + barrel heading, degrees/sec. Lower = " +
+             "slower, heavier turning; higher = quicker. ~9999 reproduces instant aim.")]
+    [SerializeField]
+    private float turnSpeedDegPerSec = 360f;
+
+    // The latest DESIRED direction off the action/input (RL action space is unchanged).
+    // FixedUpdate smooths the ACTUAL `velocity`/`aim` toward these.
+    private Vector2 desiredVelocity;
+    private Vector2 desiredAim;
+    // Actual body/barrel heading in degrees; smoothed toward the desired aim angle.
+    private float currentAimAngle;
     private Transform barrel;
     public GameObject bulletPrefab;
     private Transform firePoint;
@@ -76,6 +97,10 @@ public class PlayerController : MonoBehaviour
             xSpawnLim = config["player_x_spawn_lim"].Value<float>();
         if (config["player_y_spawn_lim"] != null)
             ySpawnLim = config["player_y_spawn_lim"].Value<float>();
+        if (config["player_moveAcceleration"] != null)
+            moveAcceleration = config["player_moveAcceleration"].Value<float>();
+        if (config["player_turnSpeedDegPerSec"] != null)
+            turnSpeedDegPerSec = config["player_turnSpeedDegPerSec"].Value<float>();
         if (DriverController.instance.verbose)
         {
             Debug.Log("Player " + playerID + " speed set to " + speed);
@@ -92,6 +117,9 @@ public class PlayerController : MonoBehaviour
         rb = GetComponent<Rigidbody2D>();
         velocity = new Vector2();
         aim = new Vector2();
+        desiredVelocity = Vector2.zero;
+        desiredAim = Vector2.zero;
+        currentAimAngle = rb.rotation;
         barrel = transform.Find("Barrel");
         firePoint = barrel.Find("FirePoint");
         canShoot = true;
@@ -219,8 +247,10 @@ public class PlayerController : MonoBehaviour
                 if (DriverController.instance.actions != null)
                 {
                     JArray myInput = DriverController.instance.actions[playerID.ToString()] as JArray;
-                    velocity.Set((float)myInput[0], (float)myInput[1]);
-                    aim.Set((float)myInput[2], (float)myInput[3]);
+                    // DESIRED direction off the socket; FixedUpdate smooths the ACTUAL
+                    // velocity/aim toward it (RL action space + path unchanged).
+                    desiredVelocity.Set((float)myInput[0], (float)myInput[1]);
+                    desiredAim.Set((float)myInput[2], (float)myInput[3]);
                     if ((float)myInput[4] > triggerThreshold && canShoot)
                     {
                         Shoot();
@@ -244,8 +274,10 @@ public class PlayerController : MonoBehaviour
                 if (fireAction != null)
                     triggerValue = fireAction.ReadValue<float>();
 
-                velocity.Set(move.x, move.y);
-                aim.Set(aimInput.x, aimInput.y);
+                // DESIRED direction from the pad/keyboard; FixedUpdate smooths the ACTUAL
+                // velocity/aim toward it, identically to the AI branch.
+                desiredVelocity.Set(move.x, move.y);
+                desiredAim.Set(aimInput.x, aimInput.y);
 
                 bool triggerPressed = triggerValue > triggerThreshold;
                 if (triggerPressed && canShoot)
@@ -282,16 +314,36 @@ public class PlayerController : MonoBehaviour
     }
     private void FixedUpdate()
     {
+        float dt = DriverController.instance.fixedDeltaTime;//Time.fixedDeltaTime;
+
+        // --- Movement smoothing (acceleration / inertia) ---------------------
+        // Ramp the ACTUAL velocity toward the DESIRED direction so commanding a
+        // direction accelerates and releasing decelerates (momentum, not snap).
+        // `velocity` stays direction-space (~0..1) and is multiplied by `speed` below,
+        // matching the original semantics + the state-vector layout.
+        velocity = Vector2.MoveTowards(velocity, desiredVelocity, moveAcceleration * dt);
+
         if (velocity.magnitude > .1f)
         {
-            rb.MovePosition(rb.position + (velocity * speed * DriverController.instance.fixedDeltaTime));//Time.fixedDeltaTime));
+            rb.MovePosition(rb.position + (velocity * speed * dt));
+            // Body faces the actual (smoothed) movement direction, as before.
             rb.SetRotation(Vector2.SignedAngle(Vector2.right, velocity));
         }
 
-        if (aim.magnitude > .1f)
+        // --- Aim smoothing (max angular rate) --------------------------------
+        // Only chase a new heading when a meaningful aim is commanded (mirrors the
+        // old `aim.magnitude > .1f` gate, so no aim input doesn't drag toward angle 0).
+        if (desiredAim.magnitude > .1f)
         {
-            barrel.rotation = Quaternion.Euler(0, 0, Vector2.SignedAngle(Vector2.right, aim));
+            float targetAngle = Vector2.SignedAngle(Vector2.right, desiredAim);
+            currentAimAngle = Mathf.MoveTowardsAngle(currentAimAngle, targetAngle, turnSpeedDegPerSec * dt);
         }
+        barrel.rotation = Quaternion.Euler(0, 0, currentAimAngle);
+        // Report the ACTUAL (smoothed) heading as a unit vector so UpdateState's
+        // `aim.x/aim.y` is the real heading, not the raw command.
+        float rad = currentAimAngle * Mathf.Deg2Rad;
+        aim.Set(Mathf.Cos(rad), Mathf.Sin(rad));
+
         GetInput();
         if (!canShoot)
         {
