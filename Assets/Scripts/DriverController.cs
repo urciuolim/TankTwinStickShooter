@@ -11,6 +11,11 @@ using System.IO;
 using Newtonsoft.Json.Linq;
 using Newtonsoft.Json;
 using Unity.Jobs.LowLevel.Unsafe;
+using System.Runtime.CompilerServices;
+
+// Exposes the otherwise-private path-resolution helpers (ResolveConfigPath / ResolveArenaPath)
+// to the EditMode test assembly for regression coverage. Visibility-only; no logic change.
+[assembly: InternalsVisibleTo("TankTwinStickShooter.EditModeTests")]
 
 public class DriverController : MonoBehaviour
 {
@@ -121,7 +126,7 @@ public class DriverController : MonoBehaviour
     // Precedence: explicit "--config <path>" / "-config <path>" CLI arg, then StreamingAssets,
     // then the legacy "Assets/config.json" working-dir path as a last-resort fallback.
     // Note: args[1] is the legacy tank_env port (parsed above), so we only honor named args here.
-    private string ResolveConfigPath(string[] args)
+    internal string ResolveConfigPath(string[] args)
     {
         for (int i = 0; i < args.Length - 1; i++)
         {
@@ -139,7 +144,7 @@ public class DriverController : MonoBehaviour
     // Resolve arena_path so it ships portably. Absolute paths are used as-is. A relative path is
     // resolved against the directory of the resolved config file (so config + arenas travel together).
     // The legacy "Assets/Arenas/..." form is also honored relative to the working dir if that file exists.
-    private string ResolveArenaPath(string configPath, string arenaPath)
+    internal string ResolveArenaPath(string configPath, string arenaPath)
     {
         if (Path.IsPathRooted(arenaPath))
             return arenaPath;
