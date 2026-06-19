@@ -37,6 +37,7 @@ from pathlib import Path
 import gymnasium
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import CheckpointCallback
+from stable_baselines3.common.logger import configure
 from stable_baselines3.common.utils import set_random_seed
 
 from tank_twin.env import TankEnv
@@ -80,6 +81,7 @@ def train_local(
     models_dir: str | Path = DEFAULT_MODELS_DIR,
     checkpoint_freq: int = 50_000,
     verbose: int = 1,
+    log_metrics: bool = True,
 ) -> PPO:
     """Train one PPO agent against the random opponent and return the built model.
 
@@ -105,6 +107,11 @@ def train_local(
         runs_dir / models_dir: output roots (defaulting to the repo's ``runs`` / ``models``).
         checkpoint_freq: env-steps between checkpoints (``CheckpointCallback``).
         verbose: SB3 verbosity (1 -> the default logger prints ``ep_rew_mean``).
+        log_metrics: if True (default), attach an SB3 logger that writes
+            ``progress.csv`` + TensorBoard ``tfevents`` into ``runs/<run_name>/``
+            AND keeps the stdout table (formats ``["stdout", "csv", "tensorboard"]``).
+            This is a SINGLE logging mechanism — we do NOT also pass
+            ``tensorboard_log=`` to PPO, so tfevents are written exactly once.
 
     Returns:
         The trained ``PPO`` model (also saved to ``<models_dir>/<run_name>.zip``).
@@ -164,6 +171,16 @@ def train_local(
             "game_path": None if game_path is None else str(game_path),
         },
     )
+
+    # --- metrics logging (single mechanism: set_logger with 3 formats) ----------------
+    # configure(run_dir, ["stdout","csv","tensorboard"]) writes progress.csv AND a
+    # tfevents file into runs/<run_name>/ while preserving the stdout table. We attach
+    # it via set_logger and deliberately do NOT pass tensorboard_log= to PPO above,
+    # so tfevents are written exactly once (no double-write). plot_metrics reads the
+    # resulting progress.csv. The default-on flag keeps every real run observable.
+    if log_metrics:
+        new_logger = configure(str(run_dir), ["stdout", "csv", "tensorboard"])
+        model.set_logger(new_logger)
 
     checkpoint_cb = CheckpointCallback(
         save_freq=checkpoint_freq,
@@ -228,6 +245,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_LEARNING_RATE,
         help="PPO learning rate.",
     )
+    parser.add_argument(
+        "--no-metrics",
+        dest="log_metrics",
+        action="store_false",
+        help="Disable the progress.csv + tfevents metrics logger (default: enabled).",
+    )
     return parser
 
 
@@ -244,6 +267,7 @@ def main(argv: list[str] | None = None) -> None:
         n_steps=args.n_steps,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
+        log_metrics=args.log_metrics,
     )
 
 

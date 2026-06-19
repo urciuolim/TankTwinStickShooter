@@ -24,6 +24,13 @@ dependencies = [
     "torch>=2.9,<2.10",
     "stable-baselines3>=2.9,<3",
     "gymnasium>=1.3,<2",
+    # Training-metrics observability (CTO-approved, board): SB3 logger writes
+    # progress.csv + tfevents; plot_metrics renders the CSV to a PNG dashboard.
+    # NOT in the pure-logic import path — matplotlib is imported only inside
+    # tank_twin.plot_metrics, and tensorboard is loaded lazily by SB3's logger.
+    # Upper-bounded to the resolved minor lines (repo "pin it" etiquette).
+    "matplotlib>=3.11,<3.12",
+    "tensorboard>=2.20,<2.21",
 ]
 
 [build-system]
