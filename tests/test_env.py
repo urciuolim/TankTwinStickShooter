@@ -350,3 +350,68 @@ def test_passes_stable_baselines3_env_checker():
 
     env = make_env()
     check_env(env, warn=True, skip_render_check=True)
+
+
+# --- close() lifecycle (env-teardown leak fix) ----------------------------
+
+
+class ClosableUnity(ScriptedUnity):
+    """A scripted transport that ALSO answers the close() end handshake and counts close().
+
+    Replies ``{"restarting": true}`` / ``{"ending": true}`` to the close handshake (so
+    ``close`` does not raise on a real-looking transport) and records how many times its
+    ``close`` was invoked — letting the test assert the connection was released AND that a
+    second ``close`` is a no-op (idempotent), with NO real Unity / subprocess / socket.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.close_count = 0
+
+    def close(self):
+        self.close_count += 1
+
+
+def test_close_closes_the_connection_transport():
+    # close() must release the injected transport (the real path frees the bound socket).
+    transport = ClosableUnity()
+    env = TankEnv(game_path=None, transport=transport)
+    env.reset(seed=0)
+    env.close()
+    assert transport.close_count == 1
+    # The Connection handle is dropped so the env no longer holds the transport.
+    assert env.conn is None
+
+
+def test_close_is_idempotent():
+    # Calling close() twice must NOT raise and must NOT re-close the transport.
+    transport = ClosableUnity()
+    env = TankEnv(game_path=None, transport=transport)
+    env.reset(seed=0)
+    env.close()
+    env.close()  # second call: a safe no-op
+    assert transport.close_count == 1  # not re-closed
+    assert env.conn is None
+
+
+def test_close_safe_with_no_connection():
+    # Introspection-only construction (no transport, no game_path): close() is a no-op.
+    env = TankEnv(game_path=None)
+    assert env.conn is None
+    env.close()  # must not raise even though there is nothing to tear down
+    env.close()  # idempotent
+
+
+def test_close_swallows_transport_errors_during_end_handshake():
+    # A transport whose close handshake errors (dropped connection) must not break close():
+    # the error is swallowed and the transport is still released.
+    class BrokenHandshake(ClosableUnity):
+        def sendall(self, data):
+            raise ConnectionError("connection dropped before teardown")
+
+    transport = BrokenHandshake()
+    env = TankEnv(game_path=None, transport=transport)
+    # No reset(): a connection that drops before any handshake still tears down cleanly.
+    env.close()
+    assert transport.close_count == 1
+    assert env.conn is None

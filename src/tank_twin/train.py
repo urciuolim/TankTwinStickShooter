@@ -137,62 +137,69 @@ def train_local(
     else:
         env = TankEnv(game_path=str(game_path), image_based=True, env_p=3, rand_opp=True)
 
-    # --- frozen pretrained CNN wired via policy_kwargs (Route B; see module docstring) -
-    policy_kwargs = {
-        "features_extractor_class": PretrainedNatureCNN,
-        "features_extractor_kwargs": {"freeze": not unfreeze},
-        # normalize_images left at SB3 default True (pretrain divided by 255).
-    }
+    # try/finally so env.close() ALWAYS runs — even on an exception or KeyboardInterrupt
+    # mid-training. On the real path this reaps the launched Unity subprocess + frees the
+    # bound socket port (the orphaned TankTwinStickShooter.exe we used to kill by hand);
+    # on the fake-transport test seam env.close() is a cheap no-op.
+    try:
+        # --- frozen pretrained CNN wired via policy_kwargs (Route B; see module docstring) -
+        policy_kwargs = {
+            "features_extractor_class": PretrainedNatureCNN,
+            "features_extractor_kwargs": {"freeze": not unfreeze},
+            # normalize_images left at SB3 default True (pretrain divided by 255).
+        }
 
-    model = PPO(
-        policy="CnnPolicy",
-        env=env,
-        learning_rate=learning_rate,
-        n_steps=n_steps,
-        batch_size=batch_size,
-        policy_kwargs=policy_kwargs,
-        seed=seed,
-        device=device,
-        verbose=verbose,
-    )
+        model = PPO(
+            policy="CnnPolicy",
+            env=env,
+            learning_rate=learning_rate,
+            n_steps=n_steps,
+            batch_size=batch_size,
+            policy_kwargs=policy_kwargs,
+            seed=seed,
+            device=device,
+            verbose=verbose,
+        )
 
-    # --- run manifest (light reproducibility: config the run was built with) ----------
-    _write_manifest(
-        run_dir / "manifest.json",
-        {
-            "run_name": run_name,
-            "timesteps": timesteps,
-            "seed": seed,
-            "frozen": not unfreeze,
-            "device": device,
-            "n_steps": n_steps,
-            "batch_size": batch_size,
-            "learning_rate": learning_rate,
-            "game_path": None if game_path is None else str(game_path),
-        },
-    )
+        # --- run manifest (light reproducibility: config the run was built with) ----------
+        _write_manifest(
+            run_dir / "manifest.json",
+            {
+                "run_name": run_name,
+                "timesteps": timesteps,
+                "seed": seed,
+                "frozen": not unfreeze,
+                "device": device,
+                "n_steps": n_steps,
+                "batch_size": batch_size,
+                "learning_rate": learning_rate,
+                "game_path": None if game_path is None else str(game_path),
+            },
+        )
 
-    # --- metrics logging (single mechanism: set_logger with 3 formats) ----------------
-    # configure(run_dir, ["stdout","csv","tensorboard"]) writes progress.csv AND a
-    # tfevents file into runs/<run_name>/ while preserving the stdout table. We attach
-    # it via set_logger and deliberately do NOT pass tensorboard_log= to PPO above,
-    # so tfevents are written exactly once (no double-write). plot_metrics reads the
-    # resulting progress.csv. The default-on flag keeps every real run observable.
-    if log_metrics:
-        new_logger = configure(str(run_dir), ["stdout", "csv", "tensorboard"])
-        model.set_logger(new_logger)
+        # --- metrics logging (single mechanism: set_logger with 3 formats) ----------------
+        # configure(run_dir, ["stdout","csv","tensorboard"]) writes progress.csv AND a
+        # tfevents file into runs/<run_name>/ while preserving the stdout table. We attach
+        # it via set_logger and deliberately do NOT pass tensorboard_log= to PPO above,
+        # so tfevents are written exactly once (no double-write). plot_metrics reads the
+        # resulting progress.csv. The default-on flag keeps every real run observable.
+        if log_metrics:
+            new_logger = configure(str(run_dir), ["stdout", "csv", "tensorboard"])
+            model.set_logger(new_logger)
 
-    checkpoint_cb = CheckpointCallback(
-        save_freq=checkpoint_freq,
-        save_path=str(run_dir),
-        name_prefix=run_name,
-    )
+        checkpoint_cb = CheckpointCallback(
+            save_freq=checkpoint_freq,
+            save_path=str(run_dir),
+            name_prefix=run_name,
+        )
 
-    model.learn(total_timesteps=timesteps, callback=checkpoint_cb, progress_bar=False)
+        model.learn(total_timesteps=timesteps, callback=checkpoint_cb, progress_bar=False)
 
-    final_path = Path(models_dir) / f"{run_name}.zip"
-    model.save(str(final_path))
-    return model
+        final_path = Path(models_dir) / f"{run_name}.zip"
+        model.save(str(final_path))
+        return model
+    finally:
+        env.close()
 
 
 def _write_manifest(path: Path, data: dict) -> None:

@@ -32,6 +32,7 @@ This module imports gymnasium + numpy + the pure tank_twin modules; it stays sb3
 (it is just the env — the trainer / feature extractor import torch elsewhere).
 """
 
+import contextlib
 import socket
 import subprocess
 from pathlib import Path
@@ -308,12 +309,26 @@ class TankEnv(gymnasium.Env):
         raise NotImplementedError()
 
     def close(self):
-        """Run the legacy end handshake (best effort) and release the transport.
+        """Release the transport and REAP the Unity subprocess (gymnasium lifecycle).
 
-        Sends ``{"restart":True}`` -> ack, ``{"end":True}`` -> ``"ending"`` ack, then
-        closes the socket / waits on the Unity subprocess. Swallows transport errors so
-        ``close`` is safe to call after a dropped connection (and on the test seam, where
-        the fake transport may not implement ``close``).
+        This is the fix for the leaked ``TankTwinStickShooter.exe`` / held socket port: a
+        real Unity run launches a child process + binds a socket, and nothing tore them
+        down, so an interrupted/finished run orphaned the process and held the port into
+        TIME_WAIT. ``close`` now ALWAYS reaps:
+
+        1. best-effort end handshake (``{"restart":True}`` -> ack, ``{"end":True}`` -> ack)
+           so Unity can exit cleanly; transport errors are swallowed (a dropped connection
+           or a fake test transport without these replies must not block teardown),
+        2. close the socket / ``Connection`` transport (frees the bound port),
+        3. terminate the Unity subprocess GRACEFULLY (``terminate()``, wait briefly, then
+           ``kill()`` if it is still alive) and ``wait()`` to reap the zombie,
+        4. close the captured game-log handle.
+
+        IDEMPOTENT and safe with no subprocess (injected ``transport``) or no connection
+        (introspection-only construction): every attribute is nulled after release, so a
+        second ``close()`` is a no-op. This is purely ``gymnasium.Env.close`` lifecycle —
+        it does NOT touch the wire protocol bytes or the 52-float state layout, so it is
+        NOT an RL-seam change.
         """
         if self.conn is not None:
             try:
@@ -326,11 +341,26 @@ class TankEnv(gymnasium.Env):
             transport = getattr(self.conn, "transport", None)
             close = getattr(transport, "close", None)
             if callable(close):
-                close()
+                with contextlib.suppress(OSError):
+                    close()
+            self.conn = None
+
         if self.game_p is not None:
-            self.game_p.wait()
+            # Graceful -> forceful reap. terminate() (SIGTERM / TerminateProcess), give the
+            # child a short window to exit, then kill() if it is still alive. Either way
+            # wait() so we never leave a zombie / orphaned TankTwinStickShooter.exe.
+            if self.game_p.poll() is None:
+                self.game_p.terminate()
+                try:
+                    self.game_p.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.game_p.kill()
+                    self.game_p.wait()
+            self.game_p = None
+
         if self.game_log is not None:
             self.game_log.close()
+            self.game_log = None
 
     # --- helper retained for parity / readability -----------------------------
 
