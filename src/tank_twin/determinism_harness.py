@@ -31,6 +31,18 @@ The harness MEASURES; it does NOT hard-fail on a chosen epsilon — per the boar
 decision the CTO sets the pass bar AFTER seeing the numbers. We write the numbers to
 ``runs/determinism/result.json`` (strict JSON) and print a clean summary.
 
+SELF-EVIDENCE so the artifact STANDS ALONE (a reviewer need not read C#):
+
+* NON-DEGENERACY. A frozen-tank build would ALSO report max-diff 0.0, so a bare 0.0
+  is ambiguous. We record, over the t1 reference trajectory, each tank's positional
+  range (max-min of x/y) and max step-to-step delta and a ``non_degenerate`` bool
+  (motion clears a world-unit floor). 0.0 then means "identical DESPITE real motion."
+  A degenerate result prints a LOUD warning.
+* WALL-CLOCK. We time each run's drive loop and record t1 / t1_again / t5 seconds and
+  ``t1_over_t5_ratio`` (≈5.0), CONFIRMING ``timeScale=5`` actually took effect rather
+  than being silently ignored. Durations are recorded measurements, NOT determinism
+  inputs — they never enter the trajectory diff.
+
 Process hygiene (the Windows orphan / TIME_WAIT trap we hit before): a FRESH port per
 launch, and every launched build is terminated + reaped before the next launch. No
 fork/forkserver. Strict JSON via :mod:`tank_twin.protocol`.
@@ -147,7 +159,7 @@ def _run_one(
     sock_timeout=15.0,
     log_dir=None,
 ):
-    """Launch the build once, drive the canned actions, return (trajectory, winners, flip).
+    """Launch the build once, drive the canned actions, return (trajectory, winners, flip, elapsed).
 
     Performs the byte-identical handshake (``restart`` ack, ``start`` -> ``starting``
     ack, first state), records the first state's flip (sign of P1 x), then drives
@@ -156,11 +168,17 @@ def _run_one(
     build and closes the socket before returning (no orphan, port freed for the next
     launch).
 
-    Returns ``(trajectory, winners, flip)`` where ``trajectory`` is ``list[list[float]]``
-    (one 52-float state per recorded step, INCLUDING the first), ``winners`` is the
-    per-step winner signal (``None`` where no winner key arrived; aligned with
-    ``trajectory`` indices for the action steps, with a leading ``None`` for the first
-    state), and ``flip`` is ``True``/``False`` for the detected side-flip.
+    Returns ``(trajectory, winners, flip, elapsed)`` where ``trajectory`` is
+    ``list[list[float]]`` (one 52-float state per recorded step, INCLUDING the first),
+    ``winners`` is the per-step winner signal (``None`` where no winner key arrived;
+    aligned with ``trajectory`` indices for the action steps, with a leading ``None``
+    for the first state), ``flip`` is ``True``/``False`` for the detected side-flip, and
+    ``elapsed`` is the wall-clock seconds spent DRIVING the canned actions (from just
+    after the first state to the last recorded step), measured with
+    :func:`time.perf_counter`. The drive loop is the only window where ``timeScale``
+    governs how fast the simulation advances, so this is the duration whose t1/t5 ratio
+    confirms ``timeScale=5`` actually took effect — it is a RECORDED measurement, not a
+    determinism INPUT, so it never enters the trajectory diff.
     """
     my_port = game_port + 1
     cmd = [str(game_path), str(game_port), "--config", str(config_path)]
@@ -198,6 +216,8 @@ def _run_one(
         game_over = ("winner" in first) or ("done" in first)
 
         actions = _canned_actions(n_steps)
+        # Time ONLY the drive loop: the window where timeScale governs sim advance.
+        drive_start = time.perf_counter()
         for action in actions:
             # Stop driving once the game has ended (winner reported / done flag).
             if game_over:
@@ -213,6 +233,7 @@ def _run_one(
             winners.append(int(received["winner"]) if "winner" in received else None)
             if "winner" in received or "done" in received:
                 break
+        elapsed = time.perf_counter() - drive_start
 
         # Best-effort clean teardown so the build quits itself (then _reap guarantees it).
         try:
@@ -223,7 +244,7 @@ def _run_one(
         except (ConnectionError, OSError, KeyError, ValueError):
             pass
 
-        return trajectory, winners, flip
+        return trajectory, winners, flip, elapsed
     finally:
         if sock is not None:
             with contextlib.suppress(OSError):
@@ -254,12 +275,16 @@ def _run_aligned(
 
     A FRESH port (``base_port + launch_index*1000 + attempt``) is used per launch so a
     lingering TIME_WAIT never collides with the next attempt.
+
+    Returns ``(trajectory, winners, flip, target, elapsed)`` — ``elapsed`` is the
+    drive-loop wall-clock of the ALIGNED run (the one whose trajectory we keep), so the
+    recorded duration matches the recorded trajectory.
     """
     attempts = 1 if target_flip is None else align_retries
     last = None
     for attempt in range(attempts):
         port = base_port + launch_index * 1000 + attempt
-        traj, winners, flip = _run_one(
+        traj, winners, flip, elapsed = _run_one(
             game_path,
             config_path,
             n_steps,
@@ -268,15 +293,18 @@ def _run_aligned(
         )
         last = (traj, winners, flip)
         if target_flip is None:
-            print(f"  [{label}] launch port={port} flip={flip} (set as target)", flush=True)
-            return traj, winners, flip, flip
+            print(
+                f"  [{label}] launch port={port} flip={flip} (set as target) drive={elapsed:.3f}s",
+                flush=True,
+            )
+            return traj, winners, flip, flip, elapsed
         print(
             f"  [{label}] launch port={port} flip={flip} "
-            f"(target={target_flip}, attempt {attempt + 1}/{attempts})",
+            f"(target={target_flip}, attempt {attempt + 1}/{attempts}) drive={elapsed:.3f}s",
             flush=True,
         )
         if flip == target_flip:
-            return traj, winners, flip, target_flip
+            return traj, winners, flip, target_flip, elapsed
     # Exhausted retries without aligning.
     _traj, _winners, flip = last
     raise RuntimeError(
@@ -299,7 +327,7 @@ def run_harness(
     The pure diff is imported lazily so the module imports without numpy on a box that
     only wants the canned-action / launch helpers.
     """
-    from tank_twin.determinism_check import diff_trajectories
+    from tank_twin.determinism_check import diff_trajectories, motion_summary
 
     game_path = Path(game_path).resolve()
     if not game_path.is_file():
@@ -313,7 +341,7 @@ def run_harness(
 
     # Run A (t1) picks the target flip.
     print("[determinism] run t1 (baseline, sets target flip):", flush=True)
-    t1_traj, t1_winners, t1_flip, target = _run_aligned(
+    t1_traj, t1_winners, t1_flip, target, t1_elapsed = _run_aligned(
         game_path,
         CONFIG_T1,
         n_steps,
@@ -327,7 +355,7 @@ def run_harness(
 
     # Run A' (t1 twin) aligned to target -> the BASELINE floor (same timeScale).
     print("[determinism] run t1-again (baseline twin, aligned):", flush=True)
-    t1b_traj, t1b_winners, _t1b_flip, _ = _run_aligned(
+    t1b_traj, t1b_winners, _t1b_flip, _, t1b_elapsed = _run_aligned(
         game_path,
         CONFIG_T1,
         n_steps,
@@ -341,7 +369,7 @@ def run_harness(
 
     # Run B (t5) aligned to target -> the TEST (timeScale 5 vs 1).
     print("[determinism] run t5 (test, aligned):", flush=True)
-    t5_traj, t5_winners, _t5_flip, _ = _run_aligned(
+    t5_traj, t5_winners, _t5_flip, _, t5_elapsed = _run_aligned(
         game_path,
         CONFIG_T5,
         n_steps,
@@ -355,6 +383,15 @@ def run_harness(
 
     baseline = diff_trajectories(t1_traj, t1b_traj, t1_winners, t1b_winners)
     test = diff_trajectories(t1_traj, t5_traj, t1_winners, t5_winners)
+
+    # Non-degeneracy evidence over the t1 REFERENCE trajectory: proves the 0.0 diff
+    # means "identical DESPITE real motion," not "identical because nothing moved."
+    motion = motion_summary(t1_traj)
+
+    # Speed evidence: t1/t5 drive-loop wall-clock ratio. timeScale=5 should make the
+    # t5 drive ~5x faster than t1; a ratio near 1.0 would mean timeScale was silently
+    # ignored even though the trajectories matched. Guard the divide.
+    ratio = (t1_elapsed / t5_elapsed) if t5_elapsed > 0 else None
 
     result = {
         "config": {
@@ -370,10 +407,40 @@ def run_harness(
             "t1_again": len(t1b_traj),
             "t5": len(t5_traj),
         },
+        "motion_t1_reference": motion.to_dict(),
+        "wall_clock": {
+            "t1_drive_seconds": float(t1_elapsed),
+            "t1_again_drive_seconds": float(t1b_elapsed),
+            "t5_drive_seconds": float(t5_elapsed),
+            "t1_over_t5_ratio": (None if ratio is None else float(ratio)),
+            "expected_ratio_approx": float(_expected_speed_ratio()),
+            "note": (
+                "drive-loop wall-clock per run; t1_over_t5_ratio ~= timeScale_t5/timeScale_t1 "
+                "confirms timeScale=5 took effect (not silently ignored). Recorded only; "
+                "durations are NOT inputs to the trajectory diff."
+            ),
+        },
         "baseline_t1_vs_t1": baseline.to_dict(),
         "test_t1_vs_t5": test.to_dict(),
     }
     return result
+
+
+def _expected_speed_ratio():
+    """Expected t1/t5 drive-time ratio = timeScale_t5 / timeScale_t1 (≈5.0).
+
+    Read from the two configs so the recorded expectation tracks the actual configs
+    rather than a hard-coded 5.0. Strict JSON parse via stdlib (the configs are our
+    own determinism fixtures). Falls back to 5.0 if a timeScale key is missing.
+    """
+    try:
+        with open(CONFIG_T1, encoding="utf-8") as fh:
+            ts1 = float(json.load(fh).get("timeScale", 1))
+        with open(CONFIG_T5, encoding="utf-8") as fh:
+            ts5 = float(json.load(fh).get("timeScale", 5))
+        return ts5 / ts1 if ts1 else 5.0
+    except (OSError, ValueError, json.JSONDecodeError):
+        return 5.0
 
 
 def _print_summary(result):
@@ -381,12 +448,56 @@ def _print_summary(result):
     base = result["baseline_t1_vs_t1"]
     test = result["test_t1_vs_t5"]
     lens = result["trajectory_lengths"]
+    motion = result["motion_t1_reference"]
+    clock = result["wall_clock"]
     print("", flush=True)
     print("=" * 68, flush=True)
     print("DETERMINISM MEASUREMENT (timeScale 1 vs 5) — no pass bar applied", flush=True)
     print("=" * 68, flush=True)
     print(
         f"  trajectory lengths : t1={lens['t1']} t1_again={lens['t1_again']} t5={lens['t5']}",
+        flush=True,
+    )
+    print(
+        "  -- NON-DEGENERACY (t1 reference; did the tanks actually MOVE?) --",
+        flush=True,
+    )
+    print(
+        f"     P1 pos range x/y  : {motion['p1_x_range']:.3f} / {motion['p1_y_range']:.3f}",
+        flush=True,
+    )
+    print(
+        f"     P2 pos range x/y  : {motion['p2_x_range']:.3f} / {motion['p2_y_range']:.3f}",
+        flush=True,
+    )
+    print(
+        f"     max step delta    : P1={motion['p1_max_step_delta']:.3f} "
+        f"P2={motion['p2_max_step_delta']:.3f}",
+        flush=True,
+    )
+    print(
+        f"     non_degenerate    : {motion['non_degenerate']} "
+        f"(floor={motion['motion_floor']} world units)",
+        flush=True,
+    )
+    if not motion["non_degenerate"]:
+        print("", flush=True)
+        print("  " + "!" * 64, flush=True)
+        print("  !! WARNING: trajectory is DEGENERATE (tanks barely moved).", flush=True)
+        print("  !! A max-diff of 0.0 over a frozen scene is MEANINGLESS — it does", flush=True)
+        print("  !! NOT prove determinism. Investigate before trusting this result.", flush=True)
+        print("  " + "!" * 64, flush=True)
+        print("", flush=True)
+    print("  -- WALL-CLOCK (drive-loop seconds; did timeScale=5 take effect?) --", flush=True)
+    ratio = clock["t1_over_t5_ratio"]
+    ratio_str = "n/a" if ratio is None else f"{ratio:.2f}x"
+    print(
+        f"     drive seconds     : t1={clock['t1_drive_seconds']:.3f} "
+        f"t1_again={clock['t1_again_drive_seconds']:.3f} t5={clock['t5_drive_seconds']:.3f}",
+        flush=True,
+    )
+    print(
+        f"     t1/t5 ratio       : {ratio_str} (expected ~{clock['expected_ratio_approx']:.1f}x)",
         flush=True,
     )
     print("  -- BASELINE (t1 vs t1, same timeScale; the noise floor) --", flush=True)

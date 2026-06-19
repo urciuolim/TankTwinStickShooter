@@ -56,6 +56,19 @@ FIELD_GROUPS = {
 # Player index of P1 / the agent under training — matches rewards.PLAYER_1.
 PLAYER_1 = 0
 
+# Position indices within the 52-float state (pos_x, pos_y per player).
+P1_POS_X, P1_POS_Y = 0, 1
+P2_POS_X, P2_POS_Y = 26, 27
+
+# Motion floor (WORLD UNITS). The canned action sequence drives both tanks across
+# multiple arena cells, so a real (non-frozen) trajectory shows positional ranges of
+# SEVERAL world units. We require the larger of each player's x/y range to clear this
+# floor before calling a trajectory non-degenerate. A frozen-tank build (the thing a
+# bare max-diff 0.0 cannot distinguish from real determinism) produces ranges of ~0
+# and fails this floor. Conservative on purpose: real motion clears it by a wide
+# margin, so the bool is unambiguous rather than knife-edge.
+MOTION_FLOOR = 1.0
+
 
 @dataclass(frozen=True)
 class InvariantResult:
@@ -81,6 +94,100 @@ class InvariantResult:
     def all_match(self) -> bool:
         """True iff every RL invariant agrees between the two trajectories."""
         return self.same_length and self.same_winner and self.same_total_reward
+
+
+@dataclass(frozen=True)
+class MotionSummary:
+    """Non-degeneracy evidence: did the tanks ACTUALLY MOVE over the trajectory?
+
+    A bitwise max-diff of 0.0 between two runs proves they are the SAME simulation —
+    but it proves nothing about whether that simulation did anything. A frozen-tank
+    build (or a config that never starts the match) would ALSO report max-diff 0.0,
+    making the determinism claim vacuous. This summary closes that gap by measuring,
+    over the SINGLE reference trajectory, how far each tank ranged.
+
+    For each player we record the positional RANGE (``max - min`` of x and y across
+    every recorded step) and the largest step-to-step position delta (Euclidean). The
+    :attr:`non_degenerate` flag is ``True`` iff the motion clearly clears
+    :data:`MOTION_FLOOR` — i.e. 0.0 here means "identical despite real motion," not
+    "identical because nothing moved." Sentinel/absent values do not occur on the tank
+    position slots (Unity reports live positions there every step).
+    """
+
+    p1_x_range: float
+    p1_y_range: float
+    p2_x_range: float
+    p2_y_range: float
+    p1_max_step_delta: float
+    p2_max_step_delta: float
+    non_degenerate: bool
+    motion_floor: float = MOTION_FLOOR
+
+    def to_dict(self) -> dict:
+        """Plain-dict view for strict-JSON serialization (no numpy scalars)."""
+        return {
+            "p1_x_range": float(self.p1_x_range),
+            "p1_y_range": float(self.p1_y_range),
+            "p2_x_range": float(self.p2_x_range),
+            "p2_y_range": float(self.p2_y_range),
+            "p1_max_step_delta": float(self.p1_max_step_delta),
+            "p2_max_step_delta": float(self.p2_max_step_delta),
+            "non_degenerate": bool(self.non_degenerate),
+            "motion_floor": float(self.motion_floor),
+        }
+
+
+def motion_summary(trajectory, motion_floor: float = MOTION_FLOOR) -> MotionSummary:
+    """Measure how far each tank moved over a trajectory (non-degeneracy evidence).
+
+    ``trajectory`` is a ``list[list[float]]`` (one 52-float state per step). For each
+    player we compute the positional range (``max - min``) of x and y across all steps
+    and the max step-to-step Euclidean position delta. :attr:`MotionSummary.non_degenerate`
+    is ``True`` iff the LARGEST of {p1 x-range, p1 y-range, p2 x-range, p2 y-range}
+    strictly exceeds ``motion_floor`` (default :data:`MOTION_FLOOR`).
+
+    A trajectory with fewer than two steps cannot move: ranges and deltas are 0.0 and
+    the result is degenerate (``non_degenerate=False``). This is pure measurement.
+    """
+    arr = _as_array(trajectory)
+    if arr.shape[0] < 2:
+        return MotionSummary(
+            p1_x_range=0.0,
+            p1_y_range=0.0,
+            p2_x_range=0.0,
+            p2_y_range=0.0,
+            p1_max_step_delta=0.0,
+            p2_max_step_delta=0.0,
+            non_degenerate=False,
+            motion_floor=float(motion_floor),
+        )
+
+    def _range(col: int) -> float:
+        column = arr[:, col]
+        return float(column.max() - column.min())
+
+    def _max_step_delta(x_col: int, y_col: int) -> float:
+        dx = np.diff(arr[:, x_col])
+        dy = np.diff(arr[:, y_col])
+        steps = np.sqrt(dx * dx + dy * dy)
+        return float(steps.max()) if steps.size else 0.0
+
+    p1_x_range = _range(P1_POS_X)
+    p1_y_range = _range(P1_POS_Y)
+    p2_x_range = _range(P2_POS_X)
+    p2_y_range = _range(P2_POS_Y)
+    largest_range = max(p1_x_range, p1_y_range, p2_x_range, p2_y_range)
+
+    return MotionSummary(
+        p1_x_range=p1_x_range,
+        p1_y_range=p1_y_range,
+        p2_x_range=p2_x_range,
+        p2_y_range=p2_y_range,
+        p1_max_step_delta=_max_step_delta(P1_POS_X, P1_POS_Y),
+        p2_max_step_delta=_max_step_delta(P2_POS_X, P2_POS_Y),
+        non_degenerate=(largest_range > float(motion_floor)),
+        motion_floor=float(motion_floor),
+    )
 
 
 @dataclass(frozen=True)

@@ -10,8 +10,10 @@ The 52-float layout matches tank_twin.observation: P1 = indices 0..25, P2 = 26..
 """
 
 from tank_twin.determinism_check import (
+    MOTION_FLOOR,
     compute_invariants,
     diff_trajectories,
+    motion_summary,
 )
 
 
@@ -194,6 +196,93 @@ def test_to_dict_first_divergence_none_when_identical():
     d = diff_trajectories(traj, traj).to_dict()
     assert d["first_divergence_step"] is None
     assert d["bitwise_identical"] is True
+
+
+# --- motion / non-degeneracy: 0.0 must mean "identical DESPITE real motion" ----
+
+
+def test_frozen_trajectory_is_degenerate():
+    # Every step identical -> zero range, zero step delta -> degenerate.
+    frozen = _trajectory(20, fill=3.0)
+    m = motion_summary(frozen)
+    assert m.p1_x_range == 0.0
+    assert m.p1_y_range == 0.0
+    assert m.p2_x_range == 0.0
+    assert m.p2_y_range == 0.0
+    assert m.p1_max_step_delta == 0.0
+    assert m.p2_max_step_delta == 0.0
+    assert m.non_degenerate is False
+
+
+def test_moving_trajectory_is_non_degenerate():
+    # Drive P1 x (index 0) and P2 y (index 27) across several world units.
+    traj = _trajectory(10, fill=0.0)
+    for i, state in enumerate(traj):
+        state[0] = float(i)  # P1 pos_x: 0..9 -> range 9.0
+        state[27] = float(2 * i)  # P2 pos_y: 0..18 -> range 18.0
+    m = motion_summary(traj)
+    assert m.p1_x_range == 9.0
+    assert m.p1_y_range == 0.0
+    assert m.p2_y_range == 18.0
+    # Max step delta: P1 moves 1.0/step in x; P2 moves 2.0/step in y.
+    assert m.p1_max_step_delta == 1.0
+    assert m.p2_max_step_delta == 2.0
+    assert m.non_degenerate is True
+    assert m.motion_floor == MOTION_FLOOR
+
+
+def test_motion_just_below_floor_is_degenerate():
+    # Largest range strictly at/under the floor -> degenerate (conservative bool).
+    traj = _trajectory(5, fill=0.0)
+    for i, state in enumerate(traj):
+        # Range over 5 steps = (4/4)*MOTION_FLOOR == MOTION_FLOOR exactly; not > floor.
+        state[0] = (i / 4.0) * MOTION_FLOOR
+    m = motion_summary(traj)
+    assert m.p1_x_range == MOTION_FLOOR
+    assert m.non_degenerate is False  # strictly-greater-than, so == floor fails
+
+
+def test_motion_summary_single_step_is_degenerate():
+    # Fewer than two steps cannot move.
+    m = motion_summary(_trajectory(1, fill=5.0))
+    assert m.non_degenerate is False
+    assert m.p1_max_step_delta == 0.0
+
+
+def test_motion_summary_empty_is_degenerate():
+    m = motion_summary([])
+    assert m.non_degenerate is False
+
+
+def test_motion_step_delta_is_euclidean():
+    # A diagonal move of (3, 4) per step has Euclidean delta 5.0 (3-4-5 triangle).
+    traj = _trajectory(3, fill=0.0)
+    for i, state in enumerate(traj):
+        state[0] = 3.0 * i  # P1 pos_x
+        state[1] = 4.0 * i  # P1 pos_y
+    m = motion_summary(traj)
+    assert m.p1_max_step_delta == 5.0
+
+
+def test_motion_summary_to_dict_is_json_clean():
+    import json
+
+    traj = _trajectory(4, fill=0.0)
+    for i, state in enumerate(traj):
+        state[0] = float(i * 3)
+    d = motion_summary(traj).to_dict()
+    decoded = json.loads(json.dumps(d))
+    assert decoded["p1_x_range"] == 9.0
+    assert decoded["non_degenerate"] is True
+    assert decoded["motion_floor"] == MOTION_FLOOR
+
+
+def test_custom_motion_floor_respected():
+    traj = _trajectory(4, fill=0.0)
+    for i, state in enumerate(traj):
+        state[0] = float(i)  # range 3.0
+    assert motion_summary(traj, motion_floor=2.0).non_degenerate is True
+    assert motion_summary(traj, motion_floor=10.0).non_degenerate is False
 
 
 # --- NaN handling: a NaN that appears in only one trajectory is a divergence ---
