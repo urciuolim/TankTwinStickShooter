@@ -4,6 +4,3 @@ __pycache__/
 # Generated training-metrics dashboard (tank_twin.plot_metrics --boardroom);
 # a runtime artifact like runs/, served at /metrics.png — not source.
 metrics.png
-# Generated eval action visualization (tank_twin.visualize_eval --boardroom);
-# a runtime artifact like runs/, served at /eval_viz.gif — not source.
-eval_viz.gif
