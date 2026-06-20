@@ -186,13 +186,23 @@ def test_step_returns_five_tuple_with_bool_flags():
 
 
 def test_step_terminates_on_winner_with_plus_one_reward():
-    env = make_env(win_after=2, winner=0)
+    # Pin the PURE terminal: a zero-shaping RewardConfig (no time / action budget) so the
+    # winning step's reward is exactly the +1 terminal (the budget reward ADDS shaping on
+    # top — that is exercised in the budget-reward tests below). This is the backward-compat
+    # case: budgets == 0 + win/loss ±1 -> the legacy ±1-only terminal.
+    from tank_twin.config import RewardConfig
+
+    env = TankEnv(
+        game_path=None,
+        transport=ScriptedUnity(win_after=2, winner=0),
+        reward_config=RewardConfig(time_total=0.0, action_total=0.0),
+    )
     env.reset(seed=0)
     env.step(np.zeros(5, dtype=np.float32))  # step 1: ongoing
     obs, reward, terminated, truncated, info = env.step(np.zeros(5, dtype=np.float32))
     assert terminated is True
     assert truncated is False
-    assert reward == 1  # winner == P1 (0) -> +1
+    assert reward == 1  # winner == P1 (0) -> +1 (no shaping)
     assert info["winner"] == 0
 
 
@@ -426,6 +436,7 @@ def test_close_swallows_transport_errors_during_end_handshake():
     # No reset(): a connection that drops before any handshake still tears down cleanly.
     env.close()
     assert transport.close_count == 1
+    assert env.conn is None
 
 
 # --- arena single-source: --config forwarding + obs from the same config ----------
@@ -546,4 +557,77 @@ def test_env_precedence_config_path_wins_over_level_path():
     g_pixels = int((env.wall_grid[:, :, G] == 255).sum())
     assert g_pixels == _CUSTOM1_G_PIXELS
     assert env.config_path == _STREAMING_CONFIG.resolve()
-    assert env.conn is None
+
+
+# --- budget-based reward wired through env.step (Change 2) -------------------------
+#
+# The action cost is computed IN env.step (the agent's action is in hand). These assert
+# the per-step penalties accrue and the ±1 terminal is ADDED, using the env's default
+# RewardConfig (time_total -1, action_total -0.1, action_norm 5) over max_steps == 300.
+
+
+def test_env_default_reward_config_is_cto_reward():
+    from tank_twin.config import RewardConfig
+
+    env = make_env()
+    assert env.reward_config == RewardConfig()
+    assert env.max_episode_length == 300
+
+
+def test_env_continuing_step_accrues_time_penalty_at_zero_action():
+    # Zero action -> action cost 0; a continuing step returns just the per-step time penalty.
+    env = make_env(win_after=5)
+    env.reset(seed=0)
+    _obs, reward, terminated, truncated, _info = env.step(np.zeros(5, dtype=np.float32))
+    assert terminated is False
+    assert truncated is False
+    assert reward == pytest.approx(-1.0 / 300)  # time_total -1 / max 300
+
+
+def test_env_continuing_step_action_cost_scales_with_l1():
+    # A max-L1 action adds the per-step action cost on top of the time penalty.
+    env = make_env(win_after=5)
+    env.reset(seed=0)
+    max_action = np.ones(5, dtype=np.float32)  # L1 == 5 == action_norm
+    _obs, reward, _term, _trunc, _info = env.step(max_action)
+    expected = (-1.0 / 300) + (-0.1 / 300)  # time/step + action/step at max
+    assert reward == pytest.approx(expected)
+
+
+def test_env_terminal_loss_adds_minus_one_onto_penalties():
+    # A late loss: the -1 terminal is ADDED to the accrued time + action penalties (not
+    # overwritten), so the decided-step reward is strictly below -1.
+    env = TankEnv(game_path=None, transport=ScriptedUnity(win_after=2, winner=1))
+    env.reset(seed=0)
+    env.step(np.ones(5, dtype=np.float32))  # ongoing (max action)
+    _obs, reward, terminated, _trunc, _info = env.step(np.ones(5, dtype=np.float32))
+    assert terminated is True
+    expected = -1.0 + (-1.0 / 300) + (-0.1 / 300)  # loss + time/step + action/step
+    assert reward == pytest.approx(expected)
+    assert reward < -1.0
+
+
+def test_env_terminal_win_adds_plus_one_onto_penalties():
+    env = TankEnv(game_path=None, transport=ScriptedUnity(win_after=2, winner=0))
+    env.reset(seed=0)
+    env.step(np.zeros(5, dtype=np.float32))  # ongoing (zero action -> no action cost)
+    _obs, reward, terminated, _trunc, _info = env.step(np.zeros(5, dtype=np.float32))
+    assert terminated is True
+    # zero action -> action cost 0; just +1 win minus the per-step time penalty.
+    assert reward == pytest.approx(1.0 + (-1.0 / 300))
+
+
+def test_env_custom_reward_config_is_honored():
+    # A zero-budget RewardConfig collapses to the legacy ±1-only terminal in env.step.
+    from tank_twin.config import RewardConfig
+
+    env = TankEnv(
+        game_path=None,
+        transport=ScriptedUnity(win_after=2, winner=0),
+        reward_config=RewardConfig(time_total=0.0, action_total=0.0),
+    )
+    env.reset(seed=0)
+    env.step(np.ones(5, dtype=np.float32))  # ongoing, max action -> still 0 (budgets 0)
+    _obs, reward, terminated, _trunc, _info = env.step(np.ones(5, dtype=np.float32))
+    assert terminated is True
+    assert reward == 1.0  # pure +1 terminal, no shaping

@@ -87,3 +87,110 @@ def step_reward(
     truncated = bool(max_steps_reached) and not terminated
 
     return reward, terminated, truncated
+
+
+# --- budget-based reward (CTO; the new env path) --------------------------------------
+#
+# The legacy step_reward above OVERWRITES the reward to ±1 on a decided game; the budget
+# reward instead ACCRUES per-step penalties EVERY step and ADDS the ±1 terminal on the
+# decided step (so a late loss is worse than ±1 alone). The budgets live in
+# tank_twin.config.RewardConfig as FULL-EPISODE totals; the two helpers below convert
+# them to per-step values (the env knows max_episode_length and has the action in hand),
+# and shaped_step_reward composes the per-step penalties with the ±1 terminal.
+#
+# BACKWARD-COMPAT (hard requirement): with time_penalty == 0 and action_cost == 0 and
+# win/loss == ±1, shaped_step_reward returns the SAME (reward, terminated, truncated) as
+# the legacy step_reward — the existing truth-table tests pin step_reward and stay green
+# (it is untouched), and new tests pin the budgets==0 equivalence.
+
+# The 5-dim action box is [-1, 1]^5, so the maximum L1 magnitude is 5.0 (a saturated
+# action). RewardConfig.action_norm defaults to this so L1(action)/action_norm in [0, 1].
+L1_MAX = 5.0
+
+
+def time_penalty_per_step(time_total, max_episode_length):
+    """Convert a full-episode time budget to the per-step time penalty.
+
+    ``time_total`` (e.g. ``-1.0``) spread over ``max_episode_length`` steps (e.g. 300)
+    -> ``-1/300`` per step. Accrues every step (continuing, draw, and the decided step).
+    """
+    return time_total / max_episode_length
+
+
+def action_cost_per_step(action, action_total, max_episode_length, action_norm=L1_MAX):
+    """Per-step action cost = ``(action_total / max_episode_length) * (L1(action)/norm)``.
+
+    Linear in the action's L1 magnitude: ``0`` at zero action; at a CONSTANT MAX action
+    (``L1 == action_norm``) it equals ``action_total / max_episode_length`` per step, so a
+    full episode at max action totals ``action_total`` (e.g. ``-0.1``). ``action`` is any
+    iterable of the 5 action dims; only its magnitude matters (sign-insensitive — L1).
+    """
+    l1 = sum(abs(float(a)) for a in action)
+    return (action_total / max_episode_length) * (l1 / action_norm)
+
+
+def shaped_step_reward(
+    winner=None,
+    *,
+    done=False,
+    survivor=False,
+    time_penalty=0.0,
+    action_cost=0.0,
+    win_reward=1.0,
+    loss_reward=-1.0,
+    max_steps_reached=False,
+    lost_connection=False,
+):
+    """Budget-based ``(reward, terminated, truncated)`` — penalties accrue, ±1 is ADDED.
+
+    Differs from :func:`step_reward` in ONE way: instead of overwriting the reward to ±1
+    on a decided game, it ACCRUES ``time_penalty + action_cost`` every step and ADDS the
+    terminal (``win_reward`` if P1 won, ``loss_reward`` if the opponent won) on the
+    decided step. A draw / winner-less ``done`` terminal contributes only the accrued
+    per-step penalties (no ±1). The ``terminated`` / ``truncated`` split and the
+    ``survivor`` / ``lost_connection`` / ``max_steps`` semantics match ``step_reward``.
+
+    BACKWARD-COMPAT: with ``time_penalty == 0``, ``action_cost == 0`` and
+    ``win/loss == ±1`` this returns the legacy ``step_reward`` numbers byte-for-byte
+    (continuing/draw -> 0.0; P1 win -> +1; opp win -> -1).
+
+    Args:
+        winner: ``0`` (P1/agent), ``1`` (opponent), ``-1`` (explicit draw), or ``None``.
+        done: raw legacy ``"done" in received`` flag (round over, possibly no winner).
+        survivor: survivor-mode terminal flip (same key-presence rule as ``step_reward``).
+        time_penalty: per-step time penalty (already converted from the budget). Accrues
+            on EVERY non-lost-connection step.
+        action_cost: per-step action cost (already converted; magnitude-scaled). Accrues
+            on EVERY non-lost-connection step, INCLUDING through to a loss.
+        win_reward / loss_reward: the terminal added on a decided P1 / opponent win.
+        max_steps_reached: env hit its step-count cap this step (truncation).
+        lost_connection: transport dropped -> reward ``0.0``, truncated (no shaping).
+    """
+    # Transport failure: a flat reward-0 truncation, exactly like step_reward — NOT a
+    # game result, so no shaping accrues either.
+    if lost_connection:
+        return 0.0, False, True
+
+    game_done = done or winner is not None
+
+    # Per-step penalties accrue on every step (continuing, draw, decided, or truncation).
+    reward = time_penalty + action_cost
+    terminated = False
+
+    if game_done:
+        terminated = True
+        if winner is not None and winner != -1:
+            # ADD (not overwrite) the terminal so a late loss is worse than -1 alone.
+            reward += win_reward if winner == PLAYER_1 else loss_reward
+
+    # Survivor flips the terminal COMPONENT (same key-presence rule as the legacy): any
+    # reported winner -> loss_reward, a winner-key-absent terminal -> win_reward. Applied
+    # AFTER the winner branch (matching step_reward), replacing the terminal component
+    # while the accrued per-step penalties are KEPT.
+    if survivor and game_done:
+        winner_reported = winner is not None
+        reward = (time_penalty + action_cost) + (loss_reward if winner_reported else win_reward)
+
+    truncated = bool(max_steps_reached) and not terminated
+
+    return reward, terminated, truncated

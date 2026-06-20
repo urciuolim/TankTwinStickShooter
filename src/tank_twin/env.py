@@ -43,9 +43,14 @@ import numpy as np
 from gymnasium import spaces
 
 from tank_twin.arenas import load_level
+from tank_twin.config import RewardConfig
 from tank_twin.observation import draw_state
 from tank_twin.protocol import Connection
-from tank_twin.rewards import step_reward
+from tank_twin.rewards import (
+    action_cost_per_step,
+    shaped_step_reward,
+    time_penalty_per_step,
+)
 from tank_twin.state import flip_state
 
 # Resolved relative to the repo root so the env works from any cwd.
@@ -144,9 +149,16 @@ class TankEnv(gymnasium.Env):
             (if given); else the default config (custom1, single-sourced with the build).
         env_p: pixels per game-grid square. **3** so the obs is (36, 60, 3) for the CNN.
         rand_opp: random opponent (the only opponent mode this single-agent port ships).
-        max_steps: step-count cap; reaching it truncates (never terminates).
-        time_reward: per-step shaping reward while the round continues.
-        survivor: survivor-mode reward flip (passed through to ``rewards.step_reward``).
+        max_steps: step-count cap; reaching it truncates (never terminates). Doubles as
+            ``max_episode_length`` for the budget->per-step reward conversion.
+        reward_config: a :class:`tank_twin.config.RewardConfig` (budget-based reward).
+            Defaults to ``RewardConfig()`` = the CTO reward (win +1 / loss -1 / time_total
+            -1 / action_total -0.1 / action_norm 5). Per-step penalties (time + L1-scaled
+            action cost) accrue EVERY step; the ±1 terminal is ADDED on the decided step.
+        time_reward: legacy per-step shaping reward param, kept for constructor
+            back-compat. The reward path now derives per-step shaping from ``reward_config``
+            (NOT this value); it is retained only so old call sites still construct.
+        survivor: survivor-mode terminal flip (threaded into ``rewards.shaped_step_reward``).
         game_ip / game_port / my_port / sock_timeout / num_connection_attempts /
         game_log_path: real-socket connection params (ignored when a transport is injected).
     """
@@ -164,6 +176,7 @@ class TankEnv(gymnasium.Env):
         rand_opp=True,
         image_based=True,
         max_steps=300,
+        reward_config=None,
         time_reward=0.0,
         survivor=False,
         game_ip="127.0.0.1",
@@ -191,6 +204,13 @@ class TankEnv(gymnasium.Env):
         self.max_steps = max_steps
         self.time_reward = time_reward
         self.survivor = survivor
+
+        # Budget-based reward (CTO). max_episode_length == max_steps (300): the per-step
+        # time penalty / action cost are the full-episode budgets divided by this. Default
+        # RewardConfig() is the new reward (win +1 / loss -1 / time_total -1 / action_total
+        # -0.1 / action_norm 5). Penalties accrue every step; the ±1 terminal is ADDED.
+        self.reward_config = RewardConfig() if reward_config is None else reward_config
+        self.max_episode_length = max_steps
 
         # --- arena single-source: ONE config feeds both the build and the obs ----------
         # PRECEDENCE: config_path (forwarded to the build AND read for the obs arena) >
@@ -340,23 +360,38 @@ class TankEnv(gymnasium.Env):
 
         The opponent action is drawn from ``self.np_random`` (NOT a bare ``np.random``)
         so a seeded ``reset`` makes the whole episode reproducible. The reward / episode
-        boundary is computed by ``rewards.step_reward`` (gymnasium ``terminated`` /
-        ``truncated``). On a dropped connection the step truncates with reward 0 (legacy
-        no-winner end), via ``step_reward(lost_connection=True)``.
+        boundary is computed by ``rewards.shaped_step_reward`` (gymnasium ``terminated`` /
+        ``truncated``): per-step time + (L1-scaled) action penalties accrue EVERY step from
+        ``self.reward_config``, and the ±1 terminal is ADDED on the decided step. The action
+        cost is computed HERE because the agent's action is in hand. On a dropped connection
+        the step truncates with reward 0 (legacy no-winner end), via
+        ``shaped_step_reward(lost_connection=True)``.
         """
         action = np.asarray(action, dtype=np.float32)
         opp_action = self.np_random.uniform(-1.0, 1.0, 5)
 
         message = {1: action.tolist(), 2: opp_action.tolist()}
 
+        # Budget -> per-step reward components. Time penalty is constant per step; the
+        # action cost scales with the agent's (key-1) action L1 magnitude. Both derive from
+        # self.reward_config and self.max_episode_length (== max_steps).
+        rc = self.reward_config
+        time_penalty = time_penalty_per_step(rc.time_total, self.max_episode_length)
+        action_cost = action_cost_per_step(
+            action, rc.action_total, self.max_episode_length, rc.action_norm
+        )
+
         try:
             self.conn.send(message)
             received = self.conn.receive()
         except ConnectionError:
-            reward, terminated, truncated = step_reward(
+            reward, terminated, truncated = shaped_step_reward(
                 lost_connection=True,
                 survivor=self.survivor,
-                time_reward=self.time_reward,
+                time_penalty=time_penalty,
+                action_cost=action_cost,
+                win_reward=rc.win_reward,
+                loss_reward=rc.loss_reward,
             )
             return self.state, reward, terminated, truncated, {"lost_connection": True}
 
@@ -368,11 +403,14 @@ class TankEnv(gymnasium.Env):
         done = bool("done" in received)
         max_steps_reached = self.step_counter >= self.max_steps
 
-        reward, terminated, truncated = step_reward(
+        reward, terminated, truncated = shaped_step_reward(
             winner=winner,
             done=done,
             survivor=self.survivor,
-            time_reward=self.time_reward,
+            time_penalty=time_penalty,
+            action_cost=action_cost,
+            win_reward=rc.win_reward,
+            loss_reward=rc.loss_reward,
             max_steps_reached=max_steps_reached,
         )
 

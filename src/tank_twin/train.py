@@ -40,6 +40,7 @@ from stable_baselines3.common.callbacks import CheckpointCallback
 from stable_baselines3.common.logger import configure
 from stable_baselines3.common.utils import set_random_seed
 
+from tank_twin.config import RewardConfig
 from tank_twin.env import TankEnv
 from tank_twin.features import PretrainedNatureCNN
 
@@ -70,6 +71,7 @@ def train_local(
     timesteps: int = DEFAULT_TIMESTEPS,
     game_path: str | Path | None = None,
     env_factory: Callable[[], gymnasium.Env] | None = None,
+    reward_config: RewardConfig | None = None,
     seed: int = 0,
     unfreeze: bool = False,
     run_name: str = "m1-local",
@@ -97,6 +99,10 @@ def train_local(
         env_factory: zero-arg callable returning a built env — the TEST seam (inject a
             ``TankEnv`` with a fake transport so no Unity / subprocess spawns). When given,
             ``game_path`` is not used.
+        reward_config: a :class:`tank_twin.config.RewardConfig` (budget-based reward) wired
+            into the real-Unity ``TankEnv``; defaults to ``RewardConfig()`` (the CTO reward).
+            Recorded (resolved) into the run manifest. Ignored when ``env_factory`` builds
+            the env (the factory owns the env's reward config in that case).
         seed: master seed; threaded through ``set_random_seed`` (numpy / torch / python),
             the env ``reset``, and ``PPO(seed=...)`` for reproducibility.
         unfreeze: if True, the pretrained CNN is loaded but left TRAINABLE
@@ -122,6 +128,7 @@ def train_local(
         )
 
     device = _resolve_device(device)
+    resolved_reward_config = reward_config if reward_config is not None else RewardConfig()
 
     # Seed everything BEFORE building the env / model so numpy/torch/python RNGs are
     # deterministic. set_random_seed also seeds torch CUDA when using_cuda is True.
@@ -135,7 +142,13 @@ def train_local(
     if env_factory is not None:
         env = env_factory()
     else:
-        env = TankEnv(game_path=str(game_path), image_based=True, env_p=3, rand_opp=True)
+        env = TankEnv(
+            game_path=str(game_path),
+            image_based=True,
+            env_p=3,
+            rand_opp=True,
+            reward_config=resolved_reward_config,
+        )
 
     # try/finally so env.close() ALWAYS runs — even on an exception or KeyboardInterrupt
     # mid-training. On the real path this reaps the launched Unity subprocess + frees the
@@ -164,17 +177,18 @@ def train_local(
         # --- run manifest (light reproducibility: config the run was built with) ----------
         _write_manifest(
             run_dir / "manifest.json",
-            {
-                "run_name": run_name,
-                "timesteps": timesteps,
-                "seed": seed,
-                "frozen": not unfreeze,
-                "device": device,
-                "n_steps": n_steps,
-                "batch_size": batch_size,
-                "learning_rate": learning_rate,
-                "game_path": None if game_path is None else str(game_path),
-            },
+            _build_manifest(
+                run_name=run_name,
+                timesteps=timesteps,
+                seed=seed,
+                frozen=not unfreeze,
+                device=device,
+                n_steps=n_steps,
+                batch_size=batch_size,
+                learning_rate=learning_rate,
+                game_path=game_path,
+                reward_config=resolved_reward_config,
+            ),
         )
 
         # --- metrics logging (single mechanism: set_logger with 3 formats) ----------------
@@ -200,6 +214,38 @@ def train_local(
         return model
     finally:
         env.close()
+
+
+def _build_manifest(
+    *,
+    run_name: str,
+    timesteps: int,
+    seed: int,
+    frozen: bool,
+    device: str,
+    n_steps: int,
+    batch_size: int,
+    learning_rate: float,
+    game_path: str | Path | None,
+    reward_config: RewardConfig,
+) -> dict:
+    """Build the run-manifest dict (unit-testable WITHOUT running SB3).
+
+    Records the RESOLVED RewardConfig (as a plain dict) so a run is reproducible from its
+    manifest alone — including which budget-based reward it trained under.
+    """
+    return {
+        "run_name": run_name,
+        "timesteps": timesteps,
+        "seed": seed,
+        "frozen": frozen,
+        "device": device,
+        "n_steps": n_steps,
+        "batch_size": batch_size,
+        "learning_rate": learning_rate,
+        "game_path": None if game_path is None else str(game_path),
+        "reward_config": reward_config.to_dict(),
+    }
 
 
 def _write_manifest(path: Path, data: dict) -> None:
@@ -258,7 +304,69 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_false",
         help="Disable the progress.csv + tfevents metrics logger (default: enabled).",
     )
+    # --- budget-based reward (RewardConfig) ----------------------------------------
+    # --reward-config loads a STRICT-JSON RewardConfig file (overrides the defaults); the
+    # per-knob flags below override the file (CLI > file > defaults). Override flags default
+    # to None so "unset" is distinguishable from an explicit value.
+    parser.add_argument(
+        "--reward-config",
+        type=Path,
+        default=None,
+        help="STRICT-JSON RewardConfig file (overrides defaults; per-knob flags override it).",
+    )
+    parser.add_argument(
+        "--win-reward", type=float, default=None, help="Override RewardConfig.win_reward."
+    )
+    parser.add_argument(
+        "--loss-reward", type=float, default=None, help="Override RewardConfig.loss_reward."
+    )
+    parser.add_argument(
+        "--time-penalty-total",
+        type=float,
+        default=None,
+        help="Override RewardConfig.time_total (full-episode time budget).",
+    )
+    parser.add_argument(
+        "--action-cost-total",
+        type=float,
+        default=None,
+        help="Override RewardConfig.action_total (full-episode action-cost budget at max action).",
+    )
+    parser.add_argument(
+        "--action-norm",
+        type=float,
+        default=None,
+        help="Override RewardConfig.action_norm (L1_MAX; default 5.0).",
+    )
     return parser
+
+
+def _resolve_reward_config(args: argparse.Namespace) -> RewardConfig:
+    """Resolve the run's RewardConfig with precedence CLI flags > file > defaults.
+
+    Starts from ``RewardConfig()`` (defaults), replaces it with ``--reward-config`` file
+    values if given (STRICT json via ``RewardConfig.load``), then applies any per-knob CLI
+    overrides that were explicitly set (non-``None``).
+    """
+    base = RewardConfig()
+    if args.reward_config is not None:
+        base = RewardConfig.load(args.reward_config)
+
+    overrides = {}
+    if args.win_reward is not None:
+        overrides["win_reward"] = args.win_reward
+    if args.loss_reward is not None:
+        overrides["loss_reward"] = args.loss_reward
+    if args.time_penalty_total is not None:
+        overrides["time_total"] = args.time_penalty_total
+    if args.action_cost_total is not None:
+        overrides["action_total"] = args.action_cost_total
+    if args.action_norm is not None:
+        overrides["action_norm"] = args.action_norm
+
+    if overrides:
+        base = RewardConfig.from_dict({**base.to_dict(), **overrides})
+    return base
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -267,6 +375,7 @@ def main(argv: list[str] | None = None) -> None:
     train_local(
         timesteps=args.timesteps,
         game_path=args.game_path,
+        reward_config=_resolve_reward_config(args),
         seed=args.seed,
         unfreeze=args.unfreeze,
         run_name=args.run_name,
