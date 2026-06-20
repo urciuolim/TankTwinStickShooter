@@ -117,6 +117,7 @@ def train_local(
     runs_dir: str | Path = DEFAULT_RUNS_DIR,
     models_dir: str | Path = DEFAULT_MODELS_DIR,
     checkpoint_freq: int = 50_000,
+    resume_from: str | Path | None = None,
     verbose: int = 1,
     log_metrics: bool = True,
 ) -> PPO:
@@ -162,6 +163,13 @@ def train_local(
         n_steps / batch_size / learning_rate: PPO rollout / optimization knobs.
         runs_dir / models_dir: output roots (defaulting to the repo's ``runs`` / ``models``).
         checkpoint_freq: env-steps between checkpoints (``CheckpointCallback``).
+        resume_from: optional path to a saved checkpoint ``.zip`` to RESUME from. When set,
+            instead of constructing a fresh ``PPO(...)`` the model is loaded via
+            ``PPO.load(resume_from, env=env, device=device)`` and trained with
+            ``reset_num_timesteps=False`` so the timestep counter CONTINUES from the
+            checkpoint (the per-step gating / schedules pick up where they left off). When
+            ``None`` (default) the fresh-PPO path is unchanged (``reset_num_timesteps=True``).
+            The resume lineage (the checkpoint path or ``None``) is recorded in the manifest.
         verbose: SB3 verbosity (1 -> the default logger prints ``ep_rew_mean``).
         log_metrics: if True (default), attach an SB3 logger that writes
             ``progress.csv`` + TensorBoard ``tfevents`` into ``runs/<run_name>/``
@@ -215,24 +223,31 @@ def train_local(
     # bound socket port (the orphaned TankTwinStickShooter.exe we used to kill by hand);
     # on the fake-transport test seam env.close() is a cheap no-op.
     try:
-        # --- frozen pretrained CNN wired via policy_kwargs (Route B; see module docstring) -
-        policy_kwargs = {
-            "features_extractor_class": PretrainedNatureCNN,
-            "features_extractor_kwargs": {"freeze": not unfreeze},
-            # normalize_images left at SB3 default True (pretrain divided by 255).
-        }
+        # --- model: fresh PPO, or RESUME from a checkpoint .zip -----------------------------
+        # resume_from set -> PPO.load(.zip, env=env) reattaches the saved policy/optimizer to
+        # THIS env; learn() below runs with reset_num_timesteps=False so the timestep counter
+        # continues. resume_from None -> the unchanged fresh-PPO path (frozen pretrained CNN
+        # wired via policy_kwargs, Route B; see module docstring).
+        if resume_from is not None:
+            model = PPO.load(str(resume_from), env=env, device=device)
+        else:
+            policy_kwargs = {
+                "features_extractor_class": PretrainedNatureCNN,
+                "features_extractor_kwargs": {"freeze": not unfreeze},
+                # normalize_images left at SB3 default True (pretrain divided by 255).
+            }
 
-        model = PPO(
-            policy="CnnPolicy",
-            env=env,
-            learning_rate=learning_rate,
-            n_steps=n_steps,
-            batch_size=batch_size,
-            policy_kwargs=policy_kwargs,
-            seed=seed,
-            device=device,
-            verbose=verbose,
-        )
+            model = PPO(
+                policy="CnnPolicy",
+                env=env,
+                learning_rate=learning_rate,
+                n_steps=n_steps,
+                batch_size=batch_size,
+                policy_kwargs=policy_kwargs,
+                seed=seed,
+                device=device,
+                verbose=verbose,
+            )
 
         # --- run manifest (light reproducibility: config the run was built with) ----------
         _write_manifest(
@@ -249,6 +264,7 @@ def train_local(
                 game_path=game_path,
                 config_path=config_path,
                 map_rotation=map_rotation,
+                resume_from=resume_from,
                 reward_config=resolved_reward_config,
             ),
         )
@@ -269,7 +285,14 @@ def train_local(
             name_prefix=run_name,
         )
 
-        model.learn(total_timesteps=timesteps, callback=checkpoint_cb, progress_bar=False)
+        # reset_num_timesteps=False ONLY on the resume path so the counter continues from the
+        # checkpoint; the fresh path keeps SB3's default (True) -> the counter starts at 0.
+        model.learn(
+            total_timesteps=timesteps,
+            callback=checkpoint_cb,
+            progress_bar=False,
+            reset_num_timesteps=(resume_from is None),
+        )
 
         final_path = Path(models_dir) / f"{run_name}.zip"
         model.save(str(final_path))
@@ -291,15 +314,17 @@ def _build_manifest(
     game_path: str | Path | None,
     config_path: str | Path | None = None,
     map_rotation: list[str | Path] | None = None,
+    resume_from: str | Path | None = None,
     reward_config: RewardConfig,
 ) -> dict:
     """Build the run-manifest dict (unit-testable WITHOUT running SB3).
 
     Records the RESOLVED RewardConfig (as a plain dict), the ``config_path`` (the arena
-    single-source the run trained on, as a string or ``None``), AND the ``map_rotation``
-    (the list of map-config paths the run rotated over, as a list of strings or ``None``) so
-    a run is reproducible from its manifest alone — which map(s) AND which budget-based
-    reward it trained under.
+    single-source the run trained on, as a string or ``None``), the ``map_rotation``
+    (the list of map-config paths the run rotated over, as a list of strings or ``None``),
+    AND the ``resume_from`` lineage (the checkpoint the run resumed from, as a string or
+    ``None``) so a run is reproducible from its manifest alone — which map(s), which reward,
+    and whether it continued an earlier checkpoint.
     """
     return {
         "run_name": run_name,
@@ -313,6 +338,7 @@ def _build_manifest(
         "game_path": None if game_path is None else str(game_path),
         "config_path": None if config_path is None else str(config_path),
         "map_rotation": None if map_rotation is None else [str(m) for m in map_rotation],
+        "resume_from": None if resume_from is None else str(resume_from),
         "reward_config": reward_config.to_dict(),
     }
 
@@ -392,6 +418,21 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=("auto", "cpu", "cuda"),
         default="auto",
         help="Torch device (auto -> cuda if available, else cpu).",
+    )
+    parser.add_argument(
+        "--checkpoint-freq",
+        type=int,
+        default=50_000,
+        help="Env-steps between checkpoints (CheckpointCallback save_freq).",
+    )
+    parser.add_argument(
+        "--resume-from",
+        type=Path,
+        default=None,
+        help=(
+            "Resume training from a saved checkpoint .zip (PPO.load + learn with "
+            "reset_num_timesteps=False). Default: fresh PPO. Recorded in the run manifest."
+        ),
     )
     parser.add_argument("--n-steps", type=int, default=DEFAULT_N_STEPS, help="PPO rollout length.")
     parser.add_argument(
@@ -490,6 +531,8 @@ def main(argv: list[str] | None = None) -> None:
         n_steps=args.n_steps,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
+        checkpoint_freq=args.checkpoint_freq,
+        resume_from=args.resume_from,
         log_metrics=args.log_metrics,
     )
 
