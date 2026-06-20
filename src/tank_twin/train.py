@@ -71,6 +71,7 @@ def train_local(
     timesteps: int = DEFAULT_TIMESTEPS,
     game_path: str | Path | None = None,
     env_factory: Callable[[], gymnasium.Env] | None = None,
+    config_path: str | Path | None = None,
     reward_config: RewardConfig | None = None,
     seed: int = 0,
     unfreeze: bool = False,
@@ -99,6 +100,14 @@ def train_local(
         env_factory: zero-arg callable returning a built env — the TEST seam (inject a
             ``TankEnv`` with a fake transport so no Unity / subprocess spawns). When given,
             ``game_path`` is not used.
+        config_path: the external game ``config.json`` (the arena single-source from Change
+            1). Threaded into the real-Unity ``TankEnv`` so it is (a) FORWARDED to the build
+            launch as ``--config <abspath>`` AND (b) read for the obs wall grid — one file
+            picks the arena for both the simulator and the obs. When ``None`` (default),
+            today's behavior is preserved: the env falls back to the build's StreamingAssets
+            config (custom1, single-sourced with the build). Recorded into the run manifest.
+            Ignored when ``env_factory`` builds the env (the factory owns the env — same as
+            ``reward_config``).
         reward_config: a :class:`tank_twin.config.RewardConfig` (budget-based reward) wired
             into the real-Unity ``TankEnv``; defaults to ``RewardConfig()`` (the CTO reward).
             Recorded (resolved) into the run manifest. Ignored when ``env_factory`` builds
@@ -147,6 +156,7 @@ def train_local(
             image_based=True,
             env_p=3,
             rand_opp=True,
+            config_path=config_path,
             reward_config=resolved_reward_config,
         )
 
@@ -187,6 +197,7 @@ def train_local(
                 batch_size=batch_size,
                 learning_rate=learning_rate,
                 game_path=game_path,
+                config_path=config_path,
                 reward_config=resolved_reward_config,
             ),
         )
@@ -227,12 +238,14 @@ def _build_manifest(
     batch_size: int,
     learning_rate: float,
     game_path: str | Path | None,
+    config_path: str | Path | None = None,
     reward_config: RewardConfig,
 ) -> dict:
     """Build the run-manifest dict (unit-testable WITHOUT running SB3).
 
-    Records the RESOLVED RewardConfig (as a plain dict) so a run is reproducible from its
-    manifest alone — including which budget-based reward it trained under.
+    Records the RESOLVED RewardConfig (as a plain dict) AND the ``config_path`` (the arena
+    single-source the run trained on, as a string or ``None``) so a run is reproducible from
+    its manifest alone — which map AND which budget-based reward it trained under.
     """
     return {
         "run_name": run_name,
@@ -244,6 +257,7 @@ def _build_manifest(
         "batch_size": batch_size,
         "learning_rate": learning_rate,
         "game_path": None if game_path is None else str(game_path),
+        "config_path": None if config_path is None else str(config_path),
         "reward_config": reward_config.to_dict(),
     }
 
@@ -269,6 +283,23 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         required=True,
         help="Path to the Unity build executable to train against.",
+    )
+    # --- arena single-source (Change 1): one config.json picks the map for BOTH the build
+    # launch (forwarded as --config <abspath>) AND the obs wall grid. --map is an explicit
+    # ALIAS for --config (same dest); both option strings write config_path so the CTO can
+    # type whichever reads best. Default None preserves today's behavior (the env falls back
+    # to the build's StreamingAssets config / custom1).
+    parser.add_argument(
+        "--config",
+        "--map",
+        dest="config_path",
+        type=Path,
+        default=None,
+        help=(
+            "External game config.json: the SINGLE SOURCE of the arena — forwarded to the "
+            "build AND read for the obs grid (--map is an alias). Default: the build's "
+            "StreamingAssets config."
+        ),
     )
     parser.add_argument("--seed", type=int, default=0, help="Master seed (reproducibility).")
     parser.add_argument(
@@ -375,6 +406,7 @@ def main(argv: list[str] | None = None) -> None:
     train_local(
         timesteps=args.timesteps,
         game_path=args.game_path,
+        config_path=args.config_path,
         reward_config=_resolve_reward_config(args),
         seed=args.seed,
         unfreeze=args.unfreeze,

@@ -4,6 +4,10 @@ RewardConfig is the CTO's budget-based reward, parameterized by full-episode bud
 These pin: the new defaults, strict-JSON loading (reject malformed / unknown keys), the
 round-trip dict view, the CLI/file/default override precedence in train._resolve_reward_config,
 and that train._build_manifest records the RESOLVED RewardConfig (built WITHOUT running SB3).
+
+Also pins the Change-1 trainer wiring: train._build_parser exposes --config and its --map
+alias (both -> the same config_path dest) and train._build_manifest records that config_path
+(the arena single-source the run trained on) — all WITHOUT running SB3.
 """
 
 import json
@@ -162,6 +166,29 @@ def test_build_manifest_records_resolved_reward_config():
     assert manifest["reward_config"] == rc.to_dict()
     assert manifest["reward_config"]["win_reward"] == 2.0
     assert manifest["reward_config"]["action_total"] == -0.2
+    # config_path defaults to None (no map given) but the key is ALWAYS present.
+    assert "config_path" in manifest
+    assert manifest["config_path"] is None
+
+
+def test_build_manifest_records_config_path_when_given():
+    # The manifest records WHICH map (arena single-source) the run trained on, as a string.
+    from tank_twin.train import _build_manifest
+
+    manifest = _build_manifest(
+        run_name="r",
+        timesteps=100,
+        seed=0,
+        frozen=True,
+        device="cpu",
+        n_steps=32,
+        batch_size=16,
+        learning_rate=3e-4,
+        game_path="C:/builds/game.exe",
+        config_path="C:/arenas/custom1/config.json",
+        reward_config=RewardConfig(),
+    )
+    assert manifest["config_path"] == "C:/arenas/custom1/config.json"
 
 
 def test_build_manifest_is_strict_json_serializable():
@@ -182,3 +209,39 @@ def test_build_manifest_is_strict_json_serializable():
     # Serializes cleanly (the manifest is written as strict JSON).
     text = json.dumps(manifest)
     assert json.loads(text)["reward_config"]["time_total"] == -1.0
+
+
+# --- train.py CLI: --config / --map arena single-source flag (Change 1 trainer wiring) ---
+
+
+def test_parser_config_flag_sets_config_path():
+    from pathlib import Path
+
+    from tank_twin.train import _build_parser
+
+    args = _build_parser().parse_args(
+        ["--game-path", "C:/builds/game.exe", "--config", "C:/arenas/custom1/config.json"]
+    )
+    assert args.config_path == Path("C:/arenas/custom1/config.json")
+
+
+def test_parser_map_alias_resolves_to_same_dest_as_config():
+    # --map is an explicit alias for --config: both write the SAME config_path dest.
+    from tank_twin.train import _build_parser
+
+    via_config = _build_parser().parse_args(
+        ["--game-path", "C:/b/g.exe", "--config", "C:/arenas/m/config.json"]
+    )
+    via_map = _build_parser().parse_args(
+        ["--game-path", "C:/b/g.exe", "--map", "C:/arenas/m/config.json"]
+    )
+    assert via_config.config_path == via_map.config_path
+    assert via_map.config_path is not None
+
+
+def test_parser_config_path_defaults_to_none():
+    # No --config / --map -> config_path is None (env falls back to the build's config).
+    from tank_twin.train import _build_parser
+
+    args = _build_parser().parse_args(["--game-path", "C:/builds/game.exe"])
+    assert args.config_path is None
