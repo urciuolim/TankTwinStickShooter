@@ -148,5 +148,32 @@ namespace TankTwinStickShooter.EditModeTests
 
             Assert.AreEqual(expected, driver.ResolveArenaPath(configPath, arenaRelative));
         }
+
+        // ---- switch_arena message: path resolution reuses ResolveArenaPath ----
+        // The additive runtime message {"switch_arena": "<path>"} resolves its path through the
+        // SAME ResolveArenaPath helper, anchored on the resolved config path. These pin that
+        // contract so the Python env can rely on absolute-as-is / relative-against-config-dir.
+
+        [Test]
+        public void SwitchArena_AbsolutePath_UsedAsIs()
+        {
+            string absolute = Path.GetFullPath("C:/arenas/switched.json");
+            Assert.AreEqual(absolute,
+                driver.ResolveArenaPath("C:/anything/config.json", absolute));
+        }
+
+        [Test]
+        public void SwitchArena_NonExistingRelativePath_ResolvedAgainstConfigDir()
+        {
+            // A switch_arena value that does not exist on the working dir is anchored to the
+            // resolved config file's directory (same rule as Awake's arena_path).
+            string configPath = "C:/game/StreamingAssets/config.json";
+            string arenaRelative = "Arenas/switched_" + System.Guid.NewGuid().ToString("N") + ".json";
+
+            string configDir = Path.GetDirectoryName(Path.GetFullPath(configPath));
+            string expected = Path.Combine(configDir, arenaRelative);
+
+            Assert.AreEqual(expected, driver.ResolveArenaPath(configPath, arenaRelative));
+        }
     }
 }

@@ -36,12 +36,16 @@ public class DriverController : MonoBehaviour
     bool aiAsync = false;
     int actionFreq = 1;
 
-    [HideInInspector] 
+    [HideInInspector]
     public JObject actions, state, config, arena;
     [HideInInspector]
     public bool verbose = false;
     [HideInInspector]
     public float fixedDeltaTime;
+
+    // Resolved config path, cached in Awake so the optional switch_arena handshake message can
+    // resolve a relative arena path against the config directory (mirrors Awake's arena load).
+    private string resolvedConfigPath;
 
     private void Awake()
     {
@@ -56,6 +60,7 @@ public class DriverController : MonoBehaviour
         }
 
         string configPath = ResolveConfigPath(args);
+        resolvedConfigPath = configPath;
 
         if (instance != null)
         {
@@ -269,6 +274,25 @@ public class DriverController : MonoBehaviour
                 JObject confirmation = JObject.Parse("{restarting:true}");
                 byte[] writeBuffer = Encoding.ASCII.GetBytes(confirmation.ToString());
                 nwStream.Write(writeBuffer, 0, writeBuffer.Length);
+            } else if (message["switch_arena"] != null)
+            {
+                // Optional, additive handshake message. Swaps the cached arena so the NEXT
+                // LoadScene("Arena") (which fires at the start of every episode via Reset())
+                // re-places walls from the new arena in GameController.Awake(). We do NOT reload
+                // the scene here: during the pre-start handshake the active scene may be "Driver",
+                // and the start/restart handshake already triggers an Arena load momentarily.
+                string switchArenaPath = message["switch_arena"].Value<string>();
+                Debug.Log("Switch arena received: " + switchArenaPath);
+                string resolvedArenaPath = ResolveArenaPath(resolvedConfigPath, switchArenaPath);
+                using (StreamReader arenaFile = File.OpenText(resolvedArenaPath))
+                using (JsonTextReader arenaReader = new JsonTextReader(arenaFile))
+                {
+                    instance.arena = (JObject)JToken.ReadFrom(arenaReader);
+                }
+                JObject confirmation = JObject.Parse("{arena_switched:true}");
+                byte[] writeBuffer = Encoding.ASCII.GetBytes(confirmation.ToString());
+                nwStream.Write(writeBuffer, 0, writeBuffer.Length);
+                Debug.Log("Arena switched to: " + resolvedArenaPath);
             }
         }
     }
