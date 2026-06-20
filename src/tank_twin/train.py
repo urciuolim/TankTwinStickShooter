@@ -36,10 +36,11 @@ from pathlib import Path
 
 import gymnasium
 from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import CheckpointCallback
+from stable_baselines3.common.callbacks import CallbackList, CheckpointCallback
 from stable_baselines3.common.logger import configure
 from stable_baselines3.common.utils import set_random_seed
 
+from tank_twin.callbacks import EvalWinRateCallback
 from tank_twin.config import RewardConfig
 from tank_twin.env import TankEnv
 from tank_twin.features import PretrainedNatureCNN
@@ -118,6 +119,8 @@ def train_local(
     models_dir: str | Path = DEFAULT_MODELS_DIR,
     checkpoint_freq: int = 50_000,
     resume_from: str | Path | None = None,
+    eval_freq: int = 0,
+    eval_episodes: int = 10,
     verbose: int = 1,
     log_metrics: bool = True,
 ) -> PPO:
@@ -170,6 +173,13 @@ def train_local(
             checkpoint (the per-step gating / schedules pick up where they left off). When
             ``None`` (default) the fresh-PPO path is unchanged (``reset_num_timesteps=True``).
             The resume lineage (the checkpoint path or ``None``) is recorded in the manifest.
+        eval_freq: env-steps between periodic greedy win-rate evaluations (vs. the random
+            opponent). ``> 0`` attaches an :class:`tank_twin.callbacks.EvalWinRateCallback`
+            (combined with the ``CheckpointCallback`` via ``CallbackList``) that logs
+            ``eval/win_rate`` at rollout boundaries. ``0`` (default) disables eval. Recorded
+            in the manifest.
+        eval_episodes: greedy episodes per evaluation when ``eval_freq > 0``. Recorded in the
+            manifest.
         verbose: SB3 verbosity (1 -> the default logger prints ``ep_rew_mean``).
         log_metrics: if True (default), attach an SB3 logger that writes
             ``progress.csv`` + TensorBoard ``tfevents`` into ``runs/<run_name>/``
@@ -265,6 +275,8 @@ def train_local(
                 config_path=config_path,
                 map_rotation=map_rotation,
                 resume_from=resume_from,
+                eval_freq=eval_freq,
+                eval_episodes=eval_episodes,
                 reward_config=resolved_reward_config,
             ),
         )
@@ -285,11 +297,23 @@ def train_local(
             name_prefix=run_name,
         )
 
+        # Periodic greedy eval (Feature 3): when eval_freq > 0, attach the rollout-boundary
+        # EvalWinRateCallback alongside the checkpoint callback via CallbackList. eval_freq == 0
+        # keeps today's single-callback behavior (no eval). The eval seed mirrors the run seed
+        # so the opponent draws are reproducible across evaluations.
+        if eval_freq > 0:
+            eval_cb = EvalWinRateCallback(
+                eval_freq=eval_freq, eval_episodes=eval_episodes, seed=seed, verbose=verbose
+            )
+            callbacks = CallbackList([checkpoint_cb, eval_cb])
+        else:
+            callbacks = checkpoint_cb
+
         # reset_num_timesteps=False ONLY on the resume path so the counter continues from the
         # checkpoint; the fresh path keeps SB3's default (True) -> the counter starts at 0.
         model.learn(
             total_timesteps=timesteps,
-            callback=checkpoint_cb,
+            callback=callbacks,
             progress_bar=False,
             reset_num_timesteps=(resume_from is None),
         )
@@ -315,6 +339,8 @@ def _build_manifest(
     config_path: str | Path | None = None,
     map_rotation: list[str | Path] | None = None,
     resume_from: str | Path | None = None,
+    eval_freq: int = 0,
+    eval_episodes: int = 10,
     reward_config: RewardConfig,
 ) -> dict:
     """Build the run-manifest dict (unit-testable WITHOUT running SB3).
@@ -322,9 +348,10 @@ def _build_manifest(
     Records the RESOLVED RewardConfig (as a plain dict), the ``config_path`` (the arena
     single-source the run trained on, as a string or ``None``), the ``map_rotation``
     (the list of map-config paths the run rotated over, as a list of strings or ``None``),
-    AND the ``resume_from`` lineage (the checkpoint the run resumed from, as a string or
-    ``None``) so a run is reproducible from its manifest alone — which map(s), which reward,
-    and whether it continued an earlier checkpoint.
+    the ``resume_from`` lineage (the checkpoint the run resumed from, as a string or
+    ``None``), AND the periodic-eval cadence (``eval_freq`` / ``eval_episodes``) so a run is
+    reproducible from its manifest alone — which map(s), which reward, whether it continued
+    an earlier checkpoint, and how it was evaluated.
     """
     return {
         "run_name": run_name,
@@ -339,6 +366,8 @@ def _build_manifest(
         "config_path": None if config_path is None else str(config_path),
         "map_rotation": None if map_rotation is None else [str(m) for m in map_rotation],
         "resume_from": None if resume_from is None else str(resume_from),
+        "eval_freq": eval_freq,
+        "eval_episodes": eval_episodes,
         "reward_config": reward_config.to_dict(),
     }
 
@@ -433,6 +462,22 @@ def _build_parser() -> argparse.ArgumentParser:
             "Resume training from a saved checkpoint .zip (PPO.load + learn with "
             "reset_num_timesteps=False). Default: fresh PPO. Recorded in the run manifest."
         ),
+    )
+    # --- periodic greedy eval (Feature 3): eval/win_rate at rollout boundaries ----------
+    parser.add_argument(
+        "--eval-freq",
+        type=int,
+        default=0,
+        help=(
+            "Env-steps between periodic greedy win-rate evaluations vs. the random opponent "
+            "(logged as eval/win_rate). 0 (default) = OFF (no eval callback)."
+        ),
+    )
+    parser.add_argument(
+        "--eval-episodes",
+        type=int,
+        default=10,
+        help="Greedy episodes per evaluation when --eval-freq > 0.",
     )
     parser.add_argument("--n-steps", type=int, default=DEFAULT_N_STEPS, help="PPO rollout length.")
     parser.add_argument(
@@ -533,6 +578,8 @@ def main(argv: list[str] | None = None) -> None:
         learning_rate=args.learning_rate,
         checkpoint_freq=args.checkpoint_freq,
         resume_from=args.resume_from,
+        eval_freq=args.eval_freq,
+        eval_episodes=args.eval_episodes,
         log_metrics=args.log_metrics,
     )
 

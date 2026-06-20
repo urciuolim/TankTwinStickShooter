@@ -5,10 +5,11 @@ helper WITHOUT running SB3 / PPO / Unity (the heavy round-trip is the e2e test).
 
 * Feature 1: ``--maps`` / ``--map-rotation`` resolution + the manifest ``map_rotation`` field;
 * Feature 2: ``--checkpoint-freq`` + ``--resume-from`` flags flow to the parser, and
-  ``_build_manifest`` records the ``resume_from`` lineage.
+  ``_build_manifest`` records the ``resume_from`` lineage;
+* Feature 3: ``--eval-freq`` + ``--eval-episodes`` flags + the manifest eval fields.
 
-The Feature-3 eval flag/manifest plumbing + the eval-callback behavior (rollout-boundary
-gating + buffer repair) are pinned in ``tests/test_callbacks.py``.
+The Feature-3 eval-CALLBACK behavior (rollout-boundary gating + buffer repair) is pinned in
+``tests/test_callbacks.py``; this file pins the flag/manifest plumbing.
 """
 
 from pathlib import Path
@@ -113,3 +114,36 @@ def test_manifest_records_resume_from_lineage():
 
 def test_manifest_resume_from_none_when_fresh():
     assert _manifest()["resume_from"] is None
+
+
+# --- Feature 3: --eval-freq + --eval-episodes parser + manifest ------------------------
+
+
+def test_eval_freq_default_is_off():
+    args = _build_parser().parse_args(["--game-path", "g.exe"])
+    assert args.eval_freq == 0  # 0 == OFF (no eval callback)
+
+
+def test_eval_freq_and_episodes_flow_to_parser():
+    args = _build_parser().parse_args(
+        ["--game-path", "g.exe", "--eval-freq", "5000", "--eval-episodes", "25"]
+    )
+    assert args.eval_freq == 5000
+    assert args.eval_episodes == 25
+
+
+def test_eval_episodes_default():
+    args = _build_parser().parse_args(["--game-path", "g.exe"])
+    assert args.eval_episodes == 10
+
+
+def test_manifest_records_eval_fields():
+    m = _manifest(eval_freq=5000, eval_episodes=25)
+    assert m["eval_freq"] == 5000
+    assert m["eval_episodes"] == 25
+
+
+def test_manifest_eval_defaults_when_unset():
+    m = _manifest()
+    assert m["eval_freq"] == 0
+    assert m["eval_episodes"] == 10
