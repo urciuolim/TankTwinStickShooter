@@ -50,6 +50,12 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_RUNS_DIR = _REPO_ROOT / "runs"
 DEFAULT_MODELS_DIR = _REPO_ROOT / "models"
 
+# The shipped 10-map experiment configs (exp-configs/maps/*.json). When the user passes the
+# rotation flag with no value (the sentinel below), the trainer rotates over these, sorted.
+DEFAULT_MAPS_DIR = _REPO_ROOT / "exp-configs" / "maps"
+# argparse const for the rotation flag used with no value -> rotate over DEFAULT_MAPS_DIR.
+ALL_MAPS_SENTINEL = "__all__"
+
 # PPO defaults: sane single-env starting knobs (the GPU smoke / Wave-4 tuning overrides).
 DEFAULT_N_STEPS = 2048
 DEFAULT_BATCH_SIZE = 64
@@ -66,12 +72,40 @@ def _resolve_device(device: str) -> str:
     return device
 
 
+def _resolve_map_rotation(values: list[str] | None) -> list[Path] | None:
+    """Resolve the ``--maps`` flag value into a list of map-config paths (or ``None``).
+
+    Precedence / semantics (matches the CLI contract). With ``argparse`` ``nargs="*"`` the
+    flag passed with NO value yields an empty list ``[]`` (the "all maps" sentinel); the flag
+    ABSENT keeps the ``default=None``:
+
+    * ``None`` (flag ABSENT) -> ``None``: NO rotation (today's single-map behavior).
+    * ``[]`` or ``[ALL_MAPS_SENTINEL]`` (flag passed with no value) -> every ``*.json`` map
+      config in :data:`DEFAULT_MAPS_DIR`, SORTED (the shipped 10 exp-configs maps).
+    * a single entry that is a DIRECTORY -> every ``*.json`` map config in it, SORTED.
+    * otherwise -> the explicit list of map-config paths, IN THE GIVEN ORDER (rotation order
+      is the user's order; not re-sorted).
+
+    Each returned entry is a map CONFIG path (with an ``arena_path``); ``TankEnv`` resolves it
+    to its arena via ``_arena_path_from_config`` (single source). Returns ``None`` for the
+    absent flag so the env stays in single-map mode.
+    """
+    if values is None:
+        return None
+    if values == [] or values == [ALL_MAPS_SENTINEL]:
+        return sorted(DEFAULT_MAPS_DIR.glob("*.json"))
+    if len(values) == 1 and Path(values[0]).is_dir():
+        return sorted(Path(values[0]).glob("*.json"))
+    return [Path(v) for v in values]
+
+
 def train_local(
     *,
     timesteps: int = DEFAULT_TIMESTEPS,
     game_path: str | Path | None = None,
     env_factory: Callable[[], gymnasium.Env] | None = None,
     config_path: str | Path | None = None,
+    map_rotation: list[str | Path] | None = None,
     reward_config: RewardConfig | None = None,
     seed: int = 0,
     unfreeze: bool = False,
@@ -108,6 +142,13 @@ def train_local(
             config (custom1, single-sourced with the build). Recorded into the run manifest.
             Ignored when ``env_factory`` builds the env (the factory owns the env — same as
             ``reward_config``).
+        map_rotation: optional list of map CONFIG paths to ROTATE over (round-robin, one per
+            ``reset()``) via the additive ``switch_arena`` runtime message — see
+            :class:`tank_twin.env.TankEnv`. When set, the build is launched ONCE on the FIRST
+            map's config (so it boots on a valid rotation arena) and the env switches maps at
+            runtime (no relaunch); if ``config_path`` is also given it wins for the build
+            launch. ``None`` (default) keeps single-map behavior. Recorded (as a list of
+            string paths) into the run manifest. Ignored when ``env_factory`` builds the env.
         reward_config: a :class:`tank_twin.config.RewardConfig` (budget-based reward) wired
             into the real-Unity ``TankEnv``; defaults to ``RewardConfig()`` (the CTO reward).
             Recorded (resolved) into the run manifest. Ignored when ``env_factory`` builds
@@ -148,6 +189,14 @@ def train_local(
     Path(models_dir).mkdir(parents=True, exist_ok=True)
 
     # --- env (single-core: bare env; SB3 wraps it in a DummyVecEnv internally) --------
+    # Build-launch composition with rotation: the build is launched ONCE and switches maps
+    # at runtime via switch_arena. To boot the build on a VALID rotation arena, when a
+    # rotation is set and no explicit --config was given, launch the build on the FIRST map's
+    # config (config_path). An explicit config_path still wins for the build launch.
+    launch_config_path = config_path
+    if env_factory is None and map_rotation and launch_config_path is None:
+        launch_config_path = map_rotation[0]
+
     if env_factory is not None:
         env = env_factory()
     else:
@@ -156,7 +205,8 @@ def train_local(
             image_based=True,
             env_p=3,
             rand_opp=True,
-            config_path=config_path,
+            config_path=launch_config_path,
+            map_rotation=map_rotation,
             reward_config=resolved_reward_config,
         )
 
@@ -198,6 +248,7 @@ def train_local(
                 learning_rate=learning_rate,
                 game_path=game_path,
                 config_path=config_path,
+                map_rotation=map_rotation,
                 reward_config=resolved_reward_config,
             ),
         )
@@ -239,13 +290,16 @@ def _build_manifest(
     learning_rate: float,
     game_path: str | Path | None,
     config_path: str | Path | None = None,
+    map_rotation: list[str | Path] | None = None,
     reward_config: RewardConfig,
 ) -> dict:
     """Build the run-manifest dict (unit-testable WITHOUT running SB3).
 
-    Records the RESOLVED RewardConfig (as a plain dict) AND the ``config_path`` (the arena
-    single-source the run trained on, as a string or ``None``) so a run is reproducible from
-    its manifest alone — which map AND which budget-based reward it trained under.
+    Records the RESOLVED RewardConfig (as a plain dict), the ``config_path`` (the arena
+    single-source the run trained on, as a string or ``None``), AND the ``map_rotation``
+    (the list of map-config paths the run rotated over, as a list of strings or ``None``) so
+    a run is reproducible from its manifest alone — which map(s) AND which budget-based
+    reward it trained under.
     """
     return {
         "run_name": run_name,
@@ -258,6 +312,7 @@ def _build_manifest(
         "learning_rate": learning_rate,
         "game_path": None if game_path is None else str(game_path),
         "config_path": None if config_path is None else str(config_path),
+        "map_rotation": None if map_rotation is None else [str(m) for m in map_rotation],
         "reward_config": reward_config.to_dict(),
     }
 
@@ -299,6 +354,25 @@ def _build_parser() -> argparse.ArgumentParser:
             "External game config.json: the SINGLE SOURCE of the arena — forwarded to the "
             "build AND read for the obs grid (--map is an alias). Default: the build's "
             "StreamingAssets config."
+        ),
+    )
+    # --- map rotation (Feature 1): round-robin over a set of map configs via switch_arena --
+    # nargs="*" so the flag accepts EITHER no value (-> the ALL_MAPS_SENTINEL const, rotate
+    # over the shipped 10 exp-configs maps), a single DIRECTORY (rotate over its *.json
+    # configs, sorted), or an explicit list of map-config paths (rotation order = given
+    # order). ABSENT (default None) -> NO rotation (today's single-map behavior). --maps and
+    # --map-rotation are aliases (same dest).
+    parser.add_argument(
+        "--maps",
+        "--map-rotation",
+        dest="maps",
+        nargs="*",
+        default=None,
+        metavar="MAP_CONFIG",
+        help=(
+            "Rotate over a set of map configs (round-robin per reset, via switch_arena). "
+            "No value -> the shipped 10 exp-configs/maps; a directory -> its *.json configs "
+            "(sorted); a list of paths -> that order. Absent -> no rotation (single map)."
         ),
     )
     parser.add_argument("--seed", type=int, default=0, help="Master seed (reproducibility).")
@@ -407,6 +481,7 @@ def main(argv: list[str] | None = None) -> None:
         timesteps=args.timesteps,
         game_path=args.game_path,
         config_path=args.config_path,
+        map_rotation=_resolve_map_rotation(args.maps),
         reward_config=_resolve_reward_config(args),
         seed=args.seed,
         unfreeze=args.unfreeze,

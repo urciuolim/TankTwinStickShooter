@@ -143,6 +143,21 @@ class TankEnv(gymnasium.Env):
             config on its own) — so the default obs matches the default build arena,
             single-sourced. Forwarding ``--config`` is config plumbing, NOT an RL-seam
             change (the wire bytes / 52-float state are untouched).
+        map_rotation: optional list of map CONFIG paths (like ``exp-configs/maps/*.json``,
+            each with an ``arena_path``) to ROTATE over, one per ``reset()`` in round-robin
+            order. Each entry is resolved to its arena via :func:`_arena_path_from_config`
+            (single-source, EXACTLY like ``config_path``). On a rotating ``reset()`` the env
+            (a) sends the additive ``{"switch_arena": <that map's ABSOLUTE arena path>}``
+            handshake message (acked by Unity with ``{"arena_switched": true}``) BEFORE the
+            restart/start handshake, and (b) reloads its OWN obs wall grid + dims from the
+            SAME arena so ``draw_state`` uses the right walls (obs == game across the switch).
+            The obs SHAPE stays ``(36, 60, 3)`` (every rotation arena must share dims) so the
+            model / ``observation_space`` are unchanged. When ``None`` (default) NO
+            ``switch_arena`` is ever sent and the handshake is byte-identical to today
+            (single-map, fully back-compat). The FIRST entry's config should also be passed
+            as ``config_path`` by the caller so the build BOOTS on a valid rotation arena
+            (the build is launched once; map switching is via the runtime message, not a
+            relaunch) — but the rotation itself is single-sourced from this list.
         level_path: an explicit arena JSON (back-compat / tests). Bypasses the config
             indirection: the env reads this arena directly and does NOT forward
             ``--config``. PRECEDENCE: ``config_path`` (if given) wins; else ``level_path``
@@ -172,6 +187,7 @@ class TankEnv(gymnasium.Env):
         transport=None,
         config_path=None,
         level_path=None,
+        map_rotation=None,
         env_p=3,
         rand_opp=True,
         image_based=True,
@@ -231,6 +247,18 @@ class TankEnv(gymnasium.Env):
             # NOT forward --config (the build falls back to this same file). Single source.
             self.config_path = None
             level = _arena_path_from_config(DEFAULT_CONFIG_PATH)
+
+        # --- map rotation (Feature 1): round-robin over a set of map CONFIGS ----------
+        # Each rotation entry is a map config path (like exp-configs/maps/*.json), resolved
+        # to its ABSOLUTE arena path via _arena_path_from_config — single-source, EXACTLY
+        # like config_path. We pre-resolve once so reset() just indexes. None / empty list
+        # disables rotation (today's single-map behavior, byte-identical handshake). The
+        # index starts at -1 and advances to 0 on the FIRST reset (deterministic round-robin).
+        if map_rotation:
+            self.map_rotation = [_arena_path_from_config(c) for c in map_rotation]
+        else:
+            self.map_rotation = None
+        self._rotation_index = -1
 
         # --- observation geometry (composed from arenas.load_level) ----------
         arena = load_level(level, p=self.p)
@@ -329,16 +357,60 @@ class TankEnv(gymnasium.Env):
 
     # --- gymnasium API --------------------------------------------------------
 
+    def _load_obs_arena(self, arena_path):
+        """Reload the env's OWN obs wall grid + dims from ``arena_path`` (G-channel walls).
+
+        Used by the map-rotation path so ``draw_state`` renders the NEW arena's walls after a
+        ``switch_arena``. The obs SHAPE must stay ``(36, 60, 3)`` — every rotation arena shares
+        dims — so ``observation_space`` / the model are unchanged. LOAD-BEARING INVARIANT:
+        after this call ``self.wall_grid``'s G channel equals the new arena's walls
+        (``load_level(arena_path).state``'s G channel) — obs == game across the switch.
+        """
+        arena = load_level(arena_path, p=self.p)
+        self.dims = arena.dims
+        self.wall_grid = arena.state
+        self.state = arena.state
+
+    def _switch_arena(self, arena_path):
+        """Send the additive ``{"switch_arena": <abs path>}`` and verify the ack.
+
+        Sent during the HANDSHAKE phase only (Unity is ``!ingame``), BEFORE the
+        restart/start handshake — the swapped arena takes effect on the subsequent
+        ``LoadScene("Arena")`` the restart/start triggers. Sends an ABSOLUTE path (single
+        source: the SAME arena we reload the obs from). Reads the ``{"arena_switched": true}``
+        ack with ``self.conn.receive()`` and verifies the key, mirroring the existing
+        ``"starting" not in received`` handshake style.
+        """
+        self.conn.send({"switch_arena": str(Path(arena_path).resolve())})
+        received = self.conn.receive()  # arena_switched ack
+        if not received.get("arena_switched"):
+            raise RuntimeError(f"unexpected switch_arena ack from game: {received!r}")
+
     def reset(self, *, seed=None, options=None):
         """Run the legacy restart/start/first-state handshake; return ``(obs, info)``.
 
         Seeds ``self.np_random`` via ``super().reset(seed=seed)`` (so the random
-        opponent + any env randomness are reproducible), then performs the
-        BYTE-IDENTICAL 2021 handshake: ``{"restart":True}`` -> ack, ``{"start":True}`` ->
+        opponent + any env randomness are reproducible). When ``map_rotation`` is set, FIRST
+        advances the round-robin index, sends the additive ``{"switch_arena": <abs arena
+        path>}`` message + reads its ``{"arena_switched": true}`` ack, AND reloads the env's
+        own obs wall grid + dims from that SAME arena (so obs == game) — all BEFORE the
+        restart/start handshake (Unity handles switch_arena while ``!ingame`` and the swapped
+        arena takes effect on the LoadScene the restart triggers). When ``map_rotation`` is
+        ``None`` NO switch_arena is sent and the handshake is BYTE-IDENTICAL to 2021.
+
+        Then performs the handshake: ``{"restart":True}`` -> ack, ``{"start":True}`` ->
         ``"starting"`` ack, first ``{"state":[...52...]}``. The first state is rendered to
         the RGB grid via ``observation.draw_state``.
         """
         super().reset(seed=seed)
+
+        # --- map rotation (additive): switch BEFORE the restart/start handshake ----------
+        if self.map_rotation is not None:
+            self._rotation_index = (self._rotation_index + 1) % len(self.map_rotation)
+            next_arena = self.map_rotation[self._rotation_index]
+            self._switch_arena(next_arena)
+            # Reload our OWN obs arena from the SAME path (single source: obs == game).
+            self._load_obs_arena(next_arena)
 
         self.conn.send({"restart": True})
         self.conn.receive()  # restart ack
