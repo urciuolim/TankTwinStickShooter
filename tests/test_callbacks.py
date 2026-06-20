@@ -22,7 +22,29 @@ from tank_twin.callbacks import EvalWinRateCallback
 
 
 class FakeRawEnv:
-    """Stand-in for the underlying gymnasium TankEnv (identity marker for the eval target)."""
+    """Stand-in for the underlying gymnasium TankEnv (identity marker for the eval target).
+
+    Models the slice of the env the callback now touches for the rotation-desync fix:
+    ``.unwrapped`` (returns self, as a bare gymnasium.Env would) and
+    ``set_rotation_enabled(bool)`` (records the on/off sequence so a test can assert eval
+    disabled rotation around the eval block and restored it). The real ``vec_env.envs[0]``
+    may be a ``Monitor`` wrapper, so the callback calls ``raw_env.unwrapped.set_rotation_*``.
+    """
+
+    def __init__(self):
+        self.rotation_enabled = True
+        # Ordered log of every set_rotation_enabled(value) call (for assertions).
+        self.rotation_calls = []
+
+    @property
+    def unwrapped(self):
+        return self
+
+    def set_rotation_enabled(self, enabled):
+        previous = self.rotation_enabled
+        self.rotation_enabled = bool(enabled)
+        self.rotation_calls.append(bool(enabled))
+        return previous
 
 
 class FakeVecEnv:
@@ -37,9 +59,13 @@ class FakeVecEnv:
         self.num_envs = 1
         self._reset_obs = reset_obs
         self.reset_count = 0
+        # Rotation-enabled state captured at the MOMENT the buffer-repair reset runs, so a
+        # test can prove the repair reset happened WHILE rotation was suppressed.
+        self.rotation_enabled_at_reset = None
 
     def reset(self):
         self.reset_count += 1
+        self.rotation_enabled_at_reset = self.envs[0].unwrapped.rotation_enabled
         return self._reset_obs
 
 
@@ -90,7 +116,18 @@ def _patch_eval(monkeypatch, win_rate):
     calls = []
 
     def fake_eval(model, env, n_episodes, seed=None):
-        calls.append({"model": model, "env": env, "n_episodes": n_episodes, "seed": seed})
+        # Capture whether rotation was suppressed AT THE MOMENT eval ran (the fix: eval must
+        # run with rotation disabled so it never drives switch_arena at a rollout boundary).
+        rotation_enabled = env.unwrapped.rotation_enabled
+        calls.append(
+            {
+                "model": model,
+                "env": env,
+                "n_episodes": n_episodes,
+                "seed": seed,
+                "rotation_enabled": rotation_enabled,
+            }
+        )
         return win_rate
 
     monkeypatch.setattr(callbacks_mod, "evaluate_winrate", fake_eval)
@@ -211,3 +248,80 @@ def test_boundary_threshold_is_inclusive(monkeypatch, freq, ts, expected_calls):
     calls = _patch_eval(monkeypatch, 0.5)
     cb._on_rollout_end()
     assert len(calls) == expected_calls
+
+
+# --- rotation-desync fix: eval suppresses map rotation around the WHOLE eval block --------
+#
+# LIVE BUG (python/training-features): with map_rotation set, the eval callback's reset()
+# (and the post-eval buffer-repair reset) would send switch_arena at a ROLLOUT BOUNDARY,
+# where the Unity build is still mid-game (ingame). The build only handles switch_arena
+# while !ingame, so the env read a stale `state` instead of the {"arena_switched":true} ack
+# and crashed (RuntimeError), and the build flooded PlayerController.GetInput NREs. The fix:
+# the callback wraps eval + the repair reset in set_rotation_enabled(False)..restore, so eval
+# pins to the CURRENT arena (plain restart/start, proven safe at the boundary) and consumes
+# no rotation slots. These pin that contract on the fake interface (they FAIL against the old
+# callback, which never touched rotation).
+
+
+def test_eval_runs_with_rotation_suppressed(monkeypatch):
+    # The crux: at eval time rotation MUST be disabled (so evaluate_winrate's reset() does the
+    # plain restart/start handshake on the current arena, not a switch_arena that desyncs).
+    cb, model, vec_env, raw_env, *_ = _make_callback(num_timesteps=1000)
+    calls = _patch_eval(monkeypatch, 0.5)
+
+    cb._on_rollout_end()
+
+    assert len(calls) == 1
+    assert calls[0]["rotation_enabled"] is False  # eval ran with rotation OFF
+
+
+def test_buffer_repair_reset_runs_with_rotation_suppressed(monkeypatch):
+    # The post-eval vec_env.reset() ALSO goes through TankEnv.reset, so it must be covered by
+    # the suppression too (it must not switch_arena either at the boundary).
+    cb, model, vec_env, raw_env, *_ = _make_callback(num_timesteps=1000)
+    _patch_eval(monkeypatch, 0.5)
+
+    cb._on_rollout_end()
+
+    assert vec_env.reset_count == 1
+    assert vec_env.rotation_enabled_at_reset is False  # repair reset ran with rotation OFF
+
+
+def test_rotation_restored_after_eval(monkeypatch):
+    # After the eval block, rotation is RESTORED to its prior value so the NEXT training
+    # rollout's first reset (the VecEnv auto-reset on episode end) rotates normally.
+    cb, model, vec_env, raw_env, *_ = _make_callback(num_timesteps=1000)
+    _patch_eval(monkeypatch, 0.5)
+
+    assert raw_env.unwrapped.rotation_enabled is True  # starts enabled
+    cb._on_rollout_end()
+    assert raw_env.unwrapped.rotation_enabled is True  # restored after the eval block
+    # And the sequence was exactly: disable for the block, then restore.
+    assert raw_env.unwrapped.rotation_calls == [False, True]
+
+
+def test_rotation_restored_even_if_eval_raises(monkeypatch):
+    # try/finally: if evaluate_winrate raises mid-eval, rotation is STILL restored so a
+    # subsequent training reset is not left wedged with rotation disabled.
+    cb, model, vec_env, raw_env, *_ = _make_callback(num_timesteps=1000)
+
+    def boom(model, env, n_episodes, seed=None):
+        raise RuntimeError("eval blew up")
+
+    monkeypatch.setattr(callbacks_mod, "evaluate_winrate", boom)
+
+    with pytest.raises(RuntimeError, match="eval blew up"):
+        cb._on_rollout_end()
+    assert raw_env.unwrapped.rotation_enabled is True  # restored despite the exception
+    assert raw_env.unwrapped.rotation_calls == [False, True]
+
+
+def test_no_eval_below_freq_does_not_touch_rotation(monkeypatch):
+    # Below the eval boundary: no eval, no rotation toggling at all (the env is untouched).
+    cb, model, vec_env, raw_env, *_ = _make_callback(eval_freq=1000, num_timesteps=500)
+    _patch_eval(monkeypatch, 0.5)
+
+    cb._on_rollout_end()
+
+    assert raw_env.unwrapped.rotation_calls == []  # never toggled
+    assert raw_env.unwrapped.rotation_enabled is True

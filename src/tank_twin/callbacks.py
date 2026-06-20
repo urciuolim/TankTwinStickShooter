@@ -85,16 +85,39 @@ class EvalWinRateCallback(BaseCallback):
         vec_env = self.model.get_env()
         raw_env = vec_env.envs[0]
 
-        rate = evaluate_winrate(self.model, raw_env, n_episodes=self.eval_episodes, seed=self.seed)
+        # --- SUPPRESS map rotation for the whole eval block (the desync fix) --------------
+        # The shared live env is at a ROLLOUT BOUNDARY: the prior training rollout left the
+        # Unity build mid-game (ingame, a state frame in flight). A rotating reset() would send
+        # switch_arena here, but the build only handles switch_arena while !ingame — so the env
+        # reads a stale `state` instead of the {"arena_switched":true} ack and crashes (and the
+        # build floods PlayerController.GetInput NREs from the out-of-order teardown). Eval does
+        # NOT need to rotate maps, so we pin it to the CURRENT arena: disable rotation around
+        # BOTH the eval episodes' resets AND the buffer-repair reset below (both go through
+        # TankEnv.reset). We reach the underlying TankEnv via .unwrapped (envs[0] may be a
+        # Monitor wrapper). Suppressed resets do NOT advance the rotation index, so the NEXT
+        # training rollout's first reset rotates normally — the proven live rotation order is
+        # preserved. try/finally ALWAYS restores rotation, even if eval raises.
+        rotating_env = raw_env.unwrapped
+        previous_rotation = rotating_env.set_rotation_enabled(False)
+        try:
+            rate = evaluate_winrate(
+                self.model, raw_env, n_episodes=self.eval_episodes, seed=self.seed
+            )
 
-        # Log into the model's existing logger so it lands in progress.csv AND tfevents.
-        self.logger.record("eval/win_rate", rate)
-        self.logger.dump(self.num_timesteps)
+            # Log into the model's existing logger so it lands in progress.csv AND tfevents.
+            self.logger.record("eval/win_rate", rate)
+            self.logger.dump(self.num_timesteps)
 
-        # --- REPAIR the rollout state (the crux) -----------------------------------------
-        # evaluate_winrate left the SHARED training env mid/just-finished an eval episode and
-        # the model's _last_obs / _last_episode_starts stale. Reset the vec env to a fresh
-        # episode and write the fresh obs back into the model so the NEXT rollout is clean.
-        obs = vec_env.reset()
-        self.model._last_obs = obs
-        self.model._last_episode_starts = np.ones((vec_env.num_envs,), dtype=bool)
+            # --- REPAIR the rollout state (the crux) -------------------------------------
+            # evaluate_winrate left the SHARED training env mid/just-finished an eval episode
+            # and the model's _last_obs / _last_episode_starts stale. Reset the vec env to a
+            # fresh episode and write the fresh obs back into the model so the NEXT rollout is
+            # clean. This reset ALSO goes through TankEnv.reset, so it is covered by the
+            # rotation suppression above (it must not switch_arena either).
+            obs = vec_env.reset()
+            self.model._last_obs = obs
+            self.model._last_episode_starts = np.ones((vec_env.num_envs,), dtype=bool)
+        finally:
+            # Restore rotation so the NEXT training rollout's first reset rotates normally
+            # (from where training left off — the suppressed eval resets consumed no slots).
+            rotating_env.set_rotation_enabled(previous_rotation)

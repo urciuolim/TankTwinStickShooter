@@ -197,6 +197,70 @@ def test_constructor_resolves_config_list_to_arenas():
     assert env.map_rotation == MAP_ARENAS
 
 
+# --- rotation suppression: the eval-desync fix at the ENV layer ------------------------
+#
+# set_rotation_enabled(False) (and reset(options={"rotate": False})) make a rotating reset
+# do the PLAIN restart/start handshake on the CURRENT arena: NO switch_arena on the wire and
+# the rotation index is NOT advanced (so the next ENABLED reset rotates from where training
+# left off). This is the primitive the eval callback uses to avoid the live rollout-boundary
+# desync. These pin it directly on the env + fake transport (no Unity).
+
+
+def test_suppressed_reset_sends_no_switch_arena():
+    env = _make_rotating_env()
+    env.set_rotation_enabled(False)
+    env.reset(seed=0)
+    sent = env.conn.transport.received
+    # Plain handshake only — restart/start, and NO switch_arena anywhere.
+    assert sent[0] == {"restart": True}
+    assert sent[1] == {"start": True}
+    assert all("switch_arena" not in m for m in sent)
+
+
+def test_suppressed_reset_does_not_advance_rotation_index():
+    env = _make_rotating_env()
+    assert env._rotation_index == -1
+    env.set_rotation_enabled(False)
+    env.reset(seed=0)
+    env.reset(seed=0)
+    # The suppressed resets consumed NO rotation slots: the index is untouched.
+    assert env._rotation_index == -1
+
+
+def test_rotation_resumes_in_order_after_suppression():
+    # The proven round-robin order is PRESERVED across a suppressed eval block: rotate to
+    # map0, suppress (eval) twice, re-enable, and the next reset rotates to map1 (NOT map2).
+    env = _make_rotating_env()
+    env.reset(seed=0)  # map0 (index 0)
+    assert env._rotation_index == 0
+    env.set_rotation_enabled(False)
+    env.reset(seed=0)  # suppressed (eval episode 1)
+    env.reset(seed=0)  # suppressed (eval episode 2 / buffer repair)
+    assert env._rotation_index == 0  # unchanged
+    env.set_rotation_enabled(True)
+    env.reset(seed=0)  # next training reset -> rotates to map1
+    assert env._rotation_index == 1
+    sent_arena = Path(env.conn.transport.received[-3]["switch_arena"])
+    assert sent_arena == MAP_ARENAS[1].resolve()
+
+
+def test_reset_options_rotate_false_suppresses_switch_arena():
+    # The per-call override matches the durable flag: options={"rotate": False} also pins the
+    # reset to the current arena (no switch_arena, index not advanced).
+    env = _make_rotating_env()
+    env.reset(options={"rotate": False})
+    sent = env.conn.transport.received
+    assert all("switch_arena" not in m for m in sent)
+    assert env._rotation_index == -1
+
+
+def test_set_rotation_enabled_returns_previous_value():
+    # Returns the PRIOR value so the callback can restore it in a finally.
+    env = _make_rotating_env()
+    assert env.set_rotation_enabled(False) is True  # was enabled by default
+    assert env.set_rotation_enabled(True) is False  # was just disabled
+
+
 def test_first_state_after_switch_renders_on_new_walls():
     # End-to-end-ish (fake socket): after the switch + handshake, the rendered obs is in
     # the declared space and the persisted walls are the new map's (not the constructor's).

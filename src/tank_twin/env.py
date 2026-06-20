@@ -259,6 +259,15 @@ class TankEnv(gymnasium.Env):
         else:
             self.map_rotation = None
         self._rotation_index = -1
+        # When False, a rotating env's reset() does NOT advance the rotation index and does
+        # NOT send switch_arena — it does the plain restart/start handshake on the CURRENT
+        # arena. Default True (training rotates normally). The eval callback flips this to
+        # False AROUND the eval episodes + the post-eval buffer-repair reset so eval never
+        # drives a switch_arena at a rollout boundary (where the build is mid-game and the
+        # switch_arena/ack handshake desyncs). Suppressed resets do NOT consume rotation
+        # slots, so the next TRAINING reset rotates from where training left off (the proven,
+        # deterministic round-robin order is preserved). See set_rotation_enabled / reset.
+        self._rotation_enabled = True
 
         # --- observation geometry (composed from arenas.load_level) ----------
         arena = load_level(level, p=self.p)
@@ -357,6 +366,27 @@ class TankEnv(gymnasium.Env):
 
     # --- gymnasium API --------------------------------------------------------
 
+    def set_rotation_enabled(self, enabled):
+        """Enable/disable map rotation on subsequent ``reset()`` calls (no-op if not rotating).
+
+        When ``enabled`` is ``False``, a rotating env's ``reset()`` does NOT advance the
+        round-robin index and does NOT send the ``switch_arena`` handshake — it runs the plain
+        restart/start handshake on the CURRENT arena (the obs wall grid is left as-is, matching
+        the arena the build is already on). The eval callback flips this to ``False`` AROUND the
+        eval episodes AND the post-eval buffer-repair reset, so eval never drives a
+        ``switch_arena`` at a rollout boundary (where the build is mid-game and the
+        switch_arena/ack handshake desyncs into a stale ``state`` read).
+
+        Suppressed resets do NOT consume rotation slots: ``_rotation_index`` is untouched while
+        disabled, so re-enabling and the NEXT training reset rotates from exactly where training
+        left off — the proven, deterministic training rotation order is preserved (the live gate
+        still cycles through multiple arenas). Returns the PREVIOUS value so a caller can restore
+        it. A no-op (other than returning the prior value) when ``map_rotation`` is ``None``.
+        """
+        previous = self._rotation_enabled
+        self._rotation_enabled = bool(enabled)
+        return previous
+
     def _load_obs_arena(self, arena_path):
         """Reload the env's OWN obs wall grid + dims from ``arena_path`` (G-channel walls).
 
@@ -390,13 +420,24 @@ class TankEnv(gymnasium.Env):
         """Run the legacy restart/start/first-state handshake; return ``(obs, info)``.
 
         Seeds ``self.np_random`` via ``super().reset(seed=seed)`` (so the random
-        opponent + any env randomness are reproducible). When ``map_rotation`` is set, FIRST
-        advances the round-robin index, sends the additive ``{"switch_arena": <abs arena
-        path>}`` message + reads its ``{"arena_switched": true}`` ack, AND reloads the env's
-        own obs wall grid + dims from that SAME arena (so obs == game) — all BEFORE the
-        restart/start handshake (Unity handles switch_arena while ``!ingame`` and the swapped
-        arena takes effect on the LoadScene the restart triggers). When ``map_rotation`` is
-        ``None`` NO switch_arena is sent and the handshake is BYTE-IDENTICAL to 2021.
+        opponent + any env randomness are reproducible). When ``map_rotation`` is set AND
+        rotation is enabled (see below), FIRST advances the round-robin index, sends the
+        additive ``{"switch_arena": <abs arena path>}`` message + reads its
+        ``{"arena_switched": true}`` ack, AND reloads the env's own obs wall grid + dims from
+        that SAME arena (so obs == game) — all BEFORE the restart/start handshake (Unity
+        handles switch_arena while ``!ingame`` and the swapped arena takes effect on the
+        LoadScene the restart triggers). When ``map_rotation`` is ``None`` NO switch_arena is
+        sent and the handshake is BYTE-IDENTICAL to 2021.
+
+        Rotation suppression (the eval-desync fix): rotation on this reset is skipped when
+        EITHER ``self._rotation_enabled`` is ``False`` (the durable flag the eval callback
+        sets around the whole eval block, including the buffer-repair reset) OR ``options``
+        carries ``{"rotate": False}`` (a per-call override). A suppressed reset does NOT
+        advance the rotation index and does NOT send switch_arena — it does the plain
+        restart/start handshake on the CURRENT arena (proven safe at a rollout boundary). The
+        index is untouched while suppressed, so the next ENABLED reset rotates from where
+        training left off (deterministic order preserved). With rotation enabled and no
+        override, behavior is identical to before (training resets rotate normally).
 
         Then performs the handshake: ``{"restart":True}`` -> ack, ``{"start":True}`` ->
         ``"starting"`` ack, first ``{"state":[...52...]}``. The first state is rendered to
@@ -404,8 +445,14 @@ class TankEnv(gymnasium.Env):
         """
         super().reset(seed=seed)
 
+        # Rotation is suppressed by the durable flag (set around the eval block by the
+        # callback) OR a per-call options={"rotate": False}. Either way this reset does the
+        # plain restart/start handshake on the CURRENT arena and leaves _rotation_index alone.
+        option_rotate = True if options is None else options.get("rotate", True)
+        rotate_this_reset = self._rotation_enabled and option_rotate
+
         # --- map rotation (additive): switch BEFORE the restart/start handshake ----------
-        if self.map_rotation is not None:
+        if self.map_rotation is not None and rotate_this_reset:
             self._rotation_index = (self._rotation_index + 1) % len(self.map_rotation)
             next_arena = self.map_rotation[self._rotation_index]
             self._switch_arena(next_arena)
