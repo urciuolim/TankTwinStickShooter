@@ -33,6 +33,7 @@ This module imports gymnasium + numpy + the pure tank_twin modules; it stays sb3
 """
 
 import contextlib
+import json
 import socket
 import subprocess
 from pathlib import Path
@@ -47,14 +48,69 @@ from tank_twin.protocol import Connection
 from tank_twin.rewards import step_reward
 from tank_twin.state import flip_state
 
-# Default arena: the canonical 20x12 grid that yields (36, 60, 3) at env_p=3 (the
-# shape the pretrained CNN expects). Resolved relative to the repo root so the env
-# works from any cwd.
+# Resolved relative to the repo root so the env works from any cwd.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# The build's StreamingAssets config.json — the SINGLE SOURCE of the arena the
+# standalone build actually simulates when launched with NO ``--config`` (it falls
+# back to this file). It declares ``"arena_path": "Arenas/custom1.json"`` (resolved
+# relative to the config dir). The env's DEFAULT reads THIS SAME config so the obs
+# wall grid matches the arena the build plays out of the box (single-source).
+DEFAULT_CONFIG_PATH = _REPO_ROOT / "Assets" / "StreamingAssets" / "config.json"
+
+# A bare arena JSON, kept for back-compat / tests that want an explicit arena with no
+# config indirection. NOT the default any more: it MISMATCHED the build (the build
+# simulates custom1, default.json has a different interior wall layout), which made the
+# obs G (wall) channel disagree with the live game. The default is now config-derived.
 DEFAULT_LEVEL_PATH = _REPO_ROOT / "Assets" / "Arenas" / "default.json"
 
 # Player index of the agent under training (P1). Matches rewards.PLAYER_1 / draw_state.
 PLAYER_1 = 0
+
+
+def _build_game_cmd(game_path, game_port, config_path=None):
+    """Build the Unity-launch subprocess ARG-LIST (never a shell string).
+
+    Returns ``[game_path, str(game_port)]`` and, when ``config_path`` is set, appends
+    ``["--config", <absolute config path>]`` so the build's
+    ``DriverController.ResolveConfigPath`` loads the SAME config the env reads its arena
+    from. The path is made absolute via ``Path.resolve()`` so the build resolves the
+    config's relative ``arena_path`` against the right directory regardless of the
+    build's working directory. When ``config_path`` is ``None`` the list is exactly the
+    legacy ``[game_path, port]`` and the build falls back to its StreamingAssets config.
+
+    Forwarding ``--config`` is config PLUMBING, not an RL-seam change: it does NOT touch
+    the wire bytes, the socket/``actions`` path, or ``GameController.UpdateState()``'s
+    52-float state layout. ``DriverController`` already parses ``--config``; this only
+    chooses which config file the build reads.
+    """
+    cmd = [str(game_path), str(game_port)]
+    if config_path is not None:
+        cmd += ["--config", str(Path(config_path).resolve())]
+    return cmd
+
+
+def _arena_path_from_config(config_path):
+    """Resolve a config's ``arena_path`` to an absolute arena JSON path (STRICT JSON).
+
+    Mirrors ``DriverController.ResolveArenaPath``: parse the config with strict
+    ``json.load`` (no trailing commas / leading-dot floats — Python's ``json`` rejects
+    what Unity's Newtonsoft tolerates), read ``arena_path``, and resolve it RELATIVE TO
+    THE CONFIG FILE'S DIRECTORY (an absolute ``arena_path`` is used as-is). This is the
+    single source: the same config feeds both the build's simulated arena (via
+    ``--config``) and the env's obs wall grid (via this resolved arena path).
+
+    Reading a config to pick an arena for the obs is config plumbing, not an RL-seam
+    change — the wire/state layout are untouched.
+    """
+    config_path = Path(config_path).resolve()
+    with open(config_path, encoding="utf-8") as config_file:
+        config = json.load(config_file)
+    arena_path = config["arena_path"]
+    arena = Path(arena_path)
+    if arena.is_absolute():
+        return arena
+    return config_path.parent / arena_path
 
 
 class TankEnv(gymnasium.Env):
@@ -71,7 +127,21 @@ class TankEnv(gymnasium.Env):
             given it is wrapped in ``protocol.Connection`` and NO socket is constructed —
             this is the test seam. When ``None`` and ``game_path`` is set, a real TCP
             socket is opened to the launched Unity build.
-        level_path: arena JSON; defaults to the canonical ``default.json`` (36x60 at p=3).
+        config_path: a game config JSON (the same shape as the build's StreamingAssets
+            ``config.json``). When set it is the SINGLE SOURCE of the arena: (a) it is
+            FORWARDED to the build launch as ``--config <abspath>`` so the build simulates
+            this config's arena, and (b) the env reads the obs wall grid from the SAME
+            config's ``arena_path`` (resolved relative to the config dir). When ``None``
+            and no ``level_path`` is given, the env defaults to reading the build's
+            StreamingAssets config (``DEFAULT_CONFIG_PATH`` -> custom1) but does NOT
+            forward ``--config`` (the build falls back to that same StreamingAssets
+            config on its own) — so the default obs matches the default build arena,
+            single-sourced. Forwarding ``--config`` is config plumbing, NOT an RL-seam
+            change (the wire bytes / 52-float state are untouched).
+        level_path: an explicit arena JSON (back-compat / tests). Bypasses the config
+            indirection: the env reads this arena directly and does NOT forward
+            ``--config``. PRECEDENCE: ``config_path`` (if given) wins; else ``level_path``
+            (if given); else the default config (custom1, single-sourced with the build).
         env_p: pixels per game-grid square. **3** so the obs is (36, 60, 3) for the CNN.
         rand_opp: random opponent (the only opponent mode this single-agent port ships).
         max_steps: step-count cap; reaching it truncates (never terminates).
@@ -88,6 +158,7 @@ class TankEnv(gymnasium.Env):
         game_path=None,
         *,
         transport=None,
+        config_path=None,
         level_path=None,
         env_p=3,
         rand_opp=True,
@@ -121,8 +192,27 @@ class TankEnv(gymnasium.Env):
         self.time_reward = time_reward
         self.survivor = survivor
 
+        # --- arena single-source: ONE config feeds both the build and the obs ----------
+        # PRECEDENCE: config_path (forwarded to the build AND read for the obs arena) >
+        # level_path (explicit arena, no --config forwarding) > default config (the
+        # build's StreamingAssets config -> custom1, NOT forwarded because the build
+        # falls back to that same file on its own). This is what makes the default obs
+        # match the arena the build simulates out of the box.
+        if config_path is not None:
+            # config_path set: forward it to the build AND derive the obs arena from it.
+            self.config_path = Path(config_path).resolve()
+            level = _arena_path_from_config(self.config_path)
+        elif level_path is not None:
+            # explicit arena, no config indirection -> do NOT forward --config.
+            self.config_path = None
+            level = level_path
+        else:
+            # default: read the build's StreamingAssets config for the obs arena, but do
+            # NOT forward --config (the build falls back to this same file). Single source.
+            self.config_path = None
+            level = _arena_path_from_config(DEFAULT_CONFIG_PATH)
+
         # --- observation geometry (composed from arenas.load_level) ----------
-        level = DEFAULT_LEVEL_PATH if level_path is None else level_path
         arena = load_level(level, p=self.p)
         self.dims = arena.dims
         # The wall-baked grid: draw_state reads its shape + the persisted G (wall) channel.
@@ -163,6 +253,10 @@ class TankEnv(gymnasium.Env):
 
         Preserves the legacy ``[game_path, str(game_port)]`` launch + bind/connect
         retry loop, wrapped so the rest of the env talks to a ``protocol.Connection``.
+        When ``self.config_path`` is set the arg-list also carries
+        ``--config <abspath>`` (built by :func:`_build_game_cmd`) so the build simulates
+        the SAME config the env read its obs arena from. Forwarding ``--config`` is config
+        plumbing, not an RL-seam change (the wire bytes / 52-float state are untouched).
         Only reached on the real path (``game_path`` set, no injected transport).
         """
         import random
@@ -171,7 +265,7 @@ class TankEnv(gymnasium.Env):
         # Long-lived handle: held open for the Unity subprocess's lifetime (it is the
         # child's stdout/stderr sink) and closed in close(); a context manager doesn't fit.
         self.game_log = open(self.game_log_path, "w")  # noqa: SIM115
-        game_cmd_list = [self.game_path, str(self.game_port)]
+        game_cmd_list = _build_game_cmd(self.game_path, self.game_port, self.config_path)
         self.game_p = subprocess.Popen(game_cmd_list, stdout=self.game_log, stderr=self.game_log)
 
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

@@ -21,11 +21,23 @@ version is a later integration-marked test (not this task).
 """
 
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
 
-from tank_twin.env import TankEnv
+from tank_twin.arenas import G, load_level
+from tank_twin.env import (
+    DEFAULT_CONFIG_PATH,
+    TankEnv,
+    _arena_path_from_config,
+    _build_game_cmd,
+)
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_STREAMING_CONFIG = _REPO_ROOT / "Assets" / "StreamingAssets" / "config.json"
+_CUSTOM1_ARENA = _REPO_ROOT / "Assets" / "Arenas" / "custom1.json"
+_DEFAULT_ARENA = _REPO_ROOT / "Assets" / "Arenas" / "default.json"
 
 # Canonical raw 52-float states. Field map per player (26 floats): [pos_x, pos_y, vec_x,
 # vec_y, aim_x, aim_y, <5 bullets x (pos_x, pos_y, vec_x, vec_y)>]; P1 = 0..25, P2 = 26..51.
@@ -414,4 +426,124 @@ def test_close_swallows_transport_errors_during_end_handshake():
     # No reset(): a connection that drops before any handshake still tears down cleanly.
     env.close()
     assert transport.close_count == 1
+
+
+# --- arena single-source: --config forwarding + obs from the same config ----------
+#
+# Change 1: ONE config feeds both the build (via --config) AND the env's obs wall grid
+# (via that config's resolved arena_path). These tests pin (a) the Popen arg-list shape
+# without launching Unity (asserting on the pure _build_game_cmd helper), and (b) that
+# the env reads the arena from the config's arena_path resolved relative to the config
+# dir, distinct from default.json.
+
+# Pre-derive the two arenas' interior-wall pixel counts straight from arenas.load_level
+# so the assertions describe the live truth (custom1 has interior walls default lacks).
+_CUSTOM1_G_PIXELS = int((load_level(_CUSTOM1_ARENA, p=3).state[:, :, G] == 255).sum())
+_DEFAULT_G_PIXELS = int((load_level(_DEFAULT_ARENA, p=3).state[:, :, G] == 255).sum())
+
+
+def test_custom1_and_default_obs_wall_grids_differ():
+    # Sanity for the rest of the suite: custom1 (the build's arena) and default.json have
+    # IDENTICAL dims (same obs shape) but DIFFERENT interior walls -> different G counts.
+    assert load_level(_CUSTOM1_ARENA, p=3).obs_shape == load_level(_DEFAULT_ARENA, p=3).obs_shape
+    assert _CUSTOM1_G_PIXELS != _DEFAULT_G_PIXELS
+
+
+def test_build_game_cmd_no_config_is_legacy_argv():
+    # config_path None -> exactly the legacy [game_path, port] (build uses its own config).
+    assert _build_game_cmd("game.exe", 50000, None) == ["game.exe", "50000"]
+
+
+def test_build_game_cmd_forwards_config_as_absolute_path():
+    cmd = _build_game_cmd("game.exe", 50000, _STREAMING_CONFIG)
+    assert cmd[0] == "game.exe"
+    assert cmd[1] == "50000"
+    assert cmd[2] == "--config"
+    # Forwarded path is ABSOLUTE (Path.resolve) so the build resolves arena_path correctly.
+    assert Path(cmd[3]).is_absolute()
+    assert Path(cmd[3]) == _STREAMING_CONFIG.resolve()
+
+
+def test_build_game_cmd_returns_arg_list_not_shell_string():
+    # subprocess arg-list, never a shell string (cross-platform / no shell injection).
+    cmd = _build_game_cmd("game.exe", 50000, _STREAMING_CONFIG)
+    assert isinstance(cmd, list)
+    assert all(isinstance(part, str) for part in cmd)
+
+
+def test_arena_path_from_config_resolves_relative_to_config_dir():
+    # The build's StreamingAssets config declares arena_path "Arenas/custom1.json";
+    # _arena_path_from_config resolves it RELATIVE TO THE CONFIG DIR (mirrors
+    # DriverController.ResolveArenaPath) -> the StreamingAssets/Arenas/custom1.json.
+    arena = _arena_path_from_config(_STREAMING_CONFIG)
+    assert arena.parent == _STREAMING_CONFIG.resolve().parent / "Arenas"
+    assert arena.name == "custom1.json"
+    assert arena.exists()
+
+
+def test_arena_path_from_config_absolute_arena_used_as_is(tmp_path):
+    # An ABSOLUTE arena_path is used verbatim (not re-rooted under the config dir).
+    abs_arena = _CUSTOM1_ARENA.resolve()
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({"arena_path": str(abs_arena)}), encoding="utf-8")
+    assert _arena_path_from_config(cfg) == abs_arena
+
+
+def test_arena_path_from_config_rejects_malformed_json(tmp_path):
+    # STRICT json.load: a trailing comma (which Unity's Newtonsoft tolerates) RAISES.
+    cfg = tmp_path / "bad.json"
+    cfg.write_text('{"arena_path": "Arenas/custom1.json",}', encoding="utf-8")
+    with pytest.raises(json.JSONDecodeError):
+        _arena_path_from_config(cfg)
+
+
+def test_env_with_config_path_reads_obs_arena_from_config():
+    # Pointing the env at the real StreamingAssets config -> the obs wall grid is custom1
+    # (the arena the build simulates), NOT default.json. Single source.
+    env = TankEnv(game_path=None, config_path=_STREAMING_CONFIG)
+    g_pixels = int((env.wall_grid[:, :, G] == 255).sum())
+    assert g_pixels == _CUSTOM1_G_PIXELS
+    assert g_pixels != _DEFAULT_G_PIXELS
+
+
+def test_env_with_config_path_stores_resolved_config_for_launch():
+    # config_path is stored (absolute) so _connect_to_unity forwards --config to the build.
+    env = TankEnv(game_path=None, config_path=_STREAMING_CONFIG)
+    assert env.config_path == _STREAMING_CONFIG.resolve()
+    # And the launch arg-list the env WOULD use carries --config <that abspath>.
+    cmd = _build_game_cmd("game.exe", env.game_port, env.config_path)
+    assert "--config" in cmd
+    assert Path(cmd[-1]) == _STREAMING_CONFIG.resolve()
+
+
+def test_env_default_obs_is_custom1_single_sourced_with_build():
+    # KEY ACCEPTANCE: with DEFAULT settings the obs wall grid == the arena the build
+    # simulates (custom1), single-sourced from the build's StreamingAssets config. This
+    # is the bug fix: the old default (default.json) mismatched the build's custom1.
+    env = TankEnv(game_path=None)
+    g_pixels = int((env.wall_grid[:, :, G] == 255).sum())
+    assert g_pixels == _CUSTOM1_G_PIXELS
+    assert g_pixels != _DEFAULT_G_PIXELS
+    # The default derives the obs arena from the build's StreamingAssets config...
+    assert _arena_path_from_config(DEFAULT_CONFIG_PATH).name == "custom1.json"
+    # ...but does NOT forward --config: the build falls back to that SAME config itself,
+    # so no redundant flag is passed (preserves the legacy [game_path, port] launch).
+    assert env.config_path is None
+
+
+def test_env_level_path_back_compat_no_config_forwarding():
+    # Explicit level_path bypasses config indirection: obs is that arena, no --config.
+    env = TankEnv(game_path=None, level_path=_DEFAULT_ARENA)
+    g_pixels = int((env.wall_grid[:, :, G] == 255).sum())
+    assert g_pixels == _DEFAULT_G_PIXELS
+    assert env.config_path is None
+
+
+def test_env_precedence_config_path_wins_over_level_path():
+    # PRECEDENCE: config_path > level_path. When BOTH are given, the config's arena wins
+    # (custom1) and level_path (default.json) is ignored; --config is forwarded.
+    env = TankEnv(game_path=None, config_path=_STREAMING_CONFIG, level_path=_DEFAULT_ARENA)
+    g_pixels = int((env.wall_grid[:, :, G] == 255).sum())
+    assert g_pixels == _CUSTOM1_G_PIXELS
+    assert env.config_path == _STREAMING_CONFIG.resolve()
     assert env.conn is None
