@@ -45,17 +45,25 @@ from tank_twin.config import RewardConfig
 from tank_twin.env import TankEnv
 from tank_twin.features import PretrainedNatureCNN
 
+# Re-export the shared map-rotation contract so the legacy import path
+# ``from tank_twin.train import DEFAULT_MAPS_DIR, ALL_MAPS_SENTINEL, _resolve_map_rotation``
+# keeps working byte-for-byte (the canonical definitions live in tank_twin.maps now).
+from tank_twin.maps import (  # noqa: F401  (re-export)
+    ALL_MAPS_SENTINEL,
+    DEFAULT_MAPS_DIR,
+    _resolve_map_rotation,
+)
+
 __all__ = ["train_local", "main"]
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_RUNS_DIR = _REPO_ROOT / "runs"
 DEFAULT_MODELS_DIR = _REPO_ROOT / "models"
 
-# The shipped 10-map experiment configs (exp-configs/maps/*.json). When the user passes the
-# rotation flag with no value (the sentinel below), the trainer rotates over these, sorted.
-DEFAULT_MAPS_DIR = _REPO_ROOT / "exp-configs" / "maps"
-# argparse const for the rotation flag used with no value -> rotate over DEFAULT_MAPS_DIR.
-ALL_MAPS_SENTINEL = "__all__"
+# Map-rotation contract lives in tank_twin.maps (SINGLE SOURCE, shared with the evaluator).
+# Imported + re-exported here so the long-standing
+# ``from tank_twin.train import DEFAULT_MAPS_DIR, ALL_MAPS_SENTINEL, _resolve_map_rotation``
+# import path (and tests/test_train_features.py) keeps working byte-for-byte.
 
 # PPO defaults: sane single-env starting knobs (the GPU smoke / Wave-4 tuning overrides).
 DEFAULT_N_STEPS = 2048
@@ -71,33 +79,6 @@ def _resolve_device(device: str) -> str:
 
         return "cuda" if torch.cuda.is_available() else "cpu"
     return device
-
-
-def _resolve_map_rotation(values: list[str] | None) -> list[Path] | None:
-    """Resolve the ``--maps`` flag value into a list of map-config paths (or ``None``).
-
-    Precedence / semantics (matches the CLI contract). With ``argparse`` ``nargs="*"`` the
-    flag passed with NO value yields an empty list ``[]`` (the "all maps" sentinel); the flag
-    ABSENT keeps the ``default=None``:
-
-    * ``None`` (flag ABSENT) -> ``None``: NO rotation (today's single-map behavior).
-    * ``[]`` or ``[ALL_MAPS_SENTINEL]`` (flag passed with no value) -> every ``*.json`` map
-      config in :data:`DEFAULT_MAPS_DIR`, SORTED (the shipped 10 exp-configs maps).
-    * a single entry that is a DIRECTORY -> every ``*.json`` map config in it, SORTED.
-    * otherwise -> the explicit list of map-config paths, IN THE GIVEN ORDER (rotation order
-      is the user's order; not re-sorted).
-
-    Each returned entry is a map CONFIG path (with an ``arena_path``); ``TankEnv`` resolves it
-    to its arena via ``_arena_path_from_config`` (single source). Returns ``None`` for the
-    absent flag so the env stays in single-map mode.
-    """
-    if values is None:
-        return None
-    if values == [] or values == [ALL_MAPS_SENTINEL]:
-        return sorted(DEFAULT_MAPS_DIR.glob("*.json"))
-    if len(values) == 1 and Path(values[0]).is_dir():
-        return sorted(Path(values[0]).glob("*.json"))
-    return [Path(v) for v in values]
 
 
 def train_local(
