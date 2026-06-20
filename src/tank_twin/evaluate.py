@@ -222,7 +222,7 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help=(
-            "External game config.json: pin a SINGLE map (the config single-source — "
+            "External game config.json: pin a SINGLE map (the config single-source - "
             "forwarded to the build AND read for the obs grid; --map is an alias). "
             "Default: the build's StreamingAssets config (custom1)."
         ),
