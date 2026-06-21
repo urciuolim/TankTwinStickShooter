@@ -92,9 +92,12 @@ npz is fine (the smoke reports measured per-pair on-disk bytes).
 ``manifest.json`` (``--out/manifest.json``, STRICT JSON, written atomically) records:
 schema_version, resolution, frame_dtype/encoding, state_len/dtype, target,
 total_pairs_collected, the per-shard list (file, worker, n, map_counts), per-map totals, the
-maps list (index -> {name, arena_path}), per-worker seeds, git_sha, time_scale, workers, and
-created/updated UTC ISO timestamps. Each worker also writes
-``worker_<k>.progress.json`` so resume reads completed counts without parsing every shard.
+maps list (index -> {name, config_path, arena_path}), per-worker seeds, the root seed, git_sha,
+time_scale, workers, and created/updated UTC ISO timestamps. The maps list stores
+``config_path``/``arena_path`` as REPO-RELATIVE POSIX strings (NOT Windows-absolute) so the
+dataset is portable to GCS/Linux for CNN training; NO absolute machine path is written anywhere
+in the manifest. Each worker also writes ``worker_<k>.progress.json`` so resume reads completed
+counts without parsing every shard.
 
 -------------------------------------------------------------------------------------------
 RESUME (``--resume``)
@@ -104,7 +107,12 @@ its ``worker_<k>.progress.json``, sums pairs already collected (total + per-map)
 toward its sub-target WITHOUT overwriting any existing shard (new shards take fresh indices =
 count of existing shards for that worker). Per-map quotas already met are honored on resume so
 balance is preserved. If ``--resume`` is NOT set and ``--out`` is non-empty, the run REFUSES
-with a clear error (no clobber).
+with a clear error (no clobber). On ``--resume``, if a sealed ``manifest.json`` exists the run
+VALIDATES that ``--workers``/``--seed`` and the maps list (same names, same order) match the
+prior run BEFORE spawning — a mismatch would replay identical action streams on the first K
+workers (``SeedSequence.spawn`` is a stateful counter) or mislabel positional ``map_ids``, so it
+REFUSES. If no manifest exists yet (a crash before sealing), it warns and falls back to the
+per-worker progress / shard scan rather than hard-failing.
 
 -------------------------------------------------------------------------------------------
 THROUGHPUT NOTE
@@ -338,6 +346,21 @@ def _atomic_savez(path: Path, **arrays) -> None:
 
 def _utc_now_iso() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _repo_relative_posix(path) -> str:
+    """Return ``path`` as a REPO-RELATIVE forward-slash string (portable for GCS/Linux).
+
+    The shipped exp-configs maps ARE under ``_REPO_ROOT``, so the normal result is a clean
+    relative POSIX path like ``exp-configs/maps/Arenas/center_block.json``. If a path is somehow
+    NOT under the repo root (shouldn't happen for shipped maps), fall back to just the basename
+    rather than crashing — the manifest must never carry a Windows absolute ``C:\\...`` path.
+    """
+    p = Path(path).resolve()
+    try:
+        return p.relative_to(_REPO_ROOT).as_posix()
+    except ValueError:
+        return Path(p.name).as_posix()
 
 
 def _git_sha() -> str:
@@ -685,6 +708,7 @@ def _write_manifest(
     target: int,
     time_scale: float,
     workers: int,
+    seed: int,
     frame_encoding: str,
     created: str,
 ):
@@ -711,9 +735,10 @@ def _write_manifest(
         "target": target,
         "total_pairs_collected": total_pairs,
         "workers": workers,
+        "seed": seed,
         "time_scale": time_scale,
         "git_sha": _git_sha(),
-        "maps": maps_meta,  # [{index, name, arena_path}]
+        "maps": maps_meta,  # [{index, name, config_path, arena_path}] — repo-relative POSIX paths
         "per_map_total": {maps_meta[i]["name"]: per_map_total[i] for i in range(num_maps)},
         "per_worker_seeds": seeds,
         "shards": shard_list,
@@ -728,10 +753,12 @@ def _write_manifest(
 # CLI / orchestration
 # ===========================================================================================
 def _resolve_maps(maps_arg: str):
-    """Resolve the --maps value to (arena_paths, map_names) via the shared resolver.
+    """Resolve the --maps value to (arena_paths, map_names, config_paths) via the shared resolver.
 
     ``all`` -> the sorted 10 exp-configs maps. A comma-list -> those config paths in order.
     Each config -> its absolute arena path (env._arena_path_from_config) + the config stem name.
+    ``arena_paths`` and ``config_paths`` are ABSOLUTE (the worker resolves switch_arena locally on
+    THIS box); the MANIFEST converts them to repo-relative POSIX (see ``_repo_relative_posix``).
     """
     if maps_arg.strip().lower() == "all":
         configs = _resolve_map_rotation([ALL_MAPS_SENTINEL])
@@ -742,6 +769,7 @@ def _resolve_maps(maps_arg: str):
         raise SystemExit(f"--maps resolved to no map configs: {maps_arg!r}")
     arena_paths = []
     names = []
+    config_paths = []
     for cfg in configs:
         cfg = Path(cfg)
         if not cfg.is_absolute():
@@ -750,12 +778,86 @@ def _resolve_maps(maps_arg: str):
 
             candidate = cfg if cfg.suffix else cfg.with_suffix(".json")
             cfg = (DEFAULT_MAPS_DIR / candidate.name).resolve()
+        else:
+            cfg = cfg.resolve()
         arena = _arena_path_from_config(cfg).resolve()
         if not arena.exists():
             raise SystemExit(f"arena not found for map config {cfg}: {arena}")
         arena_paths.append(str(arena))
         names.append(cfg.stem)
-    return arena_paths, names
+        config_paths.append(str(cfg))
+    return arena_paths, names, config_paths
+
+
+def _validate_resume_against_manifest(
+    out_dir: Path, *, workers: int, seed: int, map_names: list[str]
+) -> None:
+    """On --resume, cross-check --workers/--seed/maps against a sealed ``manifest.json``.
+
+    WHY (P0): per-worker entropy comes from ``SeedSequence(seed).spawn(workers)``, whose first K
+    children are IDENTICAL to ``spawn(K)`` (spawn is a stateful counter). So resuming with a
+    DIFFERENT ``--workers`` or ``--seed`` would replay the SAME action streams on the first K
+    workers — near-duplicate trajectories that silently skew per-map balance. ``map_ids`` are also
+    POSITIONAL into the maps list, so a different map order/set would mislabel every pair.
+
+    Behavior:
+      * If a ``manifest.json`` exists, REFUSE (SystemExit) on any mismatch of workers, seed, or the
+        maps list (same names, same order).
+      * If NO manifest exists yet (a prior run crashed before sealing it, but shards may exist),
+        do NOT hard-fail — fall back to the per-worker progress files / shard scan as usual, but
+        PRINT A WARNING that workers/seed could not be cross-checked.
+    """
+    manifest_path = out_dir / "manifest.json"
+    if not manifest_path.exists():
+        print(
+            "WARNING: --resume but no manifest.json in --out; cannot cross-check --workers/--seed "
+            "against the prior run (manifest absent — prior run likely crashed before sealing). "
+            "Falling back to the per-worker progress files / shard scan.",
+            flush=True,
+        )
+        return
+
+    try:
+        prior = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"--resume: could not read existing manifest.json: {exc}") from exc
+
+    prior_workers = prior.get("workers")
+    prior_seed = prior.get("seed")
+    prior_map_names = [m.get("name") for m in prior.get("maps", [])]
+
+    problems = []
+    if prior_workers != workers:
+        problems.append(f"--workers {prior_workers} (got {workers})")
+    # ``seed`` was added in this fix; an older manifest may lack it. Only enforce when present.
+    if prior_seed is not None and prior_seed != seed:
+        problems.append(f"--seed {prior_seed} (got {seed})")
+    if prior_map_names and prior_map_names != map_names:
+        problems.append(f"--maps producing names {prior_map_names} in this order (got {map_names})")
+
+    if problems:
+        need_workers = prior_workers if prior_workers is not None else workers
+        need_seed = prior_seed if prior_seed is not None else seed
+        raise SystemExit(
+            "--resume must match the prior run recorded in manifest.json. "
+            f"Required to match: --workers {need_workers} --seed {need_seed}. "
+            "Mismatch(es): " + "; ".join(problems) + ".\n"
+            "Resuming with a different --workers or --seed would replay identical action streams "
+            "on the first K workers (SeedSequence.spawn is a stateful counter), corrupting the "
+            "dataset; a different maps order/set would mislabel positional map_ids."
+        )
+
+
+def _clean_stale_tmp(out_dir: Path) -> None:
+    """Delete leftover ``*.tmp`` from a crashed prior run (a .tmp is by definition incomplete).
+
+    Belt-and-suspenders: the resume scan only globs final ``*.npz``/``*.json``, so a stray
+    ``shard_w*.npz.tmp`` / ``*.json.tmp`` is never trusted — but removing it keeps --out tidy and
+    avoids confusion. Best-effort; never fails the run.
+    """
+    for tmp in list(out_dir.glob("*.tmp")):
+        with contextlib.suppress(OSError):
+            tmp.unlink()
 
 
 def _split_target(target: int, workers: int) -> list[int]:
@@ -800,10 +902,28 @@ def main(argv=None):
         )
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    arena_paths, map_names = _resolve_maps(args.maps)
+    arena_paths, map_names, config_paths = _resolve_maps(args.maps)
     num_maps = len(arena_paths)
+
+    # RESUME VALIDATION (P0): cross-check --workers/--seed/maps against a sealed manifest BEFORE
+    # spawning any worker. On resume, also sweep any stale *.tmp from a crashed prior run.
+    if args.resume:
+        _validate_resume_against_manifest(
+            out_dir, workers=args.workers, seed=args.seed, map_names=map_names
+        )
+        _clean_stale_tmp(out_dir)
+
+    # MANIFEST PORTABILITY (P0): store REPO-RELATIVE POSIX paths only — the dataset is uploaded to
+    # GCS and consumed on Linux, so a Windows-absolute ``C:\...`` arena_path would be dead there.
+    # The WORKER still gets ABSOLUTE arena_paths on the wire (switch_arena resolves locally here).
     maps_meta = [
-        {"index": i, "name": map_names[i], "arena_path": arena_paths[i]} for i in range(num_maps)
+        {
+            "index": i,
+            "name": map_names[i],
+            "config_path": _repo_relative_posix(config_paths[i]),
+            "arena_path": _repo_relative_posix(arena_paths[i]),
+        }
+        for i in range(num_maps)
     ]
 
     base_config = json.loads(BUILD_PIXELS_CONFIG.read_text(encoding="utf-8"))
@@ -870,6 +990,7 @@ def main(argv=None):
         target=args.target,
         time_scale=args.time_scale,
         workers=args.workers,
+        seed=args.seed,
         frame_encoding="raw_uint8",
         created=created,
     )
