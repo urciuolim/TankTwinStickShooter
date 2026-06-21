@@ -31,6 +31,12 @@ dependencies = [
     # Upper-bounded to the resolved minor lines (repo "pin it" etiquette).
     "matplotlib>=3.11,<3.12",
     "tensorboard>=2.20,<2.21",
+    # Pillow: the pixel-capture verify (scripts/verify_pixel_capture.py) writes the
+    # decoded RGB frames to PNG for the CTO's eyeball check. Already present transitively
+    # (via matplotlib) and resolved at 12.2.0; pinned top-level so the verify's PNG write
+    # is an explicit, declared dependency (repo "pin it" etiquette). Not in the pure-logic
+    # / env / trainer import path — only the verify script imports PIL.
+    "pillow>=12.2,<13",
 ]
 
 [build-system]
