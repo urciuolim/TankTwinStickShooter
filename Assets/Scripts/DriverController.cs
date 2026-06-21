@@ -36,6 +36,15 @@ public class DriverController : MonoBehaviour
     bool aiAsync = false;
     int actionFreq = 1;
 
+    // OPTIONAL pixel-observation channel (additive Stage-1 seam). Default OFF: when obsPixels is
+    // false NOTHING new is written to the socket and the wire is byte-identical to before. See the
+    // frame wire contract in FrameCapture.cs. Width/height default to a 16:9 frame matching the
+    // build's 1920x1080 render aspect (so the captured frame is undistorted vs the live game view).
+    bool obsPixels = false;
+    int obsPixelsWidth = 640;
+    int obsPixelsHeight = 360;
+    private FrameCapture frameCapture;
+
     [HideInInspector]
     public JObject actions, state, config, arena;
     [HideInInspector]
@@ -103,6 +112,12 @@ public class DriverController : MonoBehaviour
             }
             if (config["ai_fixedDeltaTime"] != null)
                 fixedDeltaTime = config["ai_fixedDeltaTime"].Value<float>();
+            if (config["obs_pixels"] != null)
+                obsPixels = config["obs_pixels"].Value<bool>();
+            if (config["obs_pixels_width"] != null)
+                obsPixelsWidth = config["obs_pixels_width"].Value<int>();
+            if (config["obs_pixels_height"] != null)
+                obsPixelsHeight = config["obs_pixels_height"].Value<int>();
 
             if (config["arena_path"] != null)
             {
@@ -121,9 +136,21 @@ public class DriverController : MonoBehaviour
                 Debug.Log("AI Async set to " + aiAsync);
                 Debug.Log("AI action frequency set to " + actionFreq);
                 Debug.Log("Fixed delta time set to " + fixedDeltaTime);
+                Debug.Log("Obs pixels set to " + obsPixels);
+                if (obsPixels)
+                    Debug.Log("Obs pixels resolution set to " + obsPixelsWidth + "x" + obsPixelsHeight);
                 if (arena != null)
                     Debug.Log("Arena loaded from: " + config["arena_path"]);
             }
+        }
+
+        // OPTIONAL pixel channel: only attach the capture component when enabled. Lives on the
+        // DontDestroyOnLoad driver object; it resolves the Arena Main Camera lazily each capture,
+        // so it survives the per-episode LoadScene("Arena"). Default path attaches nothing.
+        if (obsPixels)
+        {
+            frameCapture = gameObject.AddComponent<FrameCapture>();
+            frameCapture.Init(obsPixelsWidth, obsPixelsHeight);
         }
     }
 
@@ -304,6 +331,25 @@ public class DriverController : MonoBehaviour
         byte[] writeBuffer = Encoding.ASCII.GetBytes(state.ToString());
         nwStream.Write(writeBuffer, 0, writeBuffer.Length);
         //Debug.Log("Sent: " + state.ToString());
+
+        // OPTIONAL pixel channel (default OFF). When obsPixels is enabled, IMMEDIATELY after the
+        // raw `state` JSON above, send ONE length-prefixed binary frame (see the wire contract in
+        // FrameCapture.cs): [ 'F' | uint32_BE payloadLen=W*H*3 | uint16_BE W | uint16_BE H | uint8 C
+        // | W*H*3 raw RGB bytes ]. Sent on EVERY step where state is sent (including the done step)
+        // so the Python read is symmetric. Time.timeScale==0 here, so the frame is time-aligned
+        // with the 52-float `state`. One contiguous Write keeps bytes contiguous on our side; the
+        // Python read-exactly loop reassembles across any TCP fragmentation. When obsPixels is
+        // false this block is skipped entirely and the wire is byte-identical to before.
+        if (obsPixels && frameCapture != null)
+        {
+            int w, h;
+            byte[] rgb = frameCapture.CaptureRGB(out w, out h);
+            if (rgb != null)
+            {
+                byte[] frameMessage = FrameCapture.BuildFrameMessage(rgb, w, h);
+                nwStream.Write(frameMessage, 0, frameMessage.Length);
+            }
+        }
 
         if (done)
         {
