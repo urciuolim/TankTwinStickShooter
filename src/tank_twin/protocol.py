@@ -12,10 +12,15 @@ parses these exact bytes:
 
 Two things are deliberately preserved from 2021 and OUT OF SCOPE to change here:
 
-* the JSON read is still unframed ``recv(1024)`` (``receive`` assumes one JSON object
-  per packet). Length-prefix framing of the JSON channel is a later Plan phase; do not
-  add it here. (The ADDITIVE binary pixel-frame channel below IS length-prefixed, but it
-  is a SEPARATE, default-OFF wire path — it does not touch ``receive`` / ``recv(1024)``.)
+* the JSON channel has no length-prefix framing — ``receive`` reads via ``recv(1024)``.
+  Length-prefix framing of the JSON channel is a later Plan phase; do not add it here.
+  ``receive`` IS buffer-aware (it returns exactly one complete JSON object via a
+  brace-depth scan and retains any trailing bytes in ``Connection._buffer`` for the next
+  read) — a correctness fix so a coalesced control-ack + state-JSON + binary-frame recv
+  on the pixels path does not feed frame bytes into ``json.loads``. On the no-pixel wire
+  (one clean JSON object per recv) it stays byte-identical: the scan stops at the closing
+  ``}`` and leaves ``_buffer`` empty after a single ``recv(1024)``. (The ADDITIVE binary
+  pixel-frame channel below IS length-prefixed; it shares the same ``_buffer``.)
 * a ``socket.timeout`` on send or recv is re-raised as ``ConnectionError`` (the env's
   reconnect path keys off ``ConnectionError``).
 
@@ -140,17 +145,25 @@ class Connection:
             raise ConnectionError from exc
 
     def receive(self):
-        """Read one ``recv(bufsize)`` packet and strict-decode it to a dict.
+        """Read EXACTLY one complete JSON object and strict-decode it to a dict.
 
-        Unframed by design (one JSON object per packet, as in 2021). A
-        ``socket.timeout`` is translated to ``ConnectionError``, matching the
-        legacy ``receive``.
+        BUFFER-AWARE: returns one COMPLETE top-level JSON object and RETAINS any bytes
+        that arrived after its closing brace in ``self._buffer`` for the next read
+        (``receive_state_and_frame`` / ``receive_frame`` / ``_recv_exactly`` all drain
+        ``self._buffer`` first). This delegates to ``_receive_one_json`` — the same
+        brace-depth scan (string/escape-aware) that ``receive_state_and_frame`` uses —
+        so a coalesced ``{ack}{state}<frame>`` recv yields ONLY the ack here (with
+        ``{state}<frame>`` buffered), instead of feeding the binary frame bytes into
+        ``json.loads`` and raising ``json.JSONDecodeError: Extra data`` (the confirmed
+        pixels-ON handshake landmine).
+
+        On the no-pixel wire (a clean single JSON object per ``recv``) this is
+        byte-identical to the legacy behavior: the brace-scan stops at the closing
+        ``}`` and leaves ``self._buffer`` empty, calling ``recv(bufsize)`` exactly once.
+        A ``socket.timeout`` is translated to ``ConnectionError`` (inside
+        ``_receive_one_json``'s recv loop), matching the legacy ``receive``.
         """
-        try:
-            received = self.transport.recv(self.bufsize)
-        except TimeoutError as exc:
-            raise ConnectionError from exc
-        return decode(received)
+        return decode(self._receive_one_json())
 
     # --- pixel frame channel (Stage 1, additive; does NOT touch send/receive above) ---
 

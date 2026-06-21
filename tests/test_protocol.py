@@ -183,3 +183,109 @@ def test_receive_strict_rejects_malformed_reply():
     t = FakeTransport(replies=[b'{"state": [1, 2, 3],}'])
     with pytest.raises(json.JSONDecodeError):
         Connection(t).receive()
+
+
+# --- buffer-aware receive(): the coalesced control-ack + state + frame landmine ----
+#
+# These pin the correctness fix: on the pixels-ON path the build writes a control ack
+# (e.g. {"starting":true}) and then IMMEDIATELY the first state JSON + its binary frame.
+# TCP coalesces them, so a single recv can return {ack}{state}<frame>. The old receive()
+# json.loads'd the WHOLE recv chunk and raised "Extra data" on the trailing bytes. The
+# buffer-aware receive() must return ONLY the ack and retain {state}<frame> in _buffer for
+# the following receive_state_and_frame(). stdlib + raw bytes for the frame; the frame is
+# decoded by the REAL receive_frame so we don't reshape by hand.
+
+FRAME_TAG = 0x46  # ASCII 'F' — must match protocol.FRAME_TAG
+
+
+def _build_frame_message(w, h):
+    """Assemble one on-wire pixel frame exactly as FrameCapture.BuildFrameMessage does.
+
+    ``[ tag=0x46 | uint32_BE payloadLen=W*H*3 | uint16_BE W | uint16_BE H | uint8 C=3 |
+    W*H*3 RGB bytes ]`` — all multi-byte ints BIG-ENDIAN. Returns (message_bytes,
+    payload_bytes); the payload is a deterministic per-row gradient (row r filled with the
+    byte value r, BOTTOM-UP as Unity ships) so the np.flipud top-left flip is observable.
+    """
+    c = 3
+    payload_len = w * h * c
+    # Bottom-up rows: wire row 0 == all 0s, wire row (h-1) == all (h-1).
+    payload = bytearray()
+    for r in range(h):
+        payload += bytes([r]) * (w * c)
+    header = (
+        bytes([FRAME_TAG])
+        + payload_len.to_bytes(4, "big")
+        + w.to_bytes(2, "big")
+        + h.to_bytes(2, "big")
+        + bytes([c])
+    )
+    return header + bytes(payload), bytes(payload)
+
+
+def test_receive_buffers_trailing_state_and_frame_after_coalesced_ack():
+    # (a) COALESCED: one recv returns {"starting":true} + {state} + <frame> glued together.
+    # receive() must return ONLY the ack and leave {state}<frame> in _buffer; then
+    # receive_state_and_frame() must drain that buffer into the right (state, frame) pair.
+    w, h = 4, 4  # tiny so the whole blob fits one FakeTransport recv
+    frame_msg, _payload = _build_frame_message(w, h)
+    state = [0.1, -2.0, 3.5] + [0.0] * 49  # 52 floats
+    ack_bytes = encode({"starting": True})
+    state_bytes = encode({"state": state})
+    coalesced = ack_bytes + state_bytes + frame_msg
+
+    t = FakeTransport(replies=[coalesced])
+    conn = Connection(t)
+
+    ack = conn.receive()
+    assert ack == {"starting": True}
+    # Everything after the ack's closing brace is retained for the next read.
+    assert conn._buffer == state_bytes + frame_msg
+
+    got_state, got_frame = conn.receive_state_and_frame()
+    assert got_state == {"state": state}
+    assert got_frame.shape == (h, w, 3)
+    assert str(got_frame.dtype) == "uint8"
+    # Verify the flip + content: array row 0 (top-left origin) is the LAST wire row (h-1),
+    # array row -1 is wire row 0 (all 0s).
+    assert int(got_frame[0].min()) == int(got_frame[0].max()) == h - 1
+    assert int(got_frame[-1].min()) == int(got_frame[-1].max()) == 0
+    assert conn._buffer == b""  # frame fully drained
+
+
+def test_receive_reassembles_ack_split_across_two_recvs():
+    # (b) SPLIT-ACROSS-RECV: the ack JSON arrives in two recv chunks (partial, remainder).
+    # receive() must loop recv until the top-level object closes and reassemble it.
+    ack_bytes = encode({"restarting": True})
+    cut = len(ack_bytes) // 2
+    t = FakeTransport(replies=[ack_bytes[:cut], ack_bytes[cut:]])
+    conn = Connection(t)
+
+    ack = conn.receive()
+    assert ack == {"restarting": True}
+    assert conn._buffer == b""
+    assert len(t.recv_sizes) == 2  # took two recvs to assemble the one object
+
+
+def test_receive_split_ack_with_trailing_state_frame_is_buffered():
+    # (b, third variant) The ack is split across two recvs AND chunk-2 carries trailing
+    # state/frame bytes. receive() returns just the ack; the trailing bytes are buffered
+    # for receive_state_and_frame().
+    w, h = 3, 3
+    frame_msg, _payload = _build_frame_message(w, h)
+    state = [1.5, -1.5, 0.25] + [0.0] * 49
+    ack_bytes = encode({"starting": True})
+    state_bytes = encode({"state": state})
+    cut = len(ack_bytes) // 2
+    chunk1 = ack_bytes[:cut]
+    chunk2 = ack_bytes[cut:] + state_bytes + frame_msg
+
+    t = FakeTransport(replies=[chunk1, chunk2])
+    conn = Connection(t)
+
+    ack = conn.receive()
+    assert ack == {"starting": True}
+    assert conn._buffer == state_bytes + frame_msg
+
+    got_state, got_frame = conn.receive_state_and_frame()
+    assert got_state == {"state": state}
+    assert got_frame.shape == (h, w, 3)
