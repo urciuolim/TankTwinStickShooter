@@ -31,6 +31,7 @@ import time
 from pathlib import Path
 
 import numpy as np
+from tqdm import tqdm
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT / "src"))
@@ -84,7 +85,7 @@ def main(argv: list[str] | None = None) -> int:
     shards = list_shards(data_dir)
     # First pass: total N (cheap header read).
     counts = []
-    for s in shards:
+    for s in tqdm(shards, desc="counting shards", unit="shard"):
         with np.load(s) as d:
             counts.append(int(d["map_ids"].shape[0]))
     total = sum(counts)
@@ -106,7 +107,8 @@ def main(argv: list[str] | None = None) -> int:
 
     row = 0
     t0 = time.time()
-    for si, s in enumerate(shards):
+    pbar = tqdm(shards, desc="caching frames", unit="shard")
+    for s in pbar:
         if row >= total:
             break
         wid = worker_id_from_shard(s.name)
@@ -123,9 +125,7 @@ def main(argv: list[str] | None = None) -> int:
             group_keys[row : row + take, 0] = wid
             group_keys[row : row + take, 1] = d["episode_ids"][:take].astype(np.int64)
         row += take
-        if (si + 1) % 50 == 0 or row >= total:
-            rate = row / max(1e-9, time.time() - t0)
-            print(f"  [cache] shard {si + 1}/{len(shards)} rows={row}/{total} ({rate:.0f} pairs/s)")
+        pbar.set_postfix(rows=f"{row}/{total}", rate=f"{row / max(1e-9, time.time() - t0):.0f}/s")
 
     frames_mm.flush()
     del frames_mm

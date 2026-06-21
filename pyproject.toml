@@ -37,6 +37,7 @@ dependencies = [
     # is an explicit, declared dependency (repo "pin it" etiquette). Not in the pure-logic
     # / env / trainer import path — only the verify script imports PIL.
     "pillow>=12.2,<13",
+    "tqdm>=4.68.3",
 ]
 
 [build-system]

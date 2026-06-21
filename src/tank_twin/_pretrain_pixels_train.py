@@ -21,6 +21,7 @@ import numpy as np
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
 
 from tank_twin.pretrain_pixels import (
     N_BULLET_POS,
@@ -332,7 +333,7 @@ def _evaluate(
     presence_correct = 0
     presence_total = 0
     n_batches = 0
-    for batch in loader:
+    for batch in tqdm(loader, desc="  eval", unit="batch", leave=False):
         b = _move_batch(batch, device)
         with torch.autocast(device_type=device.type, enabled=use_amp):
             preds = model(b["frame"])
@@ -498,7 +499,8 @@ def run_training(args: Namespace) -> int:
         model.train()
         ep_parts = {"total": 0.0, "player": 0.0, "presence": 0.0, "bullet_pos": 0.0, "wall": 0.0}
         n_batches = 0
-        for batch in train_loader:
+        pbar = tqdm(train_loader, desc=f"epoch {epoch + 1}/{args.epochs}", unit="batch")
+        for batch in pbar:
             b = _move_batch(batch, device)
             opt.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, enabled=use_amp):
@@ -513,8 +515,9 @@ def run_training(args: Namespace) -> int:
             n_batches += 1
             global_step += 1
             seen += b["frame"].shape[0]
+            pbar.set_postfix(total=f"{float(total.detach()):.3f}")
             if global_step % args.log_every == 0:
-                print(
+                tqdm.write(
                     f"  [e{epoch} s{global_step}] "
                     + " ".join(f"{k}={v:.4f}" for k, v in parts.items())
                     + f" total={float(total.detach()):.4f}"
