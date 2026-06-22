@@ -37,13 +37,16 @@ from tank_twin.pretrain_pixels import (
     fit_norm_stats,
     head_sizes,
     interior_wall_mask,
+    interior_wall_pos_weight,
     iou_score,
     map_aware_split,
     normalize,
     parse_input_res,
     parse_objectives,
+    parse_pos_weight_arg,
     player_head_size,
     player_head_vec_indices,
+    presence_pos_weight,
     resolve_map_ids,
     stratified_group_split,
     wall_target_for,
@@ -536,3 +539,123 @@ def test_interior_wall_f1_on_a_tiny_grid_example():
 
 def test_iou_both_empty_is_one():
     assert iou_score(np.zeros(10), np.zeros(10)) == 1.0
+
+
+# =============================================================================
+# Class-imbalance BCE pos_weights (CHANGE 1 + CHANGE 2 pure helpers)
+# =============================================================================
+def test_presence_pos_weight_known_positive_rate():
+    # 100 slots, exactly 20 present -> #zeros/#ones = 80/20 = 4.0.
+    presence = np.zeros((10, 10), dtype=np.float32)  # (N, 10) = 100 slots
+    presence.ravel()[:20] = 1.0
+    assert presence_pos_weight(presence) == pytest.approx(4.0)
+    # Realistic ~7.8% present -> ratio ~11.8 (the measured-data regime).
+    pres2 = np.zeros(1000, dtype=np.float32)
+    pres2[:78] = 1.0  # 78 present / 922 absent
+    assert presence_pos_weight(pres2) == pytest.approx(922 / 78)
+
+
+def test_presence_pos_weight_is_train_only_input():
+    # The helper takes ONLY the (train) array it is given; it cannot see eval/val.
+    train = np.zeros(50, dtype=np.float32)
+    train[:10] = 1.0  # 40 absent / 10 present = 4.0 on TRAIN
+    # A hypothetical eval array with a different rate must NOT change the result.
+    assert presence_pos_weight(train) == pytest.approx(4.0)
+
+
+def test_presence_pos_weight_fallback_when_no_present_slots():
+    presence = np.zeros((5, 10), dtype=np.float32)  # all absent
+    assert presence_pos_weight(presence) == pytest.approx(1.0)  # default fallback
+    assert presence_pos_weight(presence, fallback=7.0) == pytest.approx(7.0)
+
+
+def test_interior_wall_pos_weight_uses_interior_only_ignores_border():
+    # (N,12,20) with a KNOWN number of interior wall cells AND some border walls.
+    n = 3
+    walls = np.zeros((n, 12, 20), dtype=np.float32)
+    mask = interior_wall_mask()  # 128 interior cells
+    interior_rc = list(zip(*np.where(mask), strict=True))
+    # Set 8 interior wall cells in EACH of the n grids (interior cells: rows 2..9 cols 2..17).
+    n_interior_walls_per = 8
+    for i in range(n):
+        for r, c in interior_rc[:n_interior_walls_per]:
+            walls[i, r, c] = 1.0
+    # Add BORDER walls everywhere on the border for grid 0 (must NOT affect the ratio).
+    border = ~mask
+    walls[0][border] = 1.0
+    total_interior = n * 128
+    total_interior_walls = n * n_interior_walls_per
+    expected = (total_interior - total_interior_walls) / total_interior_walls
+    assert interior_wall_pos_weight(walls) == pytest.approx(expected)
+    # Sanity: flipping ALL border cells on/off leaves the ratio unchanged.
+    walls_no_border = walls.copy()
+    walls_no_border[..., border] = 0.0
+    assert interior_wall_pos_weight(walls_no_border) == pytest.approx(expected)
+
+
+def test_interior_wall_pos_weight_fallback_when_no_interior_walls():
+    # Only border walls; zero interior walls -> fallback (avoid div-by-zero).
+    walls = np.zeros((2, 12, 20), dtype=np.float32)
+    border = ~interior_wall_mask()
+    walls[..., border] = 1.0  # border fully wall, interior fully free
+    assert interior_wall_pos_weight(walls) == pytest.approx(1.0)
+    assert interior_wall_pos_weight(walls, fallback=3.5) == pytest.approx(3.5)
+
+
+def test_parse_pos_weight_arg_auto_vs_float():
+    assert parse_pos_weight_arg("auto") is None
+    assert parse_pos_weight_arg("AUTO") is None
+    assert parse_pos_weight_arg(None) is None
+    assert parse_pos_weight_arg("12.5") == pytest.approx(12.5)
+    assert parse_pos_weight_arg(3.0) == pytest.approx(3.0)
+    with pytest.raises(ValueError):
+        parse_pos_weight_arg("not_a_number")
+
+
+# --- Interior-masked + pos-weighted wall BCE: border contributes 0 (torch) ---
+def test_interior_masked_wall_loss_border_is_inert_and_walls_upweighted():
+    """The wall loss must (a) ignore border cells entirely and (b) up-weight interior
+    wall (positive) cells via pos_weight. Uses torch; skipped if torch is absent."""
+    torch = pytest.importorskip("torch")
+    from tank_twin._pretrain_pixels_train import InverseRenderer, compute_losses
+    from tank_twin.pretrain_pixels import ObjectiveConfig
+
+    mask = interior_wall_mask()
+    cfg = ObjectiveConfig.from_set(["walls"])
+    model = InverseRenderer(36, 60, cfg, embedding_dim=8)
+
+    def wall_loss(pred_grid, tgt_grid, wall_pw):
+        preds = {"wall": torch.tensor(pred_grid, dtype=torch.float32).reshape(1, 12, 20)}
+        targets = {"wall": torch.tensor(tgt_grid, dtype=torch.float32).reshape(1, 12, 20)}
+        lambdas = dict.fromkeys(("player", "presence", "bullet_pos", "bullet_dir", "wall"), 1.0)
+        _total, parts = compute_losses(preds, targets, model, lambdas, 1.0, wall_pw)
+        return parts["wall"]
+
+    # Baseline: zero logits, interior target free everywhere.
+    base_pred = np.zeros((12, 20), dtype=np.float32)
+    base_tgt = np.zeros((12, 20), dtype=np.float32)
+    loss_base = wall_loss(base_pred, base_tgt, 1.0)
+
+    # (a) Changing a BORDER target/pred must NOT change the loss (border is masked out).
+    border = ~mask
+    br, bc = np.argwhere(border)[0]
+    pred_border = base_pred.copy()
+    tgt_border = base_tgt.copy()
+    pred_border[br, bc] = 5.0  # large border logit
+    tgt_border[br, bc] = 1.0  # flip border target
+    loss_border = wall_loss(pred_border, tgt_border, 1.0)
+    assert loss_border == pytest.approx(loss_base, abs=1e-6)
+
+    # (b) An interior WALL (positive) cell is up-weighted vs an interior FREE cell.
+    ir, ic = np.argwhere(mask)[0]
+    pred_one = base_pred.copy()
+    pred_one[ir, ic] = -3.0  # wrong sign for both cases; isolate the target/weight effect
+    # Case free: interior target 0 at that cell (negative class, weight 1).
+    tgt_free = base_tgt.copy()
+    loss_free = wall_loss(pred_one, tgt_free, 5.0)
+    # Case wall: interior target 1 at that cell (positive class, weight = wall_pw = 5).
+    tgt_wall = base_tgt.copy()
+    tgt_wall[ir, ic] = 1.0
+    loss_wall = wall_loss(pred_one, tgt_wall, 5.0)
+    # The positive cell is up-weighted, so the wall case incurs strictly more loss.
+    assert loss_wall > loss_free

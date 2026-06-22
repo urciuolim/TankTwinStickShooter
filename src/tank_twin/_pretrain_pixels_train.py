@@ -44,10 +44,13 @@ from tank_twin.pretrain_pixels import (
     fit_norm_stats,
     head_sizes,
     interior_wall_mask,
+    interior_wall_pos_weight,
     list_shards,
     load_map_name_to_id,
     map_aware_split,
+    parse_pos_weight_arg,
     player_head_vec_indices,
+    presence_pos_weight,
     resolve_map_ids,
     worker_id_from_shard,
 )
@@ -126,14 +129,22 @@ def compute_losses(
     targets: dict[str, torch.Tensor],
     model: InverseRenderer,
     lambdas: dict[str, float],
+    presence_pw: float | torch.Tensor,
+    wall_pw: float | torch.Tensor,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Total + per-component loss over ENABLED objectives only.
 
     * player: MSE on the normalized enabled-sub-group slice of the 12-vector target.
-    * bullet_presence: BCEWithLogits on 10 slot bits.
+    * bullet_presence: BCEWithLogits on 10 slot bits, with ``pos_weight=presence_pw`` to
+      counter the slot-level imbalance (~7.8% present) that collapses plain BCE to F1=0.
     * bullet_position / bullet_direction: MSE on 20 normalized floats, MASKED to present
       slots (absent slots contribute 0; mean over present floats only).
-    * walls: per-cell BCEWithLogits over the (12,20) grid.
+    * walls: BCEWithLogits restricted to the INTERIOR cells only (the constant 2-deep
+      border is information-free and is dropped from the loss), with ``pos_weight=wall_pw``
+      on interior wall cells. The head stays 240 logits; border cells contribute exactly 0.
+
+    ``presence_pw`` / ``wall_pw`` are TRAIN-level scalars (float or 0-dim tensor); they are
+    materialized as scalar tensors on the preds' device/dtype inside this function.
     """
     mse = nn.functional.mse_loss
     bce = nn.functional.binary_cross_entropy_with_logits
@@ -151,9 +162,11 @@ def compute_losses(
         add("player", mse(preds["player"], targets["player"][:, idx]), lambdas["player"])
 
     if cfg.is_on("bullet_presence"):
+        p = preds["bullet_presence"]
+        pw = torch.as_tensor(presence_pw, dtype=p.dtype, device=p.device)
         add(
             "presence",
-            bce(preds["bullet_presence"], targets["bullet_presence"]),
+            bce(p, targets["bullet_presence"], pos_weight=pw),
             lambdas["presence"],
         )
 
@@ -167,13 +180,35 @@ def compute_losses(
         add("bullet_dir", sq.sum() / mask.sum().clamp_min(1.0), lambdas["bullet_dir"])
 
     if cfg.is_on("walls"):
-        add("wall", bce(preds["wall"], targets["wall"]), lambdas["wall"])
+        wp = preds["wall"]  # (B, 12, 20) logits
+        wt = targets["wall"]  # (B, 12, 20) {0,1}
+        # Interior-only BCE: select the 128 interior cells so the constant border
+        # (identical on every map, info-free) contributes EXACTLY 0 to the loss.
+        interior = _interior_wall_index(wp.device)  # (12,20) bool on device
+        wpw = torch.as_tensor(wall_pw, dtype=wp.dtype, device=wp.device)
+        per_cell = bce(wp, wt, pos_weight=wpw, reduction="none")  # (B,12,20)
+        sel = per_cell[:, interior]  # (B, 128)
+        add("wall", sel.mean(), lambdas["wall"])
 
     if not terms:  # pragma: no cover - parse_objectives forbids an empty config
         raise ValueError("no objectives enabled; nothing to optimize")
     total = terms[0] if len(terms) == 1 else torch.stack(terms).sum()
     parts["total"] = float(total.detach())
     return total, parts
+
+
+# Cache the interior-wall boolean mask as a torch tensor per device (the numpy mask is
+# constant; this avoids rebuilding it every batch).
+_INTERIOR_WALL_CACHE: dict[torch.device, torch.Tensor] = {}
+
+
+def _interior_wall_index(device: torch.device) -> torch.Tensor:
+    """The (12,20) interior-cell boolean mask as a torch tensor on ``device`` (cached)."""
+    cached = _INTERIOR_WALL_CACHE.get(device)
+    if cached is None:
+        cached = torch.from_numpy(interior_wall_mask()).to(device)
+        _INTERIOR_WALL_CACHE[device] = cached
+    return cached
 
 
 # =============================================================================
@@ -393,11 +428,15 @@ def _evaluate(
     stats: NormStats,
     use_amp: bool,
     desc: str,
+    presence_pw: float | torch.Tensor,
+    wall_pw: float | torch.Tensor,
 ) -> dict[str, object]:
     """Run the loss + the full per-objective breakdown over ``loader``.
 
     Disabled groups report ``"N/A"``. POSITION groups also report world-unit error.
-    bullet_presence -> precision/recall/F1; walls -> INTERIOR F1/IoU (+ overall acc).
+    bullet_presence -> precision/recall/F1; walls -> INTERIOR F1/precision/recall/IoU
+    (the wall loss is interior-only, so the border head output is unsupervised /
+    meaningless and ``overall_acc`` is intentionally NOT reported).
     """
     model.eval()
     cfg = model.cfg
@@ -417,15 +456,14 @@ def _evaluate(
     bdir_cnt = np.zeros(N_BULLET_DIR)
     # Presence: collect predictions/targets for F1.
     pres_tp = pres_fp = pres_fn = 0
-    # Walls: interior F1/IoU + overall accuracy.
+    # Walls: interior F1/IoU (no overall accuracy — border is unsupervised now).
     wall_tp = wall_fp = wall_fn = wall_inter = wall_union = 0
-    wall_correct = wall_total = 0
 
     for batch in tqdm(loader, desc=desc, unit="batch", leave=False):
         b = _move_batch(batch, device)
         with torch.autocast(device_type=device.type, enabled=use_amp):
             preds = model(b["frame"])
-            total, _parts = compute_losses(preds, b, model, lambdas)
+            total, _parts = compute_losses(preds, b, model, lambdas, presence_pw, wall_pw)
         loss_total += float(total.detach())
         n_batches += 1
 
@@ -462,8 +500,6 @@ def _evaluate(
         if cfg.is_on("walls"):
             pred = (preds["wall"].float().cpu().numpy() > 0).astype(np.int64)  # (B,12,20)
             tgt = b["wall"].float().cpu().numpy().astype(np.int64)
-            wall_correct += int((pred == tgt).sum())
-            wall_total += int(tgt.size)
             pi = pred[:, interior].ravel()
             ti = tgt[:, interior].ravel()
             wall_tp += int(((pi == 1) & (ti == 1)).sum())
@@ -517,7 +553,6 @@ def _evaluate(
             "interior_precision": prec,
             "interior_recall": rec,
             "interior_iou": iou,
-            "overall_acc": wall_correct / max(1, wall_total),
         }
 
     out["per_objective"] = breakdown
@@ -551,9 +586,7 @@ def _fmt_breakdown(b: dict[str, object]) -> str:
     if w == "N/A":
         parts.append("walls=N/A")
     else:
-        parts.append(
-            f"walls=intF1{w['interior_f1']:.3f}/IoU{w['interior_iou']:.3f}/acc{w['overall_acc']:.3f}"
-        )
+        parts.append(f"walls=intF1{w['interior_f1']:.3f}/IoU{w['interior_iou']:.3f}")
     return "  ".join(parts)
 
 
@@ -679,6 +712,25 @@ def run_training(args: Namespace) -> int:
         f"(data prep {time.time() - t0:.1f}s)"
     )
 
+    # --- Resolve class-imbalance BCE pos_weights (TRAIN split ONLY; no leakage) ------
+    # ds_train._cache holds the TRAIN split's decoded targets (presence (N,10), wall
+    # (N,12,20)); use those so the weights are train-level, computed ONCE here and
+    # threaded into every loss call (NOT recomputed per-batch).
+    presence_override = parse_pos_weight_arg(args.presence_pos_weight)
+    wall_override = parse_pos_weight_arg(args.wall_pos_weight)
+    train_presence = ds_train._cache["bullet_presence"]  # (N, 10) {0,1}
+    train_walls = ds_train._cache["wall"]  # (N, 12, 20) {0,1}
+    presence_pw = (
+        presence_override if presence_override is not None else presence_pos_weight(train_presence)
+    )
+    wall_pw = wall_override if wall_override is not None else interior_wall_pos_weight(train_walls)
+    presence_src = "override" if presence_override is not None else "auto(train)"
+    wall_src = "override" if wall_override is not None else "auto(train)"
+    print(
+        f"[pretrain] BCE pos_weights -> presence={presence_pw:.4f} ({presence_src}), "
+        f"wall(interior)={wall_pw:.4f} ({wall_src})"
+    )
+
     pin = device.type == "cuda"
     train_loader = DataLoader(
         ds_train,
@@ -735,7 +787,7 @@ def run_training(args: Namespace) -> int:
             opt.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, enabled=use_amp):
                 preds = model(b["frame"])
-                total, parts = compute_losses(preds, b, model, lambdas)
+                total, parts = compute_losses(preds, b, model, lambdas, presence_pw, wall_pw)
             scaler.scale(total).backward()
             scaler.step(opt)
             scaler.update()
@@ -751,7 +803,17 @@ def run_training(args: Namespace) -> int:
                     + f" total={parts['total']:.4f}"
                 )
         ep_total /= max(1, n_batches)
-        ev = _evaluate(model, eval_loader, lambdas, device, stats, use_amp, desc="  eval")
+        ev = _evaluate(
+            model,
+            eval_loader,
+            lambdas,
+            device,
+            stats,
+            use_amp,
+            desc="  eval",
+            presence_pw=presence_pw,
+            wall_pw=wall_pw,
+        )
         ev["epoch"] = epoch
         ev["train_total_loss"] = ep_total
         eval_history.append(ev)
@@ -769,7 +831,17 @@ def run_training(args: Namespace) -> int:
 
     # --- Final out-of-distribution VALIDATION (the 2 held-out maps), run ONCE ----
     print("[pretrain] running FINAL out-of-distribution VALIDATION (2 held-out maps)...")
-    validation = _evaluate(model, val_loader, lambdas, device, stats, use_amp, desc="  validation")
+    validation = _evaluate(
+        model,
+        val_loader,
+        lambdas,
+        device,
+        stats,
+        use_amp,
+        desc="  validation",
+        presence_pw=presence_pw,
+        wall_pw=wall_pw,
+    )
     print(
         f"[validation] OOD total={validation['total_loss']:.4f} | "
         f"{_fmt_breakdown(validation['per_objective'])}"
@@ -805,6 +877,12 @@ def run_training(args: Namespace) -> int:
         "objectives": cfg.to_json(),
         "head_sizes": model.sizes,
         "lambdas": lambdas,
+        "pos_weights": {
+            "presence": float(presence_pw),
+            "wall_interior": float(wall_pw),
+            "presence_source": presence_src,
+            "wall_source": wall_src,
+        },
         "batch": args.batch,
         "lr": args.lr,
         "epochs": args.epochs,

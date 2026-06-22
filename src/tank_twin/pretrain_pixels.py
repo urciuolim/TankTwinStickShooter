@@ -73,12 +73,15 @@ __all__ = [
     "encode_player_targets",
     "fit_norm_stats",
     "interior_wall_mask",
+    "interior_wall_pos_weight",
     "iou_score",
     "main",
     "map_aware_split",
     "normalize",
     "parse_input_res",
+    "parse_pos_weight_arg",
     "player_head_size",
+    "presence_pos_weight",
     "player_head_vec_indices",
     "resolve_map_ids",
     "stratified_group_split",
@@ -349,6 +352,71 @@ def interior_wall_mask() -> np.ndarray:
     c0, c1 = WALL_INTERIOR_COLS
     mask[r0 : r1 + 1, c0 : c1 + 1] = True
     return mask
+
+
+# =============================================================================
+# Class-imbalance pos_weights (pure; numpy; TRAIN-split only — torch-free)
+# =============================================================================
+def presence_pos_weight(presence: np.ndarray, *, fallback: float = 1.0) -> float:
+    """Positive-class BCE weight for the bullet-presence head: (#absent)/(#present).
+
+    Bullet slots are overwhelmingly absent (~7.8% present), so plain BCE collapses to
+    "always absent" (presence F1 = 0). A ``pos_weight`` of (#zeros)/(#ones) re-balances
+    the loss so present slots are not drowned out. MUST be computed on the TRAIN split
+    only (the caller passes the train presence targets) to avoid eval/validation leakage.
+
+    ``presence`` is a ``(N, 10)`` (or any-shape) {0,1} array. Returns the float ratio of
+    absent-to-present slots; falls back to ``fallback`` if there are zero present slots
+    (avoids divide-by-zero).
+    """
+    arr = np.asarray(presence)
+    present = float((arr > 0.5).sum())
+    if present <= 0.0:
+        return float(fallback)
+    absent = float(arr.size) - present
+    return absent / present
+
+
+def interior_wall_pos_weight(walls: np.ndarray, *, fallback: float = 1.0) -> float:
+    """Positive-class BCE weight for the INTERIOR wall cells: (#interior free)/(#interior wall).
+
+    The full 20x12 grid is ~50% walls (a constant 2-deep border), so a GLOBAL wall
+    pos_weight is ~1.0 (a no-op). The real imbalance lives in the interior (only ~6.6%
+    walls), so this restricts to :func:`interior_wall_mask` cells and returns the ratio of
+    interior FREE cells to interior WALL cells there. Border cells never enter the count.
+    MUST be computed on the TRAIN split only (the caller passes train wall targets).
+
+    ``walls`` is a ``(N, 12, 20)`` {0,1} array. Returns the float ratio; falls back to
+    ``fallback`` if there are zero interior wall cells (avoids divide-by-zero).
+    """
+    arr = np.asarray(walls)
+    mask = interior_wall_mask()  # (12, 20) bool
+    interior = arr[..., mask] > 0.5  # (N, 128)
+    wall = float(interior.sum())
+    if wall <= 0.0:
+        return float(fallback)
+    free = float(interior.size) - wall
+    return free / wall
+
+
+def parse_pos_weight_arg(value: str | float | None) -> float | None:
+    """Resolve a ``--*-pos-weight`` CLI value: ``None``/``"auto"`` -> ``None`` (compute),
+    else a parsed/passed float (used verbatim).
+
+    Returns ``None`` to signal "auto-compute from the train split", or the explicit float
+    override. Raises ValueError on a non-numeric, non-"auto" string.
+    """
+    if value is None:
+        return None
+    if isinstance(value, int | float):
+        return float(value)
+    s = value.strip().lower()
+    if s == "auto":
+        return None
+    try:
+        return float(s)
+    except ValueError as e:
+        raise ValueError(f"pos-weight must be 'auto' or a float, got {value!r}") from e
 
 
 @dataclass(frozen=True)
@@ -727,6 +795,25 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument("--lambda-bullet-pos", type=float, default=1.0)
     p.add_argument("--lambda-bullet-dir", type=float, default=1.0)
     p.add_argument("--lambda-wall", type=float, default=1.0)
+    # --- Class-imbalance pos_weights (BCE). "auto" => computed from the TRAIN split. ---
+    p.add_argument(
+        "--presence-pos-weight",
+        type=str,
+        default="auto",
+        help=(
+            "BCE pos_weight for bullet_presence. 'auto' (default) computes "
+            "(#absent)/(#present) over the TRAIN split (~12); or pass a float to use verbatim."
+        ),
+    )
+    p.add_argument(
+        "--wall-pos-weight",
+        type=str,
+        default="auto",
+        help=(
+            "BCE pos_weight for INTERIOR wall cells. 'auto' (default) computes "
+            "(#interior free)/(#interior wall) over the TRAIN split (~14); or pass a float."
+        ),
+    )
     p.add_argument("--batch", type=int, default=256)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--epochs", type=int, default=10)
