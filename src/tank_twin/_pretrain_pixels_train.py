@@ -41,6 +41,7 @@ from tank_twin.pretrain_pixels import (
     NormStats,
     ObjectiveConfig,
     aim_angular_error_deg,
+    cosine_warmup_lr_multiplier,
     decode_targets,
     denormalize,
     downsample_frames_np,
@@ -876,8 +877,36 @@ def run_training(args: Namespace) -> int:
     )
 
     model = InverseRenderer(out_h, out_w, cfg, args.embedding_dim).to(device)
-    opt = torch.optim.Adam(model.parameters(), lr=args.lr)
+    # AdamW = decoupled weight decay (the correct form); weight_decay=0.0 (default) makes
+    # this behave like the old Adam, so `--lr 3e-4 --lr-schedule constant` is unchanged.
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+
+    # --- LR schedule (per-optimizer-step LambdaLR over the WHOLE run) ----------------
+    # Total optimizer steps = steps-per-epoch * epochs. train_loader uses drop_last=False,
+    # so steps-per-epoch == len(train_loader) (number of batches). For 'constant' the
+    # multiplier is a no-op 1.0 (byte-equivalent to no scheduler); for 'cosine' it is the
+    # pure linear-warmup -> cosine-anneal multiplier. The scheduler is stepped ONCE per
+    # SUCCESSFUL optimizer step (guarded against AMP-skipped steps), so its internal step
+    # counter == the optimizer-step index passed to the multiplier helper.
+    warmup_frac = 0.05
+    steps_per_epoch = len(train_loader)
+    total_steps = max(1, steps_per_epoch * args.epochs)
+    warmup_steps = min(max(1, round(warmup_frac * total_steps)), total_steps)
+    if args.lr_schedule == "cosine":
+
+        def _lr_lambda(opt_step: int) -> float:
+            return cosine_warmup_lr_multiplier(opt_step, total_steps, warmup_frac)
+    else:
+
+        def _lr_lambda(opt_step: int) -> float:  # constant: no-op multiplier
+            return 1.0
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=_lr_lambda)
+    print(
+        f"[pretrain] lr={args.lr} schedule={args.lr_schedule} weight_decay={args.weight_decay} "
+        f"(total_steps={total_steps}, warmup_steps={warmup_steps})"
+    )
     lambdas = {
         "player": args.lambda_player,
         "aim": args.lambda_aim,
@@ -915,8 +944,18 @@ def run_training(args: Namespace) -> int:
                     preds, b, model, lambdas, presence_pw, wall_pw, stats=stats, aim_loss=aim_loss
                 )
             scaler.scale(total).backward()
+            # AMP can SKIP an optimizer step on inf/nan grads. Detect a real step by
+            # comparing the GradScaler scale across update(): on a skipped step the scaler
+            # lowers the scale (scale_after < scale_before); on a real step it is unchanged
+            # or raised. Only advance the LR schedule when the optimizer actually stepped,
+            # so a skipped step does not consume a slot of the warmup/cosine schedule.
+            # (With AMP disabled the scale is constant 1.0, so the step always counts.)
+            scale_before = scaler.get_scale()
             scaler.step(opt)
             scaler.update()
+            stepped = scaler.get_scale() >= scale_before
+            if stepped:
+                scheduler.step()
             ep_total += float(total.detach())
             n_batches += 1
             global_step += 1
@@ -1014,6 +1053,11 @@ def run_training(args: Namespace) -> int:
         },
         "batch": args.batch,
         "lr": args.lr,
+        "weight_decay": args.weight_decay,
+        "lr_schedule": args.lr_schedule,
+        "lr_schedule_warmup_frac": warmup_frac if args.lr_schedule == "cosine" else None,
+        "lr_schedule_warmup_steps": warmup_steps if args.lr_schedule == "cosine" else None,
+        "lr_schedule_total_steps": total_steps if args.lr_schedule == "cosine" else None,
         "epochs": args.epochs,
         "eval_frac": args.eval_frac,
         "holdout_maps": args.holdout_map_names,

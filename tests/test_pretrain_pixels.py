@@ -31,6 +31,7 @@ from tank_twin.pretrain_pixels import (
     binary_f1,
     bullet_direction_indices,
     bullet_position_indices,
+    cosine_warmup_lr_multiplier,
     decode_targets,
     denormalize,
     encode_bullet_targets,
@@ -788,3 +789,89 @@ def test_aim_angular_error_zero_pred_is_finite_near_90():
     assert np.isfinite(m["deg"]) and np.isfinite(m["cos"])
     assert m["cos"] == pytest.approx(0.0, abs=1e-6)
     assert m["deg"] == pytest.approx(90.0, abs=1e-4)
+
+
+# =============================================================================
+# FEATURE 1: --weight-decay arg plumbing (pure; torch-free)
+# =============================================================================
+def test_weight_decay_arg_default_zero_and_passthrough():
+    from tank_twin.pretrain_pixels import _parse_args
+
+    # Default is 0.0 (behavior-preserving: AdamW(weight_decay=0) ~ the old Adam).
+    args = _parse_args(["--out", "runs/x"])
+    assert isinstance(args.weight_decay, float)
+    assert args.weight_decay == 0.0
+    # A passed value plumbs through as a float.
+    args2 = _parse_args(["--out", "runs/x", "--weight-decay", "0.01"])
+    assert args2.weight_decay == pytest.approx(0.01)
+
+
+def test_lr_schedule_arg_default_constant_and_accepts_cosine():
+    from tank_twin.pretrain_pixels import _parse_args
+
+    assert _parse_args(["--out", "runs/x"]).lr_schedule == "constant"
+    assert _parse_args(["--out", "runs/x", "--lr-schedule", "cosine"]).lr_schedule == "cosine"
+    assert _parse_args(["--out", "runs/x", "--lr-schedule", "constant"]).lr_schedule == "constant"
+
+
+def test_lr_schedule_arg_rejects_invalid_choice():
+    from tank_twin.pretrain_pixels import _parse_args
+
+    # argparse rejects an out-of-choices value with SystemExit (exit code 2).
+    with pytest.raises(SystemExit):
+        _parse_args(["--out", "runs/x", "--lr-schedule", "linear"])
+
+
+# =============================================================================
+# FEATURE 2: cosine + linear-warmup LR multiplier (pure; torch-free)
+# =============================================================================
+def test_cosine_warmup_multiplier_curve_shape():
+    total = 1000
+    warmup_frac = 0.05
+    warmup_steps = round(warmup_frac * total)  # 50
+    # Reaches exactly 1.0 at the end of warmup.
+    assert cosine_warmup_lr_multiplier(warmup_steps, total, warmup_frac) == pytest.approx(1.0)
+    # Step 0 is strictly positive (never exactly 0) and < 1.0.
+    m0 = cosine_warmup_lr_multiplier(0, total, warmup_frac)
+    assert 0.0 < m0 < 1.0
+    # Monotone increasing on [0, warmup_steps].
+    warm = [cosine_warmup_lr_multiplier(s, total, warmup_frac) for s in range(warmup_steps + 1)]
+    assert all(b > a for a, b in zip(warm[:-1], warm[1:], strict=True))
+    # Monotone decreasing strictly after warmup, through to the end.
+    post = [
+        cosine_warmup_lr_multiplier(s, total, warmup_frac) for s in range(warmup_steps, total + 1)
+    ]
+    assert all(b < a for a, b in zip(post[:-1], post[1:], strict=True))
+    # Final step decays to ~0.
+    assert cosine_warmup_lr_multiplier(total, total, warmup_frac) == pytest.approx(0.0, abs=1e-9)
+    # Cosine-region midpoint is exactly 0.5: progress == 0.5 at step = warmup + (total-warmup)/2.
+    mid = warmup_steps + (total - warmup_steps) // 2
+    assert cosine_warmup_lr_multiplier(mid, total, warmup_frac) == pytest.approx(0.5, abs=1e-9)
+
+
+def test_cosine_warmup_multiplier_bounds_in_unit_interval():
+    total = 333
+    for s in range(total + 1):
+        m = cosine_warmup_lr_multiplier(s, total, warmup_frac=0.05)
+        assert 0.0 <= m <= 1.0
+
+
+def test_cosine_warmup_multiplier_second_known_pair():
+    # A second (step, total) pair with a different total + larger warmup_frac.
+    total = 200
+    warmup_frac = 0.1
+    warmup_steps = round(warmup_frac * total)  # 20
+    assert cosine_warmup_lr_multiplier(warmup_steps, total, warmup_frac) == pytest.approx(1.0)
+    assert cosine_warmup_lr_multiplier(total, total, warmup_frac) == pytest.approx(0.0, abs=1e-9)
+    # Quarter into the cosine region: progress == 0.25 -> 0.5*(1+cos(pi/4)).
+    q = warmup_steps + (total - warmup_steps) // 4
+    expected = 0.5 * (1.0 + np.cos(np.pi * 0.25))
+    assert cosine_warmup_lr_multiplier(q, total, warmup_frac) == pytest.approx(expected, abs=1e-9)
+
+
+def test_cosine_warmup_multiplier_degenerate_total_steps():
+    # total_steps <= 1 must not raise / divide-by-zero; warmup spans the whole run.
+    assert 0.0 <= cosine_warmup_lr_multiplier(0, 1, 0.05) <= 1.0
+    assert 0.0 <= cosine_warmup_lr_multiplier(0, 0, 0.05) <= 1.0
+    # A warmup_frac that rounds warmup to the full run still degrades gracefully.
+    assert cosine_warmup_lr_multiplier(10, 10, 1.0) == pytest.approx(1.0)

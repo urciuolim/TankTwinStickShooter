@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -68,6 +69,7 @@ __all__ = [
     "binary_f1",
     "bullet_direction_indices",
     "bullet_position_indices",
+    "cosine_warmup_lr_multiplier",
     "decode_targets",
     "denormalize",
     "encode_bullet_targets",
@@ -766,6 +768,49 @@ def aim_angular_error_deg(
 
 
 # =============================================================================
+# LR schedule: linear warmup -> cosine anneal (pure; torch-free)
+# =============================================================================
+def cosine_warmup_lr_multiplier(step: int, total_steps: int, warmup_frac: float = 0.05) -> float:
+    """LR MULTIPLIER in [0, 1] for a linear-warmup -> cosine-anneal schedule.
+
+    Drives a ``torch.optim.lr_scheduler.LambdaLR`` (the lambda just calls this), so the
+    schedule is exactly unit-testable without torch. ``step`` is the optimizer-step index
+    (0-based); ``total_steps`` is the total number of optimizer steps over the whole run
+    (steps-per-epoch * epochs). The curve is:
+
+    * WARMUP: ``warmup_steps = max(1, round(warmup_frac * total_steps))``. The multiplier
+      ramps LINEARLY from ``1 / warmup_steps`` at ``step == 0`` (strictly positive, never 0)
+      up to exactly ``1.0`` at ``step == warmup_steps`` (the base ``--lr`` is reached at the
+      end of warmup). The ramp is strictly increasing on ``[0, warmup_steps]``.
+    * COSINE: for ``step > warmup_steps`` the multiplier follows
+      ``0.5 * (1 + cos(pi * progress))`` with
+      ``progress = (step - warmup_steps) / (total_steps - warmup_steps)`` clamped to
+      ``[0, 1]`` — i.e. 1.0 right after warmup, decaying monotonically to ~0 at
+      ``step == total_steps``. The cosine midpoint (``progress == 0.5``) is exactly 0.5.
+
+    ``warmup_frac=0.05`` (5%) is the default so the aggressive ``1e-3`` arm stays stable.
+    With ``total_steps <= 1`` (or warmup spanning the whole run) it degrades gracefully to
+    the warmup ramp. The returned multiplier is in ``[0, 1]``.
+    """
+    total = max(1, int(total_steps))
+    warmup_steps = max(1, round(warmup_frac * total))
+    warmup_steps = min(warmup_steps, total)  # never warm up past the end of the run
+    if step <= warmup_steps:
+        # Linear ramp from 1/(warmup_steps+1) at step 0 to exactly 1.0 at warmup_steps:
+        # f(s) = (s + 1) / (warmup_steps + 1) for s < warmup_steps, capped at 1.0.
+        # Strictly increasing on [0, warmup_steps]; f(warmup_steps) == 1.0.
+        if step >= warmup_steps:
+            return 1.0
+        return (step + 1) / (warmup_steps + 1)
+    denom = total - warmup_steps
+    if denom <= 0:
+        return 1.0
+    progress = (step - warmup_steps) / denom
+    progress = min(1.0, max(0.0, progress))
+    return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+
+# =============================================================================
 # Data loading / downsample (numpy; torch used only in the trainer)
 # =============================================================================
 def downsample_frames_np(frames: np.ndarray, out_w: int, out_h: int) -> np.ndarray:
@@ -902,6 +947,26 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     )
     p.add_argument("--batch", type=int, default=256)
     p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument(
+        "--weight-decay",
+        type=float,
+        default=0.0,
+        help=(
+            "AdamW decoupled weight decay. Default 0.0 makes AdamW behave like the old "
+            "Adam (behavior-preserving). Set >0 to regularize."
+        ),
+    )
+    p.add_argument(
+        "--lr-schedule",
+        type=str,
+        default="constant",
+        choices=("constant", "cosine"),
+        help=(
+            "LR schedule. 'constant' (default) holds --lr (byte-equivalent to the old "
+            "behavior). 'cosine' = linear warmup (~5%% of total optimizer steps) then "
+            "cosine anneal toward ~0 over the remaining steps."
+        ),
+    )
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument(
         "--out",
