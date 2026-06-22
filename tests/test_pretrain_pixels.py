@@ -49,6 +49,8 @@ from tank_twin.pretrain_pixels import (
     per_player_cosine_distance,
     player_head_size,
     player_head_vec_indices,
+    png_decode,
+    png_encode,
     presence_pos_weight,
     resolve_map_ids,
     stratified_group_split,
@@ -875,3 +877,142 @@ def test_cosine_warmup_multiplier_degenerate_total_steps():
     assert 0.0 <= cosine_warmup_lr_multiplier(0, 0, 0.05) <= 1.0
     # A warmup_frac that rounds warmup to the full run still degrades gracefully.
     assert cosine_warmup_lr_multiplier(10, 10, 1.0) == pytest.approx(1.0)
+
+
+# =============================================================================
+# PART A: PNG-in-LMDB pixel data path (round-trip + dataset parity vs memmap)
+# =============================================================================
+def test_png_encode_decode_is_bit_identical():
+    """LOSSLESS PNG: png_decode(png_encode(arr)) must be bit-identical to arr (pure)."""
+    rng = np.random.default_rng(0)
+    # Mix of structured (gradients) + random pixels to exercise the encoder.
+    arr = rng.integers(0, 256, size=(17, 23, 3), dtype=np.uint8)
+    arr[0, :, 0] = np.arange(23, dtype=np.uint8)  # a deterministic gradient row
+    arr[:, 0, 1] = np.arange(17, dtype=np.uint8)
+    png = png_encode(arr)
+    assert isinstance(png, bytes) and len(png) > 0
+    assert png[:8] == b"\x89PNG\r\n\x1a\n"  # PNG magic -> really PNG, not JPEG
+    back = png_decode(png)
+    assert back.shape == arr.shape
+    assert back.dtype == np.uint8
+    assert np.array_equal(back, arr)  # bit-identical: lossless
+    # Also exercise the full-black / full-white extremes (1-2px feature edges).
+    for fill in (0, 255):
+        a = np.full((8, 8, 3), fill, dtype=np.uint8)
+        assert np.array_equal(png_decode(png_encode(a)), a)
+
+
+def test_png_encode_rejects_non_hwc3():
+    with pytest.raises(ValueError):
+        png_encode(np.zeros((4, 4), dtype=np.uint8))  # missing channel axis
+    with pytest.raises(ValueError):
+        png_encode(np.zeros((4, 4, 4), dtype=np.uint8))  # RGBA, not RGB
+
+
+def _write_synthetic_caches(tmp_path, frames, states, map_ids, group_keys):
+    """Build BOTH a memmap cache and an lmdb_png cache from the SAME synthetic rows.
+
+    Returns ``(memmap_dir, lmdb_dir)``. Mirrors the EXACT sidecar contract both the
+    builders write (states.npy / map_ids.npy / group_keys.npy / index.json), so the same
+    split/stats code reads either. The memmap dir uses prepare_pixel_cache's index.json
+    ('shape'/'frames_file'); the lmdb dir uses transcode_pixel_png_lmdb's index.json
+    ('shape'/'backend'/'lmdb_file'/'key_format') and an LMDB keyed f'{i:08d}'.
+    """
+    import json as _json
+
+    import lmdb
+
+    from tank_twin.pretrain_pixels import png_encode as _enc
+
+    n, h, w, _c = frames.shape
+    mm = tmp_path / "mm_cache"
+    mm.mkdir()
+    fmm = np.memmap(mm / "frames_u8.dat", dtype=np.uint8, mode="w+", shape=(n, h, w, 3))
+    fmm[:] = frames
+    fmm.flush()
+    del fmm
+    np.save(mm / "states.npy", states)
+    np.save(mm / "map_ids.npy", map_ids)
+    np.save(mm / "group_keys.npy", group_keys)
+    (mm / "index.json").write_text(
+        _json.dumps({"shape": [n, h, w, 3], "dtype": "uint8", "frames_file": "frames_u8.dat"}),
+        encoding="utf-8",
+    )
+
+    ld = tmp_path / "lmdb_cache"
+    ld.mkdir()
+    lmdb_path = ld / "frames_png.lmdb"
+    env = lmdb.open(str(lmdb_path), map_size=64 * 1024**2, subdir=False, max_dbs=0)
+    with env.begin(write=True) as txn:
+        for i in range(n):
+            txn.put(f"{i:08d}".encode("ascii"), _enc(frames[i]), overwrite=True)
+    env.sync()
+    env.close()
+    np.save(ld / "states.npy", states)
+    np.save(ld / "map_ids.npy", map_ids)
+    np.save(ld / "group_keys.npy", group_keys)
+    (ld / "index.json").write_text(
+        _json.dumps(
+            {
+                "shape": [n, h, w, 3],
+                "dtype": "uint8",
+                "backend": "lmdb_png",
+                "lmdb_file": "frames_png.lmdb",
+                "key_format": "{:08d}",
+            }
+        ),
+        encoding="utf-8",
+    )
+    return mm, ld
+
+
+def test_lmdb_png_dataset_matches_memmap_dataset(tmp_path):
+    """The load-bearing parity test: LmdbPngPixelDataset must return bit-identical frame
+    tensors and equal target tensors to MemmapPixelDataset on the same rows (torch)."""
+    pytest.importorskip("torch")
+    pytest.importorskip("lmdb")
+    import torch
+
+    from tank_twin._pretrain_pixels_train import LmdbPngPixelDataset, MemmapPixelDataset
+
+    rng = np.random.default_rng(7)
+    n, h, w = 6, 12, 16
+    frames = rng.integers(0, 256, size=(n, h, w, 3), dtype=np.uint8)
+    # Synthetic states: player block populated, a couple of present bullet slots, rest
+    # sentinel -> exercises decode_targets (presence/mask/normalization) non-trivially.
+    states = np.full((n, 52), SENTINEL, dtype=np.float32)
+    states[:, 0:6] = rng.normal(size=(n, 6))
+    states[:, 26:32] = rng.normal(size=(n, 6))
+    states[:, 6:10] = rng.normal(size=(n, 4))  # P1 slot 0 present
+    states[:, 32:36] = rng.normal(size=(n, 4))  # P2 slot 0 present
+    map_ids = np.array([0, 1, 0, 2, 1, 0], dtype=np.int32)
+    # group_keys (worker_id, episode_id) -> (N,2) int64, matching the sidecar contract.
+    group_keys = np.stack([np.zeros(n, dtype=np.int64), np.arange(n, dtype=np.int64)], axis=1)
+    wall_grids = rng.integers(0, 2, size=(3, 12, 20)).astype(np.float32)
+
+    mm_dir, ld_dir = _write_synthetic_caches(tmp_path, frames, states, map_ids, group_keys)
+
+    # Shared row subset (out-of-order, non-contiguous) -> exercises row_idx indexing.
+    row_idx = np.array([4, 0, 3, 1], dtype=np.int64)
+    stats = fit_norm_stats(states[row_idx])
+    ds_mm = MemmapPixelDataset(mm_dir, row_idx, wall_grids, stats)
+    ds_ld = LmdbPngPixelDataset(ld_dir, row_idx, wall_grids, stats)
+
+    assert len(ds_mm) == len(ds_ld) == row_idx.shape[0]
+    for i in range(len(ds_mm)):
+        a = ds_mm[i]
+        b = ds_ld[i]
+        # Frame: bit-identical uint8 (3,H,W) (NOT pre-divided in either path).
+        assert b["frame"].dtype == torch.uint8
+        assert b["frame"].shape == a["frame"].shape == (3, h, w)
+        assert torch.equal(a["frame"], b["frame"])
+        # All target tensors are equal (they decode from the SAME states/map_ids/stats).
+        for key in (
+            "player",
+            "bullet_presence",
+            "bullet_position",
+            "bullet_direction",
+            "bullet_slot_mask",
+            "wall",
+        ):
+            assert torch.equal(a[key], b[key]), key

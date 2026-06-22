@@ -37,6 +37,12 @@ dependencies = [
     # is an explicit, declared dependency (repo "pin it" etiquette). Not in the pure-logic
     # / env / trainer import path — only the verify script imports PIL.
     "pillow>=12.2,<13",
+    # lmdb: PNG-in-LMDB pixel-pretraining data path (scripts/transcode_pixel_png_lmdb.py
+    # writes it; LmdbPngPixelDataset reads it). Lets the 640x360 pretrain avoid the ~600 GB
+    # flat uint8 memmap. NOT in the pure-logic path: imported ONLY by that transcode script
+    # and the dataset class, both behind the optional --frames-backend lmdb_png. cp312 wheels
+    # ship for win_amd64 + manylinux x86_64 (this box + the GCP Linux cluster).
+    "lmdb>=2.2,<3",
     "tqdm>=4.68.3",
 ]
 

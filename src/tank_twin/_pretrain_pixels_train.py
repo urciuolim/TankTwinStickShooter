@@ -19,6 +19,7 @@ TERMINOLOGY:
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 from argparse import Namespace
@@ -54,6 +55,7 @@ from tank_twin.pretrain_pixels import (
     map_aware_split,
     parse_pos_weight_arg,
     player_head_vec_indices,
+    png_decode,
     presence_pos_weight,
     resolve_map_ids,
     worker_id_from_shard,
@@ -384,6 +386,98 @@ class MemmapPixelDataset(Dataset):
     def __getitem__(self, i: int) -> dict[str, torch.Tensor]:
         r = int(self.row_idx[i])
         frame = torch.from_numpy(np.array(self.frames[r], copy=True)).permute(2, 0, 1).contiguous()
+        return _row_item(frame, self._cache, i)
+
+
+# Process-local LMDB env cache, keyed by (pid, resolved-path). LMDB refuses to open the
+# SAME env file twice within one process, and the train/eval/val datasets all read the
+# same file — so they must SHARE one handle per process. Keying by pid (not just path)
+# makes it spawn-safe: a freshly spawned DataLoader worker starts with an empty dict and
+# opens its OWN handle (the parent's handle never survives pickling). lock=False allows
+# the many concurrent readers; the file is read-only here.
+_LMDB_ENV_CACHE: dict[tuple[int, str], object] = {}
+
+
+def _open_lmdb_env(lmdb_path: Path):
+    """Return THIS process's shared read-only env for ``lmdb_path`` (opened once per pid)."""
+    import lmdb
+
+    key = (os.getpid(), str(lmdb_path))
+    env = _LMDB_ENV_CACHE.get(key)
+    if env is None:
+        env = lmdb.open(
+            str(lmdb_path),
+            subdir=False,
+            readonly=True,
+            lock=False,
+            readahead=False,
+            meminit=False,
+            max_dbs=0,
+        )
+        _LMDB_ENV_CACHE[key] = env
+    return env
+
+
+class LmdbPngPixelDataset(Dataset):
+    """Reads PNG-encoded frames from an LMDB env + aligned states/map_ids (PNG-in-LMDB).
+
+    Parallel to :class:`MemmapPixelDataset`: SAME ``__init__`` signature, SAME target
+    cache, and SAME ``(frame, targets)`` return — it yields a uint8 ``(3,H,W)`` frame
+    tensor (NOT pre-divided; ``_move_batch`` divides by 255 downstream), bit-identical to
+    what the memmap path returns for the same row. The cache dir holds
+    ``frames_png.lmdb`` (LMDB env written by scripts/transcode_pixel_png_lmdb.py),
+    ``states.npy``, ``map_ids.npy``, ``group_keys.npy`` (N,2), and ``index.json`` with
+    ``backend == "lmdb_png"`` and the key convention.
+
+    Windows / spawn safety: an LMDB env handle does NOT survive pickling to a spawned
+    DataLoader worker, so the env is opened LAZILY on first ``__getitem__`` via the
+    process-local :data:`_LMDB_ENV_CACHE` (keyed by ``(pid, path)``). Each worker — and the
+    main process — therefore opens exactly ONE read-only handle and SHARES it across the
+    train/eval/val datasets (LMDB forbids opening the same env file twice per process). The
+    env is ``readonly=True, lock=False`` (many concurrent readers, no writer).
+    """
+
+    def __init__(
+        self,
+        cache_dir: Path,
+        row_idx: np.ndarray,
+        wall_grids: np.ndarray,
+        stats: NormStats,
+    ) -> None:
+        super().__init__()
+        self.cache_dir = Path(cache_dir)
+        meta = json.loads((self.cache_dir / "index.json").read_text(encoding="utf-8"))
+        n, h, w, c = meta["shape"]
+        self.shape = (int(n), int(h), int(w), int(c))
+        self.lmdb_path = self.cache_dir / meta.get("lmdb_file", "frames_png.lmdb")
+        self.key_format = meta.get("key_format", "{:08d}")
+        self.states = np.load(self.cache_dir / "states.npy")
+        self.map_ids = np.load(self.cache_dir / "map_ids.npy")
+        self.row_idx = np.asarray(row_idx, dtype=np.int64)
+        self.wall_grids = wall_grids
+        self.stats = stats
+        sel_states = self.states[self.row_idx]
+        sel_maps = self.map_ids[self.row_idx]
+        self._cache = decode_targets(sel_states, sel_maps, self.wall_grids, self.stats)
+
+    def _key(self, r: int) -> bytes:
+        return self.key_format.format(r).encode("ascii")
+
+    def _get_env(self):
+        """Return this process's shared read-only LMDB env (opened lazily once per pid)."""
+        return _open_lmdb_env(self.lmdb_path)
+
+    def __len__(self) -> int:
+        return self.row_idx.shape[0]
+
+    def __getitem__(self, i: int) -> dict[str, torch.Tensor]:
+        r = int(self.row_idx[i])
+        with self._get_env().begin(write=False) as txn:
+            data = txn.get(self._key(r))
+        if data is None:
+            raise KeyError(f"LMDB key for row {r} ({self._key(r)!r}) missing in {self.lmdb_path}")
+        arr = png_decode(data)  # (H, W, 3) uint8 (writable copy)
+        frame = torch.from_numpy(arr).permute(2, 0, 1).contiguous()
         return _row_item(frame, self._cache, i)
 
 
@@ -738,8 +832,27 @@ def _build_in_memory_datasets(
     return mk(train_mask), mk(eval_mask), mk(val_mask), stats, split
 
 
-def _build_memmap_datasets(args: Namespace, wall_grids: np.ndarray, holdout_ids: list[int]):
-    """FULL path: read cache, 3-way map-aware split by group, fit stats on TRAIN rows."""
+# Maps the --frames-backend flag to the cache-backed Dataset class. Both classes share
+# the IDENTICAL __init__(cache_dir, row_idx, wall_grids, stats) contract and return the
+# same uint8 (3,H,W) frame + targets, so only the class differs — the split/stats code in
+# _build_cache_datasets is shared (not copy-pasted).
+_CACHE_DATASET_CLASSES = {
+    "memmap": MemmapPixelDataset,
+    "lmdb_png": LmdbPngPixelDataset,
+}
+
+
+def _build_cache_datasets(
+    args: Namespace, wall_grids: np.ndarray, holdout_ids: list[int], frames_backend: str
+):
+    """FULL path: read cache sidecars, 3-way map-aware split by group, fit stats on TRAIN.
+
+    Backend-agnostic: the sidecars (states/map_ids/group_keys/index.json) are IDENTICAL
+    across the memmap and lmdb_png caches, so the split + stats are computed once here and
+    the only difference is which Dataset class reads the frames (selected by
+    ``frames_backend`` via :data:`_CACHE_DATASET_CLASSES`).
+    """
+    ds_cls = _CACHE_DATASET_CLASSES[frames_backend]
     cache = Path(args.cache_dir)
     group_keys_arr = np.load(cache / "group_keys.npy")  # (N, 2)
     map_ids = np.load(cache / "map_ids.npy")
@@ -757,9 +870,9 @@ def _build_memmap_datasets(args: Namespace, wall_grids: np.ndarray, holdout_ids:
     eval_rows = all_rows[[g in split.eval for g in group_keys]]
     val_rows = all_rows[[g in split.validation for g in group_keys]]
     stats = fit_norm_stats(states[train_rows])
-    ds_train = MemmapPixelDataset(cache, train_rows, wall_grids, stats)
-    ds_eval = MemmapPixelDataset(cache, eval_rows, wall_grids, stats)
-    ds_val = MemmapPixelDataset(cache, val_rows, wall_grids, stats)
+    ds_train = ds_cls(cache, train_rows, wall_grids, stats)
+    ds_eval = ds_cls(cache, eval_rows, wall_grids, stats)
+    ds_val = ds_cls(cache, val_rows, wall_grids, stats)
     return ds_train, ds_eval, ds_val, stats, split
 
 
@@ -807,12 +920,15 @@ def run_training(args: Namespace) -> int:
         f"[pretrain] holdout (validation) maps: {[(id_to_name[i], i) for i in sorted(holdout_ids)]}"
     )
 
+    # frames_backend only applies to the cache (--cache-dir) path; the SMOKE stream is
+    # unaffected. Default "memmap" preserves the current behavior.
+    frames_backend = getattr(args, "frames_backend", "memmap")
     t0 = time.time()
     if args.cache_dir is not None:
-        ds_train, ds_eval, ds_val, stats, split = _build_memmap_datasets(
-            args, wall_grids, holdout_ids
+        ds_train, ds_eval, ds_val, stats, split = _build_cache_datasets(
+            args, wall_grids, holdout_ids, frames_backend
         )
-        mode = "memmap"
+        mode = frames_backend
     else:
         ds_train, ds_eval, ds_val, stats, split = _build_in_memory_datasets(
             args, wall_grids, holdout_ids, n_maps
@@ -1063,6 +1179,7 @@ def run_training(args: Namespace) -> int:
         "holdout_maps": args.holdout_map_names,
         "seed": args.seed,
         "mode": mode,
+        "frames_backend": frames_backend,
         "device": str(device),
     }
     config_path.write_text(json.dumps(config_dict, indent=2), encoding="utf-8")

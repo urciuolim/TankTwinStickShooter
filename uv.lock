@@ -193,6 +193,20 @@ wheels = [
 ]
 
 [[package]]
+name = "lmdb"
+version = "2.2.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/3d/fa/ddef3e433950e23844fd9d82fa045637cbe84140f482120bbdf6abe6be92/lmdb-2.2.1.tar.gz", hash = "sha256:b201b416f7d6cea9bd2f977277a5f51d6e52a434d6ec511a8b34990df2b1a9c5", size = 938665, upload-time = "2026-06-04T04:46:31.461Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/1b/93/4796573d885dbc0dd94ed712d070c6919a019acd12754c4708ba8a47732d/lmdb-2.2.1-cp312-cp312-macosx_10_13_x86_64.whl", hash = "sha256:e6957c9346ce9e9300ca2b75625e681b9868bbaf4d257626ec96d221e8200fc4", size = 116824, upload-time = "2026-06-04T04:45:58.058Z" },
+    { url = "https://files.pythonhosted.org/packages/33/20/d3e48f1af18d67e56c2f42f82a598c2586d7d47dca7c8edda4f479e108b4/lmdb-2.2.1-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:bd3f3ab6feed2d4ca87d9d9063d2e371c8cc6d72879d54ae160a1c32758d26c0", size = 115341, upload-time = "2026-06-04T04:45:59.352Z" },
+    { url = "https://files.pythonhosted.org/packages/5e/3e/6c3d2aa3b2250220d664a3ebb137519b6c33f94e27bf62e903130fac2cb4/lmdb-2.2.1-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:9129a78af25dd1316784d689fefbd88bda6a756c82847a72b7f423bc1282dbd0", size = 333528, upload-time = "2026-06-04T04:46:00.748Z" },
+    { url = "https://files.pythonhosted.org/packages/cf/72/64588fb1359b9a8d2fc6d3bfd98cd6a7f22adcd5fffa4252874529e72794/lmdb-2.2.1-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:13438ad327f8bca47f1415671335eec500b653459d269556eb2cf2470cecec30", size = 338288, upload-time = "2026-06-04T04:46:02.097Z" },
+    { url = "https://files.pythonhosted.org/packages/35/19/bf3466f65c7795d44b6119cd62fa505a1fd3ebb50d71bd20b823e2b1485c/lmdb-2.2.1-cp312-cp312-win_amd64.whl", hash = "sha256:e54f8705489f8b6668b648333fbd90875c06878b3226a64f3f1af58af01c3d00", size = 113598, upload-time = "2026-06-04T04:46:03.593Z" },
+    { url = "https://files.pythonhosted.org/packages/a9/7f/214172bc46f67ec58ee0ec0cda3cf6b27ceeaef614be25c863b7da35f9a8/lmdb-2.2.1-cp312-cp312-win_arm64.whl", hash = "sha256:84468990d6b7f50243a1eb19e7f9fbaead93eb7de0eb854b7dacc7f893c699ea", size = 107614, upload-time = "2026-06-04T04:46:04.834Z" },
+]
+
+[[package]]
 name = "markdown"
 version = "3.10.2"
 source = { registry = "https://pypi.org/simple" }
@@ -593,6 +607,7 @@ version = "0.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "gymnasium" },
+    { name = "lmdb" },
     { name = "matplotlib" },
     { name = "numpy" },
     { name = "pillow" },
@@ -612,6 +627,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "gymnasium", specifier = ">=1.3,<2" },
+    { name = "lmdb", specifier = ">=2.2,<3" },
     { name = "matplotlib", specifier = ">=3.11,<3.12" },
     { name = "numpy", specifier = ">=2.0,<3" },
     { name = "pillow", specifier = ">=12.2,<13" },

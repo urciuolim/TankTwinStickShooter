@@ -47,6 +47,7 @@ Run (SMOKE)::
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import math
 import re
@@ -85,6 +86,8 @@ __all__ = [
     "parse_pos_weight_arg",
     "per_player_cosine_distance",
     "player_head_size",
+    "png_decode",
+    "png_encode",
     "presence_pos_weight",
     "player_head_vec_indices",
     "resolve_map_ids",
@@ -833,6 +836,38 @@ def downsample_frames_np(frames: np.ndarray, out_w: int, out_h: int) -> np.ndarr
     return frames[:, ys][:, :, xs].astype(np.uint8)
 
 
+# --- PNG round-trip helpers (LOSSLESS; used by the PNG-in-LMDB data path) -----
+# Imported by scripts/transcode_pixel_png_lmdb.py (writer) and LmdbPngPixelDataset
+# (reader). Pillow only (a pinned dep); NO torch — kept here in the pure module so the
+# round-trip is unit-testable without building an LMDB and without importing the trainer.
+def png_encode(arr: np.ndarray) -> bytes:
+    """LOSSLESS PNG-encode a ``(H,W,3)`` uint8 RGB array to PNG bytes in memory.
+
+    PNG is always lossless, so ``png_decode(png_encode(arr))`` is bit-identical to
+    ``arr`` (asserted by the unit test). No resize / colorspace change happens here.
+    """
+    from PIL import Image
+
+    arr = np.ascontiguousarray(arr, dtype=np.uint8)
+    if arr.ndim != 3 or arr.shape[2] != 3:
+        raise ValueError(f"png_encode expects (H,W,3) uint8, got shape {arr.shape}")
+    buf = io.BytesIO()
+    Image.fromarray(arr, mode="RGB").save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def png_decode(data: bytes) -> np.ndarray:
+    """Decode PNG bytes back to a ``(H,W,3)`` uint8 RGB array (inverse of png_encode).
+
+    Returns a WRITABLE copy (PIL's buffer is read-only; ``torch.from_numpy`` on a
+    read-only array warns), so the dataset can wrap it in a tensor without a copy-warning.
+    """
+    from PIL import Image
+
+    with Image.open(io.BytesIO(data)) as im:
+        return np.array(im.convert("RGB"), dtype=np.uint8, copy=True)
+
+
 def list_shards(data_dir: Path) -> list[Path]:
     """All pixel shards in ``data_dir``, sorted by (worker, index)."""
     shards = sorted(
@@ -882,6 +917,18 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         type=Path,
         default=None,
         help="memmap cache dir from prepare_pixel_cache.py (full run). Omit to STREAM shards.",
+    )
+    p.add_argument(
+        "--frames-backend",
+        type=str,
+        default="memmap",
+        choices=("memmap", "lmdb_png"),
+        help=(
+            "frame storage backend for --cache-dir (full run). 'memmap' (default) reads the "
+            "flat uint8 memmap from prepare_pixel_cache.py; 'lmdb_png' reads PNG-encoded "
+            "frames from the LMDB built by scripts/transcode_pixel_png_lmdb.py. No-op when "
+            "--cache-dir is omitted (the SMOKE stream path is unaffected)."
+        ),
     )
     p.add_argument("--input-res", type=str, default="160x90", help="downsample target WxH")
     p.add_argument("--embedding-dim", type=int, default=512, help="encoder embedding width")
