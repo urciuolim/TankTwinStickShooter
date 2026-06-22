@@ -1,9 +1,12 @@
 """Pure-logic tests for the pixel inverse-renderer pretraining helpers.
 
-Covers ONLY the numpy-only, torch-free pieces: target encoding / sentinel masking,
-the 12/10/40 split correctness, wall-grid lookup-by-map_id, normalization round-trip
-(with bullet stats excluding sentinels), the WxH parser, and the stratified group
-split. The trainer (torch) is NOT unit-tested here.
+Covers ONLY the numpy-only, torch-free pieces: objective config -> head sizing /
+field selection (incl. a disabled group being fully dropped and re-enabling restoring
+it), bullet position vs direction separation (the 20/20 split of the old 40), target
+encoding / sentinel masking, wall-grid lookup, normalization round-trip, the WxH
+parser, the stratified group split, the 3-way map-aware split (name->id holdout,
+no leakage, determinism), the interior-wall mask (exactly 128 cells), and F1/IoU.
+The trainer (torch) is NOT unit-tested here.
 """
 
 from __future__ import annotations
@@ -13,19 +16,35 @@ import pytest
 
 from tank_twin.pretrain_pixels import (
     BULLET_BASE_INDICES,
+    DEFAULT_OBJECTIVES,
+    N_BULLET_DIR,
     N_BULLET_POS,
     N_PLAYER,
+    OBJECTIVE_GROUPS,
     PLAYER_INDICES,
+    PLAYER_SUBGROUP_VEC_INDICES,
     SENTINEL,
+    MapAwareSplit,
     NormStats,
+    ObjectiveConfig,
+    binary_f1,
+    bullet_direction_indices,
     bullet_position_indices,
     decode_targets,
     denormalize,
     encode_bullet_targets,
     encode_player_targets,
     fit_norm_stats,
+    head_sizes,
+    interior_wall_mask,
+    iou_score,
+    map_aware_split,
     normalize,
     parse_input_res,
+    parse_objectives,
+    player_head_size,
+    player_head_vec_indices,
+    resolve_map_ids,
     stratified_group_split,
     wall_target_for,
     worker_id_from_shard,
@@ -53,14 +72,19 @@ def test_player_indices_are_p1_0_6_then_p2_26_32():
     assert N_PLAYER == 12
 
 
-def test_bullet_position_indices_are_slot_major_4_each():
-    idx = bullet_position_indices()
-    assert len(idx) == N_BULLET_POS == 40
-    # First slot is base 6 -> 6,7,8,9; P2's first is base 32 -> 32,33,34,35.
-    assert idx[0:4] == [6, 7, 8, 9]
-    assert idx[20:24] == [32, 33, 34, 35]
-    # Slot bases recoverable as every 4th entry.
-    assert tuple(idx[::4]) == BULLET_BASE_INDICES
+def test_bullet_position_and_direction_indices_split_the_old_40():
+    pos = bullet_position_indices()
+    direction = bullet_direction_indices()
+    assert len(pos) == N_BULLET_POS == 20
+    assert len(direction) == N_BULLET_DIR == 20
+    # Disjoint and together cover all 40 bullet floats.
+    assert set(pos).isdisjoint(direction)
+    assert sorted(pos + direction) == sorted(b + o for b in BULLET_BASE_INDICES for o in range(4))
+    # First slot (base 6): pos = 6,7 ; dir = 8,9. P2 first slot (base 32): pos 32,33 ; dir 34,35.
+    assert pos[0:2] == [6, 7]
+    assert direction[0:2] == [8, 9]
+    assert pos[10:12] == [32, 33]
+    assert direction[10:12] == [34, 35]
 
 
 def test_worker_id_from_shard_filename():
@@ -68,6 +92,112 @@ def test_worker_id_from_shard_filename():
     assert worker_id_from_shard("shard_w3_0247.npz") == 3
     with pytest.raises(ValueError):
         worker_id_from_shard("not_a_shard.npz")
+
+
+# =============================================================================
+# Objective config -> head sizing / field selection / drop-and-restore
+# =============================================================================
+def test_default_objectives_disable_velocity_keep_aim():
+    cfg = ObjectiveConfig.default()
+    assert cfg.is_on("player_position")
+    assert cfg.is_on("player_aim")
+    assert not cfg.is_on("player_velocity")  # velocity OFF by default
+    assert set(DEFAULT_OBJECTIVES) == set(OBJECTIVE_GROUPS) - {"player_velocity"}
+    assert len(cfg.enabled) == 6
+
+
+def test_head_sizes_default_drops_velocity_from_player_head():
+    cfg = ObjectiveConfig.default()
+    sizes = head_sizes(cfg)
+    # player head = position(4) + aim(4) = 8 ; velocity dropped.
+    assert sizes["player"] == 8
+    assert player_head_size(cfg) == 8
+    assert sizes["bullet_presence"] == 10
+    assert sizes["bullet_position"] == 20
+    assert sizes["bullet_direction"] == 20
+    assert sizes["wall"] == 240
+
+
+def test_disabled_group_fully_dropped_from_heads_and_reenable_restores():
+    # Disable bullet_direction + walls explicitly.
+    cfg = ObjectiveConfig.from_set(
+        ["player_position", "player_aim", "bullet_presence", "bullet_position"]
+    )
+    sizes = head_sizes(cfg)
+    assert "bullet_direction" not in sizes  # dropped: no head
+    assert "wall" not in sizes
+    assert not cfg.is_on("bullet_direction")
+    assert not cfg.is_on("walls")
+    # Re-enabling restores them identically.
+    cfg2 = ObjectiveConfig.from_set(
+        [
+            "player_position",
+            "player_aim",
+            "bullet_presence",
+            "bullet_position",
+            "bullet_direction",
+            "walls",
+        ]
+    )
+    sizes2 = head_sizes(cfg2)
+    assert sizes2["bullet_direction"] == 20
+    assert sizes2["wall"] == 240
+
+
+def test_player_head_vec_indices_only_enabled_subgroups_in_order():
+    # position + aim (default-style) -> 0,1,6,7 (pos) then 4,5,10,11 (aim).
+    cfg = ObjectiveConfig.from_set(["player_position", "player_aim"])
+    assert player_head_vec_indices(cfg) == [0, 1, 6, 7, 4, 5, 10, 11]
+    # velocity-only -> just velocity indices.
+    cfg2 = ObjectiveConfig.from_set(["player_velocity"])
+    assert player_head_vec_indices(cfg2) == [2, 3, 8, 9]
+    # The sub-group index map is consistent.
+    assert PLAYER_SUBGROUP_VEC_INDICES["player_position"] == (0, 1, 6, 7)
+    assert PLAYER_SUBGROUP_VEC_INDICES["player_velocity"] == (2, 3, 8, 9)
+    assert PLAYER_SUBGROUP_VEC_INDICES["player_aim"] == (4, 5, 10, 11)
+
+
+def test_no_player_groups_means_no_player_head():
+    cfg = ObjectiveConfig.from_set(["walls"])
+    sizes = head_sizes(cfg)
+    assert "player" not in sizes
+    assert player_head_size(cfg) == 0
+    assert not cfg.any_player()
+
+
+def test_parse_objectives_allowlist_and_disable_and_default():
+    # Default (neither flag): all except velocity.
+    assert parse_objectives(None, None).enabled == ObjectiveConfig.default().enabled
+    # Allowlist.
+    cfg = parse_objectives("walls,bullet_presence", None)
+    assert cfg.enabled == frozenset({"walls", "bullet_presence"})
+    # Disable subtracts from default.
+    cfg2 = parse_objectives(None, "walls")
+    assert "walls" not in cfg2.enabled
+    assert "player_velocity" not in cfg2.enabled  # still off (default)
+    assert cfg2.enabled == ObjectiveConfig.default().enabled - {"walls"}
+
+
+def test_parse_objectives_rejects_unknown_and_both_flags_and_empty():
+    with pytest.raises(ValueError):
+        parse_objectives("bogus_group", None)
+    with pytest.raises(ValueError):
+        parse_objectives(None, "bogus_group")
+    with pytest.raises(ValueError):
+        parse_objectives("walls", "walls")  # both flags
+    with pytest.raises(ValueError):
+        parse_objectives("", None)  # empty allowlist
+    with pytest.raises(ValueError):
+        # disabling every default group leaves nothing.
+        parse_objectives(None, ",".join(DEFAULT_OBJECTIVES))
+
+
+def test_objective_config_json_round_trip_and_ordering():
+    cfg = ObjectiveConfig.default()
+    d = cfg.to_json()
+    assert d["enabled"] == list(cfg.ordered())
+    # ordered() follows canonical OBJECTIVE_GROUPS order.
+    assert d["enabled"] == [g for g in OBJECTIVE_GROUPS if g != "player_velocity"]
 
 
 # --- player target slicing ---------------------------------------------------
@@ -80,51 +210,56 @@ def test_encode_player_targets_picks_the_12_always_present_floats():
     np.testing.assert_array_equal(out[0], np.array(p1 + p2, dtype=np.float32))
 
 
-# --- bullet presence + position (sentinel-aware) -----------------------------
-def test_encode_bullet_targets_presence_and_positions():
+# --- bullet presence + position + direction (sentinel-aware) -----------------
+def test_encode_bullet_targets_presence_position_direction_separation():
     # P1: slots 0 and 2 present; P2: slot 4 present. Rest absent.
     p1b = [[1, 2, 3, 4], None, [5, 6, 7, 8], None, None]
-    p2b = [None, None, None, None, [9, 9, 9, 9]]
+    p2b = [None, None, None, None, [9, 9, 8, 8]]
     s = _make_state([0] * 6, [0] * 6, p1b, p2b)
-    presence, pos = encode_bullet_targets(s[None, :])
+    presence, pos, direction = encode_bullet_targets(s[None, :])
     assert presence.shape == (1, 10)
-    assert pos.shape == (1, 40)
-    # presence bits: P1 slots 0,2 and P2 slot 4 (global index 9).
+    assert pos.shape == (1, 20)
+    assert direction.shape == (1, 20)
     expected_presence = np.zeros(10, dtype=np.float32)
     expected_presence[[0, 2, 9]] = 1.0
     np.testing.assert_array_equal(presence[0], expected_presence)
-    # absent slots retain sentinel in positions (must be masked, never regressed).
-    assert pos[0, 4] == SENTINEL  # slot 1 (absent) first float
-    np.testing.assert_array_equal(pos[0, 0:4], np.array([1, 2, 3, 4], dtype=np.float32))
-    np.testing.assert_array_equal(pos[0, 8:12], np.array([5, 6, 7, 8], dtype=np.float32))
-    np.testing.assert_array_equal(pos[0, 36:40], np.array([9, 9, 9, 9], dtype=np.float32))
+    # Slot 0: pos floats 1,2 ; dir floats 3,4. (pos = offsets 0,1 ; dir = offsets 2,3)
+    np.testing.assert_array_equal(pos[0, 0:2], np.array([1, 2], dtype=np.float32))
+    np.testing.assert_array_equal(direction[0, 0:2], np.array([3, 4], dtype=np.float32))
+    # Slot 2 (pos index 4,5 in the 20-vec): floats 5,6 ; dir 7,8.
+    np.testing.assert_array_equal(pos[0, 4:6], np.array([5, 6], dtype=np.float32))
+    np.testing.assert_array_equal(direction[0, 4:6], np.array([7, 8], dtype=np.float32))
+    # P2 slot 4 -> global slot 9 -> pos vec index 18,19.
+    np.testing.assert_array_equal(pos[0, 18:20], np.array([9, 9], dtype=np.float32))
+    np.testing.assert_array_equal(direction[0, 18:20], np.array([8, 8], dtype=np.float32))
+    # Absent slot 1 retains sentinel in BOTH pos and dir (must be masked, never regressed).
+    assert pos[0, 2] == SENTINEL
+    assert direction[0, 2] == SENTINEL
 
 
 def test_presence_partial_sentinel_slot_counts_present():
-    # A slot with 3 sentinels but one real value is NOT all -100 -> present.
     s = np.full(52, SENTINEL, dtype=np.float32)
     s[0:6] = 0
     s[26:32] = 0
     s[6:10] = [SENTINEL, SENTINEL, SENTINEL, 0.5]  # P1 slot 0: one real float
-    presence, _ = encode_bullet_targets(s[None, :])
+    presence, _, _ = encode_bullet_targets(s[None, :])
     assert presence[0, 0] == 1.0
 
 
-def test_decode_targets_masks_absent_slot_positions_to_zero():
+def test_decode_targets_masks_absent_slot_positions_and_directions_to_zero():
     s = np.full(52, SENTINEL, dtype=np.float32)
     s[0:6] = [1, 1, 1, 1, 1, 1]
     s[26:32] = [2, 2, 2, 2, 2, 2]
-    # only P1 slot 0 present.
-    s[6:10] = [3, 4, 5, 6]
+    s[6:10] = [3, 4, 5, 6]  # only P1 slot 0 present
     states = s[None, :]
     wall_grids = np.zeros((10, 12, 20), dtype=np.uint8)
     stats = fit_norm_stats(states)
     t = decode_targets(states, np.array([0]), wall_grids, stats)
-    mask = t["bullet_pos_mask"][0]
-    assert mask[0:4].sum() == 4  # present slot
-    assert mask[4:].sum() == 0  # all other slots absent
-    # masked positions are exactly zero (inert), never the sentinel.
-    assert np.all(t["bullet_pos"][0, 4:] == 0.0)
+    mask = t["bullet_slot_mask"][0]  # (20,)
+    assert mask[0:2].sum() == 2  # slot 0 present (2 floats)
+    assert mask[2:].sum() == 0  # everything else absent
+    assert np.all(t["bullet_position"][0, 2:] == 0.0)  # masked positions inert
+    assert np.all(t["bullet_direction"][0, 2:] == 0.0)  # masked directions inert
 
 
 # --- wall lookup -------------------------------------------------------------
@@ -139,6 +274,22 @@ def test_wall_target_lookup_by_map_id():
     assert out[1, 0, 0] == 1.0
     assert out[2, 5, 7] == 1.0
     assert out[0].sum() == 1.0
+
+
+# --- interior wall mask ------------------------------------------------------
+def test_interior_wall_mask_is_exactly_128_cells_rows_2_9_cols_2_17():
+    mask = interior_wall_mask()
+    assert mask.shape == (12, 20)
+    assert mask.dtype == bool
+    assert int(mask.sum()) == 128  # 8 rows x 16 cols
+    # Rows 2..9 inclusive, cols 2..17 inclusive are True; the 2-deep border is False.
+    assert mask[2, 2] and mask[9, 17]
+    assert not mask[1, 2] and not mask[10, 2]  # border rows
+    assert not mask[2, 1] and not mask[2, 18]  # border cols
+    # Every True cell lies inside the interior rectangle.
+    rows, cols = np.where(mask)
+    assert rows.min() == 2 and rows.max() == 9
+    assert cols.min() == 2 and cols.max() == 17
 
 
 # --- normalization round-trip + sentinel exclusion ---------------------------
@@ -163,25 +314,28 @@ def test_fit_norm_stats_player_matches_numpy():
     np.testing.assert_allclose(stats.player_std, player.std(axis=0), atol=1e-5)
 
 
-def test_fit_norm_stats_bullet_excludes_sentinels():
-    # Build states where ONLY P1 slot 0 is ever present, with known values.
+def test_fit_norm_stats_bullet_pos_and_dir_exclude_sentinels():
     n = 64
     states = np.full((n, 52), SENTINEL, dtype=np.float32)
     states[:, 0:6] = 0.0
     states[:, 26:32] = 0.0
     present_vals = np.arange(n, dtype=np.float32)
-    states[:, 6] = present_vals  # slot 0, field 0 present on every row
-    states[:, 7] = present_vals * 2
-    states[:, 8] = present_vals * 3
-    states[:, 9] = present_vals * 4
+    states[:, 6] = present_vals  # slot 0 pos_x
+    states[:, 7] = present_vals * 2  # slot 0 pos_y
+    states[:, 8] = present_vals * 3  # slot 0 vec_x (direction)
+    states[:, 9] = present_vals * 4  # slot 0 vec_y (direction)
     stats = fit_norm_stats(states)
-    # Field 0 of bullet positions == state index 6; stats over present (=all) rows.
-    assert stats.bullet_mean[0] == pytest.approx(present_vals.mean(), abs=1e-4)
-    assert stats.bullet_std[0] == pytest.approx(present_vals.std(), abs=1e-4)
-    # An always-absent field (e.g. slot 1 field 0 -> position idx 4) must NOT see -100:
-    # its stats fall back to mean 0 / std 1 (no present samples), not the sentinel.
-    assert stats.bullet_mean[4] == pytest.approx(0.0)
-    assert stats.bullet_std[4] == pytest.approx(1.0)
+    # Bullet POSITION field 0 == state idx 6.
+    assert stats.bullet_pos_mean[0] == pytest.approx(present_vals.mean(), abs=1e-3)
+    assert stats.bullet_pos_std[0] == pytest.approx(present_vals.std(), abs=1e-3)
+    # Bullet DIRECTION field 0 == state idx 8.
+    assert stats.bullet_dir_mean[0] == pytest.approx((present_vals * 3).mean(), abs=1e-3)
+    assert stats.bullet_dir_std[0] == pytest.approx((present_vals * 3).std(), abs=1e-3)
+    # An always-absent field falls back to 0/1, never the sentinel.
+    assert stats.bullet_pos_mean[2] == pytest.approx(0.0)  # slot 1 absent
+    assert stats.bullet_pos_std[2] == pytest.approx(1.0)
+    assert stats.bullet_dir_mean[2] == pytest.approx(0.0)
+    assert stats.bullet_dir_std[2] == pytest.approx(1.0)
 
 
 def test_norm_stats_json_round_trip():
@@ -193,7 +347,8 @@ def test_norm_stats_json_round_trip():
     stats = fit_norm_stats(states)
     back = NormStats.from_json(stats.to_json())
     np.testing.assert_allclose(back.player_mean, stats.player_mean, atol=1e-6)
-    np.testing.assert_allclose(back.bullet_std, stats.bullet_std, atol=1e-6)
+    np.testing.assert_allclose(back.bullet_pos_std, stats.bullet_pos_std, atol=1e-6)
+    np.testing.assert_allclose(back.bullet_dir_mean, stats.bullet_dir_mean, atol=1e-6)
 
 
 # --- input-res parser --------------------------------------------------------
@@ -213,18 +368,16 @@ def test_parse_input_res_rejects_bad(bad):
 
 # --- stratified group split --------------------------------------------------
 def test_stratified_group_split_holds_out_per_map_and_no_overlap():
-    # 4 maps, 10 groups each.
     group_keys = []
     map_of_group = {}
     for m in range(4):
         for e in range(10):
-            g = (m, e)  # worker=m as a stand-in
+            g = (m, e)
             group_keys.append(g)
             map_of_group[g] = m
     train, val = stratified_group_split(group_keys, map_of_group, val_frac=0.1, seed=0)
     assert train.isdisjoint(val)
     assert train | val == set(group_keys)
-    # ~10% of 10 = 1 per map -> 4 val groups, one per map.
     assert len(val) == 4
     val_maps = sorted(map_of_group[g] for g in val)
     assert val_maps == [0, 1, 2, 3]
@@ -237,13 +390,149 @@ def test_stratified_group_split_is_deterministic_by_seed():
     b = stratified_group_split(group_keys, map_of_group, val_frac=0.2, seed=7)
     c = stratified_group_split(group_keys, map_of_group, val_frac=0.2, seed=8)
     assert a == b
-    assert a != c  # different seed -> different partition (with high probability)
+    assert a != c
 
 
 def test_split_single_group_map_goes_to_train_not_val():
-    # A map with one group can't be split -> it must land in train (val needs >=2).
     group_keys = [(0, 0)] + [(1, e) for e in range(10)]
     map_of_group = {(0, 0): 0, **{(1, e): 1 for e in range(10)}}
     train, val = stratified_group_split(group_keys, map_of_group, val_frac=0.1, seed=0)
     assert (0, 0) in train
     assert (0, 0) not in val
+
+
+# =============================================================================
+# Map-id resolution + 3-way map-aware split
+# =============================================================================
+# The canonical name->id mapping (from wall_grids_meta / _resolve_maps('all')).
+_NAME_TO_ID = {
+    "center_block": 0,
+    "central_cross": 1,
+    "chokepoint": 2,
+    "custom1_2021": 3,
+    "diagonal_pillars": 4,
+    "empty": 5,
+    "four_pillars": 6,
+    "opposing_l": 7,
+    "ring_fragments": 8,
+    "scattered": 9,
+}
+
+
+def test_resolve_map_ids_by_name_and_rejects_unknown():
+    assert resolve_map_ids(["diagonal_pillars", "ring_fragments"], _NAME_TO_ID) == [4, 8]
+    with pytest.raises(ValueError):
+        resolve_map_ids(["no_such_map"], _NAME_TO_ID)
+
+
+def _ten_map_groups(groups_per_map=10):
+    group_keys = []
+    map_of_group = {}
+    for m in range(10):
+        for e in range(groups_per_map):
+            g = (m, e)
+            group_keys.append(g)
+            map_of_group[g] = m
+    return group_keys, map_of_group
+
+
+def test_map_aware_split_holds_out_two_whole_maps_no_leakage():
+    group_keys, map_of_group = _ten_map_groups()
+    holdout = resolve_map_ids(["diagonal_pillars", "ring_fragments"], _NAME_TO_ID)  # [4, 8]
+    split = map_aware_split(group_keys, map_of_group, holdout, eval_frac=0.1, seed=0)
+    assert isinstance(split, MapAwareSplit)
+    assert split.holdout_map_ids == (4, 8)
+    assert set(split.train_map_ids) == set(range(10)) - {4, 8}
+    assert len(split.train_map_ids) == 8
+    # Validation = every group on maps 4 and 8 (10 each = 20).
+    assert all(map_of_group[g] in (4, 8) for g in split.validation)
+    assert len(split.validation) == 20
+    # Train + eval live only on the 8 training maps.
+    assert all(map_of_group[g] not in (4, 8) for g in split.train | split.eval)
+    # No group appears in more than one set (no frame leakage across the 3 sets).
+    assert split.train.isdisjoint(split.eval)
+    assert split.train.isdisjoint(split.validation)
+    assert split.eval.isdisjoint(split.validation)
+    # The three sets partition exactly the full group set.
+    assert split.train | split.eval | split.validation == set(group_keys)
+    # 90/10 within the 8 training maps -> 1 eval group per map = 8 eval groups.
+    assert len(split.eval) == 8
+    assert all(map_of_group[g] not in (4, 8) for g in split.eval)
+
+
+def test_map_aware_split_deterministic_by_seed():
+    group_keys, map_of_group = _ten_map_groups()
+    holdout = [4, 8]
+    a = map_aware_split(group_keys, map_of_group, holdout, eval_frac=0.2, seed=3)
+    b = map_aware_split(group_keys, map_of_group, holdout, eval_frac=0.2, seed=3)
+    c = map_aware_split(group_keys, map_of_group, holdout, eval_frac=0.2, seed=4)
+    assert a == b
+    assert a.train != c.train or a.eval != c.eval
+
+
+def test_map_aware_split_json_serializable_and_inspectable():
+    group_keys, map_of_group = _ten_map_groups(groups_per_map=4)
+    split = map_aware_split(group_keys, map_of_group, [4, 8], eval_frac=0.25, seed=1)
+    d = split.to_json()
+    assert d["holdout_map_ids"] == [4, 8]
+    assert len(d["train_map_ids"]) == 8
+    # group lists are JSON-friendly [worker, episode] pairs.
+    assert all(isinstance(g, list) and len(g) == 2 for g in d["validation_groups"])
+
+
+# =============================================================================
+# F1 / IoU metric helpers
+# =============================================================================
+def test_binary_f1_hand_checked():
+    # pred:   1 1 0 0 1
+    # target: 1 0 0 1 1
+    # TP=2 (idx 0,4), FP=1 (idx 1), FN=1 (idx 3).
+    pred = np.array([1, 1, 0, 0, 1])
+    target = np.array([1, 0, 0, 1, 1])
+    r = binary_f1(pred, target)
+    assert r["tp"] == 2 and r["fp"] == 1 and r["fn"] == 1
+    assert r["precision"] == pytest.approx(2 / 3)
+    assert r["recall"] == pytest.approx(2 / 3)
+    assert r["f1"] == pytest.approx(2 / 3)
+
+
+def test_binary_f1_all_negative_predictions():
+    pred = np.zeros(5)
+    target = np.array([1, 0, 1, 0, 0])
+    r = binary_f1(pred, target)
+    assert r["precision"] == 0.0  # no positive predictions
+    assert r["recall"] == 0.0
+    assert r["f1"] == 0.0
+
+
+def test_binary_f1_perfect():
+    pred = np.array([1, 0, 1, 1, 0])
+    target = np.array([1, 0, 1, 1, 0])
+    r = binary_f1(pred, target)
+    assert r["f1"] == pytest.approx(1.0)
+
+
+def test_interior_wall_f1_on_a_tiny_grid_example():
+    # Build a (1,12,20) pred/target where the border is all-1 (would inflate naive acc)
+    # but the interior differs by exactly known cells. Verify masking to interior.
+    mask = interior_wall_mask()
+    target = np.ones((12, 20), dtype=np.int64)  # everything wall
+    pred = np.ones((12, 20), dtype=np.int64)
+    # Flip 2 interior target cells to 0 and predict 1 there -> 2 FP on interior.
+    target[2, 2] = 0
+    target[3, 3] = 0
+    # Flip 1 interior pred cell to 0 where target is 1 -> 1 FN.
+    pred[4, 4] = 0
+    pi = pred[mask].ravel()
+    ti = target[mask].ravel()
+    r = binary_f1(pi, ti)
+    # interior cells = 128; TP = 128 - 2(target0) - 1(pred0, target1) = 125.
+    assert r["tp"] == 125
+    assert r["fp"] == 2  # predicted 1 where interior target 0
+    assert r["fn"] == 1  # predicted 0 where interior target 1
+    expected_iou = 125 / (125 + 2 + 1)
+    assert iou_score(pi, ti) == pytest.approx(expected_iou)
+
+
+def test_iou_both_empty_is_one():
+    assert iou_score(np.zeros(10), np.zeros(10)) == 1.0
