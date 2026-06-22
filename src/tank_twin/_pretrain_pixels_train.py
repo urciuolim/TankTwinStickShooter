@@ -36,6 +36,8 @@ from tank_twin.pretrain_pixels import (
     AIM_COSINE_EPS,
     N_BULLET_DIR,
     N_BULLET_POS,
+    N_BULLET_SLOTS,
+    PLAYER_POSITION_VEC_INDICES,
     PLAYER_SUBGROUP_VEC_INDICES,
     WALL_H,
     WALL_W,
@@ -48,11 +50,13 @@ from tank_twin.pretrain_pixels import (
     downsample_frames_np,
     fit_norm_stats,
     head_sizes,
+    heatmap_point_channels,
     interior_wall_mask,
     interior_wall_pos_weight,
     list_shards,
     load_map_name_to_id,
     map_aware_split,
+    parse_head,
     parse_pos_weight_arg,
     player_head_vec_indices,
     png_decode,
@@ -116,59 +120,240 @@ def _torch_per_player_cosine_distance(
 
 
 # =============================================================================
+# Spatial-softmax / soft-argmax (heatmap head; DIFFERENTIABLE; unit-tested)
+# =============================================================================
+def spatial_soft_argmax(heatmaps: torch.Tensor, *, normalized: str = "unit") -> torch.Tensor:
+    """DIFFERENTIABLE soft-argmax over a stack of 2D heatmaps -> continuous (x, y).
+
+    ``heatmaps`` is ``(B, K, h, w)`` of raw (unnormalized) scores. A spatial SOFTMAX over
+    the ``(h, w)`` plane turns each channel into a probability map; the soft-argmax is the
+    probability-weighted mean of the cell coordinates -> one continuous ``(x, y)`` per
+    channel, giving ``(B, K, 2)`` with ``[..., 0] = x`` (column) and ``[..., 1] = y`` (row).
+
+    Coordinate convention (``normalized``):
+    * ``"unit"`` (default): cell centers span ``[0, 1]`` along each axis (col j ->
+      ``(j + 0.5) / w``, row i -> ``(i + 0.5) / h``). A heatmap peaked at one cell returns
+      that cell's center; a symmetric blob returns its centroid. Bounded in ``(0, 1)``.
+    * ``"centered"``: same but mapped to ``[-1, 1]`` (``2 * unit - 1``).
+
+    Fully differentiable: softmax + weighted sum, no argmax / indexing. Grad flows to the
+    input heatmaps (asserted by the unit test). Factored out of the head so it is unit-
+    testable on a one-hot / Gaussian heatmap without building the encoder.
+    """
+    b, k, h, w = heatmaps.shape
+    flat = heatmaps.reshape(b, k, h * w)
+    prob = torch.softmax(flat, dim=2).reshape(b, k, h, w)
+    device, dtype = heatmaps.device, heatmaps.dtype
+    xs = (torch.arange(w, device=device, dtype=dtype) + 0.5) / w  # (w,) col centers in [0,1]
+    ys = (torch.arange(h, device=device, dtype=dtype) + 0.5) / h  # (h,) row centers in [0,1]
+    exp_x = (prob.sum(dim=2) * xs).sum(dim=2)  # (B, K) sum over rows then weight cols
+    exp_y = (prob.sum(dim=3) * ys).sum(dim=2)  # (B, K) sum over cols then weight rows
+    coords = torch.stack([exp_x, exp_y], dim=2)  # (B, K, 2) -> (x, y) in [0,1]
+    if normalized == "centered":
+        return coords * 2.0 - 1.0
+    return coords
+
+
+# =============================================================================
 # Model: reusable encoder + configurable heads on the shared embedding
 # =============================================================================
 class PixelEncoder(nn.Module):
-    """NatureCNN-style encoder: 3 convs -> flatten -> Linear(embedding_dim) -> ReLU.
+    """NatureCNN-style encoder; the embedding READOUT is head-aware (Part B).
 
-    Input is channel-first ``(B, 3, H, W)`` float in [0,1]. This conv+FC stack is the
-    REUSABLE artifact; ``state_dict`` is what gets saved as ``encoder.pt``. Its
-    architecture / keys do NOT depend on the objective config.
+    Input is channel-first ``(B, 3, H, W)`` float in [0,1]. The shared 3-conv trunk is the
+    REUSABLE artifact; ``state_dict`` is what gets saved as ``encoder.pt``. Two readouts:
+
+    * ``head="fc"`` (default, UNCHANGED): ``self.cnn`` is the 3 conv+ReLU layers FOLLOWED BY
+      ``nn.Flatten()`` and ``self.linear`` is ``Linear(flatten_dim, embedding_dim)+ReLU``.
+      ``forward`` -> ``self.linear(self.cnn(x))``. The module layout / state_dict keys
+      (``cnn.0/2/4`` convs, ``linear.0``) and the forward are BYTE-IDENTICAL to the original
+      encoder, so an ``encoder.pt`` saved in fc mode reloads into a fresh fc ``PixelEncoder``
+      exactly as before.
+    * ``head="heatmap"``: ``self.cnn`` is the 3 conv+ReLU layers WITHOUT the flatten (so the
+      spatial ``(B, C, h, w)`` feature map is exposed for the heatmap head), and there is NO
+      ``self.linear``. The embedding is a GLOBAL AVERAGE POOL of the feature map over
+      ``(h, w)`` -> ``(B, C)``. This drops the (huge) flatten->FC matrix (12.8M params at 640)
+      to ~0, which is the pooling win; ``embedding_dim`` is then forced to ``C`` (=64).
+
+    ``head`` is recorded on the module so a fresh encoder can be rebuilt with the matching
+    architecture for the standalone-reload self-check (the artifact is head-specific).
     """
 
-    def __init__(self, in_h: int, in_w: int, embedding_dim: int = 512) -> None:
+    def __init__(self, in_h: int, in_w: int, embedding_dim: int = 512, *, head: str = "fc") -> None:
         super().__init__()
-        self.in_h, self.in_w, self.embedding_dim = in_h, in_w, embedding_dim
-        self.cnn = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=8, stride=4),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1),
-            nn.ReLU(),
-            nn.Flatten(),
-        )
-        with torch.no_grad():
-            flat = self.cnn(torch.zeros(1, 3, in_h, in_w)).shape[1]
-        self.flatten_dim = int(flat)
-        self.linear = nn.Sequential(nn.Linear(self.flatten_dim, embedding_dim), nn.ReLU())
+        self.head = parse_head(head)
+        self.in_h, self.in_w = in_h, in_w
+        if self.head == "fc":
+            # UNCHANGED: convs + Flatten in self.cnn, then Linear->ReLU in self.linear.
+            self.embedding_dim = embedding_dim
+            self.cnn = nn.Sequential(
+                nn.Conv2d(3, 32, kernel_size=8, stride=4),
+                nn.ReLU(),
+                nn.Conv2d(32, 64, kernel_size=4, stride=2),
+                nn.ReLU(),
+                nn.Conv2d(64, 64, kernel_size=3, stride=1),
+                nn.ReLU(),
+                nn.Flatten(),
+            )
+            with torch.no_grad():
+                flat = self.cnn(torch.zeros(1, 3, in_h, in_w)).shape[1]
+            self.flatten_dim = int(flat)
+            self.linear = nn.Sequential(nn.Linear(self.flatten_dim, embedding_dim), nn.ReLU())
+        else:
+            # heatmap: convs only (NO flatten); embedding is global-avg-pool of the map.
+            self.cnn = nn.Sequential(
+                nn.Conv2d(3, 32, kernel_size=8, stride=4),
+                nn.ReLU(),
+                nn.Conv2d(32, 64, kernel_size=4, stride=2),
+                nn.ReLU(),
+                nn.Conv2d(64, 64, kernel_size=3, stride=1),
+                nn.ReLU(),
+            )
+            with torch.no_grad():
+                fm = self.cnn(torch.zeros(1, 3, in_h, in_w))  # (1, C, h, w)
+            self.feature_channels = int(fm.shape[1])
+            self.feature_hw = (int(fm.shape[2]), int(fm.shape[3]))
+            self.flatten_dim = int(fm.numel())  # informational (what fc WOULD flatten to)
+            # The pooled embedding width is the conv channel count (global pool over h,w).
+            self.embedding_dim = self.feature_channels
+
+    def features(self, x: torch.Tensor) -> torch.Tensor:
+        """Spatial conv feature map ``(B, C, h, w)`` (heatmap head only; before any pool).
+
+        Only valid in ``head="heatmap"`` mode (the fc ``self.cnn`` ends in a Flatten and
+        returns ``(B, flatten_dim)``); callers in fc mode never invoke this.
+        """
+        return self.cnn(x)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.linear(self.cnn(x))
+        if self.head == "fc":
+            return self.linear(self.cnn(x))
+        # heatmap: global average pool the (B, C, h, w) feature map over (h, w) -> (B, C).
+        fm = self.cnn(x)
+        return fm.mean(dim=(2, 3))
 
 
 class InverseRenderer(nn.Module):
-    """Encoder + the heads for the ENABLED objective groups (read the shared embedding).
+    """Encoder + the heads for the ENABLED objective groups. The localization READOUT is
+    head-aware (Part B): ``head="fc"`` (default) is the ORIGINAL behavior; ``head="heatmap"``
+    localizes the POINT targets (player_position, bullet_position) via per-point heatmaps.
 
-    Disabled groups get no head at all (no parameters, no output, no compute). The
-    player head outputs only the enabled player sub-groups (4 floats each); bullet
-    position / direction / presence and wall heads are present only when enabled.
+    Disabled groups get no head at all (no parameters, no output, no compute).
+
+    fc mode (UNCHANGED)
+    -------------------
+    Every enabled head is an ``nn.Linear(embedding_dim, size)`` off the flatten->FC
+    embedding; the player head emits all enabled player sub-group columns; walls are a
+    Linear(240)->reshape. Byte-identical to the original ``InverseRenderer``.
+
+    heatmap mode
+    ------------
+    The encoder global-pools its spatial feature map into a ``(B, C)`` embedding (no
+    flatten->FC). The POINT targets are localized off the SPATIAL map instead of regressed:
+
+    * **player_position / bullet_position** (the point groups): a small conv on the feature
+      map emits one heatmap channel per point (2 for players, 10 for bullets). Each channel
+      is spatial-softmax'd and soft-argmax'd to a continuous ``(x, y)`` in normalized grid
+      coords ``[0,1]``, then a PER-GROUP learned affine ``Linear(2, 2)`` maps grid->the SAME
+      normalized (z-standardized) target space the fc head regresses, so the
+      ``bullet_position``/``player_position`` metrics stay apples-to-apples. The player head
+      ASSEMBLES the full ``player_vec_indices`` vector: position columns come from the
+      heatmap path, velocity/aim columns (if enabled) from a small regression head off the
+      pooled embedding (aim/velocity are directions/rates, NOT point localizations).
+    * **walls**: a small SPATIAL CONV head off the feature map predicts the (B,12,20) logits
+      (more natural than from a pooled vector; protects the spatial 20x12 wall structure
+      from the global pool). The interior-only BCE loss/metric is unchanged.
+    * **bullet_presence**: a small conv head off the feature map -> global-pool -> Linear(10)
+      so presence keeps a SPATIAL source (bullet occupancy is spatial) and its F1 does not
+      regress under the pooling. (bullet_direction is regressed from the pooled embedding.)
+
+    In BOTH modes ``forward`` returns the SAME ``preds`` dict keys/shapes, so
+    ``compute_losses`` and ``_evaluate`` are identical across heads — only the producers
+    differ. The reusable ``encoder.pt`` is head-specific (fc: flatten->FC; heatmap: pooled).
     """
 
     def __init__(
-        self, in_h: int, in_w: int, cfg: ObjectiveConfig, embedding_dim: int = 512
+        self,
+        in_h: int,
+        in_w: int,
+        cfg: ObjectiveConfig,
+        embedding_dim: int = 512,
+        *,
+        head: str = "fc",
     ) -> None:
         super().__init__()
-        self.encoder = PixelEncoder(in_h, in_w, embedding_dim)
+        self.head = parse_head(head)
+        self.encoder = PixelEncoder(in_h, in_w, embedding_dim, head=self.head)
         self.cfg = cfg
         self.sizes = head_sizes(cfg)
-        self.heads = nn.ModuleDict()
-        for name, size in self.sizes.items():
-            self.heads[name] = nn.Linear(embedding_dim, size)
         # Indices into the 12-vector that the player head predicts (enabled sub-groups).
         self.player_vec_indices = player_head_vec_indices(cfg)
+        # The pooled/FC embedding width (C in heatmap mode, embedding_dim in fc mode).
+        emb = self.encoder.embedding_dim
+
+        if self.head == "fc":
+            self._init_fc_heads(emb)
+        else:
+            self._init_heatmap_heads(emb)
+
+    # --- fc-mode heads (ORIGINAL) --------------------------------------------
+    def _init_fc_heads(self, emb: int) -> None:
+        self.heads = nn.ModuleDict()
+        for name, size in self.sizes.items():
+            self.heads[name] = nn.Linear(emb, size)
+
+    # --- heatmap-mode heads --------------------------------------------------
+    def _init_heatmap_heads(self, emb: int) -> None:
+        cfg = self.cfg
+        c = self.encoder.feature_channels
+        # Which point groups are localized (player_position -> 2, bullet_position -> 10).
+        self.point_channels = heatmap_point_channels(cfg)  # dict group -> n_points
+        n_heat = sum(self.point_channels.values())
+        # Regression heads off the POOLED embedding for the non-localized targets.
+        self.heads = nn.ModuleDict()
+        # Player velocity/aim columns (everything in player_vec_indices that is NOT position).
+        self._player_pos_cols = [
+            i for i, vi in enumerate(self.player_vec_indices) if vi in PLAYER_POSITION_VEC_INDICES
+        ]
+        self._player_reg_cols = [
+            i for i in range(len(self.player_vec_indices)) if i not in self._player_pos_cols
+        ]
+        if cfg.any_player() and self._player_reg_cols:
+            # Regress only the non-position player columns (velocity and/or aim).
+            self.heads["player_reg"] = nn.Linear(emb, len(self._player_reg_cols))
+        if cfg.is_on("bullet_direction"):
+            self.heads["bullet_direction"] = nn.Linear(emb, self.sizes["bullet_direction"])
+        # Heatmap conv: feature map -> n_heat heatmap channels (one per localized point).
+        if n_heat > 0:
+            self.heatmap_conv = nn.Sequential(
+                nn.Conv2d(c, c, kernel_size=3, padding=1),
+                nn.ReLU(),
+                nn.Conv2d(c, n_heat, kernel_size=1),
+            )
+            # Per-GROUP learned affine grid(x,y)[0,1] -> normalized target space.
+            self.point_affine = nn.ModuleDict({g: nn.Linear(2, 2) for g in self.point_channels})
+        # bullet_presence: small conv -> global pool -> Linear(10) (spatial source).
+        if cfg.is_on("bullet_presence"):
+            self.presence_conv = nn.Sequential(
+                nn.Conv2d(c, c, kernel_size=3, padding=1),
+                nn.ReLU(),
+            )
+            self.presence_fc = nn.Linear(c, N_BULLET_SLOTS)
+        # walls: small spatial conv head -> (B,1,12,20) logits via adaptive pool.
+        if cfg.is_on("walls"):
+            self.wall_conv = nn.Sequential(
+                nn.Conv2d(c, c, kernel_size=3, padding=1),
+                nn.ReLU(),
+                nn.Conv2d(c, 1, kernel_size=1),
+                nn.AdaptiveAvgPool2d((WALL_H, WALL_W)),
+            )
 
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        if self.head == "fc":
+            return self._forward_fc(x)
+        return self._forward_heatmap(x)
+
+    def _forward_fc(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         z = self.encoder(x)
         out: dict[str, torch.Tensor] = {}
         for name, head in self.heads.items():
@@ -176,6 +361,54 @@ class InverseRenderer(nn.Module):
             if name == "wall":
                 y = y.reshape(-1, WALL_H, WALL_W)
             out[name] = y
+        return out
+
+    def _forward_heatmap(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        fm = self.encoder.features(x)  # (B, C, h, w) spatial feature map
+        z = fm.mean(dim=(2, 3))  # (B, C) pooled embedding (same as encoder.forward)
+        out: dict[str, torch.Tensor] = {}
+
+        # --- Localized points: heatmaps -> soft-argmax -> per-group affine -------
+        point_xy: dict[str, torch.Tensor] = {}
+        if self.point_channels:
+            heat = self.heatmap_conv(fm)  # (B, n_heat, h, w)
+            coords = spatial_soft_argmax(heat, normalized="unit")  # (B, n_heat, 2) in [0,1]
+            off = 0
+            for g, n in self.point_channels.items():
+                grid_xy = coords[:, off : off + n, :]  # (B, n, 2)
+                # Per-group affine grid->normalized target space, shared across the group's
+                # points (applied to the last dim 2->2).
+                point_xy[g] = self.point_affine[g](grid_xy)  # (B, n, 2)
+                off += n
+
+        # --- player: assemble position (heatmap) + velocity/aim (regression) -----
+        if self.cfg.any_player():
+            b = x.shape[0]
+            player = x.new_zeros(b, len(self.player_vec_indices))
+            if "player_position" in point_xy:
+                # point_xy player_position is (B, 2, 2) = [[P1_x,P1_y],[P2_x,P2_y]] ->
+                # flatten to [P1_x,P1_y,P2_x,P2_y]; scatter into the position columns.
+                pos = point_xy["player_position"].reshape(b, -1)  # (B, 4)
+                for j, col in enumerate(self._player_pos_cols):
+                    player[:, col] = pos[:, j]
+            if self._player_reg_cols:
+                reg = self.heads["player_reg"](z)  # (B, len(reg_cols))
+                for j, col in enumerate(self._player_reg_cols):
+                    player[:, col] = reg[:, j]
+            out["player"] = player
+
+        # --- bullets: position (heatmap) + presence (conv) + direction (reg) -----
+        if "bullet_position" in point_xy:
+            out["bullet_position"] = point_xy["bullet_position"].reshape(x.shape[0], -1)  # (B,20)
+        if self.cfg.is_on("bullet_presence"):
+            pres = self.presence_conv(fm).mean(dim=(2, 3))  # (B, C)
+            out["bullet_presence"] = self.presence_fc(pres)  # (B, 10)
+        if self.cfg.is_on("bullet_direction"):
+            out["bullet_direction"] = self.heads["bullet_direction"](z)  # (B, 20)
+
+        # --- walls: spatial conv head -> (B, 12, 20) logits ----------------------
+        if self.cfg.is_on("walls"):
+            out["wall"] = self.wall_conv(fm).squeeze(1)  # (B, 12, 20)
         return out
 
 
@@ -992,7 +1225,8 @@ def run_training(args: Namespace) -> int:
         pin_memory=pin,
     )
 
-    model = InverseRenderer(out_h, out_w, cfg, args.embedding_dim).to(device)
+    head = parse_head(getattr(args, "head", "fc"))
+    model = InverseRenderer(out_h, out_w, cfg, args.embedding_dim, head=head).to(device)
     # AdamW = decoupled weight decay (the correct form); weight_decay=0.0 (default) makes
     # this behave like the old Adam, so `--lr 3e-4 --lr-schedule constant` is unchanged.
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -1034,10 +1268,14 @@ def run_training(args: Namespace) -> int:
     aim_loss = args.aim_loss
     if cfg.is_on("player_aim"):
         print(f"[pretrain] player_aim loss={aim_loss} lambda_aim={args.lambda_aim}")
+    # Encoder param count is the load-bearing A/B number (fc flatten->FC vs heatmap
+    # global-pool): record it for the report and persist it in config/metrics.
+    encoder_params = sum(p.numel() for p in model.encoder.parameters())
+    total_params = sum(p.numel() for p in model.parameters())
     print(
-        f"[pretrain] encoder flatten_dim={model.encoder.flatten_dim} "
+        f"[pretrain] head={head} encoder flatten_dim={model.encoder.flatten_dim} "
         f"embedding_dim={model.encoder.embedding_dim} heads={list(model.sizes.items())} "
-        f"params={sum(p.numel() for p in model.parameters()):,}"
+        f"encoder_params={encoder_params:,} total_params={total_params:,}"
     )
 
     run_dir.mkdir(parents=True, exist_ok=False)
@@ -1155,8 +1393,12 @@ def run_training(args: Namespace) -> int:
 
     config_dict = {
         "input_res": f"{out_w}x{out_h}",
+        "head": head,
         "embedding_dim": args.embedding_dim,
+        "encoder_embedding_dim": model.encoder.embedding_dim,
         "flatten_dim": model.encoder.flatten_dim,
+        "encoder_params": encoder_params,
+        "total_params": total_params,
         "objectives": cfg.to_json(),
         "head_sizes": model.sizes,
         "lambdas": lambdas,
@@ -1198,18 +1440,21 @@ def run_training(args: Namespace) -> int:
     print(f"[pretrain] saved metrics (eval history + validation) -> {metrics_path}")
 
     # --- Verify the encoder reloads STANDALONE into a fresh PixelEncoder -----
-    # (the encoder is objective-config-independent; this check does not touch heads.)
-    fresh = PixelEncoder(out_h, out_w, args.embedding_dim)
+    # The encoder is objective-config-independent but HEAD-specific (fc: flatten->FC,
+    # embedding=embedding_dim; heatmap: global-pool, embedding=C). Build the fresh encoder
+    # with the SAME head so the keys match (strict load) and assert its real embedding width.
+    fresh = PixelEncoder(out_h, out_w, args.embedding_dim, head=head)
     sd = torch.load(encoder_path, map_location="cpu", weights_only=True)
     fresh.load_state_dict(sd)  # strict=True: raises on any mismatch
     fresh.eval()
+    expected_emb = fresh.embedding_dim
     with torch.no_grad():
         emb = fresh(torch.zeros(2, 3, out_h, out_w))
-    assert emb.shape == (2, args.embedding_dim), emb.shape
+    assert emb.shape == (2, expected_emb), emb.shape
     print(
-        f"[pretrain] encoder reload OK: fresh PixelEncoder forward -> {tuple(emb.shape)} "
-        f"(expected (2, {args.embedding_dim})); encoder keys={sorted(sd.keys())[:2]}... "
-        f"(objective-config-independent)"
+        f"[pretrain] encoder reload OK (head={head}): fresh PixelEncoder forward -> "
+        f"{tuple(emb.shape)} (expected (2, {expected_emb})); "
+        f"encoder keys={sorted(sd.keys())[:2]}... (objective-config-independent)"
     )
     return 0
 

@@ -17,6 +17,8 @@ import pytest
 from tank_twin.pretrain_pixels import (
     BULLET_BASE_INDICES,
     DEFAULT_OBJECTIVES,
+    HEAD_CHOICES,
+    HEATMAP_LOCALIZED_GROUPS,
     N_BULLET_DIR,
     N_BULLET_POS,
     N_PLAYER,
@@ -38,11 +40,13 @@ from tank_twin.pretrain_pixels import (
     encode_player_targets,
     fit_norm_stats,
     head_sizes,
+    heatmap_point_channels,
     interior_wall_mask,
     interior_wall_pos_weight,
     iou_score,
     map_aware_split,
     normalize,
+    parse_head,
     parse_input_res,
     parse_objectives,
     parse_pos_weight_arg,
@@ -1016,3 +1020,157 @@ def test_lmdb_png_dataset_matches_memmap_dataset(tmp_path):
             "wall",
         ):
             assert torch.equal(a[key], b[key]), key
+
+
+# =============================================================================
+# PART B: --head {fc, heatmap} localization head (pure config + torch soft-argmax)
+# =============================================================================
+def test_parse_head_default_and_choices_and_rejects_unknown():
+    # None / "fc" -> fc (current behavior).
+    assert parse_head(None) == "fc"
+    assert parse_head("fc") == "fc"
+    assert parse_head("heatmap") == "heatmap"
+    # Case / whitespace tolerant.
+    assert parse_head(" HEATMAP ") == "heatmap"
+    assert set(HEAD_CHOICES) == {"fc", "heatmap"}
+    with pytest.raises(ValueError):
+        parse_head("convnet")
+
+
+def test_head_arg_default_fc_and_accepts_heatmap():
+    from tank_twin.pretrain_pixels import _parse_args
+
+    # Default head is fc (CURRENT behavior, byte-identical encoder).
+    assert _parse_args(["--out", "runs/x"]).head == "fc"
+    assert _parse_args(["--out", "runs/x", "--head", "heatmap"]).head == "heatmap"
+    assert _parse_args(["--out", "runs/x", "--head", "fc"]).head == "fc"
+    # argparse rejects an out-of-choices value with SystemExit (exit code 2).
+    with pytest.raises(SystemExit):
+        _parse_args(["--out", "runs/x", "--head", "mlp"])
+
+
+def test_heatmap_point_channels_lists_only_enabled_localized_groups():
+    # The localized point groups are exactly player_position + bullet_position.
+    assert set(HEATMAP_LOCALIZED_GROUPS) == {"player_position", "bullet_position"}
+    # Default config: both on -> player_position=2 (P1,P2), bullet_position=10 slots.
+    cfg = ObjectiveConfig.default()
+    assert heatmap_point_channels(cfg) == {"player_position": 2, "bullet_position": 10}
+    # Disabling bullet_position drops it from the localized channels.
+    cfg2 = parse_objectives(None, "bullet_position")
+    assert heatmap_point_channels(cfg2) == {"player_position": 2}
+    # A config with NEITHER localized group -> empty (aim/velocity/walls aren't points).
+    cfg3 = ObjectiveConfig.from_set(["walls", "player_aim"])
+    assert heatmap_point_channels(cfg3) == {}
+
+
+# --- Soft-argmax / spatial-softmax: correctness + differentiability (torch) ---
+def test_spatial_soft_argmax_one_hot_returns_cell_center():
+    """A one-hot heatmap at a known cell -> soft-argmax returns that cell's center."""
+    torch = pytest.importorskip("torch")
+    from tank_twin._pretrain_pixels_train import spatial_soft_argmax
+
+    h, w = 7, 16
+    # Peak at row 4, col 11 (large logit there, ~0 elsewhere -> softmax ~one-hot).
+    heat = torch.full((1, 1, h, w), -50.0)
+    heat[0, 0, 4, 11] = 50.0
+    xy = spatial_soft_argmax(heat, normalized="unit")  # (1,1,2) -> (x,y) in [0,1]
+    assert xy.shape == (1, 1, 2)
+    # Cell-center convention: x = (col+0.5)/w, y = (row+0.5)/h.
+    assert xy[0, 0, 0].item() == pytest.approx((11 + 0.5) / w, abs=1e-4)  # x = col
+    assert xy[0, 0, 1].item() == pytest.approx((4 + 0.5) / h, abs=1e-4)  # y = row
+    # Centered convention maps the same coord to [-1, 1].
+    xyc = spatial_soft_argmax(heat, normalized="centered")
+    assert xyc[0, 0, 0].item() == pytest.approx(2 * (11 + 0.5) / w - 1, abs=1e-4)
+    assert xyc[0, 0, 1].item() == pytest.approx(2 * (4 + 0.5) / h - 1, abs=1e-4)
+
+
+def test_spatial_soft_argmax_symmetric_gaussian_returns_center():
+    """A symmetric Gaussian centered at a known coord -> soft-argmax returns that coord."""
+    torch = pytest.importorskip("torch")
+    from tank_twin._pretrain_pixels_train import spatial_soft_argmax
+
+    h, w = 12, 12
+    cy, cx = 6, 4  # Gaussian center (row, col)
+    rows = torch.arange(h).float().reshape(h, 1)
+    cols = torch.arange(w).float().reshape(1, w)
+    sigma = 1.5
+    logits = -((rows - cy) ** 2 + (cols - cx) ** 2) / (2 * sigma**2)  # (h,w)
+    heat = logits.reshape(1, 1, h, w)
+    xy = spatial_soft_argmax(heat, normalized="unit")
+    # A symmetric Gaussian's soft-argmax sits at its center cell.
+    assert xy[0, 0, 0].item() == pytest.approx((cx + 0.5) / w, abs=2e-3)  # x = col 4
+    assert xy[0, 0, 1].item() == pytest.approx((cy + 0.5) / h, abs=2e-3)  # y = row 6
+
+
+def test_spatial_soft_argmax_is_differentiable():
+    """Grad must flow through soft-argmax to the input heatmap (finite, non-None)."""
+    torch = pytest.importorskip("torch")
+    from tank_twin._pretrain_pixels_train import spatial_soft_argmax
+
+    h, w = 5, 9
+    heat = torch.randn(2, 3, h, w, requires_grad=True)
+    xy = spatial_soft_argmax(heat, normalized="unit")  # (2,3,2)
+    # Drive a scalar loss toward a target coord and backprop.
+    loss = (xy - 0.5).pow(2).sum()
+    loss.backward()
+    assert heat.grad is not None
+    assert heat.grad.shape == heat.shape
+    assert torch.isfinite(heat.grad).all()
+    assert heat.grad.abs().sum().item() > 0.0  # non-trivial gradient flowed
+
+
+def test_spatial_soft_argmax_batched_independent_channels():
+    """Each channel/sample localizes independently (no cross-channel leakage)."""
+    torch = pytest.importorskip("torch")
+    from tank_twin._pretrain_pixels_train import spatial_soft_argmax
+
+    h, w = 6, 6
+    heat = torch.full((2, 2, h, w), -40.0)
+    # sample0 chan0 peak (0,0); sample0 chan1 peak (5,5); sample1 chan0 peak (2,3).
+    heat[0, 0, 0, 0] = 40.0
+    heat[0, 1, 5, 5] = 40.0
+    heat[1, 0, 2, 3] = 40.0
+    heat[1, 1, 1, 1] = 40.0
+    xy = spatial_soft_argmax(heat, normalized="unit")
+    assert xy[0, 0, 0].item() == pytest.approx(0.5 / w, abs=1e-3)
+    assert xy[0, 1, 0].item() == pytest.approx((5 + 0.5) / w, abs=1e-3)
+    assert xy[1, 0, 0].item() == pytest.approx((3 + 0.5) / w, abs=1e-3)  # col 3
+    assert xy[1, 0, 1].item() == pytest.approx((2 + 0.5) / h, abs=1e-3)  # row 2
+
+
+def test_inverse_renderer_fc_encoder_is_byte_identical_to_heatmap_independent():
+    """The fc-mode encoder/model must keep the ORIGINAL architecture (keys + shapes);
+    the heatmap-mode encoder is a DIFFERENT (global-pool) architecture. (torch)"""
+    torch = pytest.importorskip("torch")
+    from tank_twin._pretrain_pixels_train import InverseRenderer, PixelEncoder
+
+    cfg = ObjectiveConfig.default()
+    fc = PixelEncoder(90, 160, 512, head="fc")
+    # fc keys: 3 convs (cnn.0/2/4) + the flatten->FC linear.0 (UNCHANGED layout).
+    assert sorted(fc.state_dict().keys()) == [
+        "cnn.0.bias",
+        "cnn.0.weight",
+        "cnn.2.bias",
+        "cnn.2.weight",
+        "cnn.4.bias",
+        "cnn.4.weight",
+        "linear.0.bias",
+        "linear.0.weight",
+    ]
+    assert fc.embedding_dim == 512
+    hm = PixelEncoder(90, 160, 512, head="heatmap")
+    # heatmap encoder: convs ONLY (no flatten->FC); embedding == conv channel count.
+    assert "linear.0.weight" not in hm.state_dict()
+    assert hm.embedding_dim == hm.feature_channels == 64
+    # The pooling win: the heatmap encoder has strictly FEWER params (no FC matrix).
+    fc_p = sum(p.numel() for p in fc.parameters())
+    hm_p = sum(p.numel() for p in hm.parameters())
+    assert hm_p < fc_p
+    # Both head modes return the SAME preds dict keys/shapes (apples-to-apples A/B).
+    m_fc = InverseRenderer(90, 160, cfg, 512, head="fc")
+    m_hm = InverseRenderer(90, 160, cfg, 512, head="heatmap")
+    x = torch.rand(3, 3, 90, 160)
+    out_fc, out_hm = m_fc(x), m_hm(x)
+    assert set(out_fc.keys()) == set(out_hm.keys())
+    for k in out_fc:
+        assert out_fc[k].shape == out_hm[k].shape, k

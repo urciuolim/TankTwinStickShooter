@@ -59,8 +59,11 @@ import numpy as np
 
 __all__ = [
     "BULLET_BASE_INDICES",
+    "HEAD_CHOICES",
+    "HEATMAP_LOCALIZED_GROUPS",
     "OBJECTIVE_GROUPS",
     "PLAYER_INDICES",
+    "PLAYER_POSITION_VEC_INDICES",
     "PLAYER_SUBGROUP_VEC_INDICES",
     "SENTINEL",
     "MapAwareSplit",
@@ -76,12 +79,14 @@ __all__ = [
     "encode_bullet_targets",
     "encode_player_targets",
     "fit_norm_stats",
+    "heatmap_point_channels",
     "interior_wall_mask",
     "interior_wall_pos_weight",
     "iou_score",
     "main",
     "map_aware_split",
     "normalize",
+    "parse_head",
     "parse_input_res",
     "parse_pos_weight_arg",
     "per_player_cosine_distance",
@@ -125,6 +130,10 @@ PLAYER_SUBGROUP_VEC_INDICES: dict[str, tuple[int, ...]] = {
     "player_velocity": (2, 3, 8, 9),
     "player_aim": (4, 5, 10, 11),
 }
+# Player POSITION sub-group as (P1_x, P1_y, P2_x, P2_y) within the 12-vec ordering. The
+# heatmap head localizes the 2 player POINTS (P1, P2), so it groups these into 2 (x,y)
+# pairs: P1 = (idx 0, 1), P2 = (idx 6, 7).
+PLAYER_POSITION_VEC_INDICES: tuple[int, ...] = PLAYER_SUBGROUP_VEC_INDICES["player_position"]
 
 # --- Objective groups --------------------------------------------------------
 OBJECTIVE_GROUPS: tuple[str, ...] = (
@@ -148,6 +157,50 @@ WALL_INTERIOR_COLS = (2, 17)  # inclusive
 N_WALL_INTERIOR = 8 * 16  # 128
 
 _SHARD_RE = re.compile(r"shard_w(\d+)_(\d+)\.npz$")
+
+# --- Localization head selection (Part B: fc vs heatmap) ---------------------
+# The READOUT for the POINT-localization targets. 'fc' (default) regresses points from
+# the flatten->FC embedding (current behavior, byte-identical encoder). 'heatmap' predicts
+# a per-point heatmap channel off the SPATIAL conv feature map, spatial-softmax ->
+# soft-argmax -> (x,y) -> a learned affine into the SAME normalized target space the fc
+# head regresses (so the per-objective metrics stay apples-to-apples). Only the point
+# targets below switch; aim/velocity/presence/walls do NOT become heatmaps.
+HEAD_CHOICES: tuple[str, ...] = ("fc", "heatmap")
+# The objective groups whose POINTS are localized by the heatmap head (player POSITION =
+# 2 points P1/P2; bullet POSITION = 10 points). These are the ONLY groups affected by the
+# --head switch. Everything else keeps its current head type in both modes.
+HEATMAP_LOCALIZED_GROUPS: tuple[str, ...] = ("player_position", "bullet_position")
+
+
+def parse_head(value: str | None) -> str:
+    """Resolve the ``--head`` flag to a value in :data:`HEAD_CHOICES` (default ``"fc"``).
+
+    ``None`` -> ``"fc"`` (the current behavior). A known head name passes through verbatim.
+    Raises ValueError on any other string (argparse ``choices`` also guards the CLI, but
+    this keeps the helper standalone-usable / unit-testable).
+    """
+    if value is None:
+        return "fc"
+    v = value.strip().lower()
+    if v not in HEAD_CHOICES:
+        raise ValueError(f"--head must be one of {list(HEAD_CHOICES)}, got {value!r}")
+    return v
+
+
+def heatmap_point_channels(cfg: ObjectiveConfig) -> dict[str, int]:
+    """Number of heatmap CHANNELS (= localized points) per enabled localized group.
+
+    Only the groups in :data:`HEATMAP_LOCALIZED_GROUPS` that are ENABLED appear:
+    ``player_position`` -> 2 (P1, P2); ``bullet_position`` -> 10 (slots). Each channel is
+    one (h,w) heatmap whose soft-argmax yields one (x,y). Empty if neither is enabled.
+    Used only by the heatmap head; the fc head ignores it.
+    """
+    out: dict[str, int] = {}
+    if cfg.is_on("player_position"):
+        out["player_position"] = 2
+    if cfg.is_on("bullet_position"):
+        out["bullet_position"] = N_BULLET_SLOTS
+    return out
 
 
 # =============================================================================
@@ -932,6 +985,20 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     )
     p.add_argument("--input-res", type=str, default="160x90", help="downsample target WxH")
     p.add_argument("--embedding-dim", type=int, default=512, help="encoder embedding width")
+    p.add_argument(
+        "--head",
+        type=str,
+        default="fc",
+        choices=HEAD_CHOICES,
+        help=(
+            "localization READOUT for the POINT targets (player_position + bullet_position). "
+            "'fc' (default) = flatten->Linear(embedding) point regression (CURRENT behavior; "
+            "encoder.pt byte-identical). 'heatmap' = per-point heatmap channel off the spatial "
+            "conv feature map -> spatial-softmax -> soft-argmax -> learned affine into the SAME "
+            "normalized target space, and the encoder GLOBAL-POOLs the feature map (far fewer "
+            "params). Aim/velocity/presence stay regressed; walls use a spatial conv head."
+        ),
+    )
     # --- Objective selection (one mechanism; default = all except player_velocity) ---
     p.add_argument(
         "--objectives",
@@ -1056,6 +1123,8 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     args.input_wh = parse_input_res(args.input_res)
     # Resolve objectives eagerly (fails fast on unknown group / both flags).
     args.objective_config = parse_objectives(args.objectives, args.disable)
+    # Normalize the head choice (argparse choices already guard; keep it canonical).
+    args.head = parse_head(args.head)
     # Parse holdout map names (resolved to ids inside the trainer where data-dir is known).
     args.holdout_map_names = [s.strip() for s in args.holdout_maps.split(",") if s.strip()]
     return args
