@@ -59,6 +59,7 @@ import numpy as np
 
 __all__ = [
     "BULLET_BASE_INDICES",
+    "ENCODER_OUTPUT_CHOICES",
     "HEAD_CHOICES",
     "HEATMAP_LOCALIZED_GROUPS",
     "OBJECTIVE_GROUPS",
@@ -66,12 +67,17 @@ __all__ = [
     "PLAYER_POSITION_VEC_INDICES",
     "PLAYER_SUBGROUP_VEC_INDICES",
     "SENTINEL",
+    "SPATIAL_OBJECTIVE_NCHAN",
+    "SPATIAL_OBJECTIVES",
+    "WORLD_MAX_Y",
+    "WORLD_MIN_X",
     "MapAwareSplit",
     "NormStats",
     "ObjectiveConfig",
     "aim_angular_error_deg",
     "binary_f1",
     "bullet_direction_indices",
+    "bullet_occupancy_field",
     "bullet_position_indices",
     "cosine_warmup_lr_multiplier",
     "decode_targets",
@@ -79,16 +85,22 @@ __all__ = [
     "encode_bullet_targets",
     "encode_player_targets",
     "fit_norm_stats",
+    "focal_occupancy_loss_np",
+    "grid_to_world",
     "heatmap_point_channels",
     "interior_wall_mask",
     "interior_wall_pos_weight",
     "iou_score",
+    "keypoint_field",
     "main",
     "map_aware_split",
     "normalize",
+    "parse_channel_map",
+    "parse_encoder_output",
     "parse_head",
     "parse_input_res",
     "parse_pos_weight_arg",
+    "parse_spatial_shape",
     "per_player_cosine_distance",
     "player_head_size",
     "png_decode",
@@ -97,7 +109,9 @@ __all__ = [
     "player_head_vec_indices",
     "resolve_map_ids",
     "stratified_group_split",
+    "validate_channel_map",
     "wall_target_for",
+    "world_to_grid",
 ]
 
 # Epsilon floored into the L2-norm denominator of the aim cosine term, so a
@@ -156,6 +170,16 @@ WALL_INTERIOR_ROWS = (2, 9)  # inclusive
 WALL_INTERIOR_COLS = (2, 17)  # inclusive
 N_WALL_INTERIOR = 8 * 16  # 128
 
+# --- World->grid bounds (the SAME mapping wall_grids uses; see orientation above) ----
+# The wall grid is W=20 cols x H=12 rows with col = x - MIN_X, row = MAX_Y - y. So the
+# world spans x in [MIN_X, MIN_X+WALL_W) = [-10, 10) and y in (MAX_Y-WALL_H, MAX_Y] =
+# (-7, 5]. The spatial-mode field targets (bullets / keypoints) map world (x,y) into a
+# configured HxW grid by SCALING this same box: col = (x - MIN_X)/WALL_W * W,
+# row = (MAX_Y - y)/WALL_H * H. This keeps the bullet/keypoint grid axis-consistent with
+# the wall grid (and therefore with the synthetic renderer the encoder inverts).
+WORLD_MIN_X = -10.0
+WORLD_MAX_Y = 5.0
+
 _SHARD_RE = re.compile(r"shard_w(\d+)_(\d+)\.npz$")
 
 # --- Localization head selection (Part B: fc vs heatmap) ---------------------
@@ -170,6 +194,28 @@ HEAD_CHOICES: tuple[str, ...] = ("fc", "heatmap")
 # 2 points P1/P2; bullet POSITION = 10 points). These are the ONLY groups affected by the
 # --head switch. Everything else keeps its current head type in both modes.
 HEATMAP_LOCALIZED_GROUPS: tuple[str, ...] = ("player_position", "bullet_position")
+
+# --- Encoder OUTPUT format (the NEW top-level axis: flat vs spatial field) ------------
+# A higher-level axis than --head. 'flat' (default) = the ENTIRE existing world: the conv
+# trunk pools/flattens to a flat embedding -> the slot/regression heads, with --head
+# {fc,heatmap} choosing the point READOUT. Byte-identical to today. 'spatial' = a NEW
+# field-based paradigm: the conv trunk projects to a configurable C x H x W field, each
+# training objective is pinned to a channel (or channel range) of that field via
+# --channel-map, and each channel IS that objective's prediction (occupancy/keypoint
+# heatmaps + a wall grid) supervised against a FIELD target resized to H x W. In spatial
+# mode --head is N/A (the point readout is intrinsic to the heatmaps). The conv TRUNK
+# (cnn.0/2/4) is IDENTICAL across both modes; only the output projection / heads differ.
+ENCODER_OUTPUT_CHOICES: tuple[str, ...] = ("flat", "spatial")
+
+# The objectives a spatial channel-map may assign, and how many channels EACH requires.
+# bullets -> 1 occupancy heatmap channel (order-free, count-agnostic; SUBSUMES the
+# slot-based presence+position+direction objectives). walls -> 1 channel (the resized
+# 20x12 wall grid; BCE / interior-F1 as today). keypoints -> 2 channels (per-tank
+# heatmaps P1, P2, distinct, one channel EACH; soft-argmax read-out). Unassigned channels
+# are free learned capacity (no supervision). velocity/aim are DISABLED by default in
+# spatial mode and are NOT assignable here (out of scope).
+SPATIAL_OBJECTIVES: tuple[str, ...] = ("bullets", "walls", "keypoints")
+SPATIAL_OBJECTIVE_NCHAN: dict[str, int] = {"bullets": 1, "walls": 1, "keypoints": 2}
 
 
 def parse_head(value: str | None) -> str:
@@ -201,6 +247,146 @@ def heatmap_point_channels(cfg: ObjectiveConfig) -> dict[str, int]:
     if cfg.is_on("bullet_position"):
         out["bullet_position"] = N_BULLET_SLOTS
     return out
+
+
+# =============================================================================
+# Spatial encoder-output config (pure; channel-map parse + validation)
+# =============================================================================
+def parse_encoder_output(value: str | None) -> str:
+    """Resolve the ``--encoder-output`` flag to a value in :data:`ENCODER_OUTPUT_CHOICES`.
+
+    ``None`` -> ``"flat"`` (the entire existing behavior). A known name passes through
+    verbatim (case/whitespace tolerant). Raises ValueError on anything else (argparse
+    ``choices`` also guards the CLI, but this keeps the helper standalone-usable).
+    """
+    if value is None:
+        return "flat"
+    v = value.strip().lower()
+    if v not in ENCODER_OUTPUT_CHOICES:
+        raise ValueError(
+            f"--encoder-output must be one of {list(ENCODER_OUTPUT_CHOICES)}, got {value!r}"
+        )
+    return v
+
+
+def parse_spatial_shape(spec: str) -> tuple[int, int, int]:
+    """Parse a ``CxHxW`` spatial-field shape string into ``(C, H, W)`` positive ints.
+
+    e.g. ``"4x24x40"`` -> ``(4, 24, 40)``. ``C`` is the channel count of the projected
+    field, ``H``/``W`` its spatial resolution (the resolution the field targets are built
+    at). All three must be positive. Raises ValueError on a malformed / non-positive spec.
+    """
+    m = re.fullmatch(r"\s*(\d+)\s*[xX]\s*(\d+)\s*[xX]\s*(\d+)\s*", spec)
+    if not m:
+        raise ValueError(f"--spatial-shape must look like CxHxW (e.g. 4x24x40), got {spec!r}")
+    c, h, w = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    if c <= 0 or h <= 0 or w <= 0:
+        raise ValueError(f"--spatial-shape C,H,W must all be positive, got {spec!r}")
+    return c, h, w
+
+
+def parse_channel_map(spec: str) -> dict[str, tuple[int, ...]]:
+    """Parse a ``--channel-map`` string into ``{objective: (channel indices,...)}``.
+
+    FORMAT: a comma-separated list of ``name=idx`` or ``name=idx0,idx1,...`` assignments,
+    where a name owns every index up to the NEXT name. Examples::
+
+        "bullets=0,walls=1,keypoints=2,3"   # bullets->(0,), walls->(1,), keypoints->(2,3)
+        "keypoints=0,1,bullets=2,walls=3"   # order-independent
+
+    Indices are parsed in declaration order; an index with no preceding ``name=`` extends
+    the most recent objective's range. This is a PARSE-ONLY helper: it returns the raw
+    assignment WITHOUT range/overlap/count checks (use :func:`validate_channel_map` for
+    that, which also needs the field channel count C). Raises ValueError on syntax errors
+    (empty, unknown objective name, a leading bare index, a non-integer index, a repeated
+    objective name).
+    """
+    if spec is None or not spec.strip():
+        raise ValueError("--channel-map is empty")
+    assignment: dict[str, list[int]] = {}
+    current: str | None = None
+    for raw in spec.split(","):
+        tok = raw.strip()
+        if not tok:
+            raise ValueError(f"--channel-map has an empty token in {spec!r}")
+        if "=" in tok:
+            name, _, idx_str = tok.partition("=")
+            name = name.strip().lower()
+            if name not in SPATIAL_OBJECTIVES:
+                raise ValueError(
+                    f"--channel-map: unknown objective {name!r}. Valid: {list(SPATIAL_OBJECTIVES)}"
+                )
+            if name in assignment:
+                raise ValueError(f"--channel-map: objective {name!r} assigned more than once")
+            assignment[name] = []
+            current = name
+            idx_str = idx_str.strip()
+            if not idx_str:
+                raise ValueError(f"--channel-map: objective {name!r} has no channel index")
+            _append_index(assignment[current], idx_str, spec)
+        else:
+            if current is None:
+                raise ValueError(
+                    f"--channel-map: leading channel index {tok!r} has no objective "
+                    f"(expected name=idx first) in {spec!r}"
+                )
+            _append_index(assignment[current], tok, spec)
+    return {k: tuple(v) for k, v in assignment.items()}
+
+
+def _append_index(dst: list[int], tok: str, spec: str) -> None:
+    """Parse a single channel-index token into ``dst`` (raises ValueError on non-int)."""
+    try:
+        dst.append(int(tok))
+    except ValueError as e:
+        raise ValueError(
+            f"--channel-map: channel index {tok!r} is not an integer in {spec!r}"
+        ) from e
+
+
+def validate_channel_map(
+    channel_map: dict[str, tuple[int, ...]], n_channels: int
+) -> dict[str, tuple[int, ...]]:
+    """Validate a parsed channel-map against the field channel count ``C`` (n_channels).
+
+    Rules (a violation raises a CLEAN ValueError, never a mid-train crash):
+    * every index must be in range ``[0, C)``;
+    * NO overlap between objectives (each channel owned by at most one objective);
+    * each ASSIGNED objective gets EXACTLY the channels it requires
+      (:data:`SPATIAL_OBJECTIVE_NCHAN`: bullets=1, walls=1, keypoints=2);
+    * at least one objective must be assigned.
+
+    Unassigned channels in ``[0, C)`` are allowed (free learned capacity). Returns the
+    channel_map unchanged on success (so callers can chain). Negative indices are rejected
+    by the range check (``< 0``).
+    """
+    if not channel_map:
+        raise ValueError("--channel-map assigned no objectives")
+    seen: dict[int, str] = {}
+    for name, idxs in channel_map.items():
+        need = SPATIAL_OBJECTIVE_NCHAN[name]
+        if len(idxs) != need:
+            raise ValueError(
+                f"--channel-map: objective {name!r} needs exactly {need} channel(s), "
+                f"got {len(idxs)} ({list(idxs)})"
+            )
+        if len(set(idxs)) != len(idxs):
+            raise ValueError(
+                f"--channel-map: objective {name!r} has duplicate channels {list(idxs)}"
+            )
+        for ch in idxs:
+            if ch < 0 or ch >= n_channels:
+                raise ValueError(
+                    f"--channel-map: channel {ch} (objective {name!r}) out of range "
+                    f"[0,{n_channels}) for spatial-shape C={n_channels}"
+                )
+            if ch in seen:
+                raise ValueError(
+                    f"--channel-map: channel {ch} assigned to both {seen[ch]!r} and {name!r} "
+                    "(channels must not overlap)"
+                )
+            seen[ch] = name
+    return channel_map
 
 
 # =============================================================================
@@ -824,6 +1010,161 @@ def aim_angular_error_deg(
 
 
 # =============================================================================
+# Spatial-mode FIELD targets (pure; numpy): occupancy + keypoint heatmaps, wall resize
+# =============================================================================
+# All built AT the configured H x W. World (x,y) maps into the grid with the SAME box the
+# wall grid uses (WORLD_MIN_X / WORLD_MAX_Y), scaled to H,W. Coordinates returned/consumed
+# are FRACTIONAL grid coords (col_frac in [0,W], row_frac in [0,H]) so a sub-cell location
+# is preserved; the soft-argmax read-out reports in the same fractional grid frame.
+def world_to_grid(pos_xy: np.ndarray, grid_h: int, grid_w: int) -> tuple[np.ndarray, np.ndarray]:
+    """Map world ``(x, y)`` positions into FRACTIONAL ``(col, row)`` coords of an H x W grid.
+
+    ``pos_xy`` is ``(..., 2)`` = world ``[x, y]``. Returns ``(col, row)`` arrays (each the
+    leading shape of ``pos_xy``) using the canonical wall-grid box scaled to ``grid_w`` /
+    ``grid_h``: ``col = (x - WORLD_MIN_X) / WALL_W * grid_w``,
+    ``row = (WORLD_MAX_Y - y) / WALL_H * grid_h``. Fractional (not floored) so sub-cell
+    position is preserved for the Gaussian splat. Out-of-box positions map outside
+    ``[0, grid]`` (the caller's Gaussian simply contributes ~0 inside the grid).
+    """
+    pos_xy = np.asarray(pos_xy, dtype=np.float64)
+    x = pos_xy[..., 0]
+    y = pos_xy[..., 1]
+    col = (x - WORLD_MIN_X) / WALL_W * grid_w
+    row = (WORLD_MAX_Y - y) / WALL_H * grid_h
+    return col, row
+
+
+def _gaussian_splat(field: np.ndarray, col: float, row: float, sigma: float) -> None:
+    """Add a unit-peak 2D Gaussian centered at fractional ``(col, row)`` into ``field`` (H,W).
+
+    In place; ``exp(-((c-col)^2 + (r-row)^2) / (2 sigma^2))`` over all cells (cell centers
+    at integer indices). Peaks at 1.0 at the nearest cell to the center. Overlapping
+    Gaussians ACCUMULATE (so the field is the sum-of-Gaussians the CenterNet focal loss
+    expects); the read-out is per-peak, so accumulation does not change the peak locations.
+    """
+    h, w = field.shape
+    rr = np.arange(h, dtype=np.float64).reshape(h, 1)
+    cc = np.arange(w, dtype=np.float64).reshape(1, w)
+    field += np.exp(-(((cc - col) ** 2) + ((rr - row) ** 2)) / (2.0 * sigma**2))
+
+
+def bullet_occupancy_field(
+    states: np.ndarray, grid_h: int, grid_w: int, *, sigma: float = 1.0
+) -> np.ndarray:
+    """Build the bullet OCCUPANCY heatmap target ``(N, grid_h, grid_w)`` (CenterNet style).
+
+    For each frame, every PRESENT bullet (across both players' 10 slots; absent = the
+    ``-100`` sentinel) is splatted as a unit-peak 2D Gaussian at its IMAGE location (world
+    position mapped into the grid by :func:`world_to_grid`), and the per-frame field is the
+    sum/max of those Gaussians clamped to ``[0, 1]`` so each true bullet is a ~1.0 peak.
+
+    ORDER-FREE (no slots): permuting the bullets within a frame yields the SAME field.
+    COUNT-AGNOSTIC: 0 bullets -> an ~all-zero field; N bullets -> N peaks. This REPLACES
+    the slot-based presence + position + direction objectives in spatial mode. ``sigma`` is
+    the Gaussian spread (in grid cells); the field values are floored at 0 and capped at 1.
+
+    The cell NEAREST each bullet is snapped to EXACTLY 1.0 (the CenterNet positive "peak"):
+    a fractional Gaussian center otherwise tops out a hair below 1.0, which would leave the
+    focal-loss positive set (``target == 1``) empty and let the loss be satisfied by
+    predicting all-zero. The Gaussian skirts (<1) are kept for the penalty-reduction term.
+    """
+    states = np.asarray(states)
+    n = states.shape[0]
+    pos = states[:, bullet_position_indices()].reshape(n, N_BULLET_SLOTS, 2)  # (N,10,2) world xy
+    presence, _, _ = encode_bullet_targets(states)  # (N, 10) {0,1}
+    out = np.zeros((n, grid_h, grid_w), dtype=np.float32)
+    col_all, row_all = world_to_grid(pos, grid_h, grid_w)  # (N,10) each
+    for i in range(n):
+        field = np.zeros((grid_h, grid_w), dtype=np.float64)
+        peaks: list[tuple[int, int]] = []
+        for s in range(N_BULLET_SLOTS):
+            if presence[i, s] <= 0.5:
+                continue
+            c, r = float(col_all[i, s]), float(row_all[i, s])
+            _gaussian_splat(field, c, r, sigma)
+            rc = int(round(r)), int(round(c))
+            if 0 <= rc[0] < grid_h and 0 <= rc[1] < grid_w:
+                peaks.append(rc)
+        field = np.clip(field, 0.0, 1.0)
+        for r, c in peaks:  # snap the nearest cell to an EXACT 1.0 positive peak
+            field[r, c] = 1.0
+        out[i] = field.astype(np.float32)
+    return out
+
+
+def keypoint_field(
+    states: np.ndarray, grid_h: int, grid_w: int, *, sigma: float = 1.0
+) -> np.ndarray:
+    """Build the per-tank keypoint heatmap target ``(N, 2, grid_h, grid_w)`` (P1, P2 channels).
+
+    Channel 0 = a single unit-peak Gaussian at P1's grid location, channel 1 = at P2's
+    (both always present). Distinct channels (one tank EACH), soft-argmax read-out ->
+    coords. Built at the configured H x W via :func:`world_to_grid`; ``sigma`` is the
+    Gaussian spread in grid cells.
+    """
+    states = np.asarray(states)
+    n = states.shape[0]
+    # Player positions: P1 = state idx 0,1 ; P2 = idx 26,27.
+    p1 = states[:, [0, 1]]
+    p2 = states[:, [26, 27]]
+    pts = np.stack([p1, p2], axis=1)  # (N, 2, 2) world xy per tank
+    out = np.zeros((n, 2, grid_h, grid_w), dtype=np.float32)
+    col_all, row_all = world_to_grid(pts, grid_h, grid_w)  # (N,2) each
+    for i in range(n):
+        for k in range(2):
+            field = np.zeros((grid_h, grid_w), dtype=np.float64)
+            _gaussian_splat(field, float(col_all[i, k]), float(row_all[i, k]), sigma)
+            out[i, k] = field.astype(np.float32)
+    return out
+
+
+def grid_to_world(col: np.ndarray, row: np.ndarray, grid_h: int, grid_w: int):
+    """Inverse of :func:`world_to_grid`: fractional ``(col, row)`` -> world ``(x, y)``.
+
+    ``x = col / grid_w * WALL_W + WORLD_MIN_X``, ``y = WORLD_MAX_Y - row / grid_h * WALL_H``.
+    Used to convert a soft-argmax grid read-out back to world units for the keypoint /
+    occupancy world-error metric so spatial metrics stay comparable to flat's world units.
+    """
+    col = np.asarray(col, dtype=np.float64)
+    row = np.asarray(row, dtype=np.float64)
+    x = col / grid_w * WALL_W + WORLD_MIN_X
+    y = WORLD_MAX_Y - row / grid_h * WALL_H
+    return x, y
+
+
+def focal_occupancy_loss_np(
+    pred_prob: np.ndarray,
+    target: np.ndarray,
+    *,
+    alpha: float = 2.0,
+    beta: float = 4.0,
+    eps: float = 1e-6,
+) -> float:
+    """CenterNet penalty-reduced focal loss (numpy mirror; for unit tests + reference).
+
+    ``pred_prob`` and ``target`` are ``(..., H, W)`` in ``[0, 1]`` (``pred_prob`` already a
+    sigmoid output, ``target`` the sum-of-Gaussians occupancy field with ~1.0 peaks). The
+    loss (Law & Deng, CenterNet) is, per cell::
+
+        peak  (target == 1):  -(1 - p)^alpha * log(p)
+        else  (0<=target<1):  -(1 - target)^beta * p^alpha * log(1 - p)
+
+    averaged over the number of POSITIVE (peak) cells (>=1), so it is count-normalized. The
+    ``(1 - target)^beta`` factor REDUCES the penalty for negatives NEAR a peak (where
+    ``target`` is close to 1), exactly as specified. A perfect prediction -> ~0; a
+    confident-wrong prediction -> large. ``eps`` clamps ``p`` away from 0/1 for a finite log.
+    """
+    p = np.clip(np.asarray(pred_prob, dtype=np.float64), eps, 1.0 - eps)
+    t = np.asarray(target, dtype=np.float64)
+    pos = t >= 1.0 - 1e-12
+    pos_loss = -((1.0 - p) ** alpha) * np.log(p) * pos
+    neg_loss = -((1.0 - t) ** beta) * (p**alpha) * np.log(1.0 - p) * (~pos)
+    n_pos = float(pos.sum())
+    total = float(pos_loss.sum() + neg_loss.sum())
+    return total / max(1.0, n_pos)
+
+
+# =============================================================================
 # LR schedule: linear warmup -> cosine anneal (pure; torch-free)
 # =============================================================================
 def cosine_warmup_lr_multiplier(step: int, total_steps: int, warmup_frac: float = 0.05) -> float:
@@ -985,6 +1326,55 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     )
     p.add_argument("--input-res", type=str, default="160x90", help="downsample target WxH")
     p.add_argument("--embedding-dim", type=int, default=512, help="encoder embedding width")
+    # --- TOP-LEVEL output-format switch (flat = entire existing world; spatial = NEW field) ---
+    p.add_argument(
+        "--encoder-output",
+        type=str,
+        default="flat",
+        choices=ENCODER_OUTPUT_CHOICES,
+        help=(
+            "encoder OUTPUT format. 'flat' (default) = the entire EXISTING world: conv "
+            "trunk -> flat embedding -> slot/regression heads, with --head choosing the "
+            "point readout (BYTE-IDENTICAL to today). 'spatial' = NEW field paradigm: conv "
+            "trunk -> a configurable C x H x W field (--spatial-shape); each objective is "
+            "pinned to channel(s) via --channel-map and supervised against a FIELD target "
+            "(bullet occupancy + keypoint heatmaps + resized wall grid). The conv TRUNK "
+            "(cnn.0/2/4 = encoder.pt) is IDENTICAL in both modes; only the projection/heads "
+            "differ. In spatial mode --head is N/A (recorded as null in config)."
+        ),
+    )
+    p.add_argument(
+        "--spatial-shape",
+        type=str,
+        default="4x24x40",
+        help=(
+            "spatial-mode FIELD shape CxHxW (e.g. 4x24x40). C = channels of the projected "
+            "field, HxW = the resolution the field targets are built at (finer HxW helps "
+            "bullet/keypoint localization; walls are fine coarse). No-op for --encoder-output flat."
+        ),
+    )
+    p.add_argument(
+        "--channel-map",
+        type=str,
+        default="bullets=0,walls=1,keypoints=2,3",
+        help=(
+            "spatial-mode channel assignment 'name=idx[,idx...]' (comma-list; a name owns "
+            "indices up to the next name). Valid objectives: bullets (1 channel, occupancy "
+            "heatmap), walls (1, resized grid), keypoints (2, per-tank P1/P2). e.g. "
+            "'bullets=0,walls=1,keypoints=2,3'. Indices must be in [0,C), non-overlapping, "
+            "and exactly match each objective's channel count. Unassigned channels are free "
+            "capacity. No-op for --encoder-output flat."
+        ),
+    )
+    p.add_argument(
+        "--occupancy-sigma",
+        type=float,
+        default=1.0,
+        help=(
+            "Gaussian spread (in grid cells) for the spatial-mode bullet-occupancy and "
+            "keypoint heatmap TARGETS. No-op for --encoder-output flat."
+        ),
+    )
     p.add_argument(
         "--head",
         type=str,
@@ -1125,6 +1515,23 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     args.objective_config = parse_objectives(args.objectives, args.disable)
     # Normalize the head choice (argparse choices already guard; keep it canonical).
     args.head = parse_head(args.head)
+    # Normalize the encoder-output mode (top-level flat vs spatial).
+    args.encoder_output = parse_encoder_output(args.encoder_output)
+    # Resolve the spatial field config eagerly so a bad --spatial-shape / --channel-map
+    # fails CLEANLY before any heavy import or training (never mid-train). Only validated
+    # in spatial mode; in flat mode they are inert (parsed but unused).
+    if args.encoder_output == "spatial":
+        args.spatial_shape = parse_spatial_shape(args.spatial_shape)
+        args.channel_map = validate_channel_map(
+            parse_channel_map(args.channel_map), args.spatial_shape[0]
+        )
+        # In spatial mode --head is N/A; force it None so config records head: null and the
+        # flat-only point-readout switch can't be silently mis-applied.
+        args.head = None
+    else:
+        # flat mode: keep the raw strings (inert); --head stays as resolved above.
+        args.spatial_shape = None
+        args.channel_map = None
     # Parse holdout map names (resolved to ids inside the trainer where data-dir is known).
     args.holdout_map_names = [s.strip() for s in args.holdout_maps.split(",") if s.strip()]
     return args

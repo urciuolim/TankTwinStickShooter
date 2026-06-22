@@ -44,6 +44,7 @@ from tank_twin.pretrain_pixels import (
     NormStats,
     ObjectiveConfig,
     aim_angular_error_deg,
+    bullet_occupancy_field,
     cosine_warmup_lr_multiplier,
     decode_targets,
     denormalize,
@@ -62,7 +63,9 @@ from tank_twin.pretrain_pixels import (
     png_decode,
     presence_pos_weight,
     resolve_map_ids,
+    wall_target_for,
     worker_id_from_shard,
+    world_to_grid,
 )
 
 # Player sub-group -> (name, position?) and its slice within the player HEAD output.
@@ -154,6 +157,68 @@ def spatial_soft_argmax(heatmaps: torch.Tensor, *, normalized: str = "unit") -> 
     return coords
 
 
+def centernet_focal_loss(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    alpha: float = 2.0,
+    beta: float = 4.0,
+) -> torch.Tensor:
+    """CenterNet penalty-reduced focal loss on LOGITS (numerically stable).
+
+    ``logits`` are RAW occupancy logits ``(B, H, W)`` (sigmoid applied INTERNALLY);
+    ``target`` the sum-of-Gaussians occupancy field with ~1.0 peaks. Per cell::
+
+        peak (target==1): -(1-p)^alpha * log(p)
+        else:             -(1-target)^beta * p^alpha * log(1-p)
+
+    averaged over the number of POSITIVE (peak) cells across the batch (>=1, count-
+    normalized). The ``(1-target)^beta`` factor reduces the penalty for negatives NEAR a peak.
+
+    STABILITY: the log terms use ``logsigmoid`` (``log p = logsigmoid(z)``,
+    ``log(1-p) = logsigmoid(-z)``) rather than ``log(sigmoid(z).clamp(eps))``. The naive
+    clamp-then-log form has a VANISHING gradient once logits saturate (``d p/d z = p(1-p)
+    -> 0``), which lets the occupancy channel collapse to all-negative and get STUCK (a dead
+    unit). The logsigmoid form keeps a finite gradient at saturation so the positive cells
+    can always be pulled back up. Value-equivalent to the numpy reference (parity-tested).
+    """
+    logp = nn.functional.logsigmoid(logits)  # log(sigmoid(z)) = log p  (stable)
+    log1mp = nn.functional.logsigmoid(-logits)  # log(sigmoid(-z)) = log(1-p)  (stable)
+    p = torch.sigmoid(logits)
+    pos = target >= 1.0 - 1e-12
+    pos_loss = -((1.0 - p) ** alpha) * logp
+    neg_loss = -((1.0 - target) ** beta) * (p**alpha) * log1mp
+    loss = torch.where(pos, pos_loss, neg_loss)
+    n_pos = pos.sum().clamp_min(1.0)
+    return loss.sum() / n_pos
+
+
+def extract_peaks(
+    prob: np.ndarray, *, threshold: float = 0.3, nms: int = 1
+) -> list[tuple[float, float]]:
+    """Local-maximum peak extraction on a 2D occupancy heatmap (numpy; read-out for metrics).
+
+    ``prob`` is a ``(H, W)`` heatmap in [0,1]. Returns the (col, row) fractional grid coords
+    of each cell that is (a) ``>= threshold`` and (b) a strict local max in its
+    ``(2*nms+1)`` neighbourhood (3x3 by default). This is the count + location read-out that
+    makes the order-free occupancy field comparable to the slot-based count: ``len(peaks)``
+    is the predicted bullet count, the coords the predicted locations. Pure numpy so it is
+    unit-testable without torch.
+    """
+    h, w = prob.shape
+    peaks: list[tuple[float, float]] = []
+    for r in range(h):
+        for c in range(w):
+            v = prob[r, c]
+            if v < threshold:
+                continue
+            r0, r1 = max(0, r - nms), min(h, r + nms + 1)
+            c0, c1 = max(0, c - nms), min(w, c + nms + 1)
+            if v >= prob[r0:r1, c0:c1].max():
+                peaks.append((float(c), float(r)))
+    return peaks
+
+
 # =============================================================================
 # Model: reusable encoder + configurable heads on the shared embedding
 # =============================================================================
@@ -177,13 +242,31 @@ class PixelEncoder(nn.Module):
 
     ``head`` is recorded on the module so a fresh encoder can be rebuilt with the matching
     architecture for the standalone-reload self-check (the artifact is head-specific).
+
+    SPATIAL encoder-output (``spatial_trunk=True``)
+    -----------------------------------------------
+    The conv TRUNK (``cnn.0/2/4``) is BUILT IDENTICALLY to the heatmap encoder (convs only,
+    NO flatten, NO linear), so ``encoder.pt`` is the SAME 3-conv trunk and its ``cnn.0/2/4``
+    keys+shapes match the flat-mode encoder. ``forward`` returns the spatial feature map
+    ``(B, C, h, w)`` (the field projection to ``C x H x W`` lives in the InverseRenderer, NOT
+    in the saved encoder, so ``encoder.pt`` stays a pure trunk). ``head`` is forced to
+    ``None`` / inert in this mode.
     """
 
-    def __init__(self, in_h: int, in_w: int, embedding_dim: int = 512, *, head: str = "fc") -> None:
+    def __init__(
+        self,
+        in_h: int,
+        in_w: int,
+        embedding_dim: int = 512,
+        *,
+        head: str = "fc",
+        spatial_trunk: bool = False,
+    ) -> None:
         super().__init__()
-        self.head = parse_head(head)
+        self.spatial_trunk = spatial_trunk
+        self.head = None if spatial_trunk else parse_head(head)
         self.in_h, self.in_w = in_h, in_w
-        if self.head == "fc":
+        if not spatial_trunk and self.head == "fc":
             # UNCHANGED: convs + Flatten in self.cnn, then Linear->ReLU in self.linear.
             self.embedding_dim = embedding_dim
             self.cnn = nn.Sequential(
@@ -200,7 +283,8 @@ class PixelEncoder(nn.Module):
             self.flatten_dim = int(flat)
             self.linear = nn.Sequential(nn.Linear(self.flatten_dim, embedding_dim), nn.ReLU())
         else:
-            # heatmap: convs only (NO flatten); embedding is global-avg-pool of the map.
+            # heatmap OR spatial: convs only (NO flatten / NO linear) -> a clean trunk whose
+            # cnn.0/2/4 keys are IDENTICAL across modes (the reusable encoder.pt artifact).
             self.cnn = nn.Sequential(
                 nn.Conv2d(3, 32, kernel_size=8, stride=4),
                 nn.ReLU(),
@@ -218,14 +302,18 @@ class PixelEncoder(nn.Module):
             self.embedding_dim = self.feature_channels
 
     def features(self, x: torch.Tensor) -> torch.Tensor:
-        """Spatial conv feature map ``(B, C, h, w)`` (heatmap head only; before any pool).
+        """Spatial conv feature map ``(B, C, h, w)`` (heatmap/spatial trunk; before any pool).
 
-        Only valid in ``head="heatmap"`` mode (the fc ``self.cnn`` ends in a Flatten and
-        returns ``(B, flatten_dim)``); callers in fc mode never invoke this.
+        Only valid when ``self.cnn`` is convs-only (heatmap head or spatial trunk); the fc
+        ``self.cnn`` ends in a Flatten and returns ``(B, flatten_dim)``, so fc callers never
+        invoke this.
         """
         return self.cnn(x)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.spatial_trunk:
+            # Return the spatial feature map; the field projection lives in the head.
+            return self.cnn(x)
         if self.head == "fc":
             return self.linear(self.cnn(x))
         # heatmap: global average pool the (B, C, h, w) feature map over (h, w) -> (B, C).
@@ -280,11 +368,21 @@ class InverseRenderer(nn.Module):
         embedding_dim: int = 512,
         *,
         head: str = "fc",
+        encoder_output: str = "flat",
+        spatial_shape: tuple[int, int, int] | None = None,
+        channel_map: dict[str, tuple[int, ...]] | None = None,
     ) -> None:
         super().__init__()
+        self.encoder_output = encoder_output
+        self.cfg = cfg
+        if encoder_output == "spatial":
+            # SPATIAL: trunk is convs-only (cnn.0/2/4 = encoder.pt); --head is N/A.
+            self.head = None
+            self.encoder = PixelEncoder(in_h, in_w, embedding_dim, spatial_trunk=True)
+            self._init_spatial_heads(spatial_shape, channel_map)
+            return
         self.head = parse_head(head)
         self.encoder = PixelEncoder(in_h, in_w, embedding_dim, head=self.head)
-        self.cfg = cfg
         self.sizes = head_sizes(cfg)
         # Indices into the 12-vector that the player head predicts (enabled sub-groups).
         self.player_vec_indices = player_head_vec_indices(cfg)
@@ -348,10 +446,89 @@ class InverseRenderer(nn.Module):
                 nn.AdaptiveAvgPool2d((WALL_H, WALL_W)),
             )
 
+    # --- spatial-mode heads (NEW field paradigm) -----------------------------
+    def _init_spatial_heads(
+        self,
+        spatial_shape: tuple[int, int, int] | None,
+        channel_map: dict[str, tuple[int, ...]] | None,
+    ) -> None:
+        """Project the trunk feature map to a ``C x H x W`` field; pin objectives to channels.
+
+        A light 1x1 conv maps the trunk's ``feature_channels`` to ``C``; the field is then
+        bilinearly resized to ``(H, W)`` (the configured grid the targets are built at). Each
+        objective READS its assigned channel(s) of that field directly (light per-channel
+        activation); there are NO separate per-objective head matrices beyond the shared 1x1
+        projection. Unassigned channels are free learned capacity (no read-out, no loss).
+        """
+        if spatial_shape is None or channel_map is None:
+            raise ValueError("spatial encoder-output requires spatial_shape and channel_map")
+        c, h, w = spatial_shape
+        self.spatial_c, self.spatial_h, self.spatial_w = c, h, w
+        self.channel_map = dict(channel_map)
+        trunk_c = self.encoder.feature_channels
+        # Shared field projection: trunk (B, trunk_c, h0, w0) -> (B, C, h0, w0), then resize.
+        self.field_proj = nn.Sequential(
+            nn.Conv2d(trunk_c, trunk_c, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(trunk_c, c, kernel_size=1),
+        )
+        # CenterNet focal cold-start: the occupancy field is overwhelmingly NEGATIVE (a
+        # handful of bullet peaks among C*H*W cells), so a zero-init logit collapses to
+        # all-negative (the 959 negative cells out-push the 1 positive cell on the shared
+        # bias). Bias the BULLETS output channel(s) strongly negative (sigmoid ~0.05 at init,
+        # the prior), so the negative loss is small at init and the positive-cell gradient
+        # can actually raise the peaks. (Law & Deng 2018; RetinaNet pi=0.01 init.) Only the
+        # occupancy channel(s) are biased; walls/keypoints keep the default init.
+        final = self.field_proj[-1]
+        with torch.no_grad():
+            final.bias.zero_()
+            for ch in self.channel_map.get("bullets", ()):  # occupancy channel(s)
+                final.bias[ch] = -2.94  # sigmoid(-2.94) ~ 0.05
+        # head_sizes / player_vec_indices are flat-mode concepts; in spatial mode the
+        # objectives are the channel-map ones. Expose an analogous `sizes` for logging.
+        self.sizes = {name: len(idxs) for name, idxs in self.channel_map.items()}
+        self.player_vec_indices = []  # no flat player head in spatial mode
+
+    def _field(self, x: torch.Tensor) -> torch.Tensor:
+        """Trunk -> 1x1 projection -> bilinear resize to the configured ``(B, C, H, W)`` field."""
+        fm = self.encoder.features(x)  # (B, trunk_c, h0, w0)
+        proj = self.field_proj(fm)  # (B, C, h0, w0)
+        return nn.functional.interpolate(
+            proj, size=(self.spatial_h, self.spatial_w), mode="bilinear", align_corners=False
+        )
+
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        if self.encoder_output == "spatial":
+            return self._forward_spatial(x)
         if self.head == "fc":
             return self._forward_fc(x)
         return self._forward_heatmap(x)
+
+    def _forward_spatial(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Read each assigned channel of the C x H x W field as that objective's prediction.
+
+        Returns RAW field outputs (no sigmoid) so the losses control activation:
+        * ``occupancy`` ``(B, H, W)`` raw logits for the bullets channel (focal loss applies
+          sigmoid internally; the metric extracts peaks from the sigmoid).
+        * ``wall`` ``(B, 12, 20)`` logits = the walls channel adaptively pooled to the wall
+          grid (so the interior-BCE loss/metric is unchanged).
+        * ``keypoint_heat`` ``(B, 2, H, W)`` raw heatmaps for the 2 keypoint channels (the
+          soft-argmax read-out / coords happen in the loss + metric).
+        Only the keys for ASSIGNED objectives appear.
+        """
+        field = self._field(x)  # (B, C, H, W)
+        out: dict[str, torch.Tensor] = {}
+        cm = self.channel_map
+        if "bullets" in cm:
+            out["occupancy"] = field[:, cm["bullets"][0], :, :]  # (B, H, W) logits
+        if "walls" in cm:
+            wlog = field[:, cm["walls"][0] : cm["walls"][0] + 1, :, :]  # (B,1,H,W)
+            pooled = nn.functional.adaptive_avg_pool2d(wlog, (WALL_H, WALL_W))  # (B,1,12,20)
+            out["wall"] = pooled.squeeze(1)  # (B, 12, 20) logits
+        if "keypoints" in cm:
+            ch = list(cm["keypoints"])  # 2 channel indices, P1 then P2
+            out["keypoint_heat"] = field[:, ch, :, :]  # (B, 2, H, W) raw heatmaps
+        return out
 
     def _forward_fc(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         z = self.encoder(x)
@@ -520,6 +697,68 @@ def compute_losses(
     return total, parts
 
 
+def compute_spatial_losses(
+    preds: dict[str, torch.Tensor],
+    targets: dict[str, torch.Tensor],
+    channel_map: dict[str, tuple[int, ...]],
+    lambdas: dict[str, float],
+    wall_pw: float | torch.Tensor,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Total + per-objective loss for SPATIAL (field) mode over the ASSIGNED objectives.
+
+    * ``bullets`` -> CenterNet penalty-reduced FOCAL loss on the occupancy channel
+      (sigmoid(logits) vs the sum-of-Gaussians occupancy target). REPLACES the slot-based
+      presence + position + direction terms (order-free, count-agnostic). Loss key
+      ``occupancy``, ``lambdas['occupancy']``.
+    * ``walls`` -> interior-only BCEWithLogits on the (B,12,20) channel (pooled), pos_weight
+      ``wall_pw`` on interior wall cells; IDENTICAL loss to flat mode. Key ``wall``.
+    * ``keypoints`` -> per-tank MSE between the soft-argmax of each keypoint channel and the
+      target, in NORMALIZED [0,1] grid coords (NOT raw cells), averaged over the 2 tanks.
+      Normalizing keeps the term O(1) — comparable in magnitude to the focal + BCE terms —
+      so no single objective's gradient floods the shared field projection / trunk (a raw-
+      cell MSE is O(H^2) and would dominate, collapsing occupancy). Key ``keypoint``,
+      ``lambdas['keypoint']``.
+
+    ``lambdas`` keys: ``occupancy``, ``wall``, ``keypoint`` (missing -> 1.0).
+    """
+    bce = nn.functional.binary_cross_entropy_with_logits
+    terms: list[torch.Tensor] = []
+    parts: dict[str, float] = {}
+
+    def add(name: str, loss: torch.Tensor, weight: float) -> None:
+        terms.append(loss * weight)
+        parts[name] = float(loss.detach())
+
+    if "bullets" in channel_map:
+        # centernet_focal_loss applies sigmoid internally (stable logsigmoid form).
+        loss = centernet_focal_loss(preds["occupancy"], targets["occupancy"])
+        add("occupancy", loss, lambdas.get("occupancy", 1.0))
+
+    if "walls" in channel_map:
+        wp = preds["wall"]  # (B, 12, 20) logits
+        wt = targets["wall_grid"]  # (B, 12, 20) {0,1} at WALL_H x WALL_W
+        interior = _interior_wall_index(wp.device)
+        wpw = torch.as_tensor(wall_pw, dtype=wp.dtype, device=wp.device)
+        per_cell = bce(wp, wt, pos_weight=wpw, reduction="none")
+        add("wall", per_cell[:, interior].mean(), lambdas.get("wall", 1.0))
+
+    if "keypoints" in channel_map:
+        # soft-argmax over each keypoint channel -> (B, 2, 2) in [0,1] grid frac. Compare in
+        # the SAME [0,1] frame (normalize the (col,row) target by [w,h]) so the MSE is O(1).
+        heat = preds["keypoint_heat"]  # (B, 2, H, W)
+        _b, _k, h, w = heat.shape
+        coords01 = spatial_soft_argmax(heat, normalized="unit")  # (B, 2, 2) (x,y) in [0,1]
+        scale = coords01.new_tensor([w, h])  # (col,row) -> [0,1] normalizer
+        tgt01 = targets["keypoint_cr"] / scale  # (B, 2, 2) (col,row) frac -> [0,1]
+        add("keypoint", ((coords01 - tgt01) ** 2).mean(), lambdas.get("keypoint", 1.0))
+
+    if not terms:  # pragma: no cover - validate_channel_map forbids an empty map
+        raise ValueError("no spatial objectives assigned; nothing to optimize")
+    total = terms[0] if len(terms) == 1 else torch.stack(terms).sum()
+    parts["total"] = float(total.detach())
+    return total, parts
+
+
 # Cache the interior-wall boolean mask as a torch tensor per device (the numpy mask is
 # constant; this avoids rebuilding it every batch).
 _INTERIOR_WALL_CACHE: dict[torch.device, torch.Tensor] = {}
@@ -537,8 +776,47 @@ def _interior_wall_index(device: torch.device) -> torch.Tensor:
 # =============================================================================
 # Datasets
 # =============================================================================
+def decode_spatial_targets(
+    states: np.ndarray,
+    map_ids: np.ndarray,
+    wall_grids: np.ndarray,
+    spatial_shape: tuple[int, int, int],
+    *,
+    sigma: float,
+) -> dict[str, np.ndarray]:
+    """Build the SPATIAL field targets for a batch of states at the configured H x W.
+
+    Returns:
+    * ``occupancy`` ``(N, H, W)`` sum-of-Gaussians bullet occupancy (order-free,
+      count-agnostic), built via :func:`bullet_occupancy_field`.
+    * ``wall_grid`` ``(N, 12, 20)`` binary wall target (the wall head pools to WALL_H x
+      WALL_W; resizing is unnecessary so the wall target stays the native grid). Resized
+      copy not stored — the wall loss compares at the wall grid.
+    * ``keypoint_cr`` ``(N, 2, 2)`` per-tank target in FRACTIONAL (col,row) grid coords (the
+      soft-argmax read-out frame), P1 then P2.
+    """
+    _c, h, w = spatial_shape
+    occ = bullet_occupancy_field(states, h, w, sigma=sigma)  # (N,H,W)
+    walls = wall_target_for(map_ids, wall_grids)  # (N,12,20) binary
+    # Keypoint targets as fractional (col,row) at H x W (matches the soft-argmax frame).
+    p1 = states[:, [0, 1]]
+    p2 = states[:, [26, 27]]
+    pts = np.stack([p1, p2], axis=1)  # (N,2,2) world xy
+    col, row = world_to_grid(pts, h, w)  # (N,2) each
+    kp_cr = np.stack([col, row], axis=2).astype(np.float32)  # (N,2,2) (col,row)
+    return {
+        "occupancy": occ.astype(np.float32),
+        "wall_grid": walls.astype(np.float32),
+        "keypoint_cr": kp_cr,
+    }
+
+
 class _BaseRows:
-    """Holds resolved rows: frames (downsampled uint8), states, map_ids; targets cached."""
+    """Holds resolved rows: frames (downsampled uint8), states, map_ids; targets cached.
+
+    ``spatial`` (optional ``(spatial_shape, sigma)``) switches the target cache to the
+    SPATIAL field targets; otherwise the flat decode_targets cache is built (default).
+    """
 
     def __init__(
         self,
@@ -547,19 +825,39 @@ class _BaseRows:
         map_ids: np.ndarray,  # (N,) int
         wall_grids: np.ndarray,  # (10,12,20)
         stats: NormStats,
+        spatial: tuple[tuple[int, int, int], float] | None = None,
     ) -> None:
         self.frames = frames
         self.states = states.astype(np.float32, copy=False)
         self.map_ids = map_ids.astype(np.int64, copy=False)
         self.wall_grids = wall_grids
         self.stats = stats
-        self._cache = decode_targets(self.states, self.map_ids, self.wall_grids, self.stats)
+        self.spatial = spatial
+        if spatial is None:
+            self._cache = decode_targets(self.states, self.map_ids, self.wall_grids, self.stats)
+        else:
+            shape, sigma = spatial
+            self._cache = decode_spatial_targets(
+                self.states, self.map_ids, self.wall_grids, shape, sigma=sigma
+            )
 
     def __len__(self) -> int:
         return self.frames.shape[0]
 
 
-def _row_item(frame: torch.Tensor, cache: dict[str, np.ndarray], i: int) -> dict[str, torch.Tensor]:
+def _row_item(
+    frame: torch.Tensor,
+    cache: dict[str, np.ndarray],
+    i: int,
+    spatial: bool = False,
+) -> dict[str, torch.Tensor]:
+    if spatial:
+        return {
+            "frame": frame,
+            "occupancy": torch.from_numpy(cache["occupancy"][i]),
+            "wall_grid": torch.from_numpy(cache["wall_grid"][i]),
+            "keypoint_cr": torch.from_numpy(cache["keypoint_cr"][i]),
+        }
     return {
         "frame": frame,
         "player": torch.from_numpy(cache["player"][i]),
@@ -571,6 +869,20 @@ def _row_item(frame: torch.Tensor, cache: dict[str, np.ndarray], i: int) -> dict
     }
 
 
+def _decode_cache(
+    states: np.ndarray,
+    map_ids: np.ndarray,
+    wall_grids: np.ndarray,
+    stats: NormStats,
+    spatial: tuple[tuple[int, int, int], float] | None,
+) -> dict[str, np.ndarray]:
+    """Build the flat (default) OR spatial target cache for a set of rows (shared helper)."""
+    if spatial is None:
+        return decode_targets(states, map_ids, wall_grids, stats)
+    shape, sigma = spatial
+    return decode_spatial_targets(states, map_ids, wall_grids, shape, sigma=sigma)
+
+
 class InMemoryPixelDataset(Dataset, _BaseRows):
     """In-memory dataset (SMOKE streamer or a small slice). Targets precomputed."""
 
@@ -580,7 +892,7 @@ class InMemoryPixelDataset(Dataset, _BaseRows):
 
     def __getitem__(self, i: int) -> dict[str, torch.Tensor]:
         frame = torch.from_numpy(self.frames[i]).permute(2, 0, 1).contiguous()  # (3,H,W) uint8
-        return _row_item(frame, self._cache, i)
+        return _row_item(frame, self._cache, i, spatial=self.spatial is not None)
 
 
 class MemmapPixelDataset(Dataset):
@@ -596,6 +908,7 @@ class MemmapPixelDataset(Dataset):
         row_idx: np.ndarray,
         wall_grids: np.ndarray,
         stats: NormStats,
+        spatial: tuple[tuple[int, int, int], float] | None = None,
     ) -> None:
         super().__init__()
         self.cache_dir = Path(cache_dir)
@@ -609,9 +922,10 @@ class MemmapPixelDataset(Dataset):
         self.row_idx = np.asarray(row_idx, dtype=np.int64)
         self.wall_grids = wall_grids
         self.stats = stats
+        self.spatial = spatial
         sel_states = self.states[self.row_idx]
         sel_maps = self.map_ids[self.row_idx]
-        self._cache = decode_targets(sel_states, sel_maps, self.wall_grids, self.stats)
+        self._cache = _decode_cache(sel_states, sel_maps, self.wall_grids, self.stats, spatial)
 
     def __len__(self) -> int:
         return self.row_idx.shape[0]
@@ -619,7 +933,7 @@ class MemmapPixelDataset(Dataset):
     def __getitem__(self, i: int) -> dict[str, torch.Tensor]:
         r = int(self.row_idx[i])
         frame = torch.from_numpy(np.array(self.frames[r], copy=True)).permute(2, 0, 1).contiguous()
-        return _row_item(frame, self._cache, i)
+        return _row_item(frame, self._cache, i, spatial=self.spatial is not None)
 
 
 # Process-local LMDB env cache, keyed by (pid, resolved-path). LMDB refuses to open the
@@ -676,6 +990,7 @@ class LmdbPngPixelDataset(Dataset):
         row_idx: np.ndarray,
         wall_grids: np.ndarray,
         stats: NormStats,
+        spatial: tuple[tuple[int, int, int], float] | None = None,
     ) -> None:
         super().__init__()
         self.cache_dir = Path(cache_dir)
@@ -689,9 +1004,10 @@ class LmdbPngPixelDataset(Dataset):
         self.row_idx = np.asarray(row_idx, dtype=np.int64)
         self.wall_grids = wall_grids
         self.stats = stats
+        self.spatial = spatial
         sel_states = self.states[self.row_idx]
         sel_maps = self.map_ids[self.row_idx]
-        self._cache = decode_targets(sel_states, sel_maps, self.wall_grids, self.stats)
+        self._cache = _decode_cache(sel_states, sel_maps, self.wall_grids, self.stats, spatial)
 
     def _key(self, r: int) -> bytes:
         return self.key_format.format(r).encode("ascii")
@@ -711,7 +1027,7 @@ class LmdbPngPixelDataset(Dataset):
             raise KeyError(f"LMDB key for row {r} ({self._key(r)!r}) missing in {self.lmdb_path}")
         arr = png_decode(data)  # (H, W, 3) uint8 (writable copy)
         frame = torch.from_numpy(arr).permute(2, 0, 1).contiguous()
-        return _row_item(frame, self._cache, i)
+        return _row_item(frame, self._cache, i, spatial=self.spatial is not None)
 
 
 # =============================================================================
@@ -1039,10 +1355,204 @@ def _fmt_breakdown(b: dict[str, object]) -> str:
 
 
 # =============================================================================
+# Spatial-mode evaluation: per-objective metrics under the SAME 7-group keys as flat
+# =============================================================================
+def _match_peaks_to_truth(
+    pred_cr: list[tuple[float, float]],
+    true_cr: np.ndarray,
+    *,
+    radius: float,
+) -> tuple[int, int, int, float, int]:
+    """Greedy 1-1 match of predicted peaks to true bullet (col,row) within ``radius`` cells.
+
+    Returns ``(tp, fp, fn, matched_dist_sum, n_matched)`` where the distance sum is in GRID
+    cells over matched pairs (for a world-error conversion by the caller). A predicted peak
+    matches the nearest unused true point within ``radius``; unmatched preds are FP, unmatched
+    truths FN. ``true_cr`` is ``(M, 2)`` (col,row); empty arrays are handled.
+    """
+    used = np.zeros(len(true_cr), dtype=bool)
+    tp = fp = 0
+    dist_sum = 0.0
+    n_matched = 0
+    for pc, pr in pred_cr:
+        if len(true_cr) == 0:
+            fp += 1
+            continue
+        d = np.hypot(true_cr[:, 0] - pc, true_cr[:, 1] - pr)
+        d[used] = np.inf
+        j = int(np.argmin(d))
+        if d[j] <= radius:
+            used[j] = True
+            tp += 1
+            dist_sum += float(d[j])
+            n_matched += 1
+        else:
+            fp += 1
+    fn = int((~used).sum())
+    return tp, fp, fn, dist_sum, n_matched
+
+
+@torch.no_grad()
+def _evaluate_spatial(
+    model: InverseRenderer,
+    loader: DataLoader,
+    lambdas: dict[str, float],
+    device: torch.device,
+    spatial_shape: tuple[int, int, int],
+    use_amp: bool,
+    desc: str,
+    wall_pw: float | torch.Tensor,
+) -> dict[str, object]:
+    """SPATIAL eval: emits the SAME 7 per-objective group keys as :func:`_evaluate`.
+
+    The bullet OCCUPANCY field SUBSUMES the slot objectives, so its peak read-out is mapped
+    back onto the flat keys for an apples-to-apples comparison:
+    * ``bullet_presence`` -> precision/recall/F1/tp/fp/fn from greedy peak<->truth matching
+      (count-based: the occupancy peak count vs the true bullet count).
+    * ``bullet_position`` -> ``world_mae`` (mean world-unit distance of matched peaks) +
+      ``norm_mse`` (grid-frac MSE analog), the SAME sub-keys flat reports.
+    * ``bullet_direction`` -> "N/A" (occupancy drops direction by design).
+    * keypoints -> ``player_position`` ``{norm_mse, world_rmse}`` (soft-argmax coords vs the
+      keypoint target, grid-frac MSE + world RMSE); ``player_velocity`` / ``player_aim`` N/A.
+    * ``walls`` -> interior F1/precision/recall/IoU (IDENTICAL to flat).
+    """
+    model.eval()
+    _c, gh, gw = spatial_shape
+    cm = model.channel_map
+    interior = interior_wall_mask()
+    loss_total = 0.0
+    n_batches = 0
+
+    # Occupancy accumulators.
+    occ_tp = occ_fp = occ_fn = 0
+    occ_dist_sum = 0.0  # grid cells over matched peaks
+    occ_matched = 0
+    # Keypoint accumulators (grid-frac SSE + world SSE over the 2 tanks).
+    kp_grid_sse = 0.0
+    kp_world_sse = 0.0
+    kp_n = 0
+    # Wall accumulators.
+    wall_tp = wall_fp = wall_fn = wall_inter = wall_union = 0
+
+    # World-per-cell scale (for grid-cell distance -> world units): a cell spans
+    # WALL_W/gw in x and WALL_H/gh in y world units; use the mean as an isotropic scale.
+    world_per_col = WALL_W / gw
+    world_per_row = WALL_H / gh
+
+    for batch in tqdm(loader, desc=desc, unit="batch", leave=False):
+        b = _move_batch(batch, device)
+        with torch.autocast(device_type=device.type, enabled=use_amp):
+            preds = model(b["frame"])
+            total, _parts = compute_spatial_losses(preds, b, cm, lambdas, wall_pw)
+        loss_total += float(total.detach())
+        n_batches += 1
+
+        if "bullets" in cm:
+            prob = torch.sigmoid(preds["occupancy"]).float().cpu().numpy()  # (B,H,W)
+            tgt = b["occupancy"].float().cpu().numpy()  # (B,H,W)
+            for bi in range(prob.shape[0]):
+                pred_peaks = extract_peaks(prob[bi], threshold=0.3, nms=1)
+                true_peaks = extract_peaks(tgt[bi], threshold=0.5, nms=1)
+                true_cr = np.array(true_peaks, dtype=np.float64).reshape(-1, 2)
+                tp, fp, fn, dsum, nm = _match_peaks_to_truth(pred_peaks, true_cr, radius=2.0)
+                occ_tp += tp
+                occ_fp += fp
+                occ_fn += fn
+                occ_dist_sum += dsum
+                occ_matched += nm
+
+        if "keypoints" in cm:
+            heat = preds["keypoint_heat"]  # (B,2,H,W)
+            coords01 = spatial_soft_argmax(heat, normalized="unit").float().cpu().numpy()  # (B,2,2)
+            pred_col = coords01[:, :, 0] * gw
+            pred_row = coords01[:, :, 1] * gh
+            tgt_cr = b["keypoint_cr"].float().cpu().numpy()  # (B,2,2) (col,row)
+            d_col = pred_col - tgt_cr[:, :, 0]
+            d_row = pred_row - tgt_cr[:, :, 1]
+            kp_grid_sse += float((d_col**2 + d_row**2).sum())
+            wx = (pred_col - tgt_cr[:, :, 0]) * world_per_col
+            wy = (pred_row - tgt_cr[:, :, 1]) * world_per_row
+            kp_world_sse += float((wx**2 + wy**2).sum())
+            kp_n += pred_col.shape[0] * 2
+
+        if "walls" in cm:
+            pred = (preds["wall"].float().cpu().numpy() > 0).astype(np.int64)  # (B,12,20)
+            twt = b["wall_grid"].float().cpu().numpy().astype(np.int64)
+            pi = pred[:, interior].ravel()
+            ti = twt[:, interior].ravel()
+            wall_tp += int(((pi == 1) & (ti == 1)).sum())
+            wall_fp += int(((pi == 1) & (ti == 0)).sum())
+            wall_fn += int(((pi == 0) & (ti == 1)).sum())
+            wall_inter += int(((pi == 1) & (ti == 1)).sum())
+            wall_union += int(((pi == 1) | (ti == 1)).sum())
+
+    out: dict[str, object] = {"total_loss": loss_total / max(1, n_batches)}
+    # Start with ALL 7 group keys = N/A, then fill in the assigned ones (same keys as flat).
+    breakdown: dict[str, object] = {
+        g: "N/A"
+        for g in (
+            "player_position",
+            "player_velocity",
+            "player_aim",
+            "bullet_presence",
+            "bullet_position",
+            "bullet_direction",
+            "walls",
+        )
+    }
+
+    if "bullets" in cm:
+        prec = occ_tp / (occ_tp + occ_fp) if (occ_tp + occ_fp) else 0.0
+        rec = occ_tp / (occ_tp + occ_fn) if (occ_tp + occ_fn) else 0.0
+        f1 = 2 * prec * rec / (prec + rec) if (prec + rec) else 0.0
+        breakdown["bullet_presence"] = {
+            "precision": prec,
+            "recall": rec,
+            "f1": f1,
+            "tp": occ_tp,
+            "fp": occ_fp,
+            "fn": occ_fn,
+        }
+        # bullet_position world error from matched-peak grid distance -> world units.
+        mean_grid_dist = occ_dist_sum / max(1, occ_matched)
+        world_mae = mean_grid_dist * (world_per_col + world_per_row) / 2.0
+        breakdown["bullet_position"] = {
+            "norm_mse": float(mean_grid_dist**2),  # grid-frac analog of flat's norm_mse
+            "world_mae": float(world_mae),
+        }
+        # bullet_direction stays N/A: occupancy is direction-free by design.
+
+    if "keypoints" in cm:
+        breakdown["player_position"] = {
+            "norm_mse": float(kp_grid_sse / max(1, kp_n)),  # grid-frac MSE analog
+            "world_rmse": float(np.sqrt(kp_world_sse / max(1, kp_n))),
+        }
+
+    if "walls" in cm:
+        prec = wall_tp / (wall_tp + wall_fp) if (wall_tp + wall_fp) else 0.0
+        rec = wall_tp / (wall_tp + wall_fn) if (wall_tp + wall_fn) else 0.0
+        f1 = 2 * prec * rec / (prec + rec) if (prec + rec) else 0.0
+        iou = wall_inter / wall_union if wall_union else 1.0
+        breakdown["walls"] = {
+            "interior_f1": f1,
+            "interior_precision": prec,
+            "interior_recall": rec,
+            "interior_iou": iou,
+        }
+
+    out["per_objective"] = breakdown
+    return out
+
+
+# =============================================================================
 # Dataset assembly: 3-way map-aware split over both data paths
 # =============================================================================
 def _build_in_memory_datasets(
-    args: Namespace, wall_grids: np.ndarray, holdout_ids: list[int], n_maps: int
+    args: Namespace,
+    wall_grids: np.ndarray,
+    holdout_ids: list[int],
+    n_maps: int,
+    spatial: tuple[tuple[int, int, int], float] | None = None,
 ):
     """SMOKE path: map-balanced stream, then 3-way map-aware split; fit stats on TRAIN."""
     out_w, out_h = args.input_wh
@@ -1060,7 +1570,9 @@ def _build_in_memory_datasets(
     stats = fit_norm_stats(states[train_mask])
 
     def mk(m: np.ndarray) -> InMemoryPixelDataset:
-        return InMemoryPixelDataset(frames[m], states[m], map_ids[m], wall_grids, stats)
+        return InMemoryPixelDataset(
+            frames[m], states[m], map_ids[m], wall_grids, stats, spatial=spatial
+        )
 
     return mk(train_mask), mk(eval_mask), mk(val_mask), stats, split
 
@@ -1076,7 +1588,11 @@ _CACHE_DATASET_CLASSES = {
 
 
 def _build_cache_datasets(
-    args: Namespace, wall_grids: np.ndarray, holdout_ids: list[int], frames_backend: str
+    args: Namespace,
+    wall_grids: np.ndarray,
+    holdout_ids: list[int],
+    frames_backend: str,
+    spatial: tuple[tuple[int, int, int], float] | None = None,
 ):
     """FULL path: read cache sidecars, 3-way map-aware split by group, fit stats on TRAIN.
 
@@ -1103,10 +1619,43 @@ def _build_cache_datasets(
     eval_rows = all_rows[[g in split.eval for g in group_keys]]
     val_rows = all_rows[[g in split.validation for g in group_keys]]
     stats = fit_norm_stats(states[train_rows])
-    ds_train = ds_cls(cache, train_rows, wall_grids, stats)
-    ds_eval = ds_cls(cache, eval_rows, wall_grids, stats)
-    ds_val = ds_cls(cache, val_rows, wall_grids, stats)
+    ds_train = ds_cls(cache, train_rows, wall_grids, stats, spatial=spatial)
+    ds_eval = ds_cls(cache, eval_rows, wall_grids, stats, spatial=spatial)
+    ds_val = ds_cls(cache, val_rows, wall_grids, stats, spatial=spatial)
     return ds_train, ds_eval, ds_val, stats, split
+
+
+def _run_eval(
+    model: InverseRenderer,
+    loader: DataLoader,
+    lambdas: dict[str, float],
+    device: torch.device,
+    stats: NormStats,
+    use_amp: bool,
+    desc: str,
+    presence_pw: float | torch.Tensor,
+    wall_pw: float | torch.Tensor,
+    aim_loss: str,
+    is_spatial: bool,
+    spatial_shape: tuple[int, int, int] | None,
+) -> dict[str, object]:
+    """Dispatch to the flat or spatial evaluator (both emit the SAME 7 per-objective keys)."""
+    if is_spatial:
+        return _evaluate_spatial(
+            model, loader, lambdas, device, spatial_shape, use_amp, desc, wall_pw
+        )
+    return _evaluate(
+        model,
+        loader,
+        lambdas,
+        device,
+        stats,
+        use_amp,
+        desc=desc,
+        presence_pw=presence_pw,
+        wall_pw=wall_pw,
+        aim_loss=aim_loss,
+    )
 
 
 def _resolve_run_dir(out_base: Path, out_w: int, out_h: int, emb: int, batch: int) -> Path:
@@ -1140,6 +1689,22 @@ def run_training(args: Namespace) -> int:
     disabled = [g for g in OBJECTIVE_GROUPS if not cfg.is_on(g)]
     print(f"[pretrain] objectives DISABLED (reported N/A): {disabled}")
 
+    # Resolve the encoder-output mode + spatial config (validated already in _parse_args).
+    encoder_output = getattr(args, "encoder_output", "flat")
+    spatial_shape = getattr(args, "spatial_shape", None)
+    channel_map = getattr(args, "channel_map", None)
+    occupancy_sigma = getattr(args, "occupancy_sigma", 1.0)
+    is_spatial = encoder_output == "spatial"
+    spatial_spec = (spatial_shape, occupancy_sigma) if is_spatial else None
+    if is_spatial:
+        print(
+            f"[pretrain] encoder-output=spatial field={spatial_shape[0]}x"
+            f"{spatial_shape[1]}x{spatial_shape[2]} (CxHxW) channel_map={channel_map} "
+            f"occupancy_sigma={occupancy_sigma}"
+        )
+    else:
+        print(f"[pretrain] encoder-output=flat (head={getattr(args, 'head', 'fc')})")
+
     out_w, out_h = args.input_wh
     run_dir = _resolve_run_dir(Path(args.out), out_w, out_h, args.embedding_dim, args.batch)
     print(f"[pretrain] resolved run dir -> {run_dir}")
@@ -1159,12 +1724,12 @@ def run_training(args: Namespace) -> int:
     t0 = time.time()
     if args.cache_dir is not None:
         ds_train, ds_eval, ds_val, stats, split = _build_cache_datasets(
-            args, wall_grids, holdout_ids, frames_backend
+            args, wall_grids, holdout_ids, frames_backend, spatial=spatial_spec
         )
         mode = frames_backend
     else:
         ds_train, ds_eval, ds_val, stats, split = _build_in_memory_datasets(
-            args, wall_grids, holdout_ids, n_maps
+            args, wall_grids, holdout_ids, n_maps, spatial=spatial_spec
         )
         mode = "stream"
 
@@ -1183,23 +1748,32 @@ def run_training(args: Namespace) -> int:
     )
 
     # --- Resolve class-imbalance BCE pos_weights (TRAIN split ONLY; no leakage) ------
-    # ds_train._cache holds the TRAIN split's decoded targets (presence (N,10), wall
-    # (N,12,20)); use those so the weights are train-level, computed ONCE here and
-    # threaded into every loss call (NOT recomputed per-batch).
+    # ds_train._cache holds the TRAIN split's decoded targets; the wall key differs by
+    # mode ('wall' flat vs 'wall_grid' spatial). presence pos_weight is flat-only (spatial
+    # occupancy uses the focal loss, which is self-balancing; no presence head). Computed
+    # ONCE here and threaded into every loss call (NOT recomputed per-batch).
     presence_override = parse_pos_weight_arg(args.presence_pos_weight)
     wall_override = parse_pos_weight_arg(args.wall_pos_weight)
-    train_presence = ds_train._cache["bullet_presence"]  # (N, 10) {0,1}
-    train_walls = ds_train._cache["wall"]  # (N, 12, 20) {0,1}
-    presence_pw = (
-        presence_override if presence_override is not None else presence_pos_weight(train_presence)
-    )
+    wall_key = "wall_grid" if is_spatial else "wall"
+    train_walls = ds_train._cache[wall_key]  # (N, 12, 20) {0,1}
     wall_pw = wall_override if wall_override is not None else interior_wall_pos_weight(train_walls)
-    presence_src = "override" if presence_override is not None else "auto(train)"
     wall_src = "override" if wall_override is not None else "auto(train)"
-    print(
-        f"[pretrain] BCE pos_weights -> presence={presence_pw:.4f} ({presence_src}), "
-        f"wall(interior)={wall_pw:.4f} ({wall_src})"
-    )
+    if is_spatial:
+        presence_pw = 1.0  # unused in spatial mode (occupancy focal loss is self-balancing)
+        presence_src = "n/a(spatial)"
+        print(f"[pretrain] BCE pos_weights -> wall(interior)={wall_pw:.4f} ({wall_src})")
+    else:
+        train_presence = ds_train._cache["bullet_presence"]  # (N, 10) {0,1}
+        presence_pw = (
+            presence_override
+            if presence_override is not None
+            else presence_pos_weight(train_presence)
+        )
+        presence_src = "override" if presence_override is not None else "auto(train)"
+        print(
+            f"[pretrain] BCE pos_weights -> presence={presence_pw:.4f} ({presence_src}), "
+            f"wall(interior)={wall_pw:.4f} ({wall_src})"
+        )
 
     pin = device.type == "cuda"
     train_loader = DataLoader(
@@ -1225,8 +1799,20 @@ def run_training(args: Namespace) -> int:
         pin_memory=pin,
     )
 
-    head = parse_head(getattr(args, "head", "fc"))
-    model = InverseRenderer(out_h, out_w, cfg, args.embedding_dim, head=head).to(device)
+    if is_spatial:
+        head = None  # N/A in spatial mode (recorded as null in config)
+        model = InverseRenderer(
+            out_h,
+            out_w,
+            cfg,
+            args.embedding_dim,
+            encoder_output="spatial",
+            spatial_shape=spatial_shape,
+            channel_map=channel_map,
+        ).to(device)
+    else:
+        head = parse_head(getattr(args, "head", "fc"))
+        model = InverseRenderer(out_h, out_w, cfg, args.embedding_dim, head=head).to(device)
     # AdamW = decoupled weight decay (the correct form); weight_decay=0.0 (default) makes
     # this behave like the old Adam, so `--lr 3e-4 --lr-schedule constant` is unchanged.
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -1264,17 +1850,22 @@ def run_training(args: Namespace) -> int:
         "bullet_pos": args.lambda_bullet_pos,
         "bullet_dir": args.lambda_bullet_dir,
         "wall": args.lambda_wall,
+        # Spatial-mode loss-term weights reuse the flat lambdas where natural: occupancy
+        # SUBSUMES presence+pos so it takes lambda_presence; keypoints take lambda_player.
+        "occupancy": args.lambda_presence,
+        "keypoint": args.lambda_player,
     }
     aim_loss = args.aim_loss
-    if cfg.is_on("player_aim"):
+    if not is_spatial and cfg.is_on("player_aim"):
         print(f"[pretrain] player_aim loss={aim_loss} lambda_aim={args.lambda_aim}")
-    # Encoder param count is the load-bearing A/B number (fc flatten->FC vs heatmap
-    # global-pool): record it for the report and persist it in config/metrics.
+    # Encoder param count is the load-bearing A/B number (fc flatten->FC vs spatial/heatmap
+    # global-pool trunk): record it for the report and persist it in config/metrics.
     encoder_params = sum(p.numel() for p in model.encoder.parameters())
     total_params = sum(p.numel() for p in model.parameters())
     print(
-        f"[pretrain] head={head} encoder flatten_dim={model.encoder.flatten_dim} "
-        f"embedding_dim={model.encoder.embedding_dim} heads={list(model.sizes.items())} "
+        f"[pretrain] mode={encoder_output} head={head} encoder flatten_dim="
+        f"{model.encoder.flatten_dim} embedding_dim={model.encoder.embedding_dim} "
+        f"heads={list(model.sizes.items())} "
         f"encoder_params={encoder_params:,} total_params={total_params:,}"
     )
 
@@ -1294,9 +1885,19 @@ def run_training(args: Namespace) -> int:
             opt.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, enabled=use_amp):
                 preds = model(b["frame"])
-                total, parts = compute_losses(
-                    preds, b, model, lambdas, presence_pw, wall_pw, stats=stats, aim_loss=aim_loss
-                )
+                if is_spatial:
+                    total, parts = compute_spatial_losses(preds, b, channel_map, lambdas, wall_pw)
+                else:
+                    total, parts = compute_losses(
+                        preds,
+                        b,
+                        model,
+                        lambdas,
+                        presence_pw,
+                        wall_pw,
+                        stats=stats,
+                        aim_loss=aim_loss,
+                    )
             scaler.scale(total).backward()
             # AMP can SKIP an optimizer step on inf/nan grads. Detect a real step by
             # comparing the GradScaler scale across update(): on a skipped step the scaler
@@ -1322,17 +1923,19 @@ def run_training(args: Namespace) -> int:
                     + f" total={parts['total']:.4f}"
                 )
         ep_total /= max(1, n_batches)
-        ev = _evaluate(
+        ev = _run_eval(
             model,
             eval_loader,
             lambdas,
             device,
             stats,
             use_amp,
-            desc="  eval",
-            presence_pw=presence_pw,
-            wall_pw=wall_pw,
-            aim_loss=aim_loss,
+            "  eval",
+            presence_pw,
+            wall_pw,
+            aim_loss,
+            is_spatial,
+            spatial_shape,
         )
         ev["epoch"] = epoch
         ev["train_total_loss"] = ep_total
@@ -1351,17 +1954,19 @@ def run_training(args: Namespace) -> int:
 
     # --- Final out-of-distribution VALIDATION (the 2 held-out maps), run ONCE ----
     print("[pretrain] running FINAL out-of-distribution VALIDATION (2 held-out maps)...")
-    validation = _evaluate(
+    validation = _run_eval(
         model,
         val_loader,
         lambdas,
         device,
         stats,
         use_amp,
-        desc="  validation",
-        presence_pw=presence_pw,
-        wall_pw=wall_pw,
-        aim_loss=aim_loss,
+        "  validation",
+        presence_pw,
+        wall_pw,
+        aim_loss,
+        is_spatial,
+        spatial_shape,
     )
     print(
         f"[validation] OOD total={validation['total_loss']:.4f} | "
@@ -1391,9 +1996,21 @@ def run_training(args: Namespace) -> int:
     )
     split_path.write_text(json.dumps(split_payload, indent=2), encoding="utf-8")
 
+    # Spatial-mode config block (channel-map as JSON-friendly lists; null in flat mode).
+    spatial_config = None
+    if is_spatial:
+        spatial_config = {
+            "spatial_shape": list(spatial_shape),  # [C, H, W]
+            "channel_map": {k: list(v) for k, v in channel_map.items()},
+            "occupancy_sigma": occupancy_sigma,
+            "objectives": sorted(channel_map.keys()),
+            "subsumes": "bullet occupancy heatmap REPLACES presence+position+direction",
+        }
     config_dict = {
         "input_res": f"{out_w}x{out_h}",
-        "head": head,
+        "encoder_output": encoder_output,
+        "head": head,  # null in spatial mode (--head is N/A)
+        "spatial": spatial_config,
         "embedding_dim": args.embedding_dim,
         "encoder_embedding_dim": model.encoder.embedding_dim,
         "flatten_dim": model.encoder.flatten_dim,
@@ -1440,22 +2057,37 @@ def run_training(args: Namespace) -> int:
     print(f"[pretrain] saved metrics (eval history + validation) -> {metrics_path}")
 
     # --- Verify the encoder reloads STANDALONE into a fresh PixelEncoder -----
-    # The encoder is objective-config-independent but HEAD-specific (fc: flatten->FC,
-    # embedding=embedding_dim; heatmap: global-pool, embedding=C). Build the fresh encoder
-    # with the SAME head so the keys match (strict load) and assert its real embedding width.
-    fresh = PixelEncoder(out_h, out_w, args.embedding_dim, head=head)
+    # The encoder is objective-config-independent but architecture-specific (fc: flatten->FC,
+    # embedding=embedding_dim; heatmap: global-pool, embedding=C; spatial: convs-only trunk,
+    # forward returns the (B,C,h,w) feature map). Build the fresh encoder the SAME way so the
+    # keys match (strict load) and assert its forward shape. In spatial AND heatmap mode the
+    # saved keys are the SAME cnn.0/2/4 trunk (the reusable artifact).
     sd = torch.load(encoder_path, map_location="cpu", weights_only=True)
-    fresh.load_state_dict(sd)  # strict=True: raises on any mismatch
-    fresh.eval()
-    expected_emb = fresh.embedding_dim
-    with torch.no_grad():
-        emb = fresh(torch.zeros(2, 3, out_h, out_w))
-    assert emb.shape == (2, expected_emb), emb.shape
-    print(
-        f"[pretrain] encoder reload OK (head={head}): fresh PixelEncoder forward -> "
-        f"{tuple(emb.shape)} (expected (2, {expected_emb})); "
-        f"encoder keys={sorted(sd.keys())[:2]}... (objective-config-independent)"
-    )
+    if is_spatial:
+        fresh = PixelEncoder(out_h, out_w, args.embedding_dim, spatial_trunk=True)
+        fresh.load_state_dict(sd)  # strict=True
+        fresh.eval()
+        with torch.no_grad():
+            fm = fresh(torch.zeros(2, 3, out_h, out_w))  # (2, C, h, w) feature map
+        assert fm.ndim == 4 and fm.shape[0] == 2, fm.shape
+        print(
+            f"[pretrain] encoder reload OK (spatial trunk): fresh PixelEncoder forward -> "
+            f"{tuple(fm.shape)} (feature map); encoder keys={sorted(sd.keys())} "
+            "(IDENTICAL cnn.0/2/4 trunk to flat-mode encoder; objective-config-independent)"
+        )
+    else:
+        fresh = PixelEncoder(out_h, out_w, args.embedding_dim, head=head)
+        fresh.load_state_dict(sd)  # strict=True: raises on any mismatch
+        fresh.eval()
+        expected_emb = fresh.embedding_dim
+        with torch.no_grad():
+            emb = fresh(torch.zeros(2, 3, out_h, out_w))
+        assert emb.shape == (2, expected_emb), emb.shape
+        print(
+            f"[pretrain] encoder reload OK (head={head}): fresh PixelEncoder forward -> "
+            f"{tuple(emb.shape)} (expected (2, {expected_emb})); "
+            f"encoder keys={sorted(sd.keys())[:2]}... (objective-config-independent)"
+        )
     return 0
 
 

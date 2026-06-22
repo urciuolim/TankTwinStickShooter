@@ -17,6 +17,7 @@ import pytest
 from tank_twin.pretrain_pixels import (
     BULLET_BASE_INDICES,
     DEFAULT_OBJECTIVES,
+    ENCODER_OUTPUT_CHOICES,
     HEAD_CHOICES,
     HEATMAP_LOCALIZED_GROUPS,
     N_BULLET_DIR,
@@ -26,12 +27,15 @@ from tank_twin.pretrain_pixels import (
     PLAYER_INDICES,
     PLAYER_SUBGROUP_VEC_INDICES,
     SENTINEL,
+    SPATIAL_OBJECTIVE_NCHAN,
+    SPATIAL_OBJECTIVES,
     MapAwareSplit,
     NormStats,
     ObjectiveConfig,
     aim_angular_error_deg,
     binary_f1,
     bullet_direction_indices,
+    bullet_occupancy_field,
     bullet_position_indices,
     cosine_warmup_lr_multiplier,
     decode_targets,
@@ -39,17 +43,23 @@ from tank_twin.pretrain_pixels import (
     encode_bullet_targets,
     encode_player_targets,
     fit_norm_stats,
+    focal_occupancy_loss_np,
+    grid_to_world,
     head_sizes,
     heatmap_point_channels,
     interior_wall_mask,
     interior_wall_pos_weight,
     iou_score,
+    keypoint_field,
     map_aware_split,
     normalize,
+    parse_channel_map,
+    parse_encoder_output,
     parse_head,
     parse_input_res,
     parse_objectives,
     parse_pos_weight_arg,
+    parse_spatial_shape,
     per_player_cosine_distance,
     player_head_size,
     player_head_vec_indices,
@@ -58,8 +68,10 @@ from tank_twin.pretrain_pixels import (
     presence_pos_weight,
     resolve_map_ids,
     stratified_group_split,
+    validate_channel_map,
     wall_target_for,
     worker_id_from_shard,
+    world_to_grid,
 )
 
 
@@ -1174,3 +1186,387 @@ def test_inverse_renderer_fc_encoder_is_byte_identical_to_heatmap_independent():
     assert set(out_fc.keys()) == set(out_hm.keys())
     for k in out_fc:
         assert out_fc[k].shape == out_hm[k].shape, k
+
+
+# =============================================================================
+# ENCODER-OUTPUT (flat vs spatial): --encoder-output / --spatial-shape / --channel-map
+# parsing + validation, field-target builders, focal loss (all pure: numpy/torch).
+# =============================================================================
+def test_parse_encoder_output_default_and_choices_and_rejects_unknown():
+    assert parse_encoder_output(None) == "flat"  # default = entire existing world
+    assert parse_encoder_output("flat") == "flat"
+    assert parse_encoder_output("spatial") == "spatial"
+    assert parse_encoder_output(" SPATIAL ") == "spatial"  # case/whitespace tolerant
+    assert set(ENCODER_OUTPUT_CHOICES) == {"flat", "spatial"}
+    with pytest.raises(ValueError):
+        parse_encoder_output("dense")
+
+
+def test_encoder_output_arg_default_flat_and_accepts_spatial():
+    from tank_twin.pretrain_pixels import _parse_args
+
+    # Default is flat (byte-identical to today); flat keeps spatial_shape/channel_map inert.
+    a = _parse_args(["--out", "runs/x"])
+    assert a.encoder_output == "flat"
+    assert a.head == "fc"  # --head still applies in flat mode
+    assert a.spatial_shape is None
+    assert a.channel_map is None
+    # Spatial resolves + validates the field config; --head is forced None (N/A).
+    b = _parse_args(
+        ["--out", "runs/x", "--encoder-output", "spatial", "--spatial-shape", "4x24x40"]
+    )
+    assert b.encoder_output == "spatial"
+    assert b.spatial_shape == (4, 24, 40)
+    assert b.channel_map == {"bullets": (0,), "walls": (1,), "keypoints": (2, 3)}
+    assert b.head is None  # spatial mode records head: null
+    # argparse rejects an out-of-choices value.
+    with pytest.raises(SystemExit):
+        _parse_args(["--out", "runs/x", "--encoder-output", "dense"])
+
+
+@pytest.mark.parametrize(
+    ("spec", "expected"),
+    [("4x24x40", (4, 24, 40)), (" 8X12X20 ", (8, 12, 20)), ("1x1x1", (1, 1, 1))],
+)
+def test_parse_spatial_shape(spec, expected):
+    assert parse_spatial_shape(spec) == expected
+
+
+@pytest.mark.parametrize("bad", ["4x24", "4x24x40x1", "0x24x40", "-1x2x3", "axbxc", "4*24*40"])
+def test_parse_spatial_shape_rejects_bad(bad):
+    with pytest.raises(ValueError):
+        parse_spatial_shape(bad)
+
+
+# --- channel-map parsing -----------------------------------------------------
+def test_parse_channel_map_success_cases():
+    # Canonical form: bullets/walls single, keypoints two channels (range extends a name).
+    assert parse_channel_map("bullets=0,walls=1,keypoints=2,3") == {
+        "bullets": (0,),
+        "walls": (1,),
+        "keypoints": (2, 3),
+    }
+    # Order-independent.
+    assert parse_channel_map("keypoints=0,1,bullets=2,walls=3") == {
+        "keypoints": (0, 1),
+        "bullets": (2,),
+        "walls": (3,),
+    }
+    # Subset of objectives (only bullets+walls).
+    assert parse_channel_map("bullets=0,walls=2") == {"bullets": (0,), "walls": (2,)}
+    # The objective set + per-objective channel counts are the documented contract.
+    assert set(SPATIAL_OBJECTIVES) == {"bullets", "walls", "keypoints"}
+    assert SPATIAL_OBJECTIVE_NCHAN == {"bullets": 1, "walls": 1, "keypoints": 2}
+
+
+def test_parse_channel_map_syntax_errors():
+    with pytest.raises(ValueError):
+        parse_channel_map("")  # empty
+    with pytest.raises(ValueError):
+        parse_channel_map("   ")  # whitespace-only
+    with pytest.raises(ValueError):
+        parse_channel_map("0,1,2")  # leading bare index, no objective
+    with pytest.raises(ValueError):
+        parse_channel_map("bogus=0")  # unknown objective
+    with pytest.raises(ValueError):
+        parse_channel_map("bullets=x")  # non-integer index
+    with pytest.raises(ValueError):
+        parse_channel_map("bullets=0,bullets=1")  # repeated objective
+    with pytest.raises(ValueError):
+        parse_channel_map("bullets=")  # no index given
+
+
+# --- channel-map validation against C (range / overlap / count / unknown) ----
+def test_validate_channel_map_success():
+    cm = parse_channel_map("bullets=0,walls=1,keypoints=2,3")
+    assert validate_channel_map(cm, 4) == cm  # all assigned, no overlap, in [0,4)
+    # Unassigned channels are allowed (free capacity): C=6, only 4 used.
+    assert validate_channel_map(cm, 6) == cm
+    # A subset of objectives is fine.
+    cm2 = parse_channel_map("bullets=0,walls=1")
+    assert validate_channel_map(cm2, 2) == cm2
+
+
+def test_validate_channel_map_index_out_of_range():
+    cm = parse_channel_map("bullets=0,walls=1,keypoints=2,3")
+    with pytest.raises(ValueError, match="out of range"):
+        validate_channel_map(cm, 3)  # channel 3 >= C=3
+    # Negative index (would only arise via direct construction) is also rejected.
+    with pytest.raises(ValueError, match="out of range"):
+        validate_channel_map({"bullets": (-1,)}, 4)
+
+
+def test_validate_channel_map_overlap_rejected():
+    cm = parse_channel_map("bullets=0,walls=0,keypoints=1,2")  # bullets+walls both ch0
+    with pytest.raises(ValueError, match="overlap"):
+        validate_channel_map(cm, 4)
+
+
+def test_validate_channel_map_insufficient_channels_for_objective():
+    # keypoints needs exactly 2 channels; giving 1 must error cleanly.
+    cm = parse_channel_map("keypoints=0,bullets=1")
+    with pytest.raises(ValueError, match="needs exactly 2"):
+        validate_channel_map(cm, 4)
+    # bullets needs exactly 1; giving it 2 (range) must error.
+    cm2 = parse_channel_map("bullets=0,1,walls=2")
+    with pytest.raises(ValueError, match="needs exactly 1"):
+        validate_channel_map(cm2, 4)
+
+
+def test_validate_channel_map_empty_rejected():
+    with pytest.raises(ValueError):
+        validate_channel_map({}, 4)
+
+
+# --- world<->grid round-trip -------------------------------------------------
+def test_world_to_grid_and_back_round_trip():
+    # A few world points map to grid and back to themselves (within float tol).
+    pts = np.array([[0.0, 0.0], [-5.0, 2.0], [3.0, -1.5]])
+    gh, gw = 24, 40
+    col, row = world_to_grid(pts, gh, gw)
+    x, y = grid_to_world(col, row, gh, gw)
+    np.testing.assert_allclose(x, pts[:, 0], atol=1e-6)
+    np.testing.assert_allclose(y, pts[:, 1], atol=1e-6)
+
+
+# --- bullet occupancy field: peaks, order-free, count-agnostic ---------------
+def _state_with_bullets(p1_bullets, p2_bullets, p1_pos=(0.0, 0.0), p2_pos=(0.0, 0.0)):
+    """52-float state with given present bullet positions (list of (x,y) or None)."""
+    s = np.full(52, SENTINEL, dtype=np.float32)
+    s[0:2] = p1_pos
+    s[26:28] = p2_pos
+    for i, base in enumerate((6, 10, 14, 18, 22)):
+        if p1_bullets[i] is not None:
+            x, y = p1_bullets[i]
+            s[base : base + 4] = [x, y, 0.0, 0.0]
+    for i, base in enumerate((32, 36, 40, 44, 48)):
+        if p2_bullets[i] is not None:
+            x, y = p2_bullets[i]
+            s[base : base + 4] = [x, y, 0.0, 0.0]
+    return s
+
+
+def test_bullet_occupancy_field_peaks_at_right_cells():
+    gh, gw = 24, 40
+    # Two bullets at known world positions -> two peaks at their grid cells.
+    b0 = (0.0, 0.0)
+    b1 = (-5.0, 2.0)
+    s = _state_with_bullets([b0, b1, None, None, None], [None] * 5)
+    occ = bullet_occupancy_field(s[None, :], gh, gw, sigma=1.0)[0]  # (H,W)
+    # The peak cell of each bullet matches its world_to_grid mapping (rounded).
+    for bx, by in (b0, b1):
+        col, row = world_to_grid(np.array([[bx, by]]), gh, gw)
+        rc = (int(round(row[0])), int(round(col[0])))
+        # That cell is ~1.0 (the Gaussian peak) and is a local max.
+        assert occ[rc] == pytest.approx(1.0, abs=1e-3)
+
+
+def test_bullet_occupancy_field_is_order_free():
+    gh, gw = 16, 24
+    bullets = [(0.0, 0.0), (-5.0, 2.0), (3.0, -1.0)]
+    s_a = _state_with_bullets([bullets[0], bullets[1], bullets[2], None, None], [None] * 5)
+    # Permute which slots hold which bullet (different slot assignment, same set).
+    s_b = _state_with_bullets([bullets[2], None, bullets[0], None, bullets[1]], [None] * 5)
+    occ_a = bullet_occupancy_field(s_a[None, :], gh, gw)[0]
+    occ_b = bullet_occupancy_field(s_b[None, :], gh, gw)[0]
+    # Order-free: the field is identical regardless of slot ordering.
+    np.testing.assert_allclose(occ_a, occ_b, atol=1e-6)
+
+
+def test_bullet_occupancy_field_is_count_agnostic():
+    gh, gw = 20, 30
+    # 0 bullets -> ~empty field.
+    s_empty = _state_with_bullets([None] * 5, [None] * 5)
+    occ0 = bullet_occupancy_field(s_empty[None, :], gh, gw)[0]
+    assert occ0.max() == pytest.approx(0.0, abs=1e-6)
+    # N=3 well-separated bullets -> exactly 3 distinct peaks (count == #peaks). Centers are
+    # fractional, so each peak sits a hair under 1.0; count strict 3x3 local maxima >0.5.
+    bullets = [(-6.0, 3.0), (0.0, 0.0), (6.0, -3.0)]
+    s = _state_with_bullets(bullets + [None, None], [None] * 5)
+    occ = bullet_occupancy_field(s[None, :], gh, gw, sigma=0.8)[0]
+    n_peaks = 0
+    for r in range(gh):
+        for c in range(gw):
+            v = occ[r, c]
+            if v <= 0.5:
+                continue
+            window = occ[max(0, r - 1) : r + 2, max(0, c - 1) : c + 2]
+            if v >= window.max():
+                n_peaks += 1
+    assert n_peaks == 3
+
+
+# --- keypoint heatmap target + soft-argmax round-trip (torch) ----------------
+def test_keypoint_field_shape_and_peaks():
+    gh, gw = 24, 40
+    s = np.full(52, SENTINEL, dtype=np.float32)
+    s[0:2] = [-3.0, 1.0]  # P1
+    s[26:28] = [4.0, -2.0]  # P2
+    kp = keypoint_field(s[None, :], gh, gw, sigma=1.0)  # (1,2,H,W)
+    assert kp.shape == (1, 2, gh, gw)
+    for k, (px, py) in enumerate(((-3.0, 1.0), (4.0, -2.0))):
+        col, row = world_to_grid(np.array([[px, py]]), gh, gw)
+        rc = (int(round(row[0])), int(round(col[0])))
+        assert kp[0, k][rc] == pytest.approx(1.0, abs=1e-3)
+
+
+def test_keypoint_field_soft_argmax_round_trip():
+    """Build a keypoint heatmap for a known (x,y); soft-argmax recovers the grid coord."""
+    torch = pytest.importorskip("torch")
+    from tank_twin._pretrain_pixels_train import spatial_soft_argmax
+
+    gh, gw = 24, 40
+    p1 = (-3.0, 1.0)
+    p2 = (4.0, -2.0)
+    s = np.full(52, SENTINEL, dtype=np.float32)
+    s[0:2] = p1
+    s[26:28] = p2
+    kp = keypoint_field(s[None, :], gh, gw, sigma=1.2)  # (1,2,H,W) Gaussian in [0,1]
+    # The model emits raw LOGITS; the spatial-softmax sharpens them. The unit-peak Gaussian
+    # in [0,1] is too flat for softmax (near-uniform -> centroid bias), so scale it into a
+    # peaked score map (the round-trip property is about a peaked map, not the raw range).
+    heat = torch.from_numpy(kp).float() * 12.0
+    coords01 = spatial_soft_argmax(heat, normalized="unit")  # (1,2,2) (x,y) in [0,1]
+    for k, (px, py) in enumerate((p1, p2)):
+        col_true, row_true = world_to_grid(np.array([[px, py]]), gh, gw)
+        col_pred = coords01[0, k, 0].item() * gw
+        row_pred = coords01[0, k, 1].item() * gh
+        # Soft-argmax recovers the fractional grid coord within ~half a cell.
+        assert col_pred == pytest.approx(col_true[0], abs=0.6)
+        assert row_pred == pytest.approx(row_true[0], abs=0.6)
+
+
+# --- CenterNet penalty-reduced focal loss correctness ------------------------
+def test_focal_loss_perfect_prediction_is_near_zero():
+    target = np.zeros((1, 8, 10), dtype=np.float32)
+    target[0, 3, 4] = 1.0
+    target[0, 5, 6] = 1.0
+    # Near-perfect prediction == the target (clamped away from 0/1).
+    pred = np.clip(target, 1e-6, 1 - 1e-6)
+    loss = focal_occupancy_loss_np(pred, target)
+    assert loss == pytest.approx(0.0, abs=1e-3)
+
+
+def test_focal_loss_confident_wrong_is_large():
+    target = np.zeros((1, 8, 10), dtype=np.float32)
+    target[0, 3, 4] = 1.0
+    # Confidently predict the WRONG thing: ~1 everywhere (FP storm) and ~0 at the peak.
+    pred = np.full((1, 8, 10), 1 - 1e-6, dtype=np.float32)
+    pred[0, 3, 4] = 1e-6  # miss the true peak entirely
+    loss = focal_occupancy_loss_np(pred, target)
+    # Much larger than the perfect-prediction loss.
+    assert loss > 50.0
+
+
+def test_focal_loss_penalty_reduction_near_peak_handcheck():
+    """A negative cell NEAR a peak (target close to 1) is penalized LESS than a far one,
+    by the (1 - target)^beta factor — hand-checked on a 1x1x2 case."""
+    # Two negative cells with the SAME wrong prediction p, but different target proximity:
+    # cell A target=0.9 (near a peak), cell B target=0.0 (far). No actual peak (n_pos=0 ->
+    # normalized by max(1,0)=1), so the loss is the raw sum of the two neg terms.
+    p = 0.8
+    alpha, beta = 2.0, 4.0
+    pred = np.array([[p, p]], dtype=np.float64)  # (1,2)
+    tgt_near = np.array([[0.9, 0.0]], dtype=np.float64)
+    # Decompose: loss(near cell) = (1-0.9)^beta * p^alpha * -log(1-p);
+    #            loss(far cell)  = (1-0.0)^beta * p^alpha * -log(1-p).
+    base = (p**alpha) * (-np.log(1 - p))
+    expected_near = (1 - 0.9) ** beta * base
+    expected_far = (1 - 0.0) ** beta * base
+    total_expected = expected_near + expected_far
+    got = focal_occupancy_loss_np(pred, tgt_near)
+    assert got == pytest.approx(total_expected, rel=1e-6)
+    # The near-peak penalty is reduced by (0.1)^4 = 1e-4 vs the far one: near << far.
+    assert expected_near < expected_far
+    assert expected_near / expected_far == pytest.approx(0.1**beta, rel=1e-9)
+
+
+def test_torch_focal_loss_matches_numpy_reference():
+    """The torch CenterNet focal (on LOGITS, stable logsigmoid form) is value-equivalent to
+    the numpy reference (which takes probabilities) on sigmoid(logits)."""
+    torch = pytest.importorskip("torch")
+    from tank_twin._pretrain_pixels_train import centernet_focal_loss
+
+    rng = np.random.default_rng(3)
+    logits = rng.uniform(-4.0, 4.0, size=(2, 12, 16)).astype(np.float32)
+    prob = 1.0 / (1.0 + np.exp(-logits))  # sigmoid for the numpy reference
+    target = np.zeros((2, 12, 16), dtype=np.float32)
+    target[0, 4, 5] = 1.0
+    target[0, 4, 6] = 0.7  # near-peak negative
+    target[1, 2, 2] = 1.0
+    np_loss = focal_occupancy_loss_np(prob, target)
+    t_loss = float(centernet_focal_loss(torch.from_numpy(logits), torch.from_numpy(target)))
+    assert t_loss == pytest.approx(np_loss, rel=1e-4)
+
+
+def test_torch_focal_loss_has_finite_gradient_at_saturation():
+    """The stable (logsigmoid) form keeps a NON-vanishing positive-cell gradient even when
+    logits saturate very negative — the naive clamp-then-log form's gradient dies there,
+    collapsing the occupancy channel into a stuck dead unit."""
+    torch = pytest.importorskip("torch")
+    from tank_twin._pretrain_pixels_train import centernet_focal_loss
+
+    logits = torch.full((1, 8, 10), -60.0, requires_grad=True)  # saturated negative
+    target = torch.zeros(1, 8, 10)
+    target[0, 3, 4] = 1.0  # one peak the model is missing
+    loss = centernet_focal_loss(logits, target)
+    loss.backward()
+    assert torch.isfinite(loss).item()
+    # The peak cell still receives a strong UP gradient (loss decreases as logit rises).
+    assert logits.grad[0, 3, 4].item() < -1e-3
+
+
+# --- spatial model: trunk identity + preds dict (torch) ----------------------
+def test_spatial_encoder_trunk_keys_match_flat_encoder():
+    """The conv TRUNK (cnn.0/2/4) of the spatial encoder is IDENTICAL (keys+shapes) to the
+    flat fc encoder; encoder.pt stays a pure trunk (no field projection in it)."""
+    pytest.importorskip("torch")
+    from tank_twin._pretrain_pixels_train import InverseRenderer, PixelEncoder
+
+    cfg = ObjectiveConfig.default()
+    cm = validate_channel_map(parse_channel_map("bullets=0,walls=1,keypoints=2,3"), 4)
+    fc = PixelEncoder(90, 160, 512, head="fc")
+    m_sp = InverseRenderer(
+        90, 160, cfg, 512, encoder_output="spatial", spatial_shape=(4, 24, 40), channel_map=cm
+    )
+    sp_enc = m_sp.encoder
+    # Spatial encoder.pt = ONLY the cnn.0/2/4 trunk (no flatten->FC linear, no field proj).
+    assert sorted(sp_enc.state_dict().keys()) == [
+        "cnn.0.bias",
+        "cnn.0.weight",
+        "cnn.2.bias",
+        "cnn.2.weight",
+        "cnn.4.bias",
+        "cnn.4.weight",
+    ]
+    # The 3 conv layers match the flat fc encoder's trunk keys + shapes exactly.
+    trunk_keys = (
+        "cnn.0.weight",
+        "cnn.0.bias",
+        "cnn.2.weight",
+        "cnn.2.bias",
+        "cnn.4.weight",
+        "cnn.4.bias",
+    )
+    for k in trunk_keys:
+        assert k in fc.state_dict()
+        assert sp_enc.state_dict()[k].shape == fc.state_dict()[k].shape, k
+
+
+def test_spatial_model_forward_reads_assigned_channels():
+    """Spatial forward returns occupancy/wall/keypoint_heat from the assigned channels and
+    the occupancy/keypoint maps are at the configured H x W."""
+    torch = pytest.importorskip("torch")
+    from tank_twin._pretrain_pixels_train import InverseRenderer
+
+    cfg = ObjectiveConfig.default()
+    cm = validate_channel_map(parse_channel_map("bullets=0,walls=1,keypoints=2,3"), 4)
+    m = InverseRenderer(
+        90, 160, cfg, 512, encoder_output="spatial", spatial_shape=(4, 24, 40), channel_map=cm
+    )
+    x = torch.rand(2, 3, 90, 160)
+    out = m(x)
+    assert set(out.keys()) == {"occupancy", "wall", "keypoint_heat"}
+    assert out["occupancy"].shape == (2, 24, 40)  # field H x W
+    assert out["wall"].shape == (2, 12, 20)  # pooled to wall grid
+    assert out["keypoint_heat"].shape == (2, 2, 24, 40)  # 2 keypoint channels at H x W
