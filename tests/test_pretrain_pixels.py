@@ -27,6 +27,7 @@ from tank_twin.pretrain_pixels import (
     MapAwareSplit,
     NormStats,
     ObjectiveConfig,
+    aim_angular_error_deg,
     binary_f1,
     bullet_direction_indices,
     bullet_position_indices,
@@ -44,6 +45,7 @@ from tank_twin.pretrain_pixels import (
     parse_input_res,
     parse_objectives,
     parse_pos_weight_arg,
+    per_player_cosine_distance,
     player_head_size,
     player_head_vec_indices,
     presence_pos_weight,
@@ -659,3 +661,130 @@ def test_interior_masked_wall_loss_border_is_inert_and_walls_upweighted():
     loss_wall = wall_loss(pred_one, tgt_wall, 5.0)
     # The positive cell is up-weighted, so the wall case incurs strictly more loss.
     assert loss_wall > loss_free
+
+
+# =============================================================================
+# Aim cosine-distance loss + angular-error metric (per player; pixel Stage-2)
+# =============================================================================
+def _unit(angle_deg: float) -> tuple[float, float]:
+    """Unit 2D vector at ``angle_deg`` (degrees, CCW from +x)."""
+    r = np.radians(angle_deg)
+    return float(np.cos(r)), float(np.sin(r))
+
+
+def test_per_player_cosine_distance_known_angles():
+    # Both players identical direction -> distance 0.
+    pred = np.array([[1.0, 0.0, 0.0, 1.0]])
+    tgt = np.array([[1.0, 0.0, 0.0, 1.0]])
+    assert per_player_cosine_distance(pred, tgt) == pytest.approx(0.0, abs=1e-7)
+    # Both players opposite -> 1 - (-1) = 2 per player -> mean 2.
+    pred_opp = np.array([[1.0, 0.0, 1.0, 0.0]])
+    tgt_opp = np.array([[-1.0, 0.0, -1.0, 0.0]])
+    assert per_player_cosine_distance(pred_opp, tgt_opp) == pytest.approx(2.0, abs=1e-7)
+    # Both players orthogonal (90 deg) -> 1 - 0 = 1 per player -> mean 1.
+    pred_o = np.array([[1.0, 0.0, 1.0, 0.0]])
+    tgt_o = np.array([[0.0, 1.0, 0.0, 1.0]])
+    assert per_player_cosine_distance(pred_o, tgt_o) == pytest.approx(1.0, abs=1e-7)
+    # Known intermediate: 60 deg apart -> 1 - cos60 = 0.5 per player -> mean 0.5.
+    p1x, p1y = _unit(0.0)
+    t1x, t1y = _unit(60.0)
+    pred_60 = np.array([[p1x, p1y, p1x, p1y]])
+    tgt_60 = np.array([[t1x, t1y, t1x, t1y]])
+    assert per_player_cosine_distance(pred_60, tgt_60) == pytest.approx(0.5, abs=1e-7)
+
+
+def test_per_player_cosine_distance_is_per_player_not_4d():
+    # P1 identical (cos 1 -> dist 0), P2 opposite (cos -1 -> dist 2).
+    # Per-player mean distance = (0 + 2) / 2 = 1.0.
+    pred = np.array([[1.0, 0.0, 1.0, 0.0]])
+    tgt = np.array([[1.0, 0.0, -1.0, 0.0]])
+    per_player = per_player_cosine_distance(pred, tgt)
+    assert per_player == pytest.approx(1.0, abs=1e-7)
+    # A single 4D cosine over the concatenation [1,0,1,0]·[1,0,-1,0] = 0 -> dist 1.0
+    # numerically coincides here, so use a SECOND case that separates them cleanly:
+    # P1 identical (dist 0), P2 orthogonal (dist 1) -> per-player mean = 0.5.
+    pred2 = np.array([[1.0, 0.0, 1.0, 0.0]])
+    tgt2 = np.array([[1.0, 0.0, 0.0, 1.0]])
+    pp2 = per_player_cosine_distance(pred2, tgt2)
+    assert pp2 == pytest.approx(0.5, abs=1e-7)
+    # The equivalent 4D cosine: [1,0,1,0]·[1,0,0,1] = 1, |a|=|b|=sqrt2 -> cos=0.5,
+    # dist_4d = 0.5; that EQUALS pp2 by coincidence, so add a THIRD asymmetric case
+    # where 4D and per-player genuinely differ.
+    # P1 at 0 deg vs target 0 deg (dist 0); P2 |pred|=2 magnitude but same dir as target.
+    pred3 = np.array([[1.0, 0.0, 2.0, 0.0]])  # P2 pred magnitude 2, dir +x
+    tgt3 = np.array([[1.0, 0.0, 1.0, 0.0]])  # P2 target dir +x
+    pp3 = per_player_cosine_distance(pred3, tgt3)
+    # Per-player cosine is magnitude-invariant -> both players cos 1 -> dist 0.
+    assert pp3 == pytest.approx(0.0, abs=1e-6)
+    # A naive 4D cosine: [1,0,2,0]·[1,0,1,0]=3, |a|=sqrt5,|b|=sqrt2 -> cos=3/sqrt10≈0.9487,
+    # dist_4d≈0.0513 != 0. So the helper is provably per-player, not a 4D cosine.
+    a = np.array([1.0, 0.0, 2.0, 0.0])
+    b = np.array([1.0, 0.0, 1.0, 0.0])
+    cos_4d = float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b)))
+    dist_4d = 1.0 - cos_4d
+    assert dist_4d == pytest.approx(0.05131, abs=1e-4)
+    assert pp3 != pytest.approx(dist_4d, abs=1e-3)
+
+
+def test_per_player_cosine_distance_zero_pred_is_finite():
+    # A zero-magnitude prediction must yield a finite loss (eps in the denominator).
+    pred = np.array([[0.0, 0.0, 0.0, 0.0]])
+    tgt = np.array([[1.0, 0.0, 0.0, 1.0]])
+    d = per_player_cosine_distance(pred, tgt)
+    assert np.isfinite(d)
+    # cos -> 0 as |pred| -> 0, so distance -> 1 per player (not NaN/inf).
+    assert d == pytest.approx(1.0, abs=1e-5)
+
+
+def test_aim_angular_error_known_angles():
+    # Identical -> ~0 deg, cos ~1 (the eps in the norm denominator makes cos just
+    # under 1, so arccos gives a tiny nonzero angle ~0.01 deg; both are near-perfect).
+    pred = np.array([[1.0, 0.0, 0.0, 1.0]])
+    tgt = np.array([[1.0, 0.0, 0.0, 1.0]])
+    m = aim_angular_error_deg(pred, tgt)
+    assert m["deg"] == pytest.approx(0.0, abs=0.05)
+    assert m["cos"] == pytest.approx(1.0, abs=1e-6)
+    # Opposite -> ~180 deg, cos ~-1 (eps makes cos just above -1, so arccos lands a
+    # hair under 180 deg ~179.99; near-perfect anti-alignment).
+    m_opp = aim_angular_error_deg(
+        np.array([[1.0, 0.0, 1.0, 0.0]]), np.array([[-1.0, 0.0, -1.0, 0.0]])
+    )
+    assert m_opp["deg"] == pytest.approx(180.0, abs=0.05)
+    assert m_opp["cos"] == pytest.approx(-1.0, abs=1e-6)
+    # Orthogonal -> 90 deg, cos 0.
+    m_o = aim_angular_error_deg(np.array([[1.0, 0.0, 1.0, 0.0]]), np.array([[0.0, 1.0, 0.0, 1.0]]))
+    assert m_o["deg"] == pytest.approx(90.0, abs=1e-4)
+    assert m_o["cos"] == pytest.approx(0.0, abs=1e-7)
+
+
+def test_aim_angular_error_random_baseline_is_near_90_deg():
+    # Random unit pred vs random unit target -> ~90 deg mean error, cos ~0 (chance).
+    rng = np.random.default_rng(0)
+    n = 20000
+    ang_p = rng.uniform(-np.pi, np.pi, size=(n, 2))  # 2 players
+    ang_t = rng.uniform(-np.pi, np.pi, size=(n, 2))
+    pred = np.empty((n, 4))
+    tgt = np.empty((n, 4))
+    pred[:, 0], pred[:, 1] = np.cos(ang_p[:, 0]), np.sin(ang_p[:, 0])
+    pred[:, 2], pred[:, 3] = np.cos(ang_p[:, 1]), np.sin(ang_p[:, 1])
+    tgt[:, 0], tgt[:, 1] = np.cos(ang_t[:, 0]), np.sin(ang_t[:, 0])
+    tgt[:, 2], tgt[:, 3] = np.cos(ang_t[:, 1]), np.sin(ang_t[:, 1])
+    m = aim_angular_error_deg(pred, tgt)
+    assert m["deg"] == pytest.approx(90.0, abs=2.0)  # mean angular error band
+    assert m["cos"] == pytest.approx(0.0, abs=0.03)
+    # The matching cosine-distance baseline lands near 1.0 (1 - cos ~ 1).
+    assert per_player_cosine_distance(pred, tgt) == pytest.approx(1.0, abs=0.03)
+
+
+def test_aim_angular_error_zero_pred_is_finite_near_90():
+    # A zero predictor (the MSE collapse point) sits exactly at chance: cos 0, 90 deg.
+    pred = np.zeros((100, 4))
+    rng = np.random.default_rng(1)
+    ang = rng.uniform(-np.pi, np.pi, size=(100, 2))
+    tgt = np.empty((100, 4))
+    tgt[:, 0], tgt[:, 1] = np.cos(ang[:, 0]), np.sin(ang[:, 0])
+    tgt[:, 2], tgt[:, 3] = np.cos(ang[:, 1]), np.sin(ang[:, 1])
+    m = aim_angular_error_deg(pred, tgt)
+    assert np.isfinite(m["deg"]) and np.isfinite(m["cos"])
+    assert m["cos"] == pytest.approx(0.0, abs=1e-6)
+    assert m["deg"] == pytest.approx(90.0, abs=1e-4)

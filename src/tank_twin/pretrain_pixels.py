@@ -64,6 +64,7 @@ __all__ = [
     "MapAwareSplit",
     "NormStats",
     "ObjectiveConfig",
+    "aim_angular_error_deg",
     "binary_f1",
     "bullet_direction_indices",
     "bullet_position_indices",
@@ -80,6 +81,7 @@ __all__ = [
     "normalize",
     "parse_input_res",
     "parse_pos_weight_arg",
+    "per_player_cosine_distance",
     "player_head_size",
     "presence_pos_weight",
     "player_head_vec_indices",
@@ -87,6 +89,12 @@ __all__ = [
     "stratified_group_split",
     "wall_target_for",
 ]
+
+# Epsilon floored into the L2-norm denominator of the aim cosine term, so a
+# zero-magnitude prediction yields a finite loss/metric (no NaN/inf) and the
+# gradient does not blow up as |pred| -> 0. Shared by the numpy helpers here and
+# the mirrored torch loss in _pretrain_pixels_train.compute_losses.
+AIM_COSINE_EPS = 1e-8
 
 # --- Repo / dataset locations (repo-relative defaults) -----------------------
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -698,6 +706,65 @@ def normalized_mse(pred_norm: np.ndarray, target_norm: np.ndarray) -> float:
     return float(np.mean((pred_norm - target_norm) ** 2))
 
 
+# --- Aim (unit-vector direction) loss + metric (per player) ------------------
+# Aim is a UNIT vector per player. MSE's least-bad answer on a ~uniform-on-the-
+# circle unit target is to collapse to (0,0) (norm_mse == 1.0), burying any weak
+# directional signal. A per-player COSINE distance forces a directional commitment
+# instead. The aim slice is laid out [P1_x, P1_y, P2_x, P2_y] (12-vec idx 4,5,10,11);
+# the cosine is computed on each player's 2D vector SEPARATELY (NOT one 4D cosine
+# over the concatenation) and averaged over the 2 players and the batch.
+def _per_player_cos_sim(pred_aim: np.ndarray, target_aim: np.ndarray, *, eps: float) -> np.ndarray:
+    """Per-player cosine SIMILARITY for an aim slice ``(N, 4)`` -> ``(N, 2)``.
+
+    Columns are ``[P1_x, P1_y, P2_x, P2_y]``; reshaped to ``(N, 2, 2)`` (player, xy).
+    Each player's 2D vectors are L2-normalized with ``eps`` floored into the
+    denominator (so a zero-magnitude vector is finite, not NaN/inf) before the dot.
+    """
+    pred = np.asarray(pred_aim, dtype=np.float64).reshape(-1, 2, 2)
+    tgt = np.asarray(target_aim, dtype=np.float64).reshape(-1, 2, 2)
+    pn = np.sqrt((pred**2).sum(axis=2)) + eps  # (N, 2)
+    tn = np.sqrt((tgt**2).sum(axis=2)) + eps  # (N, 2)
+    dot = (pred * tgt).sum(axis=2)  # (N, 2)
+    return dot / (pn * tn)
+
+
+def per_player_cosine_distance(
+    pred_aim: np.ndarray, target_aim: np.ndarray, *, eps: float = AIM_COSINE_EPS
+) -> float:
+    """Mean per-player cosine DISTANCE ``1 - cos`` for an aim slice ``(N, 4)``.
+
+    ``pred_aim`` / ``target_aim`` are ``(N, 4)`` = ``[P1_x, P1_y, P2_x, P2_y]``. The
+    cosine is taken on each PLAYER's 2D vector separately (not a single 4D cosine over
+    the concatenation) and the ``1 - cos`` distance is averaged over the 2 players and
+    the batch. Identical directions -> 0; orthogonal -> 1; opposite -> 2. ``eps`` is
+    floored into the L2-norm denominator so a zero-magnitude prediction is finite.
+    """
+    if np.asarray(pred_aim).size == 0:
+        return 0.0
+    cos = _per_player_cos_sim(pred_aim, target_aim, eps=eps)  # (N, 2)
+    return float(np.mean(1.0 - cos))
+
+
+def aim_angular_error_deg(
+    pred_aim: np.ndarray, target_aim: np.ndarray, *, eps: float = AIM_COSINE_EPS
+) -> dict[str, float]:
+    """Mean per-player angular error (DEGREES) + mean cosine similarity for aim.
+
+    ``pred_aim`` / ``target_aim`` are ``(N, 4)`` = ``[P1_x, P1_y, P2_x, P2_y]``. Returns
+    ``{"deg": mean angular error in degrees, "cos": mean cosine similarity}``, both
+    averaged per player over the batch. The angle is a clamped ``arccos`` of the cosine
+    similarity (clamped to ``[-1, 1]`` for numerical safety). Reference baselines: a
+    random / no-signal predictor -> ~90 deg, cos ~0; perfect -> 0 deg, cos 1; opposite
+    -> 180 deg, cos -1.
+    """
+    if np.asarray(pred_aim).size == 0:
+        return {"deg": 0.0, "cos": 0.0}
+    cos = _per_player_cos_sim(pred_aim, target_aim, eps=eps)  # (N, 2)
+    clamped = np.clip(cos, -1.0, 1.0)
+    deg = np.degrees(np.arccos(clamped))
+    return {"deg": float(np.mean(deg)), "cos": float(np.mean(cos))}
+
+
 # =============================================================================
 # Data loading / downsample (numpy; torch used only in the trainer)
 # =============================================================================
@@ -795,6 +862,25 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument("--lambda-bullet-pos", type=float, default=1.0)
     p.add_argument("--lambda-bullet-dir", type=float, default=1.0)
     p.add_argument("--lambda-wall", type=float, default=1.0)
+    # --- Aim sub-objective: cosine-distance loss (default) vs the old per-field MSE ---
+    p.add_argument(
+        "--aim-loss",
+        type=str,
+        default="cosine",
+        choices=("cosine", "mse"),
+        help=(
+            "loss for the player_aim sub-objective. 'cosine' (default) = per-player "
+            "cosine distance on RAW unit aim (forces a directional commitment); 'mse' "
+            "reproduces the OLD per-field MSE on the standardized aim slice. No-op when "
+            "player_aim is disabled."
+        ),
+    )
+    p.add_argument(
+        "--lambda-aim",
+        type=float,
+        default=1.0,
+        help="weight on the player_aim loss term (no-op when player_aim is disabled).",
+    )
     # --- Class-imbalance pos_weights (BCE). "auto" => computed from the TRAIN split. ---
     p.add_argument(
         "--presence-pos-weight",

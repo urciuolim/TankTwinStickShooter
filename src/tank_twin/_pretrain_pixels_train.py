@@ -32,12 +32,15 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from tank_twin.pretrain_pixels import (
+    AIM_COSINE_EPS,
     N_BULLET_DIR,
     N_BULLET_POS,
+    PLAYER_SUBGROUP_VEC_INDICES,
     WALL_H,
     WALL_W,
     NormStats,
     ObjectiveConfig,
+    aim_angular_error_deg,
     decode_targets,
     denormalize,
     downsample_frames_np,
@@ -58,6 +61,55 @@ from tank_twin.pretrain_pixels import (
 # Player sub-group -> (name, position?) and its slice within the player HEAD output.
 _PLAYER_SUBGROUPS = ("player_position", "player_velocity", "player_aim")
 _PLAYER_POSITION_GROUPS = {"player_position"}
+# The 12-vec indices of the aim sub-group, [P1_x, P1_y, P2_x, P2_y].
+_AIM_VEC_INDICES = PLAYER_SUBGROUP_VEC_INDICES["player_aim"]
+
+
+def _aim_head_columns(model: InverseRenderer) -> list[int] | None:
+    """Columns of the player-head output that hold the aim slice (4,5,10,11), in
+    ``[P1_x, P1_y, P2_x, P2_y]`` order; ``None`` if aim is not a head output."""
+    vi = model.player_vec_indices
+    if not all(k in vi for k in _AIM_VEC_INDICES):
+        return None
+    return [vi.index(k) for k in _AIM_VEC_INDICES]
+
+
+def _player_non_aim_columns(model: InverseRenderer) -> list[int]:
+    """Columns of the player-head output that are NOT aim (position + velocity)."""
+    aim_cols = set(_aim_head_columns(model) or [])
+    return [c for c in range(len(model.player_vec_indices)) if c not in aim_cols]
+
+
+def _destandardize_aim(z_aim: torch.Tensor, stats: NormStats) -> torch.Tensor:
+    """De-standardize a ``(N, 4)`` aim slice (12-vec idx 4,5,10,11) back to RAW units.
+
+    The player target is z-standardized (decode_targets divides each aim component by
+    ~0.707, distorting the angle), so the cosine term must compare RAW directions. This
+    inverts ``z -> z*std + mean`` for the aim indices, on the slice's device/dtype.
+    """
+    idx = list(_AIM_VEC_INDICES)
+    mean = torch.as_tensor(stats.player_mean[idx], dtype=z_aim.dtype, device=z_aim.device)
+    std = torch.as_tensor(stats.player_std[idx], dtype=z_aim.dtype, device=z_aim.device)
+    return z_aim * std + mean
+
+
+def _torch_per_player_cosine_distance(
+    pred_aim: torch.Tensor, target_aim: torch.Tensor, *, eps: float = AIM_COSINE_EPS
+) -> torch.Tensor:
+    """Torch mirror of :func:`pretrain_pixels.per_player_cosine_distance`.
+
+    ``pred_aim`` / ``target_aim`` are ``(N, 4)`` = ``[P1_x, P1_y, P2_x, P2_y]``; the
+    cosine is taken per PLAYER on the 2D vector (reshape to ``(N, 2, 2)``) with ``eps``
+    floored into each L2-norm denominator, then ``1 - cos`` is averaged over the 2
+    players and the batch. Identical -> 0, orthogonal -> 1, opposite -> 2.
+    """
+    pred = pred_aim.reshape(-1, 2, 2)
+    tgt = target_aim.reshape(-1, 2, 2)
+    pn = torch.sqrt((pred**2).sum(dim=2)) + eps  # (N, 2)
+    tn = torch.sqrt((tgt**2).sum(dim=2)) + eps  # (N, 2)
+    dot = (pred * tgt).sum(dim=2)  # (N, 2)
+    cos = dot / (pn * tn)
+    return (1.0 - cos).mean()
 
 
 # =============================================================================
@@ -131,10 +183,20 @@ def compute_losses(
     lambdas: dict[str, float],
     presence_pw: float | torch.Tensor,
     wall_pw: float | torch.Tensor,
+    *,
+    stats: NormStats | None = None,
+    aim_loss: str = "cosine",
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Total + per-component loss over ENABLED objectives only.
 
-    * player: MSE on the normalized enabled-sub-group slice of the 12-vector target.
+    * player: MSE on the normalized enabled-sub-group slice of the 12-vector target,
+      EXCLUDING aim (position + velocity only when their sub-groups are enabled).
+    * aim (when ``player_aim`` enabled): a SEPARATE term. Default ``aim_loss="cosine"``
+      uses a per-player cosine distance on the RAW (de-standardized) unit aim, which
+      forces a directional commitment (MSE collapses to (0,0) on a ~uniform unit target).
+      ``aim_loss="mse"`` reproduces the OLD behavior: per-field MSE on the standardized
+      aim slice, folded into the ``player`` part. ``stats`` is required for cosine (to
+      de-standardize aim back to raw); it is unused for mse.
     * bullet_presence: BCEWithLogits on 10 slot bits, with ``pos_weight=presence_pw`` to
       counter the slot-level imbalance (~7.8% present) that collapses plain BCE to F1=0.
     * bullet_position / bullet_direction: MSE on 20 normalized floats, MASKED to present
@@ -159,7 +221,32 @@ def compute_losses(
 
     if cfg.any_player():
         idx = model.player_vec_indices
-        add("player", mse(preds["player"], targets["player"][:, idx]), lambdas["player"])
+        pred_player = preds["player"]
+        tgt_player = targets["player"][:, idx]
+        aim_cols = _aim_head_columns(model)
+        use_cosine = aim_loss == "cosine" and aim_cols is not None
+        if use_cosine:
+            # Aim leaves the player MSE term: regress position(+velocity) only.
+            non_aim = _player_non_aim_columns(model)
+            if non_aim:
+                add(
+                    "player",
+                    mse(pred_player[:, non_aim], tgt_player[:, non_aim]),
+                    lambdas["player"],
+                )
+            if stats is None:  # pragma: no cover - run_training always threads stats
+                raise ValueError("aim_loss='cosine' requires stats to de-standardize aim")
+            pred_aim_raw = _destandardize_aim(pred_player[:, aim_cols], stats)
+            tgt_aim_raw = _destandardize_aim(tgt_player[:, aim_cols], stats)
+            add(
+                "aim",
+                _torch_per_player_cosine_distance(pred_aim_raw, tgt_aim_raw),
+                lambdas["aim"],
+            )
+        else:
+            # OLD behavior (aim_loss='mse', or no aim sub-group): MSE over the whole
+            # enabled player slice, aim included, as a single 'player' term.
+            add("player", mse(pred_player, tgt_player), lambdas["player"])
 
     if cfg.is_on("bullet_presence"):
         p = preds["bullet_presence"]
@@ -430,6 +517,7 @@ def _evaluate(
     desc: str,
     presence_pw: float | torch.Tensor,
     wall_pw: float | torch.Tensor,
+    aim_loss: str = "cosine",
 ) -> dict[str, object]:
     """Run the loss + the full per-objective breakdown over ``loader``.
 
@@ -449,6 +537,10 @@ def _evaluate(
     pl_sse = np.zeros(12)
     pl_world_sse = np.zeros(12)
     pl_n = 0
+    # Aim angular-error accumulators (per-player, on RAW de-standardized aim).
+    aim_deg_sum = 0.0
+    aim_cos_sum = 0.0
+    aim_n = 0  # number of (sample, player) cosine measurements summed
     bpos_sse = np.zeros(N_BULLET_POS)
     bpos_world_sae = np.zeros(N_BULLET_POS)
     bpos_cnt = np.zeros(N_BULLET_POS)
@@ -463,7 +555,9 @@ def _evaluate(
         b = _move_batch(batch, device)
         with torch.autocast(device_type=device.type, enabled=use_amp):
             preds = model(b["frame"])
-            total, _parts = compute_losses(preds, b, model, lambdas, presence_pw, wall_pw)
+            total, _parts = compute_losses(
+                preds, b, model, lambdas, presence_pw, wall_pw, stats=stats, aim_loss=aim_loss
+            )
         loss_total += float(total.detach())
         n_batches += 1
 
@@ -476,6 +570,23 @@ def _evaluate(
             tw = denormalize(tgt, stats.player_mean[idx], stats.player_std[idx])
             pl_world_sse[idx] += ((pw - tw) ** 2).sum(axis=0)
             pl_n += pred.shape[0]
+            if cfg.is_on("player_aim"):
+                # Aim metric on RAW (de-standardized) aim: pull the aim columns out of
+                # the head output and de-standardize both pred and target to unit space.
+                aim_cols = _aim_head_columns(model)
+                aim_vi = list(_AIM_VEC_INDICES)
+                pred_aim_raw = denormalize(
+                    pred[:, aim_cols], stats.player_mean[aim_vi], stats.player_std[aim_vi]
+                )
+                tgt_aim_raw = denormalize(
+                    tgt[:, aim_cols], stats.player_mean[aim_vi], stats.player_std[aim_vi]
+                )
+                m = aim_angular_error_deg(pred_aim_raw, tgt_aim_raw)
+                # Weight each batch's mean by its (sample * 2-player) measurement count.
+                bm = pred.shape[0] * 2
+                aim_deg_sum += m["deg"] * bm
+                aim_cos_sum += m["cos"] * bm
+                aim_n += bm
 
         mask = b["bullet_slot_mask"].float().cpu().numpy() if "bullet_slot_mask" in b else None
         if cfg.is_on("bullet_position"):
@@ -512,10 +623,17 @@ def _evaluate(
     breakdown: dict[str, object] = _na_breakdown(cfg)
 
     # Player sub-groups.
-    from tank_twin.pretrain_pixels import PLAYER_SUBGROUP_VEC_INDICES
-
     for sub in _PLAYER_SUBGROUPS:
         if not cfg.is_on(sub):
+            continue
+        if sub == "player_aim":
+            # Aim reports ANGULAR error (deg) + cosine similarity instead of norm_mse:
+            # on a ~uniform unit target, norm_mse pins at ~1.0 regardless of signal, so
+            # it cannot distinguish "learning direction" from "collapsed to (0,0)".
+            breakdown[sub] = {
+                "aim_angular_error_deg": float(aim_deg_sum / max(1, aim_n)),
+                "aim_cosine": float(aim_cos_sum / max(1, aim_n)),
+            }
             continue
         vi = list(PLAYER_SUBGROUP_VEC_INDICES[sub])
         nmse = float((pl_sse[vi] / max(1, pl_n)).mean())
@@ -566,6 +684,8 @@ def _fmt_breakdown(b: dict[str, object]) -> str:
         v = b[g]
         if v == "N/A":
             parts.append(f"{g}=N/A")
+        elif g == "player_aim":
+            parts.append(f"{g}=ang{v['aim_angular_error_deg']:.1f}deg/cos{v['aim_cosine']:.3f}")
         else:
             extra = f"/world={v['world_rmse']:.3f}" if "world_rmse" in v else ""
             parts.append(f"{g}=nmse{v['norm_mse']:.3f}{extra}")
@@ -760,11 +880,15 @@ def run_training(args: Namespace) -> int:
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     lambdas = {
         "player": args.lambda_player,
+        "aim": args.lambda_aim,
         "presence": args.lambda_presence,
         "bullet_pos": args.lambda_bullet_pos,
         "bullet_dir": args.lambda_bullet_dir,
         "wall": args.lambda_wall,
     }
+    aim_loss = args.aim_loss
+    if cfg.is_on("player_aim"):
+        print(f"[pretrain] player_aim loss={aim_loss} lambda_aim={args.lambda_aim}")
     print(
         f"[pretrain] encoder flatten_dim={model.encoder.flatten_dim} "
         f"embedding_dim={model.encoder.embedding_dim} heads={list(model.sizes.items())} "
@@ -787,7 +911,9 @@ def run_training(args: Namespace) -> int:
             opt.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, enabled=use_amp):
                 preds = model(b["frame"])
-                total, parts = compute_losses(preds, b, model, lambdas, presence_pw, wall_pw)
+                total, parts = compute_losses(
+                    preds, b, model, lambdas, presence_pw, wall_pw, stats=stats, aim_loss=aim_loss
+                )
             scaler.scale(total).backward()
             scaler.step(opt)
             scaler.update()
@@ -813,6 +939,7 @@ def run_training(args: Namespace) -> int:
             desc="  eval",
             presence_pw=presence_pw,
             wall_pw=wall_pw,
+            aim_loss=aim_loss,
         )
         ev["epoch"] = epoch
         ev["train_total_loss"] = ep_total
@@ -841,6 +968,7 @@ def run_training(args: Namespace) -> int:
         desc="  validation",
         presence_pw=presence_pw,
         wall_pw=wall_pw,
+        aim_loss=aim_loss,
     )
     print(
         f"[validation] OOD total={validation['total_loss']:.4f} | "
@@ -877,6 +1005,7 @@ def run_training(args: Namespace) -> int:
         "objectives": cfg.to_json(),
         "head_sizes": model.sizes,
         "lambdas": lambdas,
+        "aim_loss": aim_loss,
         "pos_weights": {
             "presence": float(presence_pw),
             "wall_interior": float(wall_pw),
