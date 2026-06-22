@@ -50,6 +50,7 @@ from tank_twin.pretrain_pixels import (
     denormalize,
     downsample_frames_np,
     fit_norm_stats,
+    grid_to_world,
     head_sizes,
     heatmap_point_channels,
     interior_wall_mask,
@@ -743,14 +744,21 @@ def compute_spatial_losses(
         add("wall", per_cell[:, interior].mean(), lambdas.get("wall", 1.0))
 
     if "keypoints" in channel_map:
-        # soft-argmax over each keypoint channel -> (B, 2, 2) in [0,1] grid frac. Compare in
-        # the SAME [0,1] frame (normalize the (col,row) target by [w,h]) so the MSE is O(1).
+        # soft-argmax over each keypoint channel -> (B, 2, 2) in [0,1] grid frac.
+        # spatial_soft_argmax puts cell centers at (j+0.5)/[w,h]; keypoint_cr (via world_to_grid
+        # / the splat) uses INTEGER indices. Undo the +0.5 so the read-out is in the SAME
+        # integer-index frame as the target, then normalize by [w,h] so the MSE is O(1). Without
+        # this the loss optimum sits a half-cell off the true splat location (the eval metric
+        # then reads that as half-cell error). This is a CONSTANT +0.5-cell reframing of the
+        # regression target: identical MSE curvature / scale, only the (correct) optimum location
+        # shifts -- it does not change optimizer dynamics.
         heat = preds["keypoint_heat"]  # (B, 2, H, W)
         _b, _k, h, w = heat.shape
         coords01 = spatial_soft_argmax(heat, normalized="unit")  # (B, 2, 2) (x,y) in [0,1]
         scale = coords01.new_tensor([w, h])  # (col,row) -> [0,1] normalizer
-        tgt01 = targets["keypoint_cr"] / scale  # (B, 2, 2) (col,row) frac -> [0,1]
-        add("keypoint", ((coords01 - tgt01) ** 2).mean(), lambdas.get("keypoint", 1.0))
+        pred_idx01 = coords01 - 0.5 / scale  # (j+0.5)/[w,h] -> integer-index frame, in [0,1]
+        tgt01 = targets["keypoint_cr"] / scale  # (B, 2, 2) (col,row) integer-index frac -> [0,1]
+        add("keypoint", ((pred_idx01 - tgt01) ** 2).mean(), lambdas.get("keypoint", 1.0))
 
     if not terms:  # pragma: no cover - validate_channel_map forbids an empty map
         raise ValueError("no spatial objectives assigned; nothing to optimize")
@@ -1464,14 +1472,23 @@ def _evaluate_spatial(
         if "keypoints" in cm:
             heat = preds["keypoint_heat"]  # (B,2,H,W)
             coords01 = spatial_soft_argmax(heat, normalized="unit").float().cpu().numpy()  # (B,2,2)
-            pred_col = coords01[:, :, 0] * gw
-            pred_row = coords01[:, :, 1] * gh
-            tgt_cr = b["keypoint_cr"].float().cpu().numpy()  # (B,2,2) (col,row)
+            # spatial_soft_argmax puts cell centers at (j+0.5)/[w,h]; the splat / world_to_grid
+            # (-> keypoint_cr) and grid_to_world put them at INTEGER indices. Undo the +0.5 so
+            # the read-out lands in the SAME integer-index frame as the target -- otherwise a
+            # heatmap peaked at the TRUE splat cell reads a fixed half-cell-too-far world error.
+            pred_col = coords01[:, :, 0] * gw - 0.5  # integer-index grid frame
+            pred_row = coords01[:, :, 1] * gh - 0.5
+            tgt_cr = b["keypoint_cr"].float().cpu().numpy()  # (B,2,2) (col,row) integer-index
             d_col = pred_col - tgt_cr[:, :, 0]
             d_row = pred_row - tgt_cr[:, :, 1]
             kp_grid_sse += float((d_col**2 + d_row**2).sum())
-            wx = (pred_col - tgt_cr[:, :, 0]) * world_per_col
-            wy = (pred_row - tgt_cr[:, :, 1]) * world_per_row
+            # World error anchored to GROUND TRUTH: map BOTH the prediction and the target out
+            # of the grid via grid_to_world (the exact, round-trip-tested inverse of
+            # world_to_grid that built keypoint_cr) -- not the ad-hoc (pred-tgt)*world_per_cell.
+            pred_wx, pred_wy = grid_to_world(pred_col, pred_row, gh, gw)
+            tgt_wx, tgt_wy = grid_to_world(tgt_cr[:, :, 0], tgt_cr[:, :, 1], gh, gw)
+            wx = pred_wx - tgt_wx
+            wy = pred_wy - tgt_wy
             kp_world_sse += float((wx**2 + wy**2).sum())
             kp_n += pred_col.shape[0] * 2
 

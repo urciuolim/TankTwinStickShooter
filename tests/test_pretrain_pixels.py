@@ -29,6 +29,10 @@ from tank_twin.pretrain_pixels import (
     SENTINEL,
     SPATIAL_OBJECTIVE_NCHAN,
     SPATIAL_OBJECTIVES,
+    WALL_H,
+    WALL_W,
+    WORLD_MAX_Y,
+    WORLD_MIN_X,
     MapAwareSplit,
     NormStats,
     ObjectiveConfig,
@@ -1411,7 +1415,17 @@ def test_keypoint_field_shape_and_peaks():
 
 
 def test_keypoint_field_soft_argmax_round_trip():
-    """Build a keypoint heatmap for a known (x,y); soft-argmax recovers the grid coord."""
+    """Build a keypoint heatmap for a known (x,y); soft-argmax recovers the grid coord.
+
+    Pins the convention bridge between the splat frame and the soft-argmax frame: the splat
+    (``keypoint_field`` / ``world_to_grid``) puts cell centers at INTEGER indices, while
+    ``spatial_soft_argmax(normalized="unit")`` puts them at ``(j + 0.5) / [w, h]``. So the
+    raw read-out ``coords01 * [w, h]`` sits HALF A CELL above the integer-index target; the
+    integer-index coord is ``coords01 * [w, h] - 0.5`` (the conversion the world-error metric
+    and the keypoint loss now use). After undoing that half-cell shift the recovery is TIGHT
+    (sub-cell soft-argmax quantization only), which is why the old loose ``abs=0.6`` tolerance
+    is no longer needed -- see test_keypoint_world_error_metric_unbiased for the world-frame pin.
+    """
     torch = pytest.importorskip("torch")
     from tank_twin._pretrain_pixels_train import spatial_soft_argmax
 
@@ -1429,11 +1443,81 @@ def test_keypoint_field_soft_argmax_round_trip():
     coords01 = spatial_soft_argmax(heat, normalized="unit")  # (1,2,2) (x,y) in [0,1]
     for k, (px, py) in enumerate((p1, p2)):
         col_true, row_true = world_to_grid(np.array([[px, py]]), gh, gw)
-        col_pred = coords01[0, k, 0].item() * gw
-        row_pred = coords01[0, k, 1].item() * gh
-        # Soft-argmax recovers the fractional grid coord within ~half a cell.
-        assert col_pred == pytest.approx(col_true[0], abs=0.6)
-        assert row_pred == pytest.approx(row_true[0], abs=0.6)
+        # Undo the soft-argmax +0.5-cell convention to land in the integer-index splat frame.
+        col_pred = coords01[0, k, 0].item() * gw - 0.5
+        row_pred = coords01[0, k, 1].item() * gh - 0.5
+        # Recovery in the integer-index frame is tight (well under a tenth of a cell here).
+        assert col_pred == pytest.approx(col_true[0], abs=0.1)
+        assert row_pred == pytest.approx(row_true[0], abs=0.1)
+
+
+def test_keypoint_world_error_metric_unbiased():
+    """PIN the spatial player-position world-error metric: a heatmap that PERFECTLY
+    reproduces the true keypoint splat must read ~0 WORLD error -- no fixed half-cell bias.
+
+    Exercises the REAL pipeline end-to-end:
+    * a keypoint placed at a deliberately SUB-CELL world position (its fractional grid col is
+      ~12.3 / ~1.6 / near the field boundary -- NOT a cell center),
+    * its target built exactly as ``decode_spatial_targets`` does (``world_to_grid`` ->
+      ``keypoint_cr``),
+    * the target heatmap built by the REAL ``keypoint_field`` splat (so the splat convention
+      is exercised), scaled into logits the same way the round-trip test does,
+    * ``spatial_soft_argmax`` + the SAME world-error conversion the eval metric uses
+      (read-out -> integer-index frame -> ``grid_to_world`` -> compare to the keypoint's TRUE
+      world xy, recovered through ``grid_to_world`` of ``keypoint_cr``, the exact inverse).
+
+    The tolerance fails on a +0.5-cell bias but passes on pure soft-argmax sub-cell
+    quantization: world error must be CLEARLY under half a world-cell.
+    """
+    torch = pytest.importorskip("torch")
+    from tank_twin._pretrain_pixels_train import spatial_soft_argmax
+
+    gh, gw = 24, 40
+    world_per_col = WALL_W / gw  # 0.5; half a cell in world = 0.25
+    world_per_row = WALL_H / gh  # 0.5
+    half_cell_world = 0.5 * (world_per_col + world_per_row) / 2.0  # 0.25
+
+    def world_for_colrow(c: float, r: float) -> tuple[float, float]:
+        # Inverse of world_to_grid; lets us place a keypoint at a chosen FRACTIONAL grid coord.
+        x = c / gw * WALL_W + WORLD_MIN_X
+        y = WORLD_MAX_Y - r / gh * WALL_H
+        return x, y
+
+    # Two sub-cell positions: one interior (col ~12.3), one in the boundary region (col ~3.0,
+    # row ~2.5) where the splat skirt is partly clipped -- still pure quantization, no bias.
+    for c_target, r_target in ((12.3, 7.4), (3.0, 2.5)):
+        px, py = world_for_colrow(c_target, r_target)
+        s = np.full(52, SENTINEL, dtype=np.float32)
+        s[0:2] = [px, py]  # P1
+        s[26:28] = [px, py]  # P2 (same point -> both channels exercise the splat)
+
+        # Target through the REAL decode path: world_to_grid -> keypoint_cr (col,row).
+        tgt_col, tgt_row = world_to_grid(np.array([[px, py]]), gh, gw)
+        assert tgt_col[0] == pytest.approx(c_target, abs=1e-6)
+        assert tgt_row[0] == pytest.approx(r_target, abs=1e-6)
+        # TRUE world xy anchored via grid_to_world(keypoint_cr) (exact inverse of world_to_grid).
+        true_x, true_y = grid_to_world(tgt_col, tgt_row, gh, gw)
+        assert (true_x[0], true_y[0]) == pytest.approx((px, py), abs=1e-6)
+
+        # Heatmap built by the REAL splat, scaled into logits like the round-trip test.
+        kp = keypoint_field(s[None, :], gh, gw, sigma=1.2)  # (1,2,H,W)
+        heat = torch.from_numpy(kp).float() * 12.0
+        coords01 = spatial_soft_argmax(heat, normalized="unit")  # (1,2,2) (x,y) in [0,1]
+
+        for k in range(2):
+            # SAME conversion the eval metric uses: read-out -> integer-index -> grid_to_world.
+            pred_col_idx = coords01[0, k, 0].item() * gw - 0.5
+            pred_row_idx = coords01[0, k, 1].item() * gh - 0.5
+            pred_x, pred_y = grid_to_world(pred_col_idx, pred_row_idx, gh, gw)
+            world_err = float(np.hypot(pred_x - true_x[0], pred_y - true_y[0]))
+            # ~0: only finite-sigma soft-argmax quantization. MUST be well under a half-cell.
+            # The OLD (biased) metric read >= 0.32 world units here (a fixed +0.5-cell offset);
+            # the corrected metric reads <= ~0.07, so this tolerance fails the bias, passes quant.
+            assert world_err < 0.5 * half_cell_world  # < 0.125 world units (no 0.5-cell bias)
+
+            # The grid-frac (norm_mse) sub-key stays meaningful in the SAME integer-index frame.
+            grid_err = float(np.hypot(pred_col_idx - tgt_col[0], pred_row_idx - tgt_row[0]))
+            assert grid_err < 0.4  # well under half a cell in grid units too
 
 
 # --- CenterNet penalty-reduced focal loss correctness ------------------------
