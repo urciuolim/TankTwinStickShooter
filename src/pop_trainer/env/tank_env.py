@@ -28,7 +28,7 @@ Episode boundaries (gymnasium 5-tuple; see :mod:`pop_trainer.env.rewards`):
 * ``truncated`` — ``max_steps`` reached on an undecided step, OR a LOST CONNECTION.
 * a dropped connection (``core.protocol`` raises ``ConnectionError``) is translated to a
   ``truncated`` step with reward ``0.0`` and ``info["lost_connection"] = True`` — the game
-  is counted as ending with no winner (the 2021 ``TankEnv`` behaviour), NOT a crash.
+  is counted as ending with no winner, NOT a crash.
 
 Testability: the transport is INJECTED, exactly like ``core.protocol.Connection``. Pass a
 ``connection`` (a ready ``Connection`` over an in-process fake transport) or a
@@ -79,7 +79,7 @@ class TankEnv(gymnasium.Env):
       reconnect (the next step would re-raise) unless a ``connection_factory`` is also given.
     * ``connection_factory`` — a zero-arg callable returning a fresh ``Connection``. Called
       on construction (if no ``connection`` was passed) and AGAIN to reconnect after a
-      dropped connection, mirroring the 2021 reconnect-on-``ConnectionError`` path.
+      dropped connection (the reconnect-on-``ConnectionError`` path).
 
     Exactly one of ``connection`` / ``connection_factory`` must be provided.
 
@@ -91,8 +91,7 @@ class TankEnv(gymnasium.Env):
             by the env loop; the socket-address fields belong to the caller's factory).
             Defaults to ``EnvConfig()``.
         reward_config: a :class:`pop_trainer.core.config.RewardConfig` (win / loss / time
-            budgets; the action-cost component was dropped per the CTO ruling). Defaults to
-            ``RewardConfig()``.
+            budgets). Defaults to ``RewardConfig()``.
         frame_shape: the ``(H, W, 3)`` shape of the rendered pixel frame, fixing
             ``observation_space``. Must match what Unity renders. Defaults to
             :data:`DEFAULT_FRAME_SHAPE`.
@@ -196,7 +195,7 @@ class TankEnv(gymnasium.Env):
         The opponent action is drawn from ``self.np_random`` (so a seeded ``reset`` makes the
         episode reproducible). The reward / boundary is computed by
         :func:`pop_trainer.env.rewards.shaped_step_reward`: a per-step time penalty accrues
-        every step and the win/loss terminal is ADDED on the decided step (no action cost).
+        every step and the win/loss terminal is ADDED on the decided step.
 
         ``terminated`` is a decided game (winner / ``done``); ``truncated`` is ``max_steps``
         reached OR a dropped connection. On a dropped connection the step truncates with
@@ -311,9 +310,9 @@ class TankEnv(gymnasium.Env):
     def _reconnect(self):
         """Replace ``self.conn`` with a fresh connection from the factory, if one was given.
 
-        Mirrors the 2021 reconnect-on-``ConnectionError`` path. A no-op when the env was
-        constructed with a bare ``connection`` (no factory) — the next wire op would then
-        re-raise, which is the documented behaviour for that construction mode.
+        The reconnect-on-``ConnectionError`` path. A no-op when the env was constructed with a
+        bare ``connection`` (no factory) — the next wire op would then re-raise, which is the
+        documented behaviour for that construction mode.
         """
         if self._connection_factory is not None:
             self.conn = self._connection_factory()

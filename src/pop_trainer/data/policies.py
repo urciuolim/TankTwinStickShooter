@@ -1,11 +1,11 @@
 """Deterministic collection policies: PURE callables ``state -> action_list``.
 
-The collection driver (:mod:`pop_trainer.data.collect`) drives BOTH players each step with a
-policy. A policy here is a pure function of the decoded wire state (a 52-float sequence, OR
-the inbound state dict) to a 5-float action ``[move_x, move_y, aim_x, aim_y, fire]`` — no
-socket, no RNG side-channel, no global mutable state — so a recorded ``(frame, state, action)``
-trajectory is REPRODUCIBLE from the seed/spec alone and the policy is unit-testable with no
-live game.
+The collection driver (:mod:`pop_trainer.data.collect`) feeds the current state to a policy
+each step to compute the agent action it applies via ``TankEnv.step``. A policy here is a pure
+function of the decoded wire state (a 52-float sequence, OR the inbound state dict) to a 5-float
+action ``[move_x, move_y, aim_x, aim_y, fire]`` — no socket, no RNG side-channel, no global
+mutable state — so a recorded ``(frame, state, action)`` trajectory is REPRODUCIBLE from the
+seed/spec alone and the policy is unit-testable with no live game.
 
 "Deterministic" means: same input -> same output, every call. A policy MAY carry a fixed
 parameter (a constant action, a scripted cycle keyed off the step index) but draws NO entropy
@@ -29,7 +29,8 @@ Provided policies:
   player-bound :class:`AimAtOpponentPolicy` / :func:`aim_at_opponent_factory` instead.
 * :class:`AimAtOpponentPolicy` — a player-BOUND, 1-arg callable form of the aim policy (its
   ``__call__(state)`` aims the configured player at the opponent), so it plugs into the collector
-  as either the p1 or the p2 policy. :func:`aim_at_opponent_factory` is the closure equivalent.
+  as the agent policy for either perspective. :func:`aim_at_opponent_factory` is the closure
+  equivalent.
 
 stdlib + numpy; imports :mod:`pop_trainer.core.state` for the schema accessors only.
 """
@@ -185,9 +186,9 @@ class AimAtOpponentPolicy:
     """Player-BOUND aim policy: a 1-arg ``state -> action`` callable for a fixed slot.
 
     Binds ``player`` (PLAYER_1 / PLAYER_2, validated at construction) so ``__call__(state)`` aims
-    that player at its opponent and fires. This is the form to wire into the collector for the P2
-    slot (its 1-arg signature plugs straight into ``policy(state)``), mirroring the
-    :class:`ConstantPolicy` / :class:`ScriptedCyclePolicy` callable-class style. Pure / stateless.
+    that player at its opponent and fires. Its 1-arg signature plugs straight into the collector's
+    ``policy(state)`` call, mirroring the :class:`ConstantPolicy` / :class:`ScriptedCyclePolicy`
+    callable-class style. Pure / stateless.
     """
 
     def __init__(self, player: int = state_schema.PLAYER_1):

@@ -1,8 +1,10 @@
-"""Tests for the collection driver's PURE step loop against an in-process fake connection.
+"""Tests for the collection driver, driving a real ``TankEnv`` over an in-process fake transport.
 
-NO live socket is opened here (the contract: do not unit-test live collection). The transport
-is injected as a scripted fake, so ``run_episode`` / ``collect_to_shards`` are exercised end to
-end against deterministic policies.
+NO live socket is opened here (the contract: do not unit-test live collection). The transport is
+a scripted in-process fake feeding canned handshake acks, state JSON, and length-prefixed pixel
+frames through ``core.protocol.Connection`` — exactly the shape the env tests use — so
+``run_episode`` / ``collect_to_shards`` are exercised end to end through the SAME gym observation
+pipeline RL trains on, with deterministic policies.
 """
 
 import math
@@ -10,67 +12,155 @@ import math
 import numpy as np
 import pytest
 
+from pop_trainer.core import protocol as P
 from pop_trainer.core import state as S
+from pop_trainer.core.config import EnvConfig
 from pop_trainer.data import collect, policies, schema, shards
+from pop_trainer.env.tank_env import DEFAULT_FRAME_SHAPE, TankEnv
+
+FRAME_H, FRAME_W = DEFAULT_FRAME_SHAPE[0], DEFAULT_FRAME_SHAPE[1]
 
 
-class FakeConnection:
-    """In-process Connection stand-in: scripts the (state, frame) pairs each step yields.
+# --- wire-byte builders (mirrors tests/pop_trainer/env/test_tank_env.py) -----------------
 
-    Constructed with a list of (state_dict, frame) the build "would" return. The first pair is
-    consumed by the handshake (the caller passes it as first_state/first_frame); subsequent
-    ``receive_state_and_frame`` calls pop the rest in order. ``send`` records the action messages
-    so a test can assert the policy outputs were sent.
+
+def _frame_bytes(w, h, fill):
+    """A length-prefixed RGB24 frame whose every pixel is ``fill`` (an (r, g, b))."""
+    payload = bytes(fill) * (w * h)
+    header = (
+        bytes([P.FRAME_TAG])
+        + len(payload).to_bytes(4, "big")
+        + w.to_bytes(2, "big")
+        + h.to_bytes(2, "big")
+        + bytes([P.FRAME_CHANNELS])
+    )
+    return header + payload
+
+
+def _state_and_frame_bytes(state_list, *, winner=None, done=False, fill=(10, 20, 30)):
+    """A state JSON message glued to its trailing pixel frame (one step on the wire)."""
+    msg = {"state": list(state_list)}
+    if winner is not None:
+        msg["winner"] = winner
+    if done:
+        msg["done"] = True
+    return P.encode(msg) + _frame_bytes(FRAME_W, FRAME_H, fill)
+
+
+def _ack(obj):
+    return P.encode(obj)
+
+
+def _flat_state(value=0.0):
+    return [float(value)] * S.STATE_LEN
+
+
+class ScriptedTransport:
+    """In-process socket-like fake: emits queued recv blobs, records sendall bytes.
+
+    ``recv(n)`` returns the head of the next queued blob capped at ``n`` (a real socket never
+    returns more than requested); a leftover tail is re-queued. When the queue is exhausted
+    ``recv`` returns ``b""`` (peer closed) — which ``Connection`` turns into ``ConnectionError``.
     """
 
-    def __init__(self, pairs):
-        self._pairs = list(pairs)
-        self.sent = []
+    def __init__(self, blobs):
+        self.blobs = list(blobs)
+        self.sent = bytearray()
+        self.closed = False
 
-    def send(self, message):
-        self.sent.append(message)
+    def sendall(self, data):
+        self.sent += data
 
-    def receive_state_and_frame(self):
-        if not self._pairs:
-            raise AssertionError("FakeConnection ran out of scripted pairs")
-        return self._pairs.pop(0)
+    def recv(self, bufsize):
+        if not self.blobs:
+            return b""
+        blob = self.blobs[0]
+        if len(blob) <= bufsize:
+            return self.blobs.pop(0)
+        self.blobs[0] = blob[bufsize:]
+        return blob[:bufsize]
+
+    def close(self):
+        self.closed = True
 
 
-def _state_dict(value, done=False):
-    s = {"state": [float(value)] * S.STATE_LEN}
-    if done:
-        s["done"] = True
+def _reset_blobs(first_state, *, fill=(10, 20, 30)):
+    """The byte script for a successful reset handshake: restart ack, start ack, state+frame."""
+    return [
+        _ack({"restart": True}),
+        _ack({"starting": True}),
+        _state_and_frame_bytes(first_state, fill=fill),
+    ]
+
+
+def _step_episode_blobs(states, *, fills=None, winner_last=None, done_last=False):
+    """Byte script for one episode: a reset handshake on ``states[0]`` then a step per remaining.
+
+    ``states[i]`` (i >= 1) is the state the env reads on step ``i``; the last carries
+    ``winner``/``done`` if asked. ``fills[i]`` colours frame ``i`` (defaults to a per-index fill).
+    """
+    fills = fills or [(i, i, i) for i in range(len(states))]
+    blobs = _reset_blobs(states[0], fill=fills[0])
+    for i in range(1, len(states)):
+        last = i == len(states) - 1
+        blobs.append(
+            _state_and_frame_bytes(
+                states[i],
+                fill=fills[i],
+                winner=winner_last if last else None,
+                done=done_last and last,
+            )
+        )
+    return blobs
+
+
+def _make_env(blobs, **kwargs):
+    transport = ScriptedTransport(blobs)
+    conn = P.Connection(transport)
+    env = TankEnv(connection=conn, **kwargs)
+    return env, transport
+
+
+def _positioned_state(p1_xy, p2_xy):
+    """A 52-float state with P1/P2 at the given (x, y); everything else zero."""
+    s = [0.0] * S.STATE_LEN
+    s[S.PLAYER_1 * S.PLAYER_STRIDE + S.POS_X] = float(p1_xy[0])
+    s[S.PLAYER_1 * S.PLAYER_STRIDE + S.POS_Y] = float(p1_xy[1])
+    s[S.PLAYER_2 * S.PLAYER_STRIDE + S.POS_X] = float(p2_xy[0])
+    s[S.PLAYER_2 * S.PLAYER_STRIDE + S.POS_Y] = float(p2_xy[1])
     return s
 
 
-def _frame(value, h=6, w=8):
-    return np.full((h, w, 3), value, dtype=np.uint8)
+# --- run_episode -------------------------------------------------------------------------
 
 
 def test_run_episode_records_all_steps_until_cap():
-    # 5 steps total, cap at 5 -> records 5 samples, last one carries the zero action.
-    first_state, first_frame = _state_dict(0), _frame(0)
-    rest = [(_state_dict(i), _frame(i)) for i in range(1, 5)]
-    conn = FakeConnection(rest)
+    # 5 states, cap at 5 -> records 5 samples, last carries the zero action.
+    states = [_flat_state(i) for i in range(5)]
+    fills = [(i + 1, i + 1, i + 1) for i in range(5)]
+    blobs = _step_episode_blobs(states, fills=fills)
+    env, transport = _make_env(blobs, env_config=EnvConfig(max_steps=5))
     ep = collect.run_episode(
-        conn,
-        first_state=first_state,
-        first_frame=first_frame,
+        env,
         p1_policy=policies.idle_policy,
-        p2_policy=policies.idle_policy,
         map_id=3,
         episode_id=0,
         max_steps=5,
+        seed=0,
     )
     assert len(ep) == 5
     assert not ep.ended_done
     # step indices are 0..4
     assert [s.step_idx for s in ep.samples] == [0, 1, 2, 3, 4]
-    # frames are time-aligned with the scripted pairs (0,1,2,3,4)
+    # frames are time-aligned with the scripted stream (the per-step constant fill).
     for i, s in enumerate(ep.samples):
-        np.testing.assert_array_equal(s.frame, _frame(i))
-    # 4 actions were sent (one per transition; none after the final/capped step)
-    assert len(conn.sent) == 4
+        assert np.array_equal(s.frame[0, 0], [i + 1, i + 1, i + 1])
+    # states are time-aligned too.
+    for i, s in enumerate(ep.samples):
+        np.testing.assert_array_equal(s.state, np.array(states[i], dtype=np.float32))
+    # 4 action messages went on the wire (one per transition; none after the capped step).
+    sent = bytes(transport.sent).decode("utf-8")
+    assert sent.count('"1"') == 4
     # the final recorded step carries the zero action
     np.testing.assert_array_equal(
         ep.samples[-1].action, np.zeros((schema.NUM_PLAYERS, schema.ACTION_LEN), dtype=np.float32)
@@ -78,144 +168,141 @@ def test_run_episode_records_all_steps_until_cap():
 
 
 def test_run_episode_stops_on_done():
-    first_state, first_frame = _state_dict(0), _frame(0)
-    # the second state is "done"
-    rest = [(_state_dict(1, done=True), _frame(1))]
-    conn = FakeConnection(rest)
+    states = [_flat_state(0), _flat_state(1)]
+    env, _ = _make_env(_step_episode_blobs(states, done_last=True))
     ep = collect.run_episode(
-        conn,
-        first_state=first_state,
-        first_frame=first_frame,
+        env,
         p1_policy=policies.idle_policy,
-        p2_policy=policies.idle_policy,
         map_id=0,
         episode_id=0,
-        max_steps=100,  # cap not reached; done stops it
+        max_steps=100,  # cap not reached; the env's terminated boundary stops it
+        seed=0,
     )
     assert len(ep) == 2
     assert ep.ended_done
-    # one action was sent (to advance from step 0 to the done step), none after done
-    assert len(conn.sent) == 1
 
 
-def test_run_episode_records_applied_action():
-    # A constant policy: the action recorded with a non-terminal sample is the policy output.
-    a1 = [1.0, 0.0, 0.0, 0.0, 1.0]
-    a2 = [0.0, -1.0, 0.0, 0.0, 0.0]
-    first_state, first_frame = _state_dict(0), _frame(0)
-    rest = [(_state_dict(1, done=True), _frame(1))]
-    conn = FakeConnection(rest)
+def test_run_episode_stops_on_winner_terminal():
+    # A reported winner terminates the env; the episode stops there before the cap.
+    states = [_flat_state(0), _flat_state(1)]
+    env, _ = _make_env(_step_episode_blobs(states, winner_last=S.PLAYER_1))
     ep = collect.run_episode(
-        conn,
-        first_state=first_state,
-        first_frame=first_frame,
-        p1_policy=policies.ConstantPolicy(a1),
-        p2_policy=policies.ConstantPolicy(a2),
+        env,
+        p1_policy=policies.idle_policy,
         map_id=0,
         episode_id=0,
         max_steps=100,
+        seed=0,
     )
-    np.testing.assert_array_equal(ep.samples[0].action, np.array([a1, a2], dtype=np.float32))
-    # and that exact action was sent on the wire
-    assert conn.sent == [{1: a1, 2: a2}]
+    assert len(ep) == 2
+    assert ep.ended_done
+
+
+def test_run_episode_records_applied_agent_action():
+    # A constant policy: the action recorded on a non-terminal sample is the policy output in
+    # the P1 slot; the opponent slot (the env's seeded draw, not surfaced) is the zero action.
+    a1 = [1.0, 0.0, 0.0, 0.0, 1.0]
+    states = [_flat_state(0), _flat_state(1)]
+    env, transport = _make_env(_step_episode_blobs(states, done_last=True))
+    ep = collect.run_episode(
+        env,
+        p1_policy=policies.ConstantPolicy(a1),
+        map_id=0,
+        episode_id=0,
+        max_steps=100,
+        seed=0,
+    )
+    np.testing.assert_array_equal(ep.samples[0].action[0], np.array(a1, dtype=np.float32))
+    np.testing.assert_array_equal(
+        ep.samples[0].action[1], np.zeros(schema.ACTION_LEN, dtype=np.float32)
+    )
+    # The env applied exactly that agent action in the "1" slot on the wire.
+    sent = P.decode(bytes(transport.sent[bytes(transport.sent).index(b'{"1"') :]))
+    assert sent["1"] == a1
 
 
 def test_run_episode_supports_scripted_cycle_policy():
     # ScriptedCyclePolicy takes (state, step) — the loop must adapt to that signature.
     cycle = policies.ScriptedCyclePolicy([[1, 0, 0, 0, 0], [0, 1, 0, 0, 0]])
-    first_state, first_frame = _state_dict(0), _frame(0)
-    rest = [(_state_dict(i), _frame(i)) for i in range(1, 3)]
-    conn = FakeConnection(rest)
+    states = [_flat_state(i) for i in range(3)]
+    env, _ = _make_env(_step_episode_blobs(states), env_config=EnvConfig(max_steps=3))
     ep = collect.run_episode(
-        conn,
-        first_state=first_state,
-        first_frame=first_frame,
+        env,
         p1_policy=cycle,
-        p2_policy=cycle,
         map_id=0,
         episode_id=0,
         max_steps=3,
+        seed=0,
     )
-    # step 0 -> cycle[0], step 1 -> cycle[1]
     np.testing.assert_array_equal(ep.samples[0].action[0], np.array([1, 0, 0, 0, 0], np.float32))
     np.testing.assert_array_equal(ep.samples[1].action[0], np.array([0, 1, 0, 0, 0], np.float32))
 
 
-def _positioned_state(p1_xy, p2_xy, done=False):
-    """A 52-float state dict with P1/P2 at the given (x, y); everything else zero."""
-    s = [0.0] * S.STATE_LEN
-    s[S.PLAYER_1 * S.PLAYER_STRIDE + S.POS_X] = float(p1_xy[0])
-    s[S.PLAYER_1 * S.PLAYER_STRIDE + S.POS_Y] = float(p1_xy[1])
-    s[S.PLAYER_2 * S.PLAYER_STRIDE + S.POS_X] = float(p2_xy[0])
-    s[S.PLAYER_2 * S.PLAYER_STRIDE + S.POS_Y] = float(p2_xy[1])
-    d = {"state": s}
-    if done:
-        d["done"] = True
-    return d
-
-
-def test_aim_policy_through_run_episode_both_slots():
-    # The aim policy must work as a REAL collection policy via run_episode in BOTH slots, across
-    # >= 3 steps (the old per-step crash point was step index >= 2). P1 at origin, P2 at (3, 4):
-    # P1 aims toward P2 -> (0.6, 0.8); P2 aims toward P1 -> (-0.6, -0.8). Static positions keep
-    # the expected unit vectors checkable at every step.
-    p1_xy, p2_xy = (0.0, 0.0), (3.0, 4.0)
-    pairs = [(_positioned_state(p1_xy, p2_xy), _frame(i)) for i in range(4)]
-    first_state, first_frame = pairs[0]
-    conn = FakeConnection(pairs[1:])
-
-    p1_policy = policies.aim_at_opponent_policy  # 1-arg, default PLAYER_1
-    p2_policy = policies.AimAtOpponentPolicy(player=S.PLAYER_2)  # player-bound, 1-arg
-
+def test_aim_policy_through_run_episode():
+    # The aim policy works as a REAL agent policy via run_episode across >= 3 steps. P1 at origin,
+    # P2 at (3, 4): P1 aims toward P2 -> (0.6, 0.8). Static positions keep the unit vector checkable
+    # at every step (and exercise step index >= 2).
+    state = _positioned_state((0.0, 0.0), (3.0, 4.0))
+    states = [state for _ in range(4)]
+    env, _ = _make_env(_step_episode_blobs(states), env_config=EnvConfig(max_steps=4))
     ep = collect.run_episode(
-        conn,
-        first_state=first_state,
-        first_frame=first_frame,
-        p1_policy=p1_policy,
-        p2_policy=p2_policy,
+        env,
+        p1_policy=policies.aim_at_opponent_policy,  # 1-arg, default PLAYER_1
         map_id=0,
         episode_id=0,
         max_steps=4,
+        seed=0,
     )
-    # (a) no crash, all 4 steps recorded, including step indices >= 2 (the old crash point).
     assert len(ep) == 4
     assert [s.step_idx for s in ep.samples] == [0, 1, 2, 3]
-    # (c) the action sent at step index 2 exists and is correct (old code raised here).
-    assert len(conn.sent) == 3  # transitions for steps 0,1,2 (none after the capped step 3)
-    # (b) every applied action aims correctly toward the opponent for that slot's perspective.
     for sample in ep.samples[:-1]:  # the final/capped sample carries the zero action
         a1 = sample.action[0]
-        a2 = sample.action[1]
         assert math.isclose(a1[2], 0.6, abs_tol=1e-6)
         assert math.isclose(a1[3], 0.8, abs_tol=1e-6)
         assert a1[4] == 1.0
-        assert math.isclose(a2[2], -0.6, abs_tol=1e-6)
-        assert math.isclose(a2[3], -0.8, abs_tol=1e-6)
-        assert a2[4] == 1.0
-    # the wire messages carry exactly those per-slot aims.
-    for msg in conn.sent:
-        assert math.isclose(msg[1][2], 0.6, abs_tol=1e-6)
-        assert math.isclose(msg[2][2], -0.6, abs_tol=1e-6)
 
 
-def test_aim_factory_closure_through_run_episode():
-    # The closure form aims its bound slot correctly too (P2 aiming at P1).
-    pairs = [(_positioned_state((0.0, 0.0), (3.0, 4.0)), _frame(i)) for i in range(3)]
-    conn = FakeConnection(pairs[1:])
-    p2_policy = policies.aim_at_opponent_factory(S.PLAYER_2)
-    ep = collect.run_episode(
-        conn,
-        first_state=pairs[0][0],
-        first_frame=pairs[0][1],
-        p1_policy=policies.idle_policy,
-        p2_policy=p2_policy,
-        map_id=0,
-        episode_id=0,
-        max_steps=3,
-    )
-    a2 = ep.samples[0].action[1]
-    assert math.isclose(a2[2], -0.6, abs_tol=1e-6)
-    assert math.isclose(a2[3], -0.8, abs_tol=1e-6)
+def test_run_episode_validates_state_width():
+    # A short first state surfaces in info["state"] and must fail the schema validator.
+    bad = [0.0] * (S.STATE_LEN - 1)
+    env, _ = _make_env(_reset_blobs(bad))
+    with pytest.raises(ValueError):
+        collect.run_episode(
+            env,
+            p1_policy=policies.idle_policy,
+            map_id=0,
+            episode_id=0,
+            max_steps=1,
+            seed=0,
+        )
+
+
+def test_run_episode_is_deterministic_in_seed():
+    # Same (policy, seed) -> identical opponent draws on the wire, so the trajectory is
+    # reproducible. We compare the bytes the env sent across two identical runs.
+    states = [_flat_state(i) for i in range(3)]
+
+    def run():
+        env, transport = _make_env(_step_episode_blobs(states), env_config=EnvConfig(max_steps=3))
+        collect.run_episode(
+            env, p1_policy=policies.idle_policy, map_id=0, episode_id=0, max_steps=3, seed=123
+        )
+        return bytes(transport.sent)
+
+    assert run() == run()
+
+
+def test_apply_policy_does_not_mask_internal_typeerror():
+    # A 1-arg policy that raises TypeError INSIDE its body must propagate, not be retried/masked.
+    def buggy_policy(state):
+        raise TypeError("genuine bug inside the policy body")
+
+    states = [_flat_state(0), _flat_state(1)]
+    env, _ = _make_env(_step_episode_blobs(states), env_config=EnvConfig(max_steps=5))
+    with pytest.raises(TypeError, match="genuine bug"):
+        collect.run_episode(
+            env, p1_policy=buggy_policy, map_id=0, episode_id=0, max_steps=5, seed=0
+        )
 
 
 def test_policy_arity_classification():
@@ -235,64 +322,52 @@ def test_policy_arity_classification():
     assert collect._policy_takes_step(range) is False
 
 
-def test_apply_policy_does_not_mask_internal_typeerror():
-    # A 1-arg policy that raises TypeError INSIDE its body must propagate, not be retried/masked.
-    def buggy_policy(state):
-        raise TypeError("genuine bug inside the policy body")
+# --- samples_to_shard --------------------------------------------------------------------
 
-    conn = FakeConnection([(_state_dict(1), _frame(1))])
-    with pytest.raises(TypeError, match="genuine bug"):
-        collect.run_episode(
-            conn,
-            first_state=_state_dict(0),
-            first_frame=_frame(0),
-            p1_policy=buggy_policy,
-            p2_policy=policies.idle_policy,
-            map_id=0,
-            episode_id=0,
-            max_steps=5,
-        )
+
+def _sample(value, map_id=0, episode_id=0, step_idx=0):
+    frame = np.full((FRAME_H, FRAME_W, 3), value, dtype=np.uint8)
+    state = np.full(S.STATE_LEN, float(value), dtype=np.float32)
+    action = np.zeros((schema.NUM_PLAYERS, schema.ACTION_LEN), dtype=np.float32)
+    return collect.Sample(frame, state, action, map_id, episode_id, step_idx)
+
+
+def test_samples_to_shard_stacks_parallel_arrays():
+    samples = [_sample(i, map_id=i, episode_id=0, step_idx=i) for i in range(3)]
+    shard = collect.samples_to_shard(samples)
+    assert len(shard) == 3
+    assert shard.actions is not None
+    assert shard.actions.shape == (3, schema.NUM_PLAYERS, schema.ACTION_LEN)
+    np.testing.assert_array_equal(shard.map_ids, np.array([0, 1, 2], dtype=np.int32))
+
+
+def test_samples_to_shard_can_drop_actions():
+    samples = [_sample(0)]
+    shard = collect.samples_to_shard(samples, with_actions=False)
+    assert shard.actions is None
+
+
+def test_samples_to_shard_rejects_empty():
+    with pytest.raises(ValueError):
+        collect.samples_to_shard([])
+
+
+# --- collect_to_shards -------------------------------------------------------------------
 
 
 def test_collect_to_shards_writes_and_round_trips(tmp_path):
-    # Two episodes on two maps via a fake handshake; assert shards on disk carry the right maps.
-    def make_pairs(start, n, done_last=True):
-        pairs = [(_state_dict(start), _frame(start))]  # first (consumed by handshake)
-        for i in range(1, n):
-            last = i == n - 1
-            pairs.append((_state_dict(start + i, done=done_last and last), _frame(start + i)))
-        return pairs
-
-    # Per episode the connection must yield its own scripted stream. We drive episodes serially,
-    # so build a connection whose pairs cover both episodes; the handshake pops the first of each.
-    ep0 = make_pairs(0, 3)
-    ep1 = make_pairs(10, 3)
-
-    class MultiEpisodeConn(FakeConnection):
-        def __init__(self):
-            super().__init__([])
-            self._episodes = [ep0, ep1]
-            self._cursor = None
-
-        def begin(self, episode_pairs):
-            # handshake hands back the first pair; the rest stream via receive_state_and_frame
-            self._pairs = list(episode_pairs[1:])
-            return episode_pairs[0]
-
-    conn = MultiEpisodeConn()
-    episodes = iter([ep0, ep1])
-
-    def handshake(c, map_id):
-        return c.begin(next(episodes))
-
+    # Two episodes on two maps, each reset() starting a fresh round on the same env. The env
+    # script holds both episodes back to back; each run_episode replays one reset handshake.
+    ep0 = _step_episode_blobs([_flat_state(0), _flat_state(1), _flat_state(2)], done_last=True)
+    ep1 = _step_episode_blobs([_flat_state(10), _flat_state(11), _flat_state(12)], done_last=True)
+    env, _ = _make_env(ep0 + ep1, env_config=EnvConfig(max_steps=3))
     written = collect.collect_to_shards(
-        conn,
+        env,
         out_dir=tmp_path,
-        handshake=handshake,
         map_ids=[5, 7],
         p1_policy=policies.idle_policy,
-        p2_policy=policies.idle_policy,
         max_steps=3,
+        seed=0,
         shard_prefix="shard_w0",
         shard_size=10_000,
     )
@@ -306,24 +381,22 @@ def test_collect_to_shards_writes_and_round_trips(tmp_path):
     np.testing.assert_array_equal(
         out[schema.ARRAY_EPISODE_IDS], np.array([0, 0, 0, 1, 1, 1], dtype=np.int32)
     )
+    np.testing.assert_array_equal(
+        out[schema.ARRAY_STEP_IDXS], np.array([0, 1, 2, 0, 1, 2], dtype=np.int32)
+    )
 
 
 def test_collect_to_shards_respects_shard_size(tmp_path):
     # shard_size=2 over a 4-step episode -> multiple shards.
-    pairs = [(_state_dict(i), _frame(i)) for i in range(4)]
-    conn = FakeConnection(pairs[1:])
-
-    def handshake(c, map_id):
-        return pairs[0]
-
+    states = [_flat_state(i) for i in range(4)]
+    env, _ = _make_env(_step_episode_blobs(states), env_config=EnvConfig(max_steps=4))
     written = collect.collect_to_shards(
-        conn,
+        env,
         out_dir=tmp_path,
-        handshake=handshake,
         map_ids=[1],
         p1_policy=policies.idle_policy,
-        p2_policy=policies.idle_policy,
         max_steps=4,
+        seed=0,
         shard_size=2,
     )
     assert len(written) == 2
@@ -331,30 +404,28 @@ def test_collect_to_shards_respects_shard_size(tmp_path):
     assert total == 4
 
 
+# --- collect_parallel (single-spec in-process path) --------------------------------------
+
+
 def test_collect_parallel_single_spec_in_process(tmp_path):
-    # The single-spec path runs in-process (no spawn), exercising run_worker via injected
-    # factories with a fake connection — still NO live socket.
-    pairs = [(_state_dict(i), _frame(i)) for i in range(3)]
+    # The single-spec path runs in-process (no spawn), exercising run_worker via an injected
+    # env_factory that builds a real TankEnv over a fake transport — still NO live socket.
+    states = [_flat_state(i) for i in range(3)]
 
-    def transport_factory(spec):
-        return FakeConnection(pairs[1:])
-
-    def handshake_factory(spec):
-        def handshake(conn, map_id):
-            return pairs[0]
-
-        return handshake
+    def env_factory(spec):
+        transport = ScriptedTransport(_step_episode_blobs(states))
+        return TankEnv(connection=P.Connection(transport), env_config=EnvConfig(max_steps=3))
 
     def policy_factory(spec):
-        return policies.idle_policy, policies.idle_policy
+        return policies.idle_policy
 
     spec = collect.CollectionSpec(
         worker_id=0,
         out_dir=str(tmp_path),
         map_ids=[2],
         max_steps=3,
-        transport_factory=transport_factory,
-        handshake_factory=handshake_factory,
+        seed=0,
+        env_factory=env_factory,
         policy_factory=policy_factory,
     )
     results = collect.collect_parallel([spec])
@@ -365,17 +436,29 @@ def test_collect_parallel_single_spec_in_process(tmp_path):
     assert shards.shard_length(shard_path) == 3
 
 
-def test_run_episode_validates_state_width():
-    bad = {"state": [0.0] * (S.STATE_LEN - 1)}
-    conn = FakeConnection([])
-    with pytest.raises(ValueError):
-        collect.run_episode(
-            conn,
-            first_state=bad,
-            first_frame=_frame(0),
-            p1_policy=policies.idle_policy,
-            p2_policy=policies.idle_policy,
-            map_id=0,
-            episode_id=0,
-            max_steps=1,
-        )
+def test_collect_parallel_empty_specs_returns_empty():
+    assert collect.collect_parallel([]) == []
+
+
+def test_run_worker_requires_env_factory(tmp_path):
+    spec = collect.CollectionSpec(
+        worker_id=0,
+        out_dir=str(tmp_path),
+        map_ids=[0],
+        max_steps=1,
+        policy_factory=lambda spec: policies.idle_policy,
+    )
+    with pytest.raises(ValueError, match="env_factory"):
+        collect.run_worker(spec)
+
+
+def test_run_worker_requires_policy_factory(tmp_path):
+    spec = collect.CollectionSpec(
+        worker_id=0,
+        out_dir=str(tmp_path),
+        map_ids=[0],
+        max_steps=1,
+        env_factory=lambda spec: None,
+    )
+    with pytest.raises(ValueError, match="policy_factory"):
+        collect.run_worker(spec)

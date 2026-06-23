@@ -6,9 +6,7 @@ into the gymnasium ``(reward, terminated, truncated)`` triple that :meth:`TankEn
 returns. It is a PURE function — no socket, no gym, no numpy — so the reward is unit-testable
 in isolation from the environment wiring.
 
-What it is (and is NOT): the action-cost component of the legacy 2021 reward has been
-DROPPED per the CTO ruling (:class:`pop_trainer.core.config.RewardConfig` no longer carries
-``action_total`` / ``action_norm``). What remains is:
+The reward has two components:
 
 * a per-step TIME PENALTY that accrues EVERY non-lost-connection step. The full-episode
   ``time_total`` budget (e.g. ``-1.0``) is spread over ``max_steps`` (e.g. 300) by
@@ -25,15 +23,14 @@ Episode boundaries (gymnasium semantics):
   real game result.
 * ``truncated`` — a time-limit cutoff (``max_steps_reached``) on a step the game did NOT
   decide, OR a LOST CONNECTION. Neither is a decided game.
-* lost connection -> reward ``0.0``, ``truncated`` (no shaping accrues), matching the 2021
-  ``TankEnv`` "count this game as ending with no winner" behaviour.
+* lost connection -> reward ``0.0``, ``truncated`` (no shaping accrues); the game is counted
+  as ending with no winner.
 
-``survivor`` mode flips the terminal COMPONENT exactly as the 2021 reward did: the flip keys
-off whether a winner KEY was reported, NOT the winner VALUE. Any reported winner (``0``,
-``1``, or ``-1`` draw) scores ``loss_reward``; only a winner-key-ABSENT terminal (a bare
-``done`` the game resolved without a winner) scores ``win_reward`` (you survived). The
-accrued time penalty is KEPT under the flip. This asymmetry (a ``winner != -1`` decided game
-becomes a loss for BOTH players under survivor) is preserved deliberately from 2021.
+``survivor`` mode flips the terminal COMPONENT: the flip keys off whether a winner KEY was
+reported, NOT the winner VALUE. Any reported winner (``0``, ``1``, or ``-1`` draw) scores
+``loss_reward``; only a winner-key-ABSENT terminal (a bare ``done`` the game resolved without
+a winner) scores ``win_reward`` (you survived). The accrued time penalty is KEPT under the
+flip. Under this asymmetry a ``winner != -1`` decided game becomes a loss for BOTH players.
 
 SANITY EQUIVALENCE: with ``time_penalty == 0`` and ``win/loss == ±1`` this reduces to the
 plain ±1 terminal (continuing / draw -> ``0.0``; P1 win -> ``+1``; opponent win -> ``-1``).
@@ -70,7 +67,7 @@ def shaped_step_reward(
     max_steps_reached: bool = False,
     lost_connection: bool = False,
 ) -> tuple[float, bool, bool]:
-    """Compute ``(reward, terminated, truncated)`` for one env step (no action cost).
+    """Compute ``(reward, terminated, truncated)`` for one env step.
 
     Args:
         winner: ``0`` (P1/agent), ``1`` (opponent), ``-1`` (explicit draw), or ``None`` when
@@ -85,7 +82,7 @@ def shaped_step_reward(
         lost_connection: the transport dropped -> reward ``0.0``, ``truncated`` (no shaping).
     """
     # Transport failure: a flat reward-0 truncation. NOT a decided game, so no shaping
-    # accrues (matches the 2021 "no-winner end then reconnect" behaviour).
+    # accrues (the game ends with no winner; the env then reconnects).
     if lost_connection:
         return 0.0, False, True
 

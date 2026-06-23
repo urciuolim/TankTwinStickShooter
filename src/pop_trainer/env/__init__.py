@@ -13,8 +13,8 @@ Modules:
 * :mod:`pop_trainer.env.tank_env` — :class:`TankEnv` (reset/step -> the gymnasium 5-tuple);
   the OBSERVATION is the real rendered pixel frame, the 52-float state is in ``info``.
 * :mod:`pop_trainer.env.rewards` — the PURE budget-based shaped reward
-  (:func:`shaped_step_reward` / :func:`time_penalty_per_step`); no action cost (dropped per
-  the CTO ruling).
+  (:func:`shaped_step_reward` / :func:`time_penalty_per_step`): a per-step time penalty plus
+  the win/loss terminal added on the decided step.
 """
 
 from pop_trainer.env.rewards import shaped_step_reward, time_penalty_per_step

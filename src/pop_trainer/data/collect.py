@@ -1,39 +1,46 @@
-"""The collection driver: drive the game via ``core.protocol.Connection`` and capture samples.
+"""The collection driver: drive the game through ``TankEnv`` and capture samples.
 
-Drives the Unity simulator DIRECTLY over the wire seam (``core.protocol.Connection`` + the
-length-prefixed pixel-frame channel) with DETERMINISTIC policies (:mod:`pop_trainer.data.
-policies`), capturing one time-aligned ``(frame, state, action)`` sample per step into shards.
-It does NOT route through ``env``'s gym wrapper (collection needs the wire driver, not the RL
-reward machinery) and never touches the frozen RL seam beyond the public ``Connection`` API.
+Collection routes through :class:`pop_trainer.env.tank_env.TankEnv` — the SAME gymnasium
+observation pipeline RL trains on — so the pretraining ``(frame, state)`` rows are byte-for-byte
+the observations the policy will later see, with no drift between pretraining inputs and RL
+observations. Each step feeds the deterministic agent policy (:mod:`pop_trainer.data.policies`)
+the current 52-float state, applies its action via ``env.step``, and records the time-aligned
+``(frame, state, action)`` sample into shards.
+
+The env draws the OPPONENT action internally from its seeded ``np_random`` and does not surface
+it through the public gym contract. The recorded trajectory is therefore a deterministic function
+of (agent policy, seed): the agent action is ``p1_policy(state)``; the opponent action stream is
+the env's seeded draw (reproducible from the per-episode seed) and is not observable, so the
+sample's opponent slot is recorded as the zero action.
 
 LAYERING for testability:
 
-* :func:`run_episode` is the PURE step loop. It takes an ALREADY-CONNECTED, ALREADY-HANDSHAKEN
-  ``Connection`` (or any object with ``send`` / ``receive_state_and_frame``), the two policies,
-  and a step cap; it sends actions, reads ``(state, frame)`` pairs, records samples, and stops
-  on ``done`` or the cap. The transport is INJECTED, so this loop is unit-testable against an
-  in-process fake connection with NO live socket. It captures the action APPLIED to produce the
-  NEXT observation alongside the CURRENT observation, matching the inverse-render contract.
-* :func:`collect_to_shards` wraps a sequence of episodes from a handshaken connection into
-  :mod:`pop_trainer.data.shards` shards on disk (pure given a fake connection + a fake
-  handshake callable).
+* :func:`run_episode` is the PURE step loop over an INJECTED ``env`` (anything with
+  ``reset()`` / ``step(action)`` returning the gymnasium tuples). It reads the first
+  ``(obs, info)`` from ``env.reset``, then each step computes the agent action from the current
+  state, calls ``env.step``, and records the CURRENT ``(frame, state)`` paired with the action
+  APPLIED to produce the next frame — stopping on ``terminated or truncated`` or the step cap.
+  The transport lives inside the env, so this loop is unit-testable against a real ``TankEnv``
+  built over an in-process fake connection with NO live socket.
+* :func:`collect_to_shards` wraps a sequence of episodes on one env into
+  :mod:`pop_trainer.data.shards` shards on disk (pure given a fake-backed env).
 * :class:`CollectionSpec` / :func:`run_worker` / :func:`collect_parallel` are the LIVE,
   parallel-safe orchestration (multiprocessing with the SPAWN start method — never fork; this
-  is a YOU MUST in CLAUDE.md). The socket-opening transport factory is INJECTED into the worker
-  spec, so the live path is isolated and NOT unit-tested (the contract says: do not unit-test
-  live collection). The worker target is module-level + takes plain data (picklable for spawn).
+  is a YOU MUST in CLAUDE.md). The env (and its socket) is built INSIDE the worker via an
+  injected ``env_factory``, so the live path is isolated and NOT unit-tested. The worker target
+  is module-level + takes plain data (picklable for spawn).
 
-A "done" inbound state (the dict carries the ``"done"`` key the build sets at round end) ends
-an episode; the final pair for that step is still recorded. ``step_idx`` resets per episode and
-``episode_id`` increases monotonically per worker.
+An episode ends when the env reports ``terminated or truncated`` (its own boundary) or the step
+cap is reached; the final pair for that step is still recorded with the zero action. ``step_idx``
+resets per episode and ``episode_id`` increases monotonically per worker.
 
-stdlib + numpy + :mod:`pop_trainer.core.{protocol,state,config}` + :mod:`pop_trainer.data.
-{policies,schema,shards}` only. No env, no models, no tank_twin.
+stdlib + numpy + :mod:`pop_trainer.core.state` + :mod:`pop_trainer.env.tank_env` (``TankEnv``)
++ :mod:`pop_trainer.data.{policies,schema,shards}`. No models, no pretraining, no rl, no
+tank_twin.
 """
 
 from __future__ import annotations
 
-import contextlib
 import inspect
 import multiprocessing as mp
 from collections.abc import Callable, Sequence
@@ -45,6 +52,7 @@ import numpy as np
 from pop_trainer.core import state as state_schema
 from pop_trainer.data import policies as policy_mod
 from pop_trainer.data import schema, shards
+from pop_trainer.env.tank_env import TankEnv
 
 __all__ = [
     "Sample",
@@ -70,8 +78,8 @@ def _policy_takes_step(policy: PolicyFn) -> bool:
     can be passed POSITIONALLY (``POSITIONAL_ONLY`` / ``POSITIONAL_OR_KEYWORD``) up to a
     ``*args``. A keyword-only ``player`` (as on :func:`aim_at_opponent_policy`) is NOT positional,
     so that policy is correctly classified as 1-arg. ``*args`` callables are treated as 2-arg
-    (they can take the step). This replaces the old TypeError catch-and-retry, so a ``TypeError``
-    raised INSIDE a correctly-arity'd policy body propagates instead of being silently retried.
+    (they can take the step). A ``TypeError`` raised inside a correctly-dispatched policy body
+    propagates as the real bug it is rather than being masked by an arity retry.
 
     Defensive: if a callable is not introspectable (e.g. a builtin), default to 1-arg — the safer
     shape that never passes an unexpected ``step``. The policies here are all introspectable.
@@ -93,12 +101,14 @@ def _policy_takes_step(policy: PolicyFn) -> bool:
 class Sample:
     """One captured step: the time-aligned ``(frame, state, action)`` plus provenance.
 
-    * ``frame`` — ``(H, W, 3)`` uint8 RGB, the observation Unity rendered for ``state``.
-    * ``state`` — the paired 52-float wire state.
-    * ``action`` — ``(2, 5)`` float: the [p1, p2] action APPLIED at this step to advance the
-      sim (the action the inverse-render objective pairs with the resulting next frame). On the
-      LAST recorded step of an episode (the ``done`` step) no further action is applied, so it is
-      the zero action.
+    * ``frame`` — ``(H, W, 3)`` uint8 RGB, the env observation for ``state``.
+    * ``state`` — the paired 52-float wire state (``info["state"]``).
+    * ``action`` — ``(2, 5)`` float: ``[agent, opponent]`` x ``[mx, my, ax, ay, fire]``. The
+      agent (P1) slot is the action APPLIED via ``env.step`` to advance the sim (the action the
+      inverse-render objective pairs with the resulting next frame). The opponent (P2) slot is
+      the zero action: the env draws the opponent internally and does not surface it. On the LAST
+      recorded step of an episode (the boundary step) no further action is applied, so the whole
+      ``(2, 5)`` is the zero action.
     * ``map_id`` / ``episode_id`` / ``step_idx`` — provenance / the split group key.
     """
 
@@ -112,7 +122,7 @@ class Sample:
 
 @dataclass
 class EpisodeResult:
-    """The samples captured in one episode, plus whether it ended on a build ``done``."""
+    """The samples captured in one episode, plus whether it ended on the env's boundary."""
 
     samples: list[Sample] = field(default_factory=list)
     ended_done: bool = False
@@ -125,68 +135,73 @@ def _apply_policy(policy: PolicyFn, state_vec, step: int, *, takes_step: bool) -
     """Call ``policy`` with the call shape its (precomputed) arity dictates, validate the action.
 
     ``takes_step`` is the arity decided ONCE per policy by :func:`_policy_takes_step` (see
-    :func:`run_episode`, which computes it per policy before the step loop). A 2-arg policy is
-    called ``policy(state, step)``; a 1-arg policy ``policy(state)``. No catch-and-retry: a
-    ``TypeError`` raised inside a correctly-dispatched policy body propagates as the real bug it
-    is, rather than being masked by a 1-arg retry.
+    :func:`run_episode`, which computes it before the step loop). A 2-arg policy is called
+    ``policy(state, step)``; a 1-arg policy ``policy(state)``. A ``TypeError`` raised inside a
+    correctly-dispatched policy body propagates as the real bug it is.
     """
     action = policy(state_vec, step) if takes_step else policy(state_vec)
     return policy_mod.validate_action(action)
 
 
+def _zero_action() -> np.ndarray:
+    """The ``(2, 5)`` zero action recorded on a boundary step (no action applied after it)."""
+    return np.zeros((schema.NUM_PLAYERS, schema.ACTION_LEN), dtype=np.float32)
+
+
 def run_episode(
-    conn,
+    env: TankEnv,
     *,
-    first_state: dict,
-    first_frame: np.ndarray,
     p1_policy: PolicyFn,
-    p2_policy: PolicyFn,
     map_id: int,
     episode_id: int,
     max_steps: int,
+    seed: int | None = None,
 ) -> EpisodeResult:
-    """PURE step loop: drive ONE handshaken connection and capture time-aligned samples.
+    """PURE step loop: drive ONE ``TankEnv`` for an episode and capture time-aligned samples.
 
-    Given the episode's FIRST ``(state, frame)`` (already read by the handshake) plus the two
-    deterministic policies and a step cap, this:
+    Calls ``env.reset(seed=seed)`` to start a fresh round (the seed makes the env's opponent draw
+    reproducible, so the trajectory is a deterministic function of ``p1_policy`` + ``seed``), then
+    each step:
 
     1. records the CURRENT ``(frame, state)``,
-    2. if the state is ``done`` (or the cap is reached), stops — recording the zero action for
-       that final step (no action is applied after ``done``),
-    3. otherwise computes ``a1`` / ``a2`` from the policies, records THAT action with the current
-       sample (the action that produces the next frame), sends ``{1: a1, 2: a2}``, reads the next
-       ``(state, frame)`` via ``conn.receive_state_and_frame()``, and loops.
+    2. if the env has reported its boundary (``terminated or truncated``) or the cap is reached,
+       stops — recording the zero action for that final step (no action is applied after it),
+    3. otherwise computes the agent action ``a1`` from ``p1_policy`` on the current state, records
+       it (P1 slot; the opponent slot is zero) with the current sample, calls
+       ``env.step(a1)``, takes the next ``(frame, state)`` from the returned obs / ``info``, and
+       loops.
 
-    The transport is whatever ``conn`` wraps, so this is unit-testable against an in-process fake
-    connection. Returns an :class:`EpisodeResult`.
+    The transport lives inside ``env``, so this is unit-testable against a real ``TankEnv`` built
+    over an in-process fake connection. Returns an :class:`EpisodeResult`.
     """
     result = EpisodeResult()
-    state_dict = first_state
-    frame = first_frame
+    obs, info = env.reset(seed=seed)
+    frame = obs
+    vec = info["state"]
     step_idx = 0
-    # Decide each policy's arity ONCE, here, by introspecting the actual callable wired in for
-    # THIS episode — so the cache cannot leak across episodes/policies (a different policy object
-    # gets a fresh classification). The two flags are then reused for every step.
+    done = False
+    # Decide the policy's arity ONCE, here, by introspecting the actual callable wired in for
+    # THIS episode — so the classification cannot leak across episodes/policies. The flag is then
+    # reused for every step.
     p1_takes_step = _policy_takes_step(p1_policy)
-    p2_takes_step = _policy_takes_step(p2_policy)
     while True:
-        vec = state_dict["state"]
-        done = "done" in state_dict
         at_cap = step_idx >= max_steps - 1
         if done or at_cap:
             # Final recorded step: no further action is applied; record the zero action.
-            action = np.zeros((schema.NUM_PLAYERS, schema.ACTION_LEN), dtype=np.float32)
-            result.samples.append(_make_sample(frame, vec, action, map_id, episode_id, step_idx))
+            result.samples.append(
+                _make_sample(frame, vec, _zero_action(), map_id, episode_id, step_idx)
+            )
             result.ended_done = done
             return result
 
         a1 = _apply_policy(p1_policy, vec, step_idx, takes_step=p1_takes_step)
-        a2 = _apply_policy(p2_policy, vec, step_idx, takes_step=p2_takes_step)
-        action = np.array([a1, a2], dtype=np.float32)
+        action = np.array([a1, [0.0] * schema.ACTION_LEN], dtype=np.float32)
         result.samples.append(_make_sample(frame, vec, action, map_id, episode_id, step_idx))
 
-        conn.send({1: a1, 2: a2})
-        state_dict, frame = conn.receive_state_and_frame()
+        obs, _reward, terminated, truncated, info = env.step(a1)
+        frame = obs
+        vec = info["state"]
+        done = bool(terminated or truncated)
         step_idx += 1
 
 
@@ -227,30 +242,26 @@ def samples_to_shard(samples: Sequence[Sample], *, with_actions: bool = True) ->
     )
 
 
-# A handshake callable opens/prepares an episode on a given map and returns its first
-# (state_dict, frame). The LIVE implementation is supplied by the worker; tests pass a fake.
-HandshakeFn = Callable[[object, int], tuple[dict, np.ndarray]]
-
-
 def collect_to_shards(
-    conn,
+    env: TankEnv,
     *,
     out_dir: str | Path,
-    handshake: HandshakeFn,
     map_ids: Sequence[int],
     p1_policy: PolicyFn,
-    p2_policy: PolicyFn,
     max_steps: int,
+    seed: int | None = None,
     shard_prefix: str = "shard_w0",
     shard_size: int = 10_000,
     with_actions: bool = True,
 ) -> list[Path]:
-    """Run one episode per entry of ``map_ids`` on ``conn`` and write shards to ``out_dir``.
+    """Run one episode per entry of ``map_ids`` on ``env`` and write shards to ``out_dir``.
 
-    ``handshake(conn, map_id)`` prepares the episode (switch arena, restart, start, read first
-    state+frame); :func:`run_episode` then drives it. Samples accumulate and flush to a shard
-    every ``shard_size``, plus a final flush. Returns the list of written shard paths. Pure given
-    a fake ``conn`` + fake ``handshake`` (the live socket path lives in :func:`run_worker`).
+    Each episode calls ``env.reset`` (via :func:`run_episode`) to start a fresh round; ``map_ids``
+    tags each episode's samples with its map. The per-episode seed is ``seed + episode_id`` (when
+    a base ``seed`` is given) so each episode's opponent stream is distinct yet reproducible.
+    Samples accumulate and flush to a shard every ``shard_size``, plus a final flush. Returns the
+    list of written shard paths. Pure given a fake-backed ``env`` (the live socket path lives in
+    :func:`run_worker`).
     """
     out_dir = Path(out_dir)
     buffer: list[Sample] = []
@@ -268,16 +279,14 @@ def collect_to_shards(
         buffer = []
 
     for episode_id, map_id in enumerate(map_ids):
-        first_state, first_frame = handshake(conn, map_id)
+        episode_seed = None if seed is None else seed + episode_id
         ep = run_episode(
-            conn,
-            first_state=first_state,
-            first_frame=first_frame,
+            env,
             p1_policy=p1_policy,
-            p2_policy=p2_policy,
             map_id=map_id,
             episode_id=episode_id,
             max_steps=max_steps,
+            seed=episode_seed,
         )
         buffer.extend(ep.samples)
         while len(buffer) >= shard_size:
@@ -297,63 +306,59 @@ def collect_to_shards(
 class CollectionSpec:
     """Plain, picklable data one worker needs to collect (spawn-safe: no live handles).
 
-    Holds ONLY plain data + import-able factory names. The transport (socket) and the live
-    handshake are constructed INSIDE the worker via ``transport_factory`` / ``handshake_factory``
-    (picklable callables, e.g. module-level functions), so NO socket or ``Connection`` crosses
-    the spawn boundary. Policies are likewise built inside the worker from ``policy_factory``.
+    Holds ONLY plain data + import-able factory names. The env (and its socket) is constructed
+    INSIDE the worker via ``env_factory`` (a picklable callable, e.g. a module-level function),
+    so NO socket / env / ``Connection`` crosses the spawn boundary. The policy is likewise built
+    inside the worker from ``policy_factory``.
     """
 
     worker_id: int
     out_dir: str
     map_ids: list[int]
     max_steps: int
+    seed: int | None = None
     shard_size: int = 10_000
     with_actions: bool = True
     # Picklable factories, called INSIDE the worker process:
-    #   transport_factory(spec) -> a Connection (socket opened in-worker).
-    #   handshake_factory(spec) -> HandshakeFn.
-    #   policy_factory(spec) -> (p1_policy, p2_policy).
-    transport_factory: Callable[[CollectionSpec], object] | None = None
-    handshake_factory: Callable[[CollectionSpec], HandshakeFn] | None = None
-    policy_factory: Callable[[CollectionSpec], tuple[PolicyFn, PolicyFn]] | None = None
+    #   env_factory(spec) -> a TankEnv (socket opened in-worker).
+    #   policy_factory(spec) -> the agent (P1) policy.
+    env_factory: Callable[[CollectionSpec], object] | None = None
+    policy_factory: Callable[[CollectionSpec], PolicyFn] | None = None
     extra: dict = field(default_factory=dict)
 
 
 def run_worker(spec: CollectionSpec) -> dict:
-    """Module-level worker entry point (picklable for spawn). Opens the socket IN-WORKER.
+    """Module-level worker entry point (picklable for spawn). Builds the env IN-WORKER.
 
-    Builds the Connection via ``spec.transport_factory`` (socket opened HERE, never inherited),
-    the handshake via ``spec.handshake_factory``, and the policies via ``spec.policy_factory``,
-    then delegates to :func:`collect_to_shards`. Returns a small result dict (worker id, sample
-    count, shard file names). Live path — exercised by the orchestrator, not the unit tests.
+    Builds the ``TankEnv`` via ``spec.env_factory`` (its socket opened HERE, never inherited) and
+    the agent policy via ``spec.policy_factory``, then delegates to :func:`collect_to_shards`.
+    Closes the env in a ``finally`` so the worker that opened the socket also releases it. Returns
+    a small result dict (worker id, shard file names, count). Live path — exercised by the
+    orchestrator, not the unit tests.
     """
-    if spec.transport_factory is None or spec.handshake_factory is None:
-        raise ValueError("run_worker needs transport_factory and handshake_factory")
+    if spec.env_factory is None:
+        raise ValueError("run_worker needs an env_factory")
     if spec.policy_factory is None:
         raise ValueError("run_worker needs a policy_factory")
-    conn = spec.transport_factory(spec)
-    handshake = spec.handshake_factory(spec)
-    p1_policy, p2_policy = spec.policy_factory(spec)
+    env = spec.env_factory(spec)
+    p1_policy = spec.policy_factory(spec)
     try:
         written = collect_to_shards(
-            conn,
+            env,
             out_dir=spec.out_dir,
-            handshake=handshake,
             map_ids=spec.map_ids,
             p1_policy=p1_policy,
-            p2_policy=p2_policy,
             max_steps=spec.max_steps,
+            seed=spec.seed,
             shard_prefix=f"shard_w{spec.worker_id}",
             shard_size=spec.shard_size,
             with_actions=spec.with_actions,
         )
     finally:
-        # Best-effort socket close: the worker opened it, so the worker closes it.
-        transport = getattr(conn, "transport", None)
-        close = getattr(transport, "close", None)
+        # The worker built the env, so the worker closes it (releases the socket).
+        close = getattr(env, "close", None)
         if callable(close):
-            with contextlib.suppress(OSError):
-                close()
+            close()
     return {
         "worker_id": spec.worker_id,
         "shards": [p.name for p in written],
@@ -366,9 +371,9 @@ def collect_parallel(specs: Sequence[CollectionSpec]) -> list[dict]:
 
     Uses ``multiprocessing.get_context("spawn")`` explicitly so behavior is identical on Windows
     and POSIX and no parent file descriptors / sockets are inherited. A single spec runs
-    in-process (simpler, still spawn-safe). Each ``CollectionSpec`` opens its own socket inside
-    its worker; nothing live crosses the process boundary. Returns the per-worker result dicts,
-    sorted by worker id.
+    in-process (simpler, still spawn-safe). Each ``CollectionSpec`` builds its own env (and socket)
+    inside its worker; nothing live crosses the process boundary. Returns the per-worker result
+    dicts, sorted by worker id.
     """
     specs = list(specs)
     if not specs:
