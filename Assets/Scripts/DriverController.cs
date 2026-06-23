@@ -56,6 +56,11 @@ public class DriverController : MonoBehaviour
     // resolve a relative arena path against the config directory (mirrors Awake's arena load).
     private string resolvedConfigPath;
 
+    // The identity of the currently-loaded map, carried in the one-time wall message (Unity ->
+    // Python; see WallMessage.cs). Set in Awake from config["arena_path"] (initial load) and
+    // updated in the switch_arena branch to the new arena path. Empty string when no arena is set.
+    private string currentMapId = "";
+
     private void Awake()
     {
         //JobsUtility.JobWorkerCount = 2;
@@ -125,6 +130,9 @@ public class DriverController : MonoBehaviour
                 StreamReader arenaFile = File.OpenText(arenaPath);
                 JsonTextReader arenaReader = new JsonTextReader(arenaFile);
                 arena = (JObject)JToken.ReadFrom(arenaReader);
+                // Map id for the one-time wall message = the configured arena_path (verbatim, not
+                // the resolved absolute path) so Python sees the same identity it requested.
+                currentMapId = config["arena_path"].Value<string>();
             }
             
             if (verbose)
@@ -287,6 +295,10 @@ public class DriverController : MonoBehaviour
                 JObject confirmation = JObject.Parse("{starting:true}");
                 byte[] writeBuffer = Encoding.ASCII.GetBytes(confirmation.ToString());
                 nwStream.Write(writeBuffer, 0, writeBuffer.Length);
+                // One-time wall-layout message, AFTER the {starting:true} confirmation, as its
+                // OWN discrete write (see SendWallMessage / WallMessage.cs). Ordering is PINNED:
+                // confirmation first, walls second. Skipped gracefully if no arena is configured.
+                SendWallMessage();
                 ingame = true;
             } else if (message["end"] != null && message["end"].Value<bool>())
             {
@@ -316,12 +328,39 @@ public class DriverController : MonoBehaviour
                 {
                     instance.arena = (JObject)JToken.ReadFrom(arenaReader);
                 }
+                // Map id = the requested switch_arena path (verbatim), mirroring Awake's choice.
+                currentMapId = switchArenaPath;
                 JObject confirmation = JObject.Parse("{arena_switched:true}");
                 byte[] writeBuffer = Encoding.ASCII.GetBytes(confirmation.ToString());
                 nwStream.Write(writeBuffer, 0, writeBuffer.Length);
+                // One-time wall-layout message, AFTER the {arena_switched:true} confirmation, as
+                // its OWN discrete write. Ordering is PINNED: confirmation first, walls second.
+                SendWallMessage();
                 Debug.Log("Arena switched to: " + resolvedArenaPath);
             }
         }
+    }
+
+    // Emits the one-time map wall-layout message (Unity -> Python) as its OWN discrete socket
+    // write. Called from the start (initial load) and switch_arena (map change) handshake branches,
+    // AFTER their respective confirmation writes (ordering PINNED in WallMessage.cs's wire contract).
+    // GUARD: if no arena is configured (instance.arena null) or it carries no "Walls" block, nothing
+    // is written -- the handshake confirmation already went out, so Python simply receives no walls
+    // message for that map. This is NEVER on the per-step RL path (state/frame/action), so that wire
+    // stays byte-for-byte unchanged.
+    private void SendWallMessage()
+    {
+        if (instance.arena == null)
+            return;
+        JToken walls = instance.arena["Walls"];
+        if (walls == null)
+            return;
+
+        JObject wallMessage = WallMessage.Build(walls, currentMapId);
+        byte[] writeBuffer = Encoding.ASCII.GetBytes(wallMessage.ToString());
+        nwStream.Write(writeBuffer, 0, writeBuffer.Length);
+        if (verbose)
+            Debug.Log("Wall message sent for map: " + currentMapId);
     }
 
     private void SendAndReceiveData()

@@ -95,3 +95,7 @@ __pycache__/
 /gamelog*.txt
 /scripts/*.out
 .claude/worktrees/
+
+# Unity headless test outputs
+/editmode-results.xml
+/editmode-run.log
