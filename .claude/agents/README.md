@@ -12,8 +12,8 @@
 | Team | Manager | Members | Status |
 |---|---|---|---|
 | **Research** | `research-manager` | `research-docs`, `research-source`, `research-empirical` | **staffed** |
-| **Engineering** | eng-manager | common `builder` (skill-scoped; specialty builders on demand) | deferred |
-| **Infra / platform** | infra-manager | `code-reviewer`, `evaluation`, `repo-steward`, `documentation`; `ci-cd`, `cloud` | deferred |
+| **Engineering** | `eng-manager` | `builder` (Python) + `unity-builder` (C#/Unity, `Assets/`); specialty builders on demand | **staffed** |
+| **Infra / platform** | `infra-manager` | `code-reviewer`, `evaluation`, `repo-steward` staffed; `documentation`, `ci-cd`, `cloud` deferred | **staffed** |
 
 ### Rules that distinguish the teams
 - **Researchers** run code only as *throwaway spikes* (empirical lane); they return findings, not edits.
