@@ -9,7 +9,7 @@ Modules:
 
 * :mod:`pop_trainer.core.state` — the 52-float game-state schema (single source of truth):
   layout constants, pure accessors, bullet iteration, and the perspective transforms
-  (``flip_state`` / ``split_state_for_opponent``).
+  (``flip_frame_perspective`` / ``split_state_for_opponent``).
 * :mod:`pop_trainer.core.protocol` — the strict TCP-JSON wire client over an injected
   transport: ``encode`` / ``decode``, frame-aware ``Connection``, and the additive
   length-prefixed REAL pixel-frame channel (the actual observation input path).

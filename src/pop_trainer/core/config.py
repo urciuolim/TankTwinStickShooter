@@ -39,15 +39,11 @@ class RewardConfig:
 
     * ``win_reward`` / ``loss_reward``: the +/-1 terminal added on the decided step.
     * ``time_total``: total time penalty over a full episode (accrues every step).
-    * ``action_total``: total action-cost budget at constant max action over an episode.
-    * ``action_norm``: the L1 normalizer (a saturated action has ``L1/action_norm == 1``).
     """
 
     win_reward: float = 1.0
     loss_reward: float = -1.0
     time_total: float = -1.0
-    action_total: float = -0.1
-    action_norm: float = 5.0
 
     def to_dict(self) -> dict:
         """Plain-dict view; float-cast for JSON stability."""

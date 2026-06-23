@@ -12,8 +12,6 @@ def test_reward_defaults():
     assert r.win_reward == 1.0
     assert r.loss_reward == -1.0
     assert r.time_total == -1.0
-    assert r.action_total == -0.1
-    assert r.action_norm == 5.0
 
 
 def test_reward_round_trip_dict():
@@ -37,9 +35,10 @@ def test_reward_from_json_strict_rejects_trailing_comma():
         RewardConfig.from_json('{"win_reward": 1.0,}')
 
 
-def test_reward_from_json_rejects_non_object():
+@pytest.mark.parametrize("cls", [RewardConfig, EnvConfig, RunConfig])
+def test_from_json_rejects_non_object(cls):
     with pytest.raises(TypeError):
-        RewardConfig.from_json("[1, 2, 3]")
+        cls.from_json("[1, 2, 3]")
 
 
 def test_env_defaults():
@@ -63,12 +62,12 @@ def test_run_config_nested_round_trip():
         run_name="exp42",
         seed=7,
         env=EnvConfig(env_p=4),
-        reward=RewardConfig(action_total=-0.2),
+        reward=RewardConfig(time_total=-0.2),
     )
     d = run.to_dict()
     # Nested configs are expanded to dicts in the dict form.
     assert d["env"]["env_p"] == 4
-    assert d["reward"]["action_total"] == -0.2
+    assert d["reward"]["time_total"] == -0.2
     rebuilt = RunConfig.from_dict(d)
     assert rebuilt == run
     assert isinstance(rebuilt.env, EnvConfig)

@@ -24,8 +24,9 @@ that is well off-board and negative, consumers test ``pos_x >= 0`` (or
 
 The accessors are pure and accept ANY indexable sequence (a Python list or a numpy
 array) — numpy is NOT required to read the schema. The perspective transforms
-(:func:`flip_state`, :func:`split_state_for_opponent`) ARE numpy operations and are part
-of the state contract (the RL self-play seam). stdlib + numpy only; nothing internal.
+(:func:`flip_frame_perspective`, :func:`split_state_for_opponent`) ARE numpy operations
+and are part of the state contract (the RL self-play seam). stdlib + numpy only; nothing
+internal.
 """
 
 from __future__ import annotations
@@ -156,14 +157,15 @@ def iter_bullets(state, player: int, *, include_absent: bool = False):
 # --- perspective transforms (part of the RL self-play state contract) ------------------
 
 
-def flip_state(state):
+def flip_frame_perspective(state):
     """Swap the R (self) and B (opponent) channels of a rendered RGB frame; keep G.
 
     A self-play perspective op on the REAL rendered pixel frame from Unity (an
     ``(H, W, 3)`` array, e.g. from :meth:`pop_trainer.core.protocol.Connection.receive_frame`):
     returns a new array of the same shape and dtype with the red/blue channels exchanged so
-    the opponent's view puts "self" back in R. ``flip_state`` is an involution on the R/B
-    channels — ``flip_state(flip_state(s))`` restores the original.
+    the opponent's view puts "self" back in R. ``flip_frame_perspective`` is an involution on
+    the R/B channels — ``flip_frame_perspective(flip_frame_perspective(s))`` restores the
+    original.
     """
     r, g, b = (0, 1, 2)
     new_state = np.zeros(state.shape, dtype=state.dtype)

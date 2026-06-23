@@ -95,16 +95,16 @@ def test_player_arg_validated():
         S.bullet_field_indices(5)
 
 
-def test_flip_state_is_involution_and_swaps_rb():
+def test_flip_frame_perspective_is_involution_and_swaps_rb():
     rng = np.random.default_rng(0)
     img = rng.integers(0, 256, size=(4, 5, 3), dtype=np.uint8)
-    flipped = S.flip_state(img)
+    flipped = S.flip_frame_perspective(img)
     # R<->B swapped, G unchanged.
     assert np.array_equal(flipped[:, :, 0], img[:, :, 2])
     assert np.array_equal(flipped[:, :, 2], img[:, :, 0])
     assert np.array_equal(flipped[:, :, 1], img[:, :, 1])
     # Involution.
-    assert np.array_equal(S.flip_state(flipped), img)
+    assert np.array_equal(S.flip_frame_perspective(flipped), img)
     # dtype preserved.
     assert flipped.dtype == img.dtype
 
