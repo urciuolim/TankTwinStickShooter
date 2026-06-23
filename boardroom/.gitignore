@@ -1,6 +1,0 @@
-decisions.json
-__pycache__/
-.venv/
-# Generated training-metrics dashboard (tank_twin.plot_metrics --boardroom);
-# a runtime artifact like runs/, served at /metrics.png — not source.
-metrics.png

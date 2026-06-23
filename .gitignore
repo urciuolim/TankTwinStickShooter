@@ -89,3 +89,9 @@ mono_crash.*
 .python-version
 __pycache__/
 *.py[cod]
+# generated artifacts (cleanup)
+.coverage
+*.log
+/gamelog*.txt
+/scripts/*.out
+.claude/worktrees/
