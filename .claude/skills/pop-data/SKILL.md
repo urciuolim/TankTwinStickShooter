@@ -5,15 +5,15 @@ description: Contract + boundaries for the data/ component of src/pop_trainer. L
 
 # Component: `data/` — the datasets pipeline
 
-**Responsibility:** collection + sharding of `(frame, state[, action, next])` pairs/tuples for pretraining, plus dataset readers/index. Drives the game **directly via `core.protocol`** (the `Connection` + frame channel) with deterministic policies; produces dataset artifacts on disk. It does NOT go through `env`'s gym wrapper — collection needs the wire driver, not the RL reward machinery.
+**Responsibility:** collection + sharding of `(frame, state[, action, next])` pairs/tuples for pretraining, plus dataset readers/index. Collection drives the game **through the `env` gym wrapper** (`TankEnv.reset` / `step`, with deterministic policies; capture the obs + `info["state"]` it yields) — so the data captured for pretraining is the EXACT same observation pipeline RL trains on, with no drift between pretraining inputs and RL observations. Produces dataset artifacts on disk.
 
 **Contains:**
-- the collection driver (uses `core.protocol.Connection`; parallel-safe; **spawn not fork**; buffer-aware reads).
+- the collection driver (drives `TankEnv` with deterministic policies; parallel-safe — **spawn not fork**; one env per worker).
 - shard format read/write (npz) — the on-disk dataset artifact.
 - dataset readers / index (map-aware splits, group keys) — describe and organize the shards.
 
-**NOT here (per CTO):** no pre-resize / memmap **cache creation**. Training **streams** from the dataset at train time instead. The streaming loader (decode + batch shards on demand) is **deferred to `pretraining/`**, built when the training loop needs it — `data/` only produces and describes the dataset.
+**NOT here:** no pre-resize / memmap **cache creation**. Training **streams** from the dataset at train time; the streaming loader (decode + batch shards on demand) is **deferred to `pretraining/`**. `data/` only produces and describes the dataset.
 
-**Boundaries:** imports `core` only (the protocol `Connection`, the state schema, `EnvConfig`) — never Unity specifics. Imports nothing from `env / models / pretraining / rl` (it drives the wire directly; it does not depend on the gym wrapper). Communicates downstream ONLY via dataset artifacts on disk. The package is named `data/` — **NOT `datasets/`** (collides with the git-ignored data dir).
+**Boundaries:** imports `core` and `env` (the gym wrapper). Imports nothing from `models / pretraining / rl`. Dependency direction: `core ← env ← data`. Communicates downstream ONLY via dataset artifacts on disk. The package is named `data/` — **NOT `datasets/`** (collides with the git-ignored data dir).
 
-**Inspiration (do NOT copy):** `src/tank_twin/collect_pixels.py`. (The old `prepare_pixel_cache.py` cache builder is explicitly NOT carried over.)
+**Inspiration (do NOT copy):** `src/tank_twin/collect_pixels.py`.

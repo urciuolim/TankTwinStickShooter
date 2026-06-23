@@ -21,9 +21,10 @@ The platform team is the cross-team adversarial gate on engineering. It emits VE
 - No hallucinated / nonexistent API or package (imports + symbols actually exist).
 - No new/changed behavior without a test.
 - No scope creep beyond the assigned component.
+- No legacy/historical narration in comments — comments describe only the CURRENT code (not what was removed or how it used to be). We build fresh.
 
 **It's structurally sound** (`repo-steward`)
-- No dependency-boundary violation (`core ← {models, env, data} ← {pretraining, rl}`; `core` imports nothing internal).
+- No dependency-boundary violation — each component imports only what its component skill permits (e.g. `data → env → core`: collection routes through the gym env); `core` is the dependency-free root.
 - No import cycle.
 - No duplication of existing logic; no superseded code left beside its replacement (add-X-delete-Y honored).
 - Right package placement.
