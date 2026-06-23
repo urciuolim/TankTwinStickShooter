@@ -43,6 +43,13 @@ dependencies = [
     # and the dataset class, both behind the optional --frames-backend lmdb_png. cp312 wheels
     # ship for win_amd64 + manylinux x86_64 (this box + the GCP Linux cluster).
     "lmdb>=2.2,<3",
+    # onnx: REQUIRED by torch 2.9's legacy torch.onnx.export to serialize the model proto
+    # (we use dynamo=False, so onnx alone is needed — NOT onnxscript/onnxruntime). It is the
+    # ONNX project's reference PyPI package that torch.onnx.export itself imports. NOT in the
+    # pure-logic import path: imported only by pop_trainer.models.export_onnx and the export
+    # test's op-scan. cp312 wheels ship for win_amd64 + manylinux x86_64 (this box + the GCP
+    # Linux cluster). Upper-bounded to the resolved minor line (repo "pin it" etiquette).
+    "onnx>=1.22,<1.23",
     "tqdm>=4.68.3",
 ]
 
