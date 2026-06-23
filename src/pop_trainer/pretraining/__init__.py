@@ -1,1 +1,1 @@
-"""pretraining/ — see the pop-pretraining skill for the contract. (to be implemented by the engineering team)"""
+"""pretraining/ — see the pop-pretraining skill (contract); to be built."""

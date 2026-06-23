@@ -1,0 +1,360 @@
+"""TCP-JSON wire protocol: strict (de)serialization over an injected transport.
+
+This is the Python side of the Unity wire seam. The Unity simulator parses these exact
+bytes, so the wire format is preserved EXACTLY:
+
+* control / handshake messages: ``{"restart": True}``, ``{"start": True}``,
+  ``{"end": True}``. The start-ack Unity sends back contains the substring ``"starting"``.
+* a step message: ``{1: action_list, 2: opp_action_list}`` — note the INTEGER keys.
+  ``json.dumps`` coerces them to the strings ``"1"`` / ``"2"`` on the wire; Unity reads
+  ``"1"`` / ``"2"``.
+* an inbound state message: ``{"state": [...52 floats...]}`` plus optional ``"winner"``
+  (an int; ``PLAYER_1`` == 0 won, ``-1`` == draw) and ``"done"`` keys.
+
+Design notes:
+
+* The transport is INJECTED, not constructed here. :class:`Connection` wraps any object
+  exposing ``sendall(bytes)`` / ``recv(int)`` — a real ``socket.socket`` in production, an
+  in-process fake in tests. :func:`encode` / :func:`decode` are PURE (no socket) so the
+  serialization is testable with no I/O.
+* JSON is STRICT in both directions. Python's ``json`` rejects trailing commas /
+  leading-dot floats; we add NO tolerant fallback (Unity's Newtonsoft tolerates such JSON;
+  this side must not).
+* Reads are FRAME-AWARE, not ``recv(1024)``-as-the-contract: :meth:`Connection.receive`
+  reads EXACTLY one complete top-level JSON object via a string/escape-aware brace-depth
+  scan and RETAINS any trailing bytes in an internal buffer for the next read (TCP can
+  coalesce back-to-back writes into one ``recv``). It never feeds extra bytes into
+  ``json.loads``.
+* A ``socket.timeout`` (an alias of the builtin ``TimeoutError`` since Python 3.10) on
+  send or recv is re-raised as ``ConnectionError``; a ``recv`` returning ``b""`` mid-read
+  also raises ``ConnectionError`` (the env's reconnect path keys off ``ConnectionError``).
+* Inbound reads are SIZE-GUARDED against a runaway / desynced peer: a single JSON object
+  that never closes is capped at ``Connection.max_object_bytes`` (raising
+  ``ConnectionError`` as bytes accumulate), and an over-cap advertised pixel-frame
+  ``payload_len`` is rejected with ``ValueError`` BEFORE any payload allocation
+  (``Connection.max_frame_bytes``). Both caps are constructor parameters with generous
+  defaults (:data:`DEFAULT_MAX_OBJECT_BYTES` / :data:`DEFAULT_MAX_FRAME_BYTES`).
+
+PIXEL FRAME CHANNEL (additive). When the build runs with pixel observations, Unity writes
+one length-prefixed binary RGB frame on the SAME socket IMMEDIATELY AFTER each state JSON.
+:func:`parse_frame_header` decodes the 10-byte prefix and :meth:`Connection.receive_frame`
+reads + reshapes the payload into a ``(H, W, 3)`` uint8 array (vertically flipped to a
+top-left origin). numpy is used ONLY on this frame path; the JSON path stays numpy-free in
+behavior.
+"""
+
+from __future__ import annotations
+
+import json
+
+import numpy as np
+
+from pop_trainer.core.state import STATE_LEN
+
+# Default recv chunk size. Reads are frame-aware (the scan below), so this is just the
+# per-``recv`` cap, not a framing assumption.
+RECV_BUFSIZE = 1024
+
+# --- inbound size guards (defense against a runaway / desynced peer flooding memory) -----
+# Upper bound on a SINGLE top-level JSON object. A real state message is ~52 floats (well
+# under a few KB); this is deliberately generous headroom so legitimate traffic is never
+# clipped, while a peer that never closes a brace cannot grow the read buffer without bound.
+# Enforced as bytes accumulate (not only after a complete object). Tunable per-Connection.
+DEFAULT_MAX_OBJECT_BYTES = 4 * 1024 * 1024  # 4 MiB
+
+# Upper bound on a pixel-frame payload (the RGB bytes only). A 1024x1024x3 RGB frame is
+# ~3 MiB; this leaves headroom above that while rejecting an absurd advertised length
+# BEFORE any allocation/read of the payload. Tunable per-Connection.
+DEFAULT_MAX_FRAME_BYTES = 8 * 1024 * 1024  # 8 MiB
+
+# --- pixel frame wire contract (additive; big-endian, matches the Unity frame writer) ---
+FRAME_TAG = 0x46  # ASCII 'F' — magic/type byte at offset 0 of every frame message
+FRAME_CHANNELS = 3  # RGB24; the C byte at offset 9 must equal this
+FRAME_HEADER_LEN = 10  # 1 (tag) + 4 (uint32 payload len) + 2 (W) + 2 (H) + 1 (C)
+
+# Brace-scan byte constants (kept readable; the scan operates on raw bytes).
+_QUOTE = 0x22  # "
+_BACKSLASH = 0x5C  # \
+_OPEN_BRACE = 0x7B  # {
+_CLOSE_BRACE = 0x7D  # }
+
+__all__ = [
+    "RECV_BUFSIZE",
+    "DEFAULT_MAX_OBJECT_BYTES",
+    "DEFAULT_MAX_FRAME_BYTES",
+    "FRAME_TAG",
+    "FRAME_CHANNELS",
+    "FRAME_HEADER_LEN",
+    "encode",
+    "decode",
+    "parse_frame_header",
+    "Connection",
+    "state_message_is_valid",
+]
+
+
+def encode(message) -> bytes:
+    """Serialize a message dict to UTF-8 wire bytes (STRICT JSON). Pure: no socket.
+
+    Integer keys ``{1: ..., 2: ...}`` become the strings ``"1"`` / ``"2"`` on the wire,
+    exactly as the step protocol relies on (``json.dumps`` does this coercion).
+    """
+    return json.dumps(message).encode("utf-8")
+
+
+def decode(data) -> dict:
+    """Parse UTF-8 wire bytes (or a str) into a dict with STRICT JSON. Pure: no socket.
+
+    Strict ``json.loads`` — a trailing comma / leading-dot float RAISES
+    ``json.JSONDecodeError`` rather than being tolerated.
+    """
+    if isinstance(data, bytes | bytearray):
+        data = bytes(data).decode("utf-8")
+    return json.loads(data)
+
+
+def parse_frame_header(prefix):
+    """Parse the 10-byte pixel-frame header -> ``(w, h, c, payload_len)``. Pure (no socket).
+
+    Layout (all multi-byte ints BIG-ENDIAN):
+
+    * offset 0, 1 byte:  magic tag, must equal :data:`FRAME_TAG` (0x46, ASCII 'F').
+    * offset 1, 4 bytes: uint32 payload length = ``W*H*3`` (the RGB bytes ONLY; excludes
+      the tag, this length field, and the W/H/C header).
+    * offset 5, 2 bytes: uint16 width W.
+    * offset 7, 2 bytes: uint16 height H.
+    * offset 9, 1 byte:  uint8 channels C.
+
+    Raises ``ValueError`` if ``prefix`` is not exactly :data:`FRAME_HEADER_LEN` (10) bytes
+    or if the magic tag is not 0x46 (an early, clear failure on a desynced / wrong-channel
+    read). Does NOT assert C == 3 here — :meth:`Connection.receive_frame` does that once it
+    knows the shape. Returns plain Python ints.
+    """
+    if len(prefix) != FRAME_HEADER_LEN:
+        raise ValueError(
+            f"frame header must be exactly {FRAME_HEADER_LEN} bytes, got {len(prefix)}"
+        )
+    tag = prefix[0]
+    if tag != FRAME_TAG:
+        raise ValueError(f"bad frame magic tag: expected {FRAME_TAG:#04x} ('F'), got {tag:#04x}")
+    payload_len = int.from_bytes(prefix[1:5], "big")
+    w = int.from_bytes(prefix[5:7], "big")
+    h = int.from_bytes(prefix[7:9], "big")
+    c = prefix[9]
+    return w, h, c, payload_len
+
+
+class Connection:
+    """Strict-JSON send/receive over an injected socket-like transport.
+
+    ``transport`` must expose ``sendall(bytes)`` and ``recv(int)`` — a real
+    ``socket.socket`` in production, or any in-process fake in tests. ``send`` / ``receive``
+    translate a ``socket.timeout`` (builtin ``TimeoutError``) to ``ConnectionError``.
+
+    Two upper-bound guards protect against a runaway / desynced peer flooding memory:
+
+    * ``max_object_bytes`` — cap on ONE top-level JSON object. Enforced as bytes accumulate
+      in :meth:`receive`; exceeding it raises ``ConnectionError`` (the env's reconnect path
+      keys off ``ConnectionError``). Default :data:`DEFAULT_MAX_OBJECT_BYTES`.
+    * ``max_frame_bytes`` — cap on a pixel-frame payload. Checked in :meth:`receive_frame`
+      right after the header is parsed, BEFORE allocating/reading the payload; an over-cap
+      advertised length raises ``ValueError`` (consistent with the other malformed-header
+      rejections). Default :data:`DEFAULT_MAX_FRAME_BYTES`.
+    """
+
+    def __init__(
+        self,
+        transport,
+        bufsize: int = RECV_BUFSIZE,
+        max_object_bytes: int = DEFAULT_MAX_OBJECT_BYTES,
+        max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES,
+    ):
+        self.transport = transport
+        self.bufsize = bufsize
+        self.max_object_bytes = max_object_bytes
+        self.max_frame_bytes = max_frame_bytes
+        # Bytes that arrived after one complete read (TCP coalescing glues the next state
+        # JSON, or a trailing pixel frame, onto the current read). Drained FIRST on the next
+        # JSON or frame read so nothing is lost and binary frame bytes never reach json.loads.
+        self._buffer = b""
+
+    def send(self, message) -> None:
+        """Encode ``message`` (strict JSON) and write it to the transport.
+
+        A ``socket.timeout`` is translated to ``ConnectionError`` (the env's reconnect
+        logic keys off that).
+        """
+        data = encode(message)
+        try:
+            self.transport.sendall(data)
+        except TimeoutError as exc:
+            raise ConnectionError("send timed out") from exc
+
+    def receive(self) -> dict:
+        """Read EXACTLY one complete JSON object and strict-decode it to a dict.
+
+        BUFFER-AWARE: returns one COMPLETE top-level JSON object and RETAINS any bytes that
+        arrived after its closing brace in ``self._buffer`` for the next read. So a coalesced
+        ``{ack}{state}`` recv yields ONLY the ``{ack}`` here, with ``{state}`` buffered for
+        the next :meth:`receive`. On a clean single-object-per-recv wire the scan stops at
+        the closing ``}`` and leaves ``self._buffer`` empty. A ``socket.timeout`` mid-read is
+        translated to ``ConnectionError``.
+        """
+        return decode(self._receive_one_json())
+
+    # --- pixel frame channel (additive; shares ``self._buffer`` with the JSON read) ------
+
+    def _recv_exactly(self, n: int) -> bytes:
+        """Read EXACTLY ``n`` bytes, draining ``self._buffer`` first then looping over recv.
+
+        ``recv`` may return fewer bytes than requested (TCP is a stream, not framed), so this
+        loops until ``n`` bytes are collected, never reading past ``n``. A ``recv`` returning
+        ``b""`` (peer closed mid-read) raises ``ConnectionError``; a ``socket.timeout`` is
+        likewise translated to ``ConnectionError``. Returns exactly ``n`` bytes.
+        """
+        chunks = []
+        remaining = n
+        if self._buffer:
+            take = min(remaining, len(self._buffer))
+            chunks.append(self._buffer[:take])
+            self._buffer = self._buffer[take:]
+            remaining -= take
+        while remaining > 0:
+            try:
+                chunk = self.transport.recv(min(remaining, self.bufsize))
+            except TimeoutError as exc:
+                raise ConnectionError("recv timed out") from exc
+            if not chunk:
+                raise ConnectionError(
+                    f"connection closed mid-read: wanted {n} bytes, got {n - remaining}"
+                )
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+
+    def receive_frame(self):
+        """Read ONE length-prefixed pixel frame and return a ``(H, W, 3)`` uint8 array.
+
+        Reads exactly the 10-byte header, parses it (:func:`parse_frame_header` — asserts the
+        0x46 magic), then GUARDS the advertised ``payload_len`` against ``max_frame_bytes``
+        BEFORE allocating/reading any payload (an over-cap length raises ``ValueError`` — a
+        malformed/oversized header is a protocol error). Asserts ``C == 3`` and
+        ``payload_len == W*H*C``, then reads exactly ``W*H*3`` payload bytes. The payload is
+        RGB24 rows in BOTTOM-UP order (Unity ``ReadPixels`` origin), so the array is built
+        ``(H, W, 3)`` and VERTICALLY FLIPPED (``np.flipud``) to a conventional top-left
+        origin. Returns a contiguous uint8 copy. A dropped connection mid-frame raises
+        ``ConnectionError`` (via ``_recv_exactly``).
+        """
+        header = self._recv_exactly(FRAME_HEADER_LEN)
+        w, h, c, payload_len = parse_frame_header(header)
+        # Reject an absurd advertised length BEFORE allocating/reading the payload.
+        if payload_len > self.max_frame_bytes:
+            raise ValueError(
+                f"frame payload length {payload_len} exceeds max_frame_bytes {self.max_frame_bytes}"
+            )
+        if c != FRAME_CHANNELS:
+            raise ValueError(f"unexpected frame channel count: expected {FRAME_CHANNELS}, got {c}")
+        if payload_len != w * h * c:
+            raise ValueError(
+                f"frame payload length {payload_len} != W*H*C ({w}*{h}*{c} = {w * h * c})"
+            )
+        payload = self._recv_exactly(payload_len)
+        frame = np.frombuffer(payload, dtype=np.uint8).reshape(h, w, c)
+        return np.flipud(frame).copy()
+
+    def receive_state_and_frame(self):
+        """Read one step's state JSON dict AND its trailing pixel frame -> ``(dict, ndarray)``.
+
+        Reads EXACTLY one complete state JSON object (buffering any frame bytes glued on by
+        TCP coalescing), strict-decodes it, then reads the length-prefixed frame (which drains
+        the buffered bytes first). Returns the decoded state dict and the ``(H, W, 3)`` uint8
+        frame, time-aligned (the frame Unity captured for THIS state).
+        """
+        state = decode(self._receive_one_json())
+        frame = self.receive_frame()
+        return state, frame
+
+    # --- internal: read exactly one top-level JSON object, buffer the rest --------------
+
+    def _receive_one_json(self) -> bytes:
+        """Read EXACTLY one complete top-level JSON object as bytes; buffer any trailing bytes.
+
+        ``recv`` chunks are accumulated (draining ``self._buffer`` first) while a brace-depth
+        scan — string/escape-aware so braces inside strings don't count — tracks the depth of
+        ``{`` / ``}`` OUTSIDE strings. When the top-level object closes (depth returns to 0)
+        everything AFTER its closing brace is stashed into ``self._buffer`` for the next read,
+        and the exact object bytes are returned. A dropped connection mid-object raises
+        ``ConnectionError``; a ``socket.timeout`` is translated to ``ConnectionError``.
+
+        GUARD: if the accumulated bytes for a SINGLE object exceed ``self.max_object_bytes``
+        before the object closes (e.g. a peer that never sends a closing brace), this raises
+        ``ConnectionError`` rather than letting the buffer grow without bound. The cap is
+        checked as bytes accumulate, not only after a complete object.
+        """
+        out = bytearray()
+        scan_from = 0
+        # Scanner state, persisted across recv chunks via the closure below.
+        state = {"depth": 0, "in_string": False, "escaped": False, "started": False}
+
+        def scan(buf) -> int | None:
+            """Advance the scanner over ``buf``; return the index AFTER the top-level object's
+            closing brace, or ``None`` if it is not yet complete."""
+            for i in range(len(buf)):
+                byte = buf[i]
+                if state["in_string"]:
+                    if state["escaped"]:
+                        state["escaped"] = False
+                    elif byte == _BACKSLASH:
+                        state["escaped"] = True
+                    elif byte == _QUOTE:
+                        state["in_string"] = False
+                    continue
+                if byte == _QUOTE:
+                    state["in_string"] = True
+                elif byte == _OPEN_BRACE:
+                    state["depth"] += 1
+                    state["started"] = True
+                elif byte == _CLOSE_BRACE:
+                    state["depth"] -= 1
+                    if state["started"] and state["depth"] == 0:
+                        return i + 1
+            return None
+
+        if self._buffer:
+            chunk = self._buffer
+            self._buffer = b""
+        else:
+            chunk = b""
+        while True:
+            if not chunk:
+                try:
+                    chunk = self.transport.recv(self.bufsize)
+                except TimeoutError as exc:
+                    raise ConnectionError("recv timed out") from exc
+                if not chunk:
+                    raise ConnectionError("connection closed mid-json-object")
+            out += chunk
+            end = scan(out[scan_from:])
+            if end is not None:
+                end_abs = scan_from + end
+                self._buffer = bytes(out[end_abs:])  # trailing bytes (next object / frame)
+                return bytes(out[:end_abs])
+            # No top-level object has closed yet — guard the still-open object's size as it
+            # grows so a peer that never sends a closing brace cannot flood memory.
+            if len(out) > self.max_object_bytes:
+                raise ConnectionError(
+                    f"incoming JSON object exceeds max_object_bytes "
+                    f"{self.max_object_bytes} (read {len(out)} bytes with no top-level close)"
+                )
+            scan_from = len(out)
+            chunk = b""
+
+
+def state_message_is_valid(message) -> bool:
+    """Whether ``message`` is an inbound state message with a 52-float ``state`` array.
+
+    Convenience contract check for consumers: ``True`` iff ``message`` has a ``"state"`` key
+    whose value is a length-:data:`STATE_LEN` sequence. Does not mutate or raise.
+    """
+    state = message.get("state") if isinstance(message, dict) else None
+    return isinstance(state, list | tuple) and len(state) == STATE_LEN

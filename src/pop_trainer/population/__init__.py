@@ -1,1 +1,1 @@
-"""population/ — STUB (deferred, not implemented). Created to lock the boundary; build when needed."""
+"""population/ — deferred stub."""

@@ -1,1 +1,1 @@
-"""deployment/ — STUB (deferred, not implemented). Created to lock the boundary; build when needed."""
+"""deployment/ — deferred stub."""
