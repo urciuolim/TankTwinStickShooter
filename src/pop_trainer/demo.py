@@ -30,10 +30,8 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import socket
 import subprocess
 import sys
-import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,6 +39,7 @@ from pathlib import Path
 from pop_trainer import agents
 from pop_trainer.core import agent as core_agent
 from pop_trainer.core.config import EnvConfig
+from pop_trainer.core.launch import build_launch_cmd, connect
 from pop_trainer.core.protocol import Connection, WallLayout
 from pop_trainer.env.tank_env import TankEnv
 
@@ -62,11 +61,6 @@ FRAME_SHAPE = (FRAME_HEIGHT, FRAME_WIDTH, 3)
 
 DEFAULT_MAX_STEPS = 600
 DEFAULT_SEED = 0
-
-# Socket connect retry budget (the build needs a moment to boot + start its listener).
-_CONNECT_ATTEMPTS = 30
-_CONNECT_BACKOFF_SEC = 1.0
-_SOCK_TIMEOUT_SEC = 30.0
 
 
 # --- agent selectors --------------------------------------------------------------------
@@ -191,56 +185,7 @@ def _maybe_reset(agent: object) -> None:
         reset()
 
 
-# --- live launch + socket connect (NOT unit-tested) --------------------------------------
-
-
-def _build_launch_cmd(exe: Path, port: int, config: Path) -> list[str]:
-    """The Popen ARG-LIST that launches the build WINDOWED (never fullscreen, never batchmode).
-
-    ``args[1]`` is the TCP port (DriverController parses it positionally); ``--config`` points
-    at the obs_pixels-enabled demo config. ``-screen-fullscreen 0`` + an explicit 1280x720
-    keep the player a watchable window. ``-batchmode`` is deliberately ABSENT (it would hide
-    the window).
-    """
-    return [
-        str(exe),
-        str(port),
-        "--config",
-        str(config),
-        "-screen-fullscreen",
-        "0",
-        "-screen-width",
-        "1280",
-        "-screen-height",
-        "720",
-    ]
-
-
-def _connect(port: int) -> socket.socket:
-    """Connect to the running build at 127.0.0.1:``port`` with a bounded retry/backoff.
-
-    The build needs a moment to boot and start its TCP listener, so connection is refused at
-    first; retry with backoff. ``SO_REUSEADDR`` avoids a lingering-TIME_WAIT bind clash on a
-    rapid relaunch. A read/write timeout is set so a wedged build surfaces as a
-    ``ConnectionError`` in the env rather than hanging forever. Raises ``ConnectionError`` if
-    no connection is made within the budget.
-    """
-    last_err: OSError | None = None
-    for _ in range(_CONNECT_ATTEMPTS):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            sock.connect(("127.0.0.1", port))
-        except OSError as exc:
-            last_err = exc
-            sock.close()
-            time.sleep(_CONNECT_BACKOFF_SEC)
-            continue
-        sock.settimeout(_SOCK_TIMEOUT_SEC)
-        return sock
-    raise ConnectionError(
-        f"could not connect to the build at 127.0.0.1:{port} after {_CONNECT_ATTEMPTS} attempts"
-    ) from last_err
+# --- live launch + socket connect (NOT unit-tested; the shared seam lives in core.launch) -
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -303,13 +248,13 @@ def main(argv: list[str] | None = None) -> int:
     agent1 = make_agent(args.player1, seed=args.seed)
     agent2 = make_agent(args.player2, seed=args.seed)
 
-    cmd = _build_launch_cmd(args.exe, args.port, args.config)
+    cmd = build_launch_cmd(args.exe, args.port, args.config)
     print("launching:", " ".join(cmd))
     proc = subprocess.Popen(cmd)  # noqa: S603 (arg-list, trusted local build path)
 
     env: TankEnv | None = None
     try:
-        connection = Connection(_connect(args.port))
+        connection = Connection(connect(args.port))
         env = TankEnv(
             connection=connection,
             player2=agent2,
