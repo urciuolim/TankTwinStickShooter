@@ -13,12 +13,13 @@
 |---|---|---|---|
 | **Research** | `research-manager` | `research-docs`, `research-source`, `research-empirical` | **staffed** |
 | **Engineering** | `eng-manager` | `builder` (Python) + `unity-builder` (C#/Unity, `Assets/`); specialty builders on demand | **staffed** |
-| **Infra / platform** | `infra-manager` | `code-reviewer`, `evaluation`, `repo-steward` staffed; `documentation`, `ci-cd`, `cloud` deferred | **staffed** |
+| **Infra / platform** | `infra-manager` | `code-reviewer`, `evaluation`, `repo-steward`, `documentarian` staffed; `ci-cd`, `cloud` deferred | **staffed** |
 
 ### Rules that distinguish the teams
 - **Researchers** run code only as *throwaway spikes* (empirical lane); they return findings, not edits.
 - **Builders** are the only agents that write production code — single-threaded writes, worktree isolation, component context via skills.
 - **Infra / platform agents are read-only verdict-emitters** — they produce GO / NO-GO conclusions against explicit criteria and never write code; a NO-GO routes back to engineering. `repo-steward` earns its slot by *objective isolation*: a dedicated repo-health objective a builder would deprioritize. Deterministic boundary checks via CI tooling (e.g. import-linter) are its instrument, not its replacement.
+- **The one writer on the platform team is the `documentarian`** — it writes documentation only (`./docs/` Markdown, never `src/`) as the post-GO tail of the pipeline: build → platform GO → docs update → commit. Separation of duties holds because it documents code it didn't write and that already passed the gate; the infra-manager accuracy-checks the docs against the source.
 
 ## This is a deliberate bet — so it's instrumented
 The field is immature and the recent evidence is contested. We are establishing this org model ahead of settled practice, on purpose. Leading indicators we watch to know if it's working (else we collapse layers):
