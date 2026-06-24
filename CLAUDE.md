@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Operational guide for agents on the Tank Twin Stick Shooter revival. Load-bearing rules only — see `@Plan.md` (revival plan), `@docs/revival-research-2026.md` (2026 stack research), `@docs/engineering-standards.md` (coding standards), `@docs/definition-of-done.md`, and `@.claude/agents/README.md` (agent org) for the full picture.
+Operational guide for agents on the Tank Twin Stick Shooter revival. Load-bearing rules only — see `@Plan.md` (revival plan), `@docs/engineering-standards.md` (coding standards), `@docs/definition-of-done.md`, and `@.claude/agents/README.md` (agent org) for the full picture.
 
 ## What this is
 Unity 6.5 (2D twin-stick tank game) as the simulator + a Python 3.12 reinforcement-learning driver (Stable-Baselines3 PPO, population-based self-play) over a TCP-JSON protocol. Milestones: M0 playable game (two humans, Xbox pads + shared keyboard) → M1 single-agent PPO → M2 population training. Cluster target: GCP.
