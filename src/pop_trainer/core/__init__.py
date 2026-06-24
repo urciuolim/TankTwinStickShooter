@@ -16,8 +16,12 @@ Modules:
 * :mod:`pop_trainer.core.config` — frozen, strict-JSON config dataclasses
   (``RunConfig`` / ``EnvConfig`` / ``RewardConfig``).
 * :mod:`pop_trainer.core.maps` — the map-rotation resolution contract.
+* :mod:`pop_trainer.core.agent` — the Agent Protocol (``act(obs) -> action``), the
+  type-only decision-maker interface ``agents`` implements and ``env`` consumes (keeping
+  ``env`` torch-free).
 """
 
-from pop_trainer.core import config, maps, protocol, state
+from pop_trainer.core import agent, config, maps, protocol, state
+from pop_trainer.core.agent import Agent, StatefulAgent
 
-__all__ = ["state", "protocol", "config", "maps"]
+__all__ = ["state", "protocol", "config", "maps", "agent", "Agent", "StatefulAgent"]

@@ -10,6 +10,7 @@ description: Contract + boundaries for the env/ component of src/pop_trainer. Lo
 **Contains:**
 - `TankEnv` — Gymnasium API (reset/step → 5-tuple `(obs, reward, terminated, truncated, info)`).
 - the Unity socket driver (uses `core.protocol`).
+- **`player2` is an injected `Agent`** (any `core.Agent`; default = a trivial built-in random player2 implemented in `env`, so the env never imports `agents`). The env computes `player2`'s own view (the perspective flip via `core.state`) and calls `player2.act()`; BOTH players' actions are captured. `player2`-as-learner / true 2-agent obs+reward is a FUTURE mode — leave the seam open, do not build it.
 - reward shaping — the budget-based shaped reward (env/domain logic, **not** core) + episode-boundary logic.
 
 **Boundaries:** imports `core` only. Imports nothing from `models / data / pretraining / rl`. The Unity game is the implementation *behind* this interface (bridged only by `core.protocol`); never reach into Unity specifics elsewhere.

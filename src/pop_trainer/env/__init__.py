@@ -8,6 +8,11 @@ Boundary: imports ``core`` only (plus ``gymnasium`` + ``numpy``). Imports NOTHIN
 ``models`` / ``data`` / ``pretraining`` / ``rl`` and NOTHING from ``tank_twin``. No torch,
 no stable-baselines3.
 
+``player2`` is an INJECTED :class:`pop_trainer.core.agent.Agent`; when none is supplied the
+env uses a trivial built-in random player2 (so ``env`` never imports ``agents``). The env
+computes player2's own perspective-flipped view, calls ``player2.act``, and captures BOTH
+players' actions (``info["p1_action"]`` / ``info["p2_action"]``).
+
 Modules:
 
 * :mod:`pop_trainer.env.tank_env` — :class:`TankEnv` (reset/step -> the gymnasium 5-tuple);

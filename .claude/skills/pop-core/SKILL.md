@@ -14,6 +14,7 @@ description: Contract + boundaries for the core/ component of src/pop_trainer. L
 - `protocol.py` — the TCP-JSON wire client (framing/handshake) + the real pixel-frame channel (the actual obs input path).
 - `config.py` — typed config dataclasses (run / env / reward).
 - `maps.py` — map selection / rotation (which map to play).
+- `agent.py` — the **Agent Protocol** (`act(obs) -> action`), the shared decision-maker interface that `player1` / `player2` satisfy. Pure / torch-free (a `typing.Protocol`); `agents/` implements it and `env` consumes it — which keeps `env` torch-free.
 - A small world-bounds CONSTANT may live here if a downstream objective needs world→grid coords — a constant, NOT an arena-file loader.
 
 **Boundaries:** imports nothing from `models / env / data / pretraining / rl`. No torch. No cycles.

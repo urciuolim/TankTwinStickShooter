@@ -218,7 +218,7 @@ def test_step_terminates_on_winner_p1_win():
     assert reward == pytest.approx(RewardConfig().win_reward + tp)
 
 
-def test_step_terminates_on_opponent_win():
+def test_step_terminates_on_player2_win():
     raw0 = _flat_state()
     raw1 = _flat_state(1.0)
     blobs = _reset_blobs(raw0) + [_state_and_frame_bytes(raw1, winner=1)]
@@ -294,8 +294,10 @@ def test_lost_connection_reconnects_via_factory():
     assert info2["state"] == raw_again
 
 
-def test_seeded_reset_makes_opponent_action_reproducible():
-    # Two envs reset with the same seed must send identical opponent (key "2") actions.
+def test_seeded_reset_makes_player2_action_reproducible():
+    # Two DEFAULT-player2 envs reset with the same seed must send byte-identical key "2"
+    # actions: this is the frozen-seam reproducibility contract (the built-in player2 draws
+    # from the env's single seeded np_random, exactly as the prior direct uniform draw did).
     raw0 = _flat_state()
     raw1 = _flat_state(1.0)
 
@@ -310,30 +312,105 @@ def test_seeded_reset_makes_opponent_action_reproducible():
     assert run() == run()
 
 
+# --- player2 injection ------------------------------------------------------------------
+
+
+class _FixedPlayer2:
+    """A test player2 returning a constant action (no ``agents`` import)."""
+
+    def __init__(self, action):
+        self.action = list(action)
+
+    def act(self, obs):
+        return self.action
+
+
+class _RecordingPlayer2:
+    """A test player2 that records the obs it was handed and returns a fixed action."""
+
+    def __init__(self, action):
+        self.action = list(action)
+        self.seen_obs = None
+
+    def act(self, obs):
+        self.seen_obs = obs
+        return self.action
+
+
+def test_injected_player2_drives_key2_action_and_info():
+    raw0 = _flat_state()
+    raw1 = _flat_state(1.0)
+    fixed = [0.2, -0.4, 0.6, -0.8, 1.0]
+    blobs = _reset_blobs(raw0) + [_state_and_frame_bytes(raw1)]
+    env, transport = _make_env(blobs, player2=_FixedPlayer2(fixed))
+    env.reset(seed=0)
+    transport.sent.clear()
+    p1 = np.array([0.1, 0.1, 0.1, 0.1, 0.1], dtype=np.float32)
+    _, _, _, _, info = env.step(p1)
+
+    # The wire "2" action is exactly the injected agent's fixed action.
+    sent = P.decode(bytes(transport.sent))
+    assert sent["2"] == pytest.approx(fixed)
+    # Surfaced both actions: p2 is the agent's; p1 is the action passed to step.
+    assert info["p2_action"] == pytest.approx(fixed)
+    assert info["p1_action"] == pytest.approx(p1.tolist())
+    # Captured on the env too.
+    assert env.last_p2_action == pytest.approx(fixed)
+    assert env.last_p1_action == pytest.approx(p1.tolist())
+
+
+def test_injected_player2_receives_flipped_state_view():
+    # player2 must be handed its FLIPPED 52-float view of the state it is reacting to (the
+    # state present BEFORE this step), proving the perspective flip is wired correctly.
+    raw0 = [float(i) for i in range(S.STATE_LEN)]
+    raw1 = _flat_state(7.0)
+    recorder = _RecordingPlayer2([0.0, 0.0, 0.0, 0.0, 0.0])
+    blobs = _reset_blobs(raw0) + [_state_and_frame_bytes(raw1)]
+    env, _ = _make_env(blobs, player2=recorder)
+    env.reset(seed=0)
+    env.step(np.zeros(ACTION_DIM, dtype=np.float32))
+
+    expected_view = S.split_state_for_opponent(np.asarray(raw0))
+    assert np.array_equal(recorder.seen_obs, expected_view)
+
+
+def test_injected_player2_action_is_clipped_and_length_fitted():
+    # An out-of-range / wrong-length player2 action is coerced to the [-1,1] length-5 wire shape.
+    raw0 = _flat_state()
+    raw1 = _flat_state(1.0)
+    blobs = _reset_blobs(raw0) + [_state_and_frame_bytes(raw1)]
+    env, transport = _make_env(blobs, player2=_FixedPlayer2([5.0, -5.0, 0.3]))
+    env.reset(seed=0)
+    transport.sent.clear()
+    env.step(np.zeros(ACTION_DIM, dtype=np.float32))
+    sent = P.decode(bytes(transport.sent))
+    assert sent["2"] == pytest.approx([1.0, -1.0, 0.3, 0.0, 0.0])
+
+
 # --- self-play perspective helpers ------------------------------------------------------
 
 
-def test_opp_frame_swaps_rb_channels():
+def test_player2_frame_swaps_rb_channels():
     raw0 = _flat_state()
     env, _ = _make_env(_reset_blobs(raw0, fill=(11, 22, 33)))
     obs, _ = env.reset(seed=0)
-    opp = env.opp_frame()
+    view = env.player2_frame()
     # R and B are swapped relative to the obs; G is unchanged.
-    assert np.array_equal(opp[0, 0], [33, 22, 11])
-    assert np.array_equal(opp[..., 1], obs[..., 1])
+    assert np.array_equal(view[0, 0], [33, 22, 11])
+    assert np.array_equal(view[..., 1], obs[..., 1])
 
 
-def test_opp_state_swaps_halves_and_is_none_before_reset():
+def test_player2_state_swaps_halves_and_is_none_before_reset():
     transport = ScriptedTransport([])
     env = TankEnv(connection=P.Connection(transport))
-    assert env.opp_state() is None  # no state yet
+    assert env.player2_state() is None  # no state yet
 
     raw = [float(i) for i in range(S.STATE_LEN)]
     env2, _ = _make_env(_reset_blobs(raw))
     env2.reset(seed=0)
-    opp = env2.opp_state()
-    assert np.array_equal(opp[:26], np.asarray(raw[26:]))
-    assert np.array_equal(opp[26:], np.asarray(raw[:26]))
+    view = env2.player2_state()
+    assert np.array_equal(view[:26], np.asarray(raw[26:]))
+    assert np.array_equal(view[26:], np.asarray(raw[:26]))
 
 
 # --- close lifecycle --------------------------------------------------------------------
@@ -382,8 +459,8 @@ def test_render_not_implemented():
 
 
 def test_default_seed_used_when_reset_seed_omitted():
-    # Two envs constructed with the same default seed and reset() (no seed arg) must produce
-    # identical opponent actions, proving the constructor seed is the fallback.
+    # Two default-player2 envs constructed with the same default seed and reset() (no seed arg)
+    # must produce identical key "2" actions, proving the constructor seed is the fallback.
     raw0 = _flat_state()
     raw1 = _flat_state(1.0)
 
