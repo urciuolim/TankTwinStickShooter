@@ -14,4 +14,4 @@ description: Contract + boundaries for the rl/ component of src/pop_trainer. Loa
 
 **Boundaries:** imports `core`, `env`, `models`. Consumes the pretrained encoder as a loaded artifact via `models.from_pretrained` — does NOT import `pretraining` or `data`. No cycles.
 
-**Inspiration (do NOT copy):** `src/tank_twin/{train,evaluate,callbacks,opponents,elo}.py`; the 2021 `PythonScripts/` PPO scripts.
+**Inspiration (do NOT copy):** `reference/tank_twin_m1/{train,evaluate,callbacks,elo}.py`; the 2021 `PythonScripts/` PPO scripts.

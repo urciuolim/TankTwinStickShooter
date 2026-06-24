@@ -19,7 +19,7 @@ Unity 6.5 (2D twin-stick tank game) as the simulator + a Python 3.12 reinforceme
 - The game is a **Python-clocked simulator**: it blocks on `AcceptTcpClient` and Python drives the clock/opponent — there is NO standalone human-play mode yet. Human *input* is read locally by Unity; AI opponents are Python. Opening `Arena.unity` alone throws NREs (it needs the Driver scene). See `docs/game-architecture.md`.
 
 ## Standards — apply your phase's section of `@docs/engineering-standards.md`
-- Python: `uv` + `ruff` (lint+format) + `pytest`; src-layout `tank_twin` package; test pure functions/contracts, not the trainer.
+- Python: `uv` + `ruff` (lint+format) + `pytest`; src-layout `pop_trainer` package; test pure functions/contracts, not the trainer.
 - Unity/C#: asmdefs (runtime + 2 test); Test Framework 1.7; `.editorconfig` + Microsoft.Unity.Analyzers; extract pure logic from MonoBehaviours.
 
 ## Repo etiquette

@@ -52,6 +52,11 @@ Budget-based (full-episode totals, spread per step over `max_episode_length = 30
 
 ## Run an experiment (PowerShell, one line each)
 
+> **RETIRED AT M1:** the `tank_twin.train` commands below no longer run — the `tank_twin`
+> package was removed; its M1 sources are kept inert under `reference/tank_twin_m1/`, and a
+> `pop_trainer` training entrypoint supersedes them (not yet wired). Kept here as historical
+> reference only.
+
 The 2021 map with the 2021 reward:
 
 ```powershell

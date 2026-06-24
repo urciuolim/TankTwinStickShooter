@@ -1,5 +1,11 @@
 # Experiments: any reward on any map (self-serve)
 
+> **RETIRED AT M1 — these `tank_twin.train` flows no longer run.** The `tank_twin` package
+> was removed; its M1 sources are kept inert (not built/imported) under
+> `reference/tank_twin_m1/`. The `pop_trainer` training entrypoint supersedes the commands
+> below (not yet wired). The `uv run python -m tank_twin.train ...` examples in this guide are
+> preserved as a historical reference datapoint only — they will fail if run.
+
 The trainer and the Unity build now read the **same map from one source**, so the agent's
 observation matches the live game (no more "the obs and the simulator disagree"). And the
 reward is **fully configurable** from the CLI or a JSON file. This guide is how you, the

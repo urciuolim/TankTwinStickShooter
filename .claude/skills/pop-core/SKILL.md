@@ -21,4 +21,4 @@ description: Contract + boundaries for the core/ component of src/pop_trainer. L
 
 **Map-state (built):** the static wall layout is sent by Unity as a one-time `{"type":"walls",...}` message on load/map-change. `protocol.py` PARSES it (`WallLayout`); `env/` consumes + TRACKS it as map-state. Unity is the source of truth — never re-parse arena JSON in Python.
 
-**Inspiration (do NOT copy):** `src/tank_twin/{state,protocol,config,maps}.py`; the 2021 `PythonScripts/` originals. Build fresh — match the Unity wire contract exactly (52-float layout, JSON shape, big-endian frame header), but this is NEW code; it does not modify `src/tank_twin`'s frozen seam.
+**Inspiration (do NOT copy):** the 2021 `PythonScripts/` originals. Build fresh — match the Unity wire contract exactly (52-float layout, JSON shape, big-endian frame header), but this is NEW code.
