@@ -27,6 +27,15 @@ from here instead of re-hardcoding them. All JSON is strict.
   [`RewardConfig`](../../src/pop_trainer/core/config.py) (reject unknown keys).
 - [`core.maps`](../../src/pop_trainer/core/maps.py) — the **map-rotation resolution contract**:
   `resolve_map_rotation` turns a `--maps` flag value into a list of map-config paths.
+- [`core.launch`](../../src/pop_trainer/core/launch.py) — the **shared live-launch seam**
+  (stdlib only — `subprocess` / `socket` / `time` / `pathlib`, no internal imports, so `core`
+  stays the leaf). [`build_launch_cmd`](../../src/pop_trainer/core/launch.py) is the **pure**
+  `Popen` arg-list builder that launches the build **windowed** (`-screen-fullscreen 0` at
+  1280×720; `-batchmode` deliberately absent), with the port positional + `--config` JSON;
+  [`connect`](../../src/pop_trainer/core/launch.py) opens a TCP socket to `127.0.0.1:port` with a
+  bounded retry/backoff (the build needs a moment to boot its listener). Shared by both the
+  [demo](demo.md) (one local watch) and the [data](data.md) collection runner (one build per
+  worker).
 - [`core.agent`](../../src/pop_trainer/core/agent.py) — the **Agent Protocol** (`act(obs) →
   action`), type-only. [`Agent`](../../src/pop_trainer/core/agent.py) is `@runtime_checkable`
   (declares only `act`); [`StatefulAgent`](../../src/pop_trainer/core/agent.py) adds the OPTIONAL
@@ -65,8 +74,11 @@ Every other component depends on `core`:
 - [env](env.md) — `state` (schema + transforms), `protocol` (`Connection`, `WallLayout`),
   `config`, `agent.Agent`.
 - [agents](agents.md) — `agent.Agent` Protocol + the `state` schema.
-- [data](data.md) — `state` (for `STATE_LEN` + `validate`).
-- [demo](demo.md) — `protocol.Connection` / `WallLayout`, `config.EnvConfig`, `agent.Agent`.
+- [data](data.md) — `state` (`STATE_LEN` + `validate`), `config.EnvConfig`,
+  `protocol.Connection`, `agent.Agent`, and `launch` (the collection runner launches + connects
+  one build per worker).
+- [demo](demo.md) — `protocol.Connection` / `WallLayout`, `config.EnvConfig`, `agent.Agent`, and
+  `launch` (`build_launch_cmd` / `connect`).
 
 ## Where it sits in the run
 

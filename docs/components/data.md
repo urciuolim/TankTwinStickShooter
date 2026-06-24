@@ -40,13 +40,33 @@ package is named `data` (not `datasets` — that name collides with the git-igno
   [`collect_parallel`](../../src/pop_trainer/data/collect.py) are the **spawn-based** (never
   fork — a CLAUDE.md YOU MUST) parallel orchestration; each worker builds its own env + socket
   inside the process, so nothing live crosses the spawn boundary.
+- [`data.collect_runner`](../../src/pop_trainer/data/collect_runner.py) — the **live collection
+  entry point** (`python -m pop_trainer.data.collect_runner`): the concrete factories + CLI riding
+  on `collect`'s orchestration. It is **multi-worker, SINGLE-map** (Phase A — `custom1` only;
+  rotation is Phase B, not built).
+  [`env_factory`](../../src/pop_trainer/data/collect_runner.py) is the module-level (spawn-safe,
+  no closures) factory that launches one Unity build per worker via
+  [`core.launch.build_launch_cmd`](core.md) + `subprocess.Popen` on `port = base_port + worker_id`,
+  connects via [`core.launch.connect`](core.md), and builds the
+  [`TankEnv`](env.md) (its player2 injected) — wrapping `env.close` so closing the env also reaps
+  the launched build.
+  [`player1_factory`](../../src/pop_trainer/data/collect_runner.py) builds the driver's player1
+  from a selector name. [`build_specs`](../../src/pop_trainer/data/collect_runner.py) is the pure
+  CLI-args→`list[CollectionSpec]` builder (one per worker, `--workers` clamped to `[1, 8]`, each
+  worker an own `worker_<id>/` out-dir + a distinct seed `base + w*10000`).
+  [`main`](../../src/pop_trainer/data/collect_runner.py) parses the flags, resolves `--map custom1`
+  to the obs_pixels-enabled `demo_config.json`, and drives `collect_parallel`. See the
+  [runbook](../runbook.md#4-collect-a-dataset-cli) for the flags.
 
 ## Pulls from (upstream)
 
-- [core](core.md) — `state` (`STATE_LEN`, `validate`).
+- [core](core.md) — `state` (`STATE_LEN`, `validate`), `config.EnvConfig`,
+  `protocol.Connection`, `agent.Agent`, and `launch` (`build_launch_cmd` / `connect` — the shared
+  build-launch + socket-connect seam `collect_runner` uses per worker).
 - [env](env.md) — `TankEnv` (collection drives episodes through it).
-- [agents](agents.md) — the `player1` / `player2` policies, and `validate_action`.
-- Plus numpy + stdlib (`multiprocessing` spawn context).
+- [agents](agents.md) — the `player1` / `player2` policies (the coverage / random presets), and
+  `validate_action`.
+- Plus numpy + stdlib (`multiprocessing` spawn context, `subprocess`).
 
 ## Pushes to (downstream)
 
@@ -68,11 +88,15 @@ episodes, and writes shards to disk — producing the supervised-pretraining cor
 
 ```mermaid
 graph LR
+    cli["collect_runner.main (CLI)"] --> specs["build_specs → CollectionSpec[]"]
+    specs --> par["collect_parallel (spawn)"]
+    par --> ef["env_factory (per worker)"]
+    ef -->|build_launch_cmd + connect| launch["core.launch"]
+    ef --> env["TankEnv (+ player2)"]
     a1["player1 agent"] --> ep["run_episode"]
-    a2["player2 agent (in env)"] --> env["TankEnv"]
     env --> ep
     ep --> samples["Sample[(frame,state,action)]"]
-    samples --> shards["collect_to_shards → .npz shards"]
+    samples --> shards["collect_to_shards → worker_<id>/*.npz"]
     shards --> idx["build_index → DatasetIndex"]
     idx --> split["split_groups (map-aware)"]
 ```

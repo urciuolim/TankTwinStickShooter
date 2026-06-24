@@ -32,6 +32,7 @@ graph TD
         Config["config.py<br/>RunConfig / EnvConfig /<br/>RewardConfig"]
         Maps["maps.py<br/>resolve_map_rotation"]
         AgentProto["agent.py<br/>Agent / StatefulAgent<br/>(Protocol)"]
+        Launch["launch.py<br/>build_launch_cmd / connect<br/>(stdlib leaf)"]
     end
 
     subgraph models["models (torch; no internal deps)"]
@@ -48,6 +49,7 @@ graph TD
     end
 
     subgraph data["data"]
+        Runner["collect_runner.py<br/>env_factory / player1_factory /<br/>build_specs / main (CLI)"]
         Collect["collect.py<br/>run_episode / collect_to_shards /<br/>collect_parallel"]
         Shards["shards.py / schema.py"]
         Readers["readers.py<br/>split_groups / build_index"]
@@ -79,6 +81,10 @@ graph TD
     Encoder -.->|leaf, no internal import| core
 
     %% data wiring
+    Runner --> Collect
+    Runner --> Launch
+    Runner --> TankEnv
+    Runner --> AgentImpls
     Collect --> TankEnv
     Collect --> AgentImpls
     Collect --> State
@@ -89,6 +95,7 @@ graph TD
     Demo --> TankEnv
     Demo --> AgentImpls
     Demo --> Protocol
+    Demo --> Launch
 
     classDef root fill:#d4edda,stroke:#28a745;
     class core root;
@@ -108,6 +115,12 @@ graph TD
   `demo` call `set_map` on `player1` (all `getattr`-probed). A [`CoverageAgent`](components/agents.md)
   rebuilds its coverage grid from the layout; `RandomAgent` does not implement the hook. See
   [core](components/core.md#the-wall-message--protocol-seam-walllayout--infomap).
+- **`core.launch` is the shared live seam.** Both the `demo` and `data.collect_runner` launch the
+  build + open the socket through `build_launch_cmd` / `connect`; it is stdlib-only so `core` stays
+  the leaf. `collect_runner.env_factory` calls it once per worker (`port = base_port + worker_id`).
+- **`data.collect_runner` is the collection CLI** (`python -m pop_trainer.data.collect_runner`):
+  the concrete `env_factory` / `player1_factory` + `build_specs` over `collect`'s spawn
+  orchestration — multi-worker, single-map (Phase A `custom1`).
 - **`models` is detached** from the live loop today — it's the shared vision backbone the
   future `pretraining` / `rl` will consume, and the deployable ONNX artifact.
 

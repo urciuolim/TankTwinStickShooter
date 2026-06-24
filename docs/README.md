@@ -55,7 +55,7 @@ internal — it only shares `core`'s place as a leaf the future `pretraining` / 
 | [models](components/models.md) | Composable, ablation-ready vision encoders + Sentis-clean ONNX export (torch). |
 | [env](components/env.md) | `TankEnv` — the Gymnasium wrapper over the Unity socket; the simulator swap point. |
 | [agents](components/agents.md) | The model-free decision-makers: the map-aware `CoverageAgent` family (+ presets) + the `RandomAgent` baseline + the coverage-measurement harness. |
-| [data](components/data.md) | The dataset pipeline: collect `(frame, state, action)` samples → shards → map-aware splits. |
+| [data](components/data.md) | The dataset pipeline: a multi-worker collection CLI (`collect_runner`) → `(frame, state, action)` samples → shards → map-aware splits. |
 | [demo](components/demo.md) | `python -m pop_trainer.demo` — launch the live build and watch two agents play. |
 
 - [Architecture](architecture.md) — the cross-component class-to-class interaction map.

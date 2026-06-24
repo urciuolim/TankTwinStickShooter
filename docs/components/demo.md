@@ -13,9 +13,11 @@ can watch the difference.
 All in [`demo.py`](../../src/pop_trainer/demo.py):
 
 - [`main`](../../src/pop_trainer/demo.py) — the live path (not unit-tested): launches the build
-  via `subprocess.Popen` (an arg-list, windowed — `-batchmode` deliberately absent), connects
-  with a bounded retry/backoff, builds the env, runs the episode, prints a trace, and tears down
-  cleanly.
+  via `subprocess.Popen` over the shared [`core.launch.build_launch_cmd`](core.md) arg-list
+  (windowed — `-batchmode` deliberately absent), connects with
+  [`core.launch.connect`](core.md)'s bounded retry/backoff, builds the env, runs the episode,
+  prints a trace, and tears down cleanly. (The launch + connect helpers moved to `core.launch` so
+  the [data](data.md) collection runner shares them.)
 - [`run_demo_episode`](../../src/pop_trainer/demo.py) — the **pure** episode loop (an
   already-built env + `agent1` in, a [`DemoResult`](../../src/pop_trainer/demo.py) out). Drives
   `player1` off `info["state"]`; the env owns and acts `player2`. Unit-testable against a
@@ -39,7 +41,8 @@ match. That config lives inside `StreamingAssets` so its relative `arena_path`
 
 ## Pulls from (upstream)
 
-- [core](core.md) — `protocol.Connection` / `WallLayout`, `config.EnvConfig`, `agent.Agent`.
+- [core](core.md) — `protocol.Connection` / `WallLayout`, `config.EnvConfig`, `agent.Agent`, and
+  `launch` (`build_launch_cmd` / `connect`).
 - [env](env.md) — `TankEnv`.
 - [agents](agents.md) — the selectable policies for both players.
 

@@ -68,17 +68,51 @@ Useful flags (defaults shown): `--exe build/TankTwinStickShooter.exe`,
 (any of: `aggressive-coverage`, `wall-hugger`, `opponent-shadower`, `random`), `--max-steps 600`,
 `--seed 0`. The demo exits `2` if the build exe or config is missing.
 
-## 4. Collect a dataset (programmatic)
+## 4. Collect a dataset (CLI)
 
-There is **no collection CLI entry point yet** — data collection is driven through the
-[`data.collect`](../src/pop_trainer/data/collect.py) API
-([`run_worker`](../src/pop_trainer/data/collect.py) /
-[`collect_parallel`](../src/pop_trainer/data/collect.py)) with caller-supplied env + agent
-factories, writing `.npz` shards to disk. See the [data component page](components/data.md) for
-the shape of the pipeline. (A thin CLI lands with the agent redesign.)
+Phase A ships a **multi-worker, single-map** collection runner:
+[`python -m pop_trainer.data.collect_runner`](../src/pop_trainer/data/collect_runner.py)
+([`main`](../src/pop_trainer/data/collect_runner.py)). It builds one
+[`CollectionSpec`](../src/pop_trainer/data/collect.py) per worker and drives them through the
+[`data.collect`](../src/pop_trainer/data/collect.py) orchestration
+([`collect_parallel`](../src/pop_trainer/data/collect.py), spawn-based), each worker launching its
+**own** Unity build + socket and writing `.npz` shards to a `worker_<id>/` subdir of `--out-dir`:
+
+```bash
+uv run python -m pop_trainer.data.collect_runner --out-dir runs/collect-demo
+```
+
+See the full flag surface:
+
+```bash
+uv run python -m pop_trainer.data.collect_runner --help
+```
+
+Flags (defaults shown), grounded in
+[`_parse_args`](../src/pop_trainer/data/collect_runner.py):
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--player1` | `aggressive-coverage` | player1 selector (driven by the collection loop) |
+| `--player2` | `opponent-shadower` | player2 selector (injected into the env) |
+| `--map` | `custom1` | map to collect on — **`custom1` is the only choice today** (Phase A is single-map) |
+| `--episodes` | `1` | episodes **per worker** |
+| `--max-steps` | `800` | per-episode step cap |
+| `--out-dir` | *(required)* | root output dir; worker `w` writes shards to `worker_<w>/` under it |
+| `--workers` | `2` | parallel workers, one build per worker (**clamped to `[1, 8]`**) |
+| `--exe` | `build/TankTwinStickShooter.exe` | path to the Unity build |
+| `--base-port` | `50000` | base TCP port; worker `w` connects on `base_port + w` |
+| `--seed` | `0` | base seed; worker `w` uses `base + w*10000` |
+
+Each worker resolves `--map custom1` to the obs_pixels-enabled
+`Assets/StreamingAssets/demo_config.json` (the **same** config the demo launches with — 640×360
+pixels on, arena `Arenas/custom1.json`), so the captured `(frame, state)` rows are byte-for-byte
+the demo's / RL's observation pipeline. `main` exits `2` if the build exe or the resolved config
+is missing. Map / pairing **rotation** is Phase B — not built yet.
 
 > **Episode budget.** The coverage family fully sweeps a map only by ~800 decisions on the live
-> engine, so set the collection `max_steps` long enough to cover the map (see the
+> engine — which is why `--max-steps` defaults to `800` — so keep it long enough to cover the map
+> (see the
 > [agents operational note](components/agents.md#operational-note--coverage-is-step-budget-dependent-on-the-real-engine)).
 
 ## 5. Validate coverage (no Unity required)
