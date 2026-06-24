@@ -52,3 +52,4 @@ Style/naming nits; soft cohesion/size flags (the ~1000-line *signal*, not a hard
 1. **Adversarially vet every finding** — downgrade weak/unsupported ones (this is what prevents a false-positive NO-GO). Demand `file:line` + severity.
 2. **GO** iff zero *valid* blockers across all four dimensions AND evidence (including the coverage report) was shown.
 3. **NO-GO** = the valid blockers, each with `file:line` + why + fix direction → routed back to `eng-manager`.
+4. **On GO, before returning: run the docs.** Dispatch the `documentarian` to update the affected `./docs/` for the deliverable, then accuracy-check its output against the code. Return GO **with** the docs updated + checked — GO means "clearing to commit," so the docs must match the code. (A NO-GO skips this.)
