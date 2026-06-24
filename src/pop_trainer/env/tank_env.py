@@ -283,6 +283,9 @@ class TankEnv(gymnasium.Env):
         message = self.conn.receive()
         if is_walls_message(message):
             self.current_map = parse_walls_message(message)
+            # Hand the static layout to a map-aware player2 (the OPTIONAL ``set_map`` hook); a
+            # map-agnostic player2 (or the built-in random fallback) does not expose it.
+            self._notify_player2_map()
             received, frame = self.conn.receive_state_and_frame()
         else:
             # The object already held is the first state; pair it with its trailing frame.
@@ -439,6 +442,20 @@ class TankEnv(gymnasium.Env):
         return S.split_state_for_opponent(np.asarray(self._raw_state))
 
     # --- internal ------------------------------------------------------------------------
+
+    def _notify_player2_map(self):
+        """Hand ``self.current_map`` to player2's OPTIONAL ``set_map`` hook, if it exposes one.
+
+        Map-aware agents implement ``set_map(layout)`` to rebuild map-derived state; map-agnostic
+        agents (and the built-in ``_RandomPlayer2`` fallback) do not. Called only when a walls
+        message was tracked (a non-``None`` map). Keeps the env ``agents``-free: it probes for the
+        method via ``getattr`` and never requires it.
+        """
+        if self.current_map is None:
+            return
+        set_map = getattr(self.player2, "set_map", None)
+        if callable(set_map):
+            set_map(self.current_map)
 
     def _reconnect(self):
         """Replace ``self.conn`` with a fresh connection from the factory, if one was given.

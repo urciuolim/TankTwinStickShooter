@@ -120,19 +120,57 @@ def _episode_blobs_with_walls(states, *, walls=None, winner_last=None, done_last
     return blobs
 
 
+class _FixedAgent:
+    """A minimal deterministic player for tests: a constant action, ignores the obs.
+
+    Stands in for the deleted fixed/constant agents now that the data-collection surface is the
+    coverage family + RandomAgent; the demo loop only needs an ``act`` that returns a length-5
+    action.
+    """
+
+    def __init__(self, action=(0.0, 0.0, 0.0, 0.0, 0.0)):
+        self._action = [float(x) for x in action]
+
+    def act(self, obs):  # noqa: ARG002
+        return list(self._action)
+
+
 def _make_env(blobs, *, player2=None, max_steps=100):
     transport = ScriptedTransport(blobs)
     conn = P.Connection(transport)
     env = TankEnv(
         connection=conn,
-        player2=player2 if player2 is not None else agents.IdleAgent(),
+        player2=player2 if player2 is not None else _FixedAgent(),
         frame_shape=demo.FRAME_SHAPE,
         env_config=EnvConfig(max_steps=max_steps),
     )
     return env, transport
 
 
+class _MapRecordingAgent:
+    """A map-aware player whose ``set_map`` records the layout it was handed."""
+
+    def __init__(self):
+        self.got_map = None
+
+    def act(self, obs):  # noqa: ARG002
+        return [0.0, 0.0, 0.0, 0.0, 0.0]
+
+    def set_map(self, layout):
+        self.got_map = layout
+
+
 # --- run_demo_episode --------------------------------------------------------------------
+
+
+def test_run_demo_episode_hands_map_to_player1_set_map():
+    # When the env tracks a walls layout, run_demo_episode forwards it to a map-aware player1.
+    states = [_flat_state(i) for i in range(3)]
+    env, _ = _make_env(_episode_blobs_with_walls(states, done_last=True), max_steps=100)
+    agent1 = _MapRecordingAgent()
+    result = demo.run_demo_episode(env, agent1, max_steps=100)
+    assert result.map is not None
+    assert agent1.got_map is result.map  # the tracked layout reached the agent's set_map
 
 
 def test_run_demo_episode_reaches_winner_terminal_and_tracks_map():
@@ -140,10 +178,10 @@ def test_run_demo_episode_reaches_winner_terminal_and_tracks_map():
     states = [_flat_state(i) for i in range(4)]
     env, _ = _make_env(
         _episode_blobs_with_walls(states, winner_last=S.PLAYER_1),
-        player2=agents.ExplorerAgent(),
+        player2=agents.CoverageAgent.aggressive(seed=0),
         max_steps=100,
     )
-    result = demo.run_demo_episode(env, agents.AimAtPlayer2Agent(), max_steps=100)
+    result = demo.run_demo_episode(env, _FixedAgent(), max_steps=100)
 
     assert result.steps == 3  # one step per state after the first
     assert result.terminated
@@ -163,7 +201,7 @@ def test_run_demo_episode_player2_loss_outcome():
         _episode_blobs_with_walls(states, winner_last=S.PLAYER_2),
         max_steps=100,
     )
-    result = demo.run_demo_episode(env, agents.AimAtPlayer2Agent(), max_steps=100)
+    result = demo.run_demo_episode(env, _FixedAgent(), max_steps=100)
     assert result.terminated
     assert result.winner == S.PLAYER_2
     assert result.outcome == "loss"
@@ -173,7 +211,7 @@ def test_run_demo_episode_truncates_at_max_steps():
     # No terminal in the script; the loop stops at max_steps with truncated semantics.
     states = [_flat_state(i) for i in range(4)]
     env, _ = _make_env(_episode_blobs_with_walls(states), max_steps=3)
-    result = demo.run_demo_episode(env, agents.AimAtPlayer2Agent(), max_steps=3)
+    result = demo.run_demo_episode(env, _FixedAgent(), max_steps=3)
     assert result.steps == 3
     assert not result.terminated
     assert result.truncated
@@ -182,14 +220,15 @@ def test_run_demo_episode_truncates_at_max_steps():
 
 
 def test_run_demo_episode_drives_player1_actions_on_the_wire():
-    # AimAtPlayer2Agent as player1: P1 at origin, P2 at (3, 4) -> aim unit vector (0.6, 0.8),
-    # fire. The first action sent on the wire must carry that aim in slot "1".
+    # opponent-shadower as player1: P1 at origin, P2 at (3, 4) -> the aim layer points the unit
+    # vector (0.6, 0.8) at the opponent and the first step fires. The first action sent on the
+    # wire must carry that aim in slot "1".
     state = [0.0] * S.STATE_LEN
     state[S.PLAYER_2 * S.PLAYER_STRIDE + S.POS_X] = 3.0
     state[S.PLAYER_2 * S.PLAYER_STRIDE + S.POS_Y] = 4.0
     states = [state, state, state]
     env, transport = _make_env(_episode_blobs_with_walls(states, done_last=True), max_steps=100)
-    demo.run_demo_episode(env, agents.AimAtPlayer2Agent(), max_steps=100)
+    demo.run_demo_episode(env, agents.CoverageAgent.opponent_shadower(seed=0), max_steps=100)
     # Decode ONLY the first step message off the wire (sent holds several back to back); a
     # Connection over the sent bytes reads exactly one top-level object via its brace scan.
     step_start = bytes(transport.sent).index(b'{"1"')
@@ -204,17 +243,31 @@ def test_run_demo_episode_drives_player1_actions_on_the_wire():
 # --- agent selectors ---------------------------------------------------------------------
 
 
-def test_default_selectors_pick_aim_and_explorer():
-    assert demo.DEFAULT_PLAYER1 == "aim-at-player2"
-    assert demo.DEFAULT_PLAYER2 == "explorer"
-    assert isinstance(demo.make_agent(demo.DEFAULT_PLAYER1), agents.AimAtPlayer2Agent)
-    assert isinstance(demo.make_agent(demo.DEFAULT_PLAYER2), agents.ExplorerAgent)
+def test_default_selectors_pick_coverage_and_shadower():
+    assert demo.DEFAULT_PLAYER1 == "aggressive-coverage"
+    assert demo.DEFAULT_PLAYER2 == "opponent-shadower"
+    assert isinstance(demo.make_agent(demo.DEFAULT_PLAYER1), agents.CoverageAgent)
+    assert isinstance(demo.make_agent(demo.DEFAULT_PLAYER2), agents.CoverageAgent)
 
 
-def test_two_default_selectors_are_different_agent_types():
-    a1 = demo.make_agent(demo.DEFAULT_PLAYER1)
-    a2 = demo.make_agent(demo.DEFAULT_PLAYER2)
-    assert type(a1) is not type(a2)
+def test_default_selectors_are_visibly_different_policies():
+    # Both are the coverage family, but the default pairing is distinct presets (the player2
+    # shadower aims at the opponent while player1 sweeps aim) — a visibly different demo.
+    assert demo.DEFAULT_PLAYER1 != demo.DEFAULT_PLAYER2
+
+
+def test_selector_surface_is_the_new_family_plus_random():
+    assert set(demo.AGENT_SELECTORS) == {
+        "aggressive-coverage",
+        "wall-hugger",
+        "opponent-shadower",
+        "random",
+    }
+
+
+def test_no_deleted_selectors_remain():
+    for gone in ("aim-at-player2", "explorer", "aim-sweep", "spray", "perimeter", "idle"):
+        assert gone not in demo.AGENT_SELECTORS
 
 
 def test_every_selector_builds_a_valid_agent():

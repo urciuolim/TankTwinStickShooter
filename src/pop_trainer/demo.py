@@ -71,25 +71,18 @@ _SOCK_TIMEOUT_SEC = 30.0
 
 # --- agent selectors --------------------------------------------------------------------
 # Selector name -> a zero-arg-friendly factory taking an optional seed. The default pairing is
-# player1 = aim-at-player2 (purposeful tactical), player2 = explorer (sweeps the arena): two
-# visibly different policies. ``idle`` / ``constant`` / ``scripted-cycle`` are low-information
-# player2 options, included so the selector surface is complete.
+# player1 = aggressive-coverage (sweeps the arena, aim-sweeps + fires) vs player2 =
+# opponent-shadower (the same coverage movement but the aim layer tracks player1 and fires):
+# two visibly different policies. ``random`` is the map-agnostic baseline.
 AGENT_SELECTORS: dict[str, Callable[[int | None], core_agent.Agent]] = {
-    "aim-at-player2": lambda seed: agents.AimAtPlayer2Agent(),
-    "explorer": lambda seed: agents.ExplorerAgent(seed=seed),
-    "aim-sweep": lambda seed: agents.AimSweepAgent(),
-    "spray": lambda seed: agents.SprayAgent(),
-    "perimeter": lambda seed: agents.PerimeterAgent(),
+    "aggressive-coverage": lambda seed: agents.CoverageAgent.aggressive(seed=seed),
+    "wall-hugger": lambda seed: agents.CoverageAgent.wall_hugger(seed=seed),
+    "opponent-shadower": lambda seed: agents.CoverageAgent.opponent_shadower(seed=seed),
     "random": lambda seed: agents.RandomAgent(seed=seed),
-    "idle": lambda seed: agents.IdleAgent(),
-    "constant": lambda seed: agents.ConstantAgent([1.0, 0.0, 1.0, 0.0, 1.0]),
-    "scripted-cycle": lambda seed: agents.ScriptedCycleAgent(
-        [[1.0, 0.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0, 0.0]]
-    ),
 }
 
-DEFAULT_PLAYER1 = "aim-at-player2"
-DEFAULT_PLAYER2 = "explorer"
+DEFAULT_PLAYER1 = "aggressive-coverage"
+DEFAULT_PLAYER2 = "opponent-shadower"
 
 
 def make_agent(selector: str, *, seed: int | None = None) -> core_agent.Agent:
@@ -151,6 +144,13 @@ def run_demo_episode(
     del obs  # the observation is the pixel frame; this loop drives off info["state"].
     state_vec = info["state"]
     tracked_map = info.get("map")
+
+    # Hand the static layout to a map-aware player1 (the OPTIONAL ``set_map`` hook); player2's
+    # map is handled inside the env. A map-agnostic agent1 does not expose ``set_map``.
+    if tracked_map is not None:
+        set_map = getattr(agent1, "set_map", None)
+        if callable(set_map):
+            set_map(tracked_map)
 
     steps = 0
     total_reward = 0.0

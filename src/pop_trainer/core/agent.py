@@ -19,17 +19,29 @@ Two protocols, on purpose, because of how :func:`typing.runtime_checkable` works
   EXIST, so the runtime-checkable surface must be exactly the REQUIRED surface — ``act``.
   A pure, stateless agent that implements only ``act`` therefore passes
   ``isinstance(x, Agent)``.
-* :class:`StatefulAgent` extends :class:`Agent` with the OPTIONAL ``reset`` method (for
-  seeded / stateful agents). It is intentionally NOT ``runtime_checkable``: folding
-  ``reset`` into the runtime-checkable Protocol would make a stateless ``act``-only agent
-  FAIL ``isinstance``, which would wrongly reject a valid agent. ``reset`` thus lives in a
-  separate static-only Protocol — documented and statically checkable, never required at
-  runtime.
+* :class:`StatefulAgent` extends :class:`Agent` with the OPTIONAL ``reset`` and ``set_map``
+  methods (for seeded / stateful and map-aware agents). These live in a SEPARATE Protocol —
+  NOT folded into :class:`Agent` — to keep the runtime-checkable surface exactly the REQUIRED
+  surface (``act``): if ``reset`` / ``set_map`` were on :class:`Agent`, a stateless ``act``-only
+  agent would FAIL ``isinstance(x, Agent)`` and be wrongly rejected. The optional methods are
+  consumed by probing with ``getattr`` / ``hasattr`` at runtime — never via ``isinstance`` — so
+  :class:`StatefulAgent` exists for STATIC typing.
+
+The map hook (:meth:`StatefulAgent.set_map`) is how a map-aware agent receives the static
+wall layout once per episode. The env / demo / collection call it via ``getattr`` ONLY when
+the agent exposes it (it is never required), passing the
+:class:`pop_trainer.core.protocol.WallLayout` from ``info["map"]``. Map-agnostic agents (e.g.
+``RandomAgent``) simply do not implement it. ``WallLayout`` is referenced under
+``TYPE_CHECKING`` only — importing it at runtime would create an ``agent`` -> ``protocol`` ->
+``state`` cycle, and this module must stay import-free of the rest of ``core`` at runtime.
 """
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
+
+if TYPE_CHECKING:
+    from pop_trainer.core.protocol import WallLayout
 
 __all__ = ["Agent", "StatefulAgent"]
 
@@ -53,14 +65,26 @@ class Agent(Protocol):
 
 
 class StatefulAgent(Agent, Protocol):
-    """An :class:`Agent` that also supports an OPTIONAL seeded :meth:`reset`.
+    """An :class:`Agent` that also supports OPTIONAL seeded :meth:`reset` / :meth:`set_map`.
 
-    Static-only (NOT ``runtime_checkable``): stateful / seeded agents may implement
-    ``reset`` to clear or re-seed internal state between episodes, but pure agents need not
-    — they still satisfy :class:`Agent`. Use this Protocol for static typing where the
-    caller relies on ``reset`` being present.
+    A STATIC-typing Protocol — the optional methods are consumed via ``getattr`` / ``hasattr``,
+    never ``isinstance``: stateful / seeded agents may implement ``reset`` to clear or re-seed
+    internal state between episodes, and map-aware agents may implement ``set_map`` to receive
+    the static wall layout — but pure / map-agnostic agents need neither and still satisfy
+    :class:`Agent`. Use this Protocol for static typing where the caller relies on ``reset`` /
+    ``set_map`` being present.
     """
 
     def reset(self, *, seed: int | None = None) -> None:
         """Clear or re-seed any internal episode state; ``seed`` makes it deterministic."""
+        ...
+
+    def set_map(self, layout: WallLayout) -> None:
+        """Receive the static :class:`~pop_trainer.core.protocol.WallLayout` for this episode.
+
+        Called once per episode (on map load / change) for map-aware agents to (re)build any
+        map-derived state — e.g. a coverage policy's free/reachable grid. The caller invokes
+        it ONLY when the agent exposes it (``getattr``/``hasattr``); a map-agnostic agent need
+        not implement it.
+        """
         ...

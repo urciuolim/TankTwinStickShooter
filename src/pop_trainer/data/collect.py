@@ -108,12 +108,26 @@ def _maybe_reset(agent: object, seed: int | None) -> None:
     """Call ``agent.reset(seed=seed)`` if the agent exposes ``reset`` (it is OPTIONAL).
 
     ``core.Agent`` requires only ``act``; ``reset`` belongs to the static-only ``StatefulAgent``
-    surface. Stateful / seeded agents (e.g. ``RandomAgent``, ``ScriptedCycleAgent``) implement it
-    so an episode replays deterministically; pure agents do not, and are left untouched.
+    surface. Stateful / seeded agents (e.g. ``RandomAgent``, ``CoverageAgent``) implement it so
+    an episode replays deterministically; pure agents do not, and are left untouched.
     """
     reset = getattr(agent, "reset", None)
     if callable(reset):
         reset(seed=seed)
+
+
+def _maybe_set_map(agent: object, layout) -> None:
+    """Call ``agent.set_map(layout)`` if the agent exposes the OPTIONAL hook and ``layout`` exists.
+
+    ``core.Agent`` requires only ``act``; ``set_map`` belongs to the static-only ``StatefulAgent``
+    surface. Map-aware agents (the coverage family) implement it to (re)build their grid; map-
+    agnostic agents do not, and are left untouched. A ``None`` layout (no arena) is a no-op.
+    """
+    if layout is None:
+        return
+    set_map = getattr(agent, "set_map", None)
+    if callable(set_map):
+        set_map(layout)
 
 
 def _zero_action() -> np.ndarray:
@@ -153,6 +167,9 @@ def run_episode(
     _maybe_reset(player1, seed)
     _maybe_reset(getattr(env, "player2", None), seed)
     obs, info = env.reset(seed=seed)
+    # Hand the static layout to a map-aware player1 (the OPTIONAL ``set_map`` hook); player2's
+    # map is handled inside the env. A map-agnostic player1 does not expose ``set_map``.
+    _maybe_set_map(player1, info.get("map"))
     frame = obs
     vec = info["state"]
     step_idx = 0

@@ -29,6 +29,20 @@ class SeededAgent:
         self.last_seed = seed
 
 
+class MapAwareAgent:
+    """A map-aware agent: ``act`` + ``set_map``. Satisfies ``Agent`` (act present)."""
+
+    def __init__(self, action):
+        self._action = action
+        self.got_map = "unset"
+
+    def act(self, obs):
+        return self._action
+
+    def set_map(self, layout):
+        self.got_map = layout
+
+
 class NotAnAgent:
     """No ``act`` method — must fail the runtime-checkable ``Agent`` check."""
 
@@ -65,6 +79,29 @@ def test_stateless_agent_still_satisfies_agent_without_reset():
     stateless = StatelessAgent([0.0, 0.0, 0.0, 0.0, 0.0])
     assert isinstance(stateless, Agent)
     assert not hasattr(stateless, "reset")
+
+
+def test_stateful_agent_documents_optional_set_map():
+    # The map hook lives on the static-only StatefulAgent protocol (NOT runtime-checkable Agent),
+    # so adding it never breaks isinstance(x, Agent).
+    assert hasattr(StatefulAgent, "set_map")
+
+
+def test_map_aware_agent_satisfies_agent_and_receives_layout():
+    # A map-aware agent (act + set_map) is still an Agent (act present), and set_map accepts a
+    # layout — a lightweight runtime check of the optional hook.
+    agent = MapAwareAgent([0.0, 0.0, 0.0, 0.0, 0.0])
+    assert isinstance(agent, Agent)
+    sentinel = object()
+    agent.set_map(sentinel)
+    assert agent.got_map is sentinel
+
+
+def test_map_agnostic_agent_need_not_implement_set_map():
+    # An act-only agent is a valid Agent and is never required to expose set_map.
+    stateless = StatelessAgent([0.0, 0.0, 0.0, 0.0, 0.0])
+    assert isinstance(stateless, Agent)
+    assert not hasattr(stateless, "set_map")
 
 
 def test_import_surface():

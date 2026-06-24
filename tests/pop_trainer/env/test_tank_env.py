@@ -423,6 +423,50 @@ class _RecordingPlayer2:
         return self.action
 
 
+class _MapAwarePlayer2:
+    """A map-aware test player2: records the layout handed to its OPTIONAL ``set_map`` hook."""
+
+    def __init__(self, action):
+        self.action = list(action)
+        self.got_map = None
+
+    def act(self, obs):  # noqa: ARG002
+        return self.action
+
+    def set_map(self, layout):
+        self.got_map = layout
+
+
+def test_env_hands_map_to_map_aware_player2_set_map():
+    # When the handshake delivers a walls layout, the env forwards it to a map-aware player2's
+    # OPTIONAL set_map hook (probed via getattr — never required).
+    raw0 = _flat_state()
+    blobs = _reset_blobs_with_walls(raw0)
+    player2 = _MapAwarePlayer2([0.0, 0.0, 0.0, 0.0, 0.0])
+    env, _ = _make_env(blobs, player2=player2)
+    _, info = env.reset(seed=0)
+    assert player2.got_map is env.current_map
+    assert player2.got_map is info["map"]
+
+
+def test_env_does_not_require_set_map_on_player2():
+    # A map-agnostic player2 (no set_map) is never called with it — a walls reset must not crash.
+    raw0 = _flat_state()
+    blobs = _reset_blobs_with_walls(raw0)
+    env, _ = _make_env(blobs, player2=_FixedPlayer2([0.0, 0.0, 0.0, 0.0, 0.0]))
+    obs, info = env.reset(seed=0)  # must not raise though player2 has no set_map
+    assert info["map"] is not None
+
+
+def test_env_skips_player2_set_map_without_walls():
+    # No walls message: set_map is never invoked (the map is None).
+    raw0 = _flat_state()
+    player2 = _MapAwarePlayer2([0.0, 0.0, 0.0, 0.0, 0.0])
+    env, _ = _make_env(_reset_blobs(raw0), player2=player2)
+    env.reset(seed=0)
+    assert player2.got_map is None
+
+
 def test_injected_player2_drives_key2_action_and_info():
     raw0 = _flat_state()
     raw1 = _flat_state(1.0)
