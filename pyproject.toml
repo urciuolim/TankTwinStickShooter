@@ -53,6 +53,13 @@ dependencies = [
     "tqdm>=4.68.3",
 ]
 
+[project.optional-dependencies]
+# Keyboard-driven human play (pop_trainer.agents.HumanAgent) — an OPTIONAL extra so the core
+# package installs without it. pynput is imported LAZILY (only inside KeyboardListener), so
+# `import pop_trainer.agents` works without this extra. Pure-Python universal wheel (py2.py3),
+# cp312 win_amd64 + manylinux. Install: `uv sync --extra human`.
+human = ["pynput>=1.8,<2"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

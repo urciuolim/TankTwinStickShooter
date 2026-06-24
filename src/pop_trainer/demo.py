@@ -26,6 +26,13 @@ StreamingAssets next to the ``Arenas/`` directory so its relative ``arena_path``
 (``Arenas/custom1.json``) resolves against the config directory — exactly how
 ``DriverController.ResolveArenaPath`` resolves it. It also drops ``timeScale`` from the shipped
 20 to a human-watchable 2.
+
+HUMAN PLAY. Passing ``--player1 human`` and/or ``--player2 human`` makes that player
+keyboard-driven (:class:`pop_trainer.agents.HumanAgent`): a SINGLE shared
+:class:`~pop_trainer.agents.KeyboardListener` + state feeds BOTH agents (two players, one
+keyboard), started before the episode and stopped on teardown. When a player is human the default
+config switches to ``human_config.json`` (real-time ``timeScale: 1``) unless ``--config`` is given.
+``pynput`` is the optional ``human`` extra, imported lazily by the listener.
 """
 
 from __future__ import annotations
@@ -56,6 +63,10 @@ DEFAULT_EXE = _REPO_ROOT / "build" / "TankTwinStickShooter.exe"
 # The demo config enables obs_pixels and lives in StreamingAssets so its relative arena_path
 # resolves against the config directory (DriverController.ResolveArenaPath).
 DEFAULT_CONFIG = _REPO_ROOT / "Assets" / "StreamingAssets" / "demo_config.json"
+# Real-time human play needs a slower, more forgiving cadence than the watch-the-bots demo:
+# timeScale 1, a responsive ai_actionFreq, and more health for a duel. Used as the default config
+# when EITHER player is "human" (unless --config is explicitly overridden).
+HUMAN_CONFIG = _REPO_ROOT / "Assets" / "StreamingAssets" / "human_config.json"
 DEFAULT_PORT = 50000
 
 # Rendered pixel-frame dimensions (W x H) — MUST match demo_config.json's obs_pixels_*.
@@ -83,17 +94,52 @@ AGENT_SELECTORS: dict[str, Callable[[int | None], core_agent.Agent]] = {
 DEFAULT_PLAYER1 = "aggressive-coverage"
 DEFAULT_PLAYER2 = "opponent-shadower"
 
+# The "human" selector is NOT a seed-factory (it needs a SHARED keyboard listener + state that a
+# per-agent seed factory cannot express), so it is a SPECIAL PATH in main, not an AGENT_SELECTORS
+# entry. It is offered alongside the seed-factory selectors as a --player1 / --player2 choice.
+HUMAN_SELECTOR = "human"
+PLAYER_CHOICES = sorted(AGENT_SELECTORS) + [HUMAN_SELECTOR]
+
 
 def make_agent(selector: str, *, seed: int | None = None) -> core_agent.Agent:
     """Build the agent named by ``selector`` (see :data:`AGENT_SELECTORS`).
 
-    Raises ``ValueError`` on an unknown selector, listing the valid names.
+    Raises ``ValueError`` on an unknown selector, listing the valid names. The ``"human"`` selector
+    is NOT handled here — it is a special shared-listener path in :func:`main`.
     """
     factory = AGENT_SELECTORS.get(selector)
     if factory is None:
         valid = ", ".join(sorted(AGENT_SELECTORS))
         raise ValueError(f"unknown agent selector {selector!r}; choose one of: {valid}")
     return factory(seed)
+
+
+def build_human_agents(
+    player1: str,
+    player2: str,
+    state: agents.KeyboardState,
+    *,
+    seed: int | None = None,
+) -> tuple[core_agent.Agent, core_agent.Agent]:
+    """Build the (agent1, agent2) pair, wiring any ``"human"`` player to the SHARED ``state``.
+
+    A ``"human"`` player becomes a :class:`~pop_trainer.agents.HumanAgent` over the player's
+    keymap and the ONE shared :class:`~pop_trainer.agents.KeyboardState` (so two humans read the
+    SAME pressed-key source); a non-human player is built via :func:`make_agent`. Pure: takes an
+    already-built ``state`` and never constructs a listener / touches ``pynput``, so the wiring is
+    unit-testable.
+    """
+    agent1: core_agent.Agent = (
+        agents.HumanAgent(agents.player1_mapping(), state)
+        if player1 == HUMAN_SELECTOR
+        else make_agent(player1, seed=seed)
+    )
+    agent2: core_agent.Agent = (
+        agents.HumanAgent(agents.player2_mapping(), state)
+        if player2 == HUMAN_SELECTOR
+        else make_agent(player2, seed=seed)
+    )
+    return agent1, agent2
 
 
 # --- pure episode loop (unit-tested against a fake transport) ----------------------------
@@ -210,20 +256,23 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=Path,
-        default=DEFAULT_CONFIG,
-        help="config JSON for the build (MUST enable obs_pixels at 640x360)",
+        default=None,
+        help=(
+            "config JSON for the build (MUST enable obs_pixels at 640x360); defaults to "
+            "human_config.json when a player is 'human', else demo_config.json"
+        ),
     )
     parser.add_argument(
         "--player1",
         default=DEFAULT_PLAYER1,
-        choices=sorted(AGENT_SELECTORS),
-        help="agent selector for player1 (driven by this module)",
+        choices=PLAYER_CHOICES,
+        help="agent selector for player1 (driven by this module; 'human' = keyboard play)",
     )
     parser.add_argument(
         "--player2",
         default=DEFAULT_PLAYER2,
-        choices=sorted(AGENT_SELECTORS),
-        help="agent selector for player2 (driven by this module)",
+        choices=PLAYER_CHOICES,
+        help="agent selector for player2 (driven by this module; 'human' = keyboard play)",
     )
     parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
@@ -250,22 +299,36 @@ def main(argv: list[str] | None = None) -> int:
     """Launch the build, connect, run one episode, print the trace, tear down cleanly."""
     args = _parse_args(argv)
 
+    human_play = HUMAN_SELECTOR in (args.player1, args.player2)
+    # A human player needs real-time cadence; pick human_config.json by default, unless the user
+    # explicitly passed --config.
+    if args.config is not None:
+        config = args.config
+    else:
+        config = HUMAN_CONFIG if human_play else DEFAULT_CONFIG
+
     if not args.exe.exists():
         print(f"error: build not found at {args.exe}", file=sys.stderr)
         return 2
-    if not args.config.exists():
-        print(f"error: config not found at {args.config}", file=sys.stderr)
+    if not config.exists():
+        print(f"error: config not found at {config}", file=sys.stderr)
         return 2
 
-    agent1 = make_agent(args.player1, seed=args.seed)
-    agent2 = make_agent(args.player2, seed=args.seed)
+    # For human play, ONE listener owns ONE shared KeyboardState that both HumanAgents read; the
+    # listener is started before the episode and stopped in the teardown. pynput is imported lazily
+    # by KeyboardListener, so a missing 'human' extra fails here with an actionable message.
+    listener = agents.KeyboardListener() if human_play else None
+    state = listener.state if listener is not None else agents.KeyboardState()
+    agent1, agent2 = build_human_agents(args.player1, args.player2, state, seed=args.seed)
 
-    cmd = build_launch_cmd(args.exe, args.port, args.config)
+    cmd = build_launch_cmd(args.exe, args.port, config)
     print("launching:", " ".join(cmd))
     proc = subprocess.Popen(cmd)  # noqa: S603 (arg-list, trusted local build path)
 
     env: TankEnv | None = None
     try:
+        if listener is not None:
+            listener.start()
         connection = Connection(connect(args.port))
         env = TankEnv(
             connection=connection,
@@ -276,6 +339,9 @@ def main(argv: list[str] | None = None) -> int:
         result = run_demo_episode(env, agent1, agent2, max_steps=args.max_steps)
         _print_trace(result, player1=args.player1, player2=args.player2)
     finally:
+        if listener is not None:
+            with contextlib.suppress(Exception):
+                listener.stop()
         if env is not None:
             with contextlib.suppress(Exception):
                 env.close()

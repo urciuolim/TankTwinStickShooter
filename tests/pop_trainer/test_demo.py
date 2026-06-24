@@ -324,6 +324,38 @@ def test_seed_is_threaded_into_seeded_agents():
     np.testing.assert_array_equal(a.act(None), b.act(None))
 
 
+# --- human-play wiring --------------------------------------------------------------------
+
+
+def test_human_is_a_player_choice_but_not_a_selector():
+    # "human" is offered as a --player1 / --player2 choice but is NOT a seed-factory selector
+    # (it is a special shared-listener path in main).
+    assert "human" in demo.PLAYER_CHOICES
+    assert "human" not in demo.AGENT_SELECTORS
+
+
+def test_build_human_agents_shares_one_state_between_both_humans():
+    # With BOTH players human, both HumanAgents read the SAME shared KeyboardState (identity).
+    state = agents.KeyboardState()
+    agent1, agent2 = demo.build_human_agents("human", "human", state)
+    assert isinstance(agent1, agents.HumanAgent)
+    assert isinstance(agent2, agents.HumanAgent)
+    assert agent1.keyboard_state is state
+    assert agent2.keyboard_state is agent1.keyboard_state  # the SAME object
+    # P1 / P2 get their respective keymaps.
+    assert agent1.mapping.name == "player1"
+    assert agent2.mapping.name == "player2"
+
+
+def test_build_human_agents_mixes_human_and_non_human():
+    # A non-human player is built via make_agent; the human reads the shared state.
+    state = agents.KeyboardState()
+    agent1, agent2 = demo.build_human_agents("random", "human", state, seed=0)
+    assert isinstance(agent1, agents.RandomAgent)
+    assert isinstance(agent2, agents.HumanAgent)
+    assert agent2.keyboard_state is state
+
+
 # --- import-boundary guard ---------------------------------------------------------------
 
 

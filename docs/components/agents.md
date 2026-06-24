@@ -14,8 +14,11 @@ baseline. The old explorer / aim-sweep / spray / perimeter / rules variants are 
 subsumed by the one family, its aim/fire layer, and the `opponent-shadower` preset.
 
 **Boundary:** imports [`core`](core.md) only (the `Agent` Protocol, the `state` schema, the
-`protocol.WallLayout` type) plus numpy + stdlib. No torch; nothing from `env` / `data` /
-`models` / `rl` / `pretraining`; nothing from `tank_twin`.
+`protocol.WallLayout` type) plus numpy + stdlib — and `pynput` LAZILY, listener-only (see
+[`HumanAgent`](#humanagent--keyboard-driven-live-play) below). No torch; nothing from `env` /
+`data` / `models` / `rl` / `pretraining`; nothing from `tank_twin`. The `human`-extra `pynput`
+import is the ONE exception to the import boundary, and it is lazy: `import pop_trainer.agents`
+succeeds core-only, without `pynput` installed.
 
 ## Key classes / entry points
 
@@ -54,6 +57,39 @@ subsumed by the one family, its aim/fire layer, and the `opponent-shadower` pres
   `coverage_metrics.py:24`), and returns a [`CoverageReport`](../../src/pop_trainer/agents/coverage_metrics.py)
   (`coverage_metrics.py:68`). This is how the family is validated against `RandomAgent` in-tree
   without a live Unity.
+
+## `HumanAgent` — keyboard-driven live play
+
+A SEPARATE family from the coverage surface: `HumanAgent` is **not** a data-collection coverage
+agent — it is a **live-play input agent** for human-vs-human (or human-vs-bot) testing, consumed
+only by [demo](demo.md). It exercises none of the coverage harness above.
+
+- [`HumanAgent`](../../src/pop_trainer/agents/human_agent.py) — a KEYBOARD-driven
+  [`core.agent.Agent`](core.md) whose `act(obs)` **IGNORES the observation** (the action comes from
+  the keyboard, not the pixels/state) and emits the same env 5-float
+  `[move_x, move_y, aim_x, aim_y, fire]` (`human_agent.py:228-243`). Per-channel math:
+  `move_x = right − left`, `move_y = up − down` (same for aim); `fire = 1.0` iff the fire key is
+  down; all keys released → `[0, 0, 0, 0, 0]`. Diagonals are left UN-normalized (the wire /
+  `validate_action` / env coerces).
+- **Two players, one keyboard.** A SINGLE [`KeyboardListener`](../../src/pop_trainer/agents/human_agent.py)
+  tracks the pressed-key set into a shared [`KeyboardState`](../../src/pop_trainer/agents/human_agent.py),
+  and TWO `HumanAgent`s — one per [`KeyMapping`](../../src/pop_trainer/agents/human_agent.py) —
+  read that SAME state (`human_agent.py:215-247`).
+- **The mapping** (matches the CTO spec) — built by `player1_mapping` / `player2_mapping`:
+  - **P1** — move WASD, aim TFGH, fire LEFT SHIFT (`human_agent.py:129-146`).
+  - **P2** — move IJKL, aim NUMPAD 8/4/5/6, fire ENTER (`human_agent.py:149-170`).
+- **Numpad-by-vk (load-bearing).** The P2 aim keys are detected by VIRTUAL-KEY CODE (8=104,
+  4=100, 5=101, 6=102) so they work regardless of Num Lock. With Num Lock OFF the keys arrive as
+  arrows (8→up, 4→left, 6→right) or numpad-5 as `VK_CLEAR` (vk 12); each numpad token is a SET
+  accepting EITHER encoding (`human_agent.py:149-170, 319-348`).
+- **`pynput` is an OPTIONAL, LAZY dependency** (the `human` extra). The ONLY `pynput` import is
+  inside [`KeyboardListener._require_pynput`](../../src/pop_trainer/agents/human_agent.py) — never
+  at module top — so `import pop_trainer.agents` works core-only WITHOUT `pynput`. Building or
+  starting a listener without `pynput` raises a clear `RuntimeError` naming the `human` extra
+  (`PYNPUT_MISSING_MSG`, `human_agent.py:69-72, 263-279`).
+- **Pure vs. hardware split.** The pure layer (`KeyMapping` / `KeyboardState` / `HumanAgent` + the
+  mapping factories) never touches `pynput` and is unit-tested with NO hardware; ONLY
+  `KeyboardListener` touches `pynput`.
 
 ## Objectives vs guardrail (the metric suite)
 
@@ -112,7 +148,9 @@ engine.
 - [data](data.md) — collection pairs a `player1` + `player2` agent to drive episodes (both
   driver-side; the env owns neither player), and calls `set_map` on **both** via `_maybe_set_map`.
 - [demo](demo.md) — the `--player1` / `--player2` selectors (`aggressive-coverage` /
-  `wall-hugger` / `opponent-shadower` / `random`) build agents from here.
+  `wall-hugger` / `opponent-shadower` / `random`) build agents from here. The `human` choice
+  (NOT a coverage selector) wires a `HumanAgent` per player over ONE shared `KeyboardListener` /
+  `KeyboardState` (`pynput` loaded lazily, listener-only) for live human play.
 
 ## Where it sits in the run
 

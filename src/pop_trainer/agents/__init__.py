@@ -27,9 +27,15 @@ THE COVERAGE FAMILY. The data-collection surface is ONE map-aware policy family,
 provides the kinematic-rollout coverage-measurement harness (coverage-fraction +
 occupancy-entropy + an ESS guardrail) that validates the family against ``RandomAgent``.
 
+:class:`HumanAgent` (:mod:`pop_trainer.agents.human_agent`) is a KEYBOARD-driven agent for live
+human-vs-human play: two players share one keyboard via a single :class:`KeyboardListener` /
+:class:`KeyboardState`, and two :class:`HumanAgent`s (P1 / P2 :class:`KeyMapping`) read that shared
+state. ``pynput`` is an OPTIONAL, LAZY dependency (the ``human`` extra) imported only inside the
+listener — so importing this package never imports ``pynput``.
+
 Boundaries: imports :mod:`pop_trainer.core` only (the Agent Protocol, the state schema, the
-``WallLayout`` type) plus numpy and stdlib. No torch; nothing from ``env`` / ``data`` /
-``pretraining`` / ``rl`` / ``models``; nothing from ``tank_twin``.
+``WallLayout`` type) plus numpy and stdlib (and ``pynput`` LAZILY, listener-only). No torch;
+nothing from ``env`` / ``data`` / ``pretraining`` / ``rl`` / ``models``; nothing from ``tank_twin``.
 """
 
 from __future__ import annotations
@@ -49,6 +55,14 @@ from pop_trainer.agents.coverage_metrics import (
     CoverageReport,
     build_grid,
     measure_coverage,
+)
+from pop_trainer.agents.human_agent import (
+    HumanAgent,
+    KeyboardListener,
+    KeyboardState,
+    KeyMapping,
+    player1_mapping,
+    player2_mapping,
 )
 from pop_trainer.agents.random_agent import RandomAgent
 
@@ -70,4 +84,11 @@ __all__ = [
     "measure_coverage",
     "build_grid",
     "CoverageReport",
+    # keyboard-driven human play (pynput is a lazy optional 'human' extra)
+    "HumanAgent",
+    "KeyMapping",
+    "KeyboardState",
+    "KeyboardListener",
+    "player1_mapping",
+    "player2_mapping",
 ]

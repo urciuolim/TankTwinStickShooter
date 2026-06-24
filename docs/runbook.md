@@ -65,8 +65,36 @@ uv run python -m pop_trainer.demo --help
 
 Useful flags (defaults shown): `--exe build/TankTwinStickShooter.exe`,
 `--config Assets/StreamingAssets/demo_config.json`, `--port 50000`, `--player1` / `--player2`
-(any of: `aggressive-coverage`, `wall-hugger`, `opponent-shadower`, `random`), `--max-steps 600`,
-`--seed 0`. The demo exits `2` if the build exe or config is missing.
+(any of: `aggressive-coverage`, `wall-hugger`, `opponent-shadower`, `random`, `human`),
+`--max-steps 600`, `--seed 0`. The demo exits `2` if the build exe or config is missing.
+
+### Human-vs-human play (two players, one keyboard)
+
+Human play needs the optional `human` extra (installs `pynput`, the global keyboard hook):
+
+```bash
+uv sync --extra human
+```
+
+Then make either or both players keyboard-driven. Two humans share ONE keyboard:
+
+```bash
+uv run python -m pop_trainer.demo --player1 human --player2 human
+```
+
+One human + one bot is also valid, e.g. `--player1 human --player2 opponent-shadower`.
+
+Controls:
+
+- **P1** — move WASD, aim TFGH, fire LEFT SHIFT.
+- **P2** — move IJKL, aim numpad 8/4/5/6, fire ENTER. (Numpad aim works with Num Lock ON or OFF.)
+
+When a player is `human` the demo auto-selects `Assets/StreamingAssets/human_config.json` (real-time
+`timeScale: 1`, a more forgiving cadence) instead of `demo_config.json` — unless you pass `--config`.
+
+> **LOCAL-DEV ONLY.** `pynput` installs a GLOBAL keyboard hook that needs a real desktop session.
+> Human play is NOT part of the headless GCP / cluster path — that path is bot-vs-bot collection /
+> training only. **Do not add `--extra human` to the cluster / headless install.**
 
 ## 4. Collect a dataset (CLI)
 
