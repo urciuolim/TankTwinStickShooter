@@ -1,0 +1,105 @@
+# Architecture
+
+The cross-component class-to-class interaction map for the built + GO'd slice of `pop_trainer`.
+
+## Dependency direction
+
+`core` is the **dependency-free root**; every component points inward toward it, never back out.
+`models` imports nothing internal (a leaf alongside `core`). The full direction:
+
+```
+core  ←  { models, env, agents, data }  ←  demo
+```
+
+- [core](components/core.md) — stdlib + numpy only; imports nothing internal.
+- [models](components/models.md) — torch only; imports nothing internal.
+- [env](components/env.md) — imports `core` (+ gymnasium, numpy).
+- [agents](components/agents.md) — imports `core` (+ numpy).
+- [data](components/data.md) — imports `core`, `env`, `agents`.
+- [demo](components/demo.md) — imports `core`, `env`, `agents`.
+
+No import cycles: `data` and `demo` sit at the top, `core` at the bottom, `models` off to the
+side. (`pretraining` / `rl` / `eval` / `population` / `deployment` / `imitation` are not built
+yet and are omitted.)
+
+## Class-to-class interaction map
+
+```mermaid
+graph TD
+    subgraph core["core (contract layer — dep-free root)"]
+        State["state.py<br/>52-float schema +<br/>split_state_for_opponent /<br/>flip_frame_perspective"]
+        Protocol["protocol.py<br/>Connection, encode/decode,<br/>receive_frame, WallLayout,<br/>parse_walls_message"]
+        Config["config.py<br/>RunConfig / EnvConfig /<br/>RewardConfig"]
+        Maps["maps.py<br/>resolve_map_rotation"]
+        AgentProto["agent.py<br/>Agent / StatefulAgent<br/>(Protocol)"]
+    end
+
+    subgraph models["models (torch; no internal deps)"]
+        Encoder["Encoder = Trunk × Pooling<br/>build_encoder / export_onnx"]
+    end
+
+    subgraph agents["agents (model-free policies)"]
+        AgentImpls["Agent implementations<br/>(redesign in flight)"]
+    end
+
+    subgraph env["env"]
+        TankEnv["TankEnv<br/>(gymnasium.Env)"]
+        Rewards["shaped_step_reward /<br/>time_penalty_per_step"]
+    end
+
+    subgraph data["data"]
+        Collect["collect.py<br/>run_episode / collect_to_shards /<br/>collect_parallel"]
+        Shards["shards.py / schema.py"]
+        Readers["readers.py<br/>split_groups / build_index"]
+    end
+
+    Demo["demo.py<br/>run_demo_episode / main"]
+
+    Unity["Unity sim<br/>(GameController, DriverController,<br/>WallMessage, FrameCapture)"]
+
+    %% env wiring
+    TankEnv --> Protocol
+    TankEnv --> State
+    TankEnv --> Config
+    TankEnv --> AgentProto
+    TankEnv --> Rewards
+    TankEnv <-->|TCP-JSON + pixel frames| Unity
+
+    %% agents wiring
+    AgentImpls --> AgentProto
+    AgentImpls --> State
+
+    %% models wiring
+    Encoder -.->|leaf, no internal import| core
+
+    %% data wiring
+    Collect --> TankEnv
+    Collect --> AgentImpls
+    Collect --> State
+    Collect --> Shards
+    Readers --> Shards
+
+    %% demo wiring
+    Demo --> TankEnv
+    Demo --> AgentImpls
+    Demo --> Protocol
+
+    classDef root fill:#d4edda,stroke:#28a745;
+    class core root;
+```
+
+## Reading the map
+
+- **`TankEnv` is the hub.** It pulls every `core` module it needs (`protocol`, `state`,
+  `config`, `agent`, plus its own `rewards`) and is the only thing that talks to Unity over the
+  socket. Both `data.collect` and `demo` run their episodes through it.
+- **The self-play seam** lives in `core.state` (`split_state_for_opponent` /
+  `flip_frame_perspective`): `TankEnv` flips perspective to feed the injected player2, and agents
+  read `PLAYER_1` out of whatever (possibly flipped) view they're handed.
+- **The wall-message seam** flows `WallMessage` (Unity) → `protocol.parse_walls_message` →
+  `WallLayout` → `TankEnv.current_map` → `info["map"]`. See [core](components/core.md#the-wall-message--protocol-seam-walllayout--infomap).
+- **`models` is detached** from the live loop today — it's the shared vision backbone the
+  future `pretraining` / `rl` will consume, and the deployable ONNX artifact.
+
+---
+[← back to index](README.md)
