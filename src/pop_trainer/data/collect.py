@@ -4,35 +4,35 @@ Collection routes through :class:`pop_trainer.env.tank_env.TankEnv` — the SAME
 observation pipeline RL trains on — so the pretraining ``(frame, state)`` rows are byte-for-byte
 the observations the policy will later see, with no drift between pretraining inputs and RL
 observations. Collection pairs a ``player1`` agent + a ``player2`` agent (both
-:mod:`pop_trainer.agents` policies). ``player2`` is injected into the ENV (the env owns it):
-each step the env computes player2's flipped first-person view and calls ``player2.act``. The
-driver here drives ``player1`` directly: it hands ``player1.act`` the current 52-float state —
-which for player1 is the UNFLIPPED state (player1 already occupies the ``PLAYER_1`` slot), the
-mirror of how the env hands ``player2`` its FLIPPED state. The two halves of the self-play pair
-therefore each see their OWN first-person view.
+:mod:`pop_trainer.agents` policies), BOTH driven HERE (the env is a bare pure transport that owns
+neither player). The driver hands ``player1.act`` the current 52-float state — which for player1
+is the UNFLIPPED state (player1 already occupies the ``PLAYER_1`` slot) — and hands ``player2.act``
+its FLIPPED first-person view (computed here via :func:`core.state.split_state_for_opponent`),
+then passes BOTH actions to ``env.step(a1, a2)``. The two halves of the self-play pair therefore
+each see their OWN first-person view.
 
 BOTH players' actions are captured: ``env.step`` surfaces ``info["p1_action"]`` (the action
 actually sent for player1, equal to what ``player1.act`` returned) and ``info["p2_action"]``
-(player2's actual action, drawn inside the env). The recorded ``(2, 5)`` action array stores
-BOTH — there is no zeroed-player2 slot.
+(the ``a2`` the driver passed). The recorded ``(2, 5)`` action array stores BOTH — there is no
+zeroed-player2 slot.
 
 LAYERING for testability:
 
-* :func:`run_episode` is the PURE step loop over an INJECTED ``env`` (anything with
-  ``reset()`` / ``step(action)`` returning the gymnasium tuples) built with its ``player2``.
-  It reads the first ``(obs, info)`` from ``env.reset``, then each step computes the player1
-  action from the current state, calls ``env.step``, and records the CURRENT ``(frame, state)``
-  paired with BOTH actions that advanced t -> t+1 (taken from ``info``) — stopping on
-  ``terminated or truncated`` or the step cap. The transport lives inside the env, so this loop
-  is unit-testable against a real ``TankEnv`` built over an in-process fake connection with NO
-  live socket.
+* :func:`run_episode` is the PURE step loop over an INJECTED ``env`` (a bare ``TankEnv`` with a
+  ``reset()`` / ``step(action, opponent_action)`` returning the gymnasium tuples) plus the
+  ``player1`` + ``player2`` agents. It reads the first ``(obs, info)`` from ``env.reset``, then
+  each step computes both actions from the current state, calls ``env.step(a1, a2)``, and records
+  the CURRENT ``(frame, state)`` paired with BOTH actions that advanced t -> t+1 (taken from
+  ``info``) — stopping on ``terminated or truncated`` or the step cap. The transport lives inside
+  the env, so this loop is unit-testable against a real ``TankEnv`` built over an in-process fake
+  connection with NO live socket.
 * :func:`collect_to_shards` wraps a sequence of episodes on one env into
   :mod:`pop_trainer.data.shards` shards on disk (pure given a fake-backed env).
 * :class:`CollectionSpec` / :func:`run_worker` / :func:`collect_parallel` are the LIVE,
   parallel-safe orchestration (multiprocessing with the SPAWN start method — never fork; this
-  is a YOU MUST in CLAUDE.md). The env (with its player2) and the player1 agent are built INSIDE
-  the worker via injected factories, so the live path is isolated and NOT unit-tested. The
-  worker target is module-level + takes plain data (picklable for spawn).
+  is a YOU MUST in CLAUDE.md). The bare env and BOTH agents are built INSIDE the worker via
+  injected factories, so the live path is isolated and NOT unit-tested. The worker target is
+  module-level + takes plain data (picklable for spawn).
 
 An episode ends when the env reports ``terminated or truncated`` (its own boundary) or the step
 cap is reached; the final pair for that step is recorded with the zero ``(2, 5)`` action (no
@@ -79,9 +79,9 @@ class Sample:
     * ``action`` — ``(2, 5)`` float: ``[player1, player2]`` x ``[mx, my, ax, ay, fire]``. Both
       rows are the actions APPLIED via ``env.step`` to advance the sim to the next frame: row 0
       is ``info["p1_action"]`` (player1's applied action) and row 1 is ``info["p2_action"]``
-      (player2's actual action, drawn inside the env). On the LAST recorded step of an episode
-      (the boundary step) no further action is applied, so the whole ``(2, 5)`` is the zero
-      action.
+      (player2's applied action, the ``a2`` the driver passed). On the LAST recorded step of an
+      episode (the boundary step) no further action is applied, so the whole ``(2, 5)`` is the
+      zero action.
     * ``map_id`` / ``episode_id`` / ``step_idx`` — provenance / the split group key.
     """
 
@@ -139,24 +139,26 @@ def run_episode(
     env: TankEnv,
     *,
     player1: core_agent.Agent,
+    player2: core_agent.Agent,
     map_id: int,
     episode_id: int,
     max_steps: int,
     seed: int | None = None,
 ) -> EpisodeResult:
-    """PURE step loop: drive ONE ``TankEnv`` for an episode and capture time-aligned samples.
+    """PURE step loop: drive ONE bare ``TankEnv`` for an episode and capture time-aligned samples.
 
-    ``env`` MUST already be built with the desired ``player2`` agent (the env owns it); this
-    loop drives ``player1`` only. It resets ``player1`` (and the env's ``player2``, if either
-    exposes ``reset``) and calls ``env.reset(seed=seed)`` to start a fresh round, so the whole
-    trajectory is a deterministic function of (player1, player2, seed). Then each step:
+    ``env`` is a bare pure-transport :class:`TankEnv`; this loop drives BOTH ``player1`` and
+    ``player2``. It resets both agents (if either exposes ``reset``) and calls
+    ``env.reset(seed=seed)`` to start a fresh round, so the whole trajectory is a deterministic
+    function of (player1, player2, seed). Then each step:
 
     1. records nothing yet — it computes player1's action ``a1 = player1.act(vec)`` from the
-       CURRENT 52-float state (player1's own UNFLIPPED view), validates it, and calls
-       ``env.step(a1)``,
+       CURRENT 52-float state (player1's own UNFLIPPED view), validates it, computes player2's
+       action ``a2 = player2.act(split_state_for_opponent(vec))`` from player2's FLIPPED first-
+       person view, and calls ``env.step(a1, a2)``,
     2. records the CURRENT ``(frame, state)`` paired with the BOTH actions that advanced this
        step, read back from ``info`` (row 0 = ``info["p1_action"]`` == ``a1``, row 1 =
-       ``info["p2_action"]`` == player2's actual action),
+       ``info["p2_action"]`` == player2's applied action),
     3. on the env's boundary (``terminated or truncated``) or the step cap, records the final
        ``(frame, state)`` with the zero ``(2, 5)`` action (no action is applied after it).
 
@@ -165,11 +167,12 @@ def run_episode(
     """
     result = EpisodeResult()
     _maybe_reset(player1, seed)
-    _maybe_reset(getattr(env, "player2", None), seed)
+    _maybe_reset(player2, seed)
     obs, info = env.reset(seed=seed)
-    # Hand the static layout to a map-aware player1 (the OPTIONAL ``set_map`` hook); player2's
-    # map is handled inside the env. A map-agnostic player1 does not expose ``set_map``.
+    # Hand the static layout to a map-aware agent (the OPTIONAL ``set_map`` hook); both agents are
+    # driver-side now. A map-agnostic agent does not expose ``set_map``.
     _maybe_set_map(player1, info.get("map"))
+    _maybe_set_map(player2, info.get("map"))
     frame = obs
     vec = info["state"]
     step_idx = 0
@@ -184,10 +187,12 @@ def run_episode(
             result.ended_done = done
             return result
 
-        # player1 acts on its OWN unflipped view (the current 52-float state). The env fills
-        # player2 internally and surfaces BOTH applied actions in ``info`` after the step.
+        # player1 acts on its OWN unflipped view; player2 acts on its FLIPPED first-person view
+        # (the perspective flip lives here in the driver). The env transports both and surfaces
+        # BOTH applied actions in ``info`` after the step.
         a1 = agents.validate_action(player1.act(vec))
-        next_obs, _reward, terminated, truncated, info = env.step(a1)
+        a2 = player2.act(state_schema.split_state_for_opponent(np.asarray(vec)))
+        next_obs, _reward, terminated, truncated, info = env.step(a1, a2)
 
         action = np.array([info["p1_action"], info["p2_action"]], dtype=np.float32)
         result.samples.append(_make_sample(frame, vec, action, map_id, episode_id, step_idx))
@@ -241,6 +246,7 @@ def collect_to_shards(
     out_dir: str | Path,
     map_ids: Sequence[int],
     player1: core_agent.Agent,
+    player2: core_agent.Agent,
     max_steps: int,
     seed: int | None = None,
     shard_prefix: str = "shard_w0",
@@ -249,13 +255,13 @@ def collect_to_shards(
 ) -> list[Path]:
     """Run one episode per entry of ``map_ids`` on ``env`` and write shards to ``out_dir``.
 
-    ``env`` must already carry its ``player2``; this drives ``player1`` against it. Each episode
-    calls ``env.reset`` (via :func:`run_episode`) to start a fresh round; ``map_ids`` tags each
-    episode's samples with its map. The per-episode seed is ``seed + episode_id`` (when a base
-    ``seed`` is given) so each episode resets ``player1`` (and the env's ``player2``) to a
-    distinct yet reproducible state. Samples accumulate and flush to a shard every ``shard_size``,
-    plus a final flush. Returns the list of written shard paths. Pure given a fake-backed ``env``
-    (the live socket path lives in :func:`run_worker`).
+    ``env`` is a bare pure-transport env; this drives ``player1`` + ``player2`` against it. Each
+    episode calls ``env.reset`` (via :func:`run_episode`) to start a fresh round; ``map_ids`` tags
+    each episode's samples with its map. The per-episode seed is ``seed + episode_id`` (when a base
+    ``seed`` is given) so each episode resets BOTH agents to a distinct yet reproducible state.
+    Samples accumulate and flush to a shard every ``shard_size``, plus a final flush. Returns the
+    list of written shard paths. Pure given a fake-backed ``env`` (the live socket path lives in
+    :func:`run_worker`).
     """
     out_dir = Path(out_dir)
     buffer: list[Sample] = []
@@ -277,6 +283,7 @@ def collect_to_shards(
         ep = run_episode(
             env,
             player1=player1,
+            player2=player2,
             map_id=map_id,
             episode_id=episode_id,
             max_steps=max_steps,
@@ -300,11 +307,11 @@ def collect_to_shards(
 class CollectionSpec:
     """Plain, picklable data one worker needs to collect (spawn-safe: no live handles).
 
-    Holds ONLY plain data + import-able factory names. The env (and its socket) is constructed
-    INSIDE the worker via ``env_factory`` (a picklable callable, e.g. a module-level function);
-    ``env_factory`` is also responsible for injecting the desired ``player2`` agent into the env
-    (the env owns player2). The ``player1`` agent is built inside the worker from
-    ``player1_factory``. So NO socket / env / agent crosses the spawn boundary.
+    Holds ONLY plain data + import-able factory names. The bare env (and its socket) is constructed
+    INSIDE the worker via ``env_factory`` (a picklable callable, e.g. a module-level function); the
+    ``player1`` and ``player2`` agents are built inside the worker from ``player1_factory`` /
+    ``player2_factory`` (both driver-side, symmetric). So NO socket / env / agent crosses the spawn
+    boundary.
     """
 
     worker_id: int
@@ -315,18 +322,20 @@ class CollectionSpec:
     shard_size: int = 10_000
     with_actions: bool = True
     # Picklable factories, called INSIDE the worker process:
-    #   env_factory(spec) -> a TankEnv built WITH its player2 (socket opened in-worker).
+    #   env_factory(spec) -> a bare TankEnv (socket opened in-worker).
     #   player1_factory(spec) -> the player1 agent the driver advances.
+    #   player2_factory(spec) -> the player2 agent the driver advances (symmetric with player1).
     env_factory: Callable[[CollectionSpec], object] | None = None
     player1_factory: Callable[[CollectionSpec], core_agent.Agent] | None = None
+    player2_factory: Callable[[CollectionSpec], core_agent.Agent] | None = None
     extra: dict = field(default_factory=dict)
 
 
 def run_worker(spec: CollectionSpec) -> dict:
     """Module-level worker entry point (picklable for spawn). Builds the env IN-WORKER.
 
-    Builds the ``TankEnv`` (with its player2) via ``spec.env_factory`` (its socket opened HERE,
-    never inherited) and the ``player1`` agent via ``spec.player1_factory``, then delegates to
+    Builds the bare ``TankEnv`` via ``spec.env_factory`` (its socket opened HERE, never inherited)
+    and BOTH agents via ``spec.player1_factory`` / ``spec.player2_factory``, then delegates to
     :func:`collect_to_shards`. Closes the env in a ``finally`` so the worker that opened the
     socket also releases it. Returns a small result dict (worker id, shard file names, count).
     Live path — exercised by the orchestrator, not the unit tests.
@@ -335,14 +344,18 @@ def run_worker(spec: CollectionSpec) -> dict:
         raise ValueError("run_worker needs an env_factory")
     if spec.player1_factory is None:
         raise ValueError("run_worker needs a player1_factory")
+    if spec.player2_factory is None:
+        raise ValueError("run_worker needs a player2_factory")
     env = spec.env_factory(spec)
     player1 = spec.player1_factory(spec)
+    player2 = spec.player2_factory(spec)
     try:
         written = collect_to_shards(
             env,
             out_dir=spec.out_dir,
             map_ids=spec.map_ids,
             player1=player1,
+            player2=player2,
             max_steps=spec.max_steps,
             seed=spec.seed,
             shard_prefix=f"shard_w{spec.worker_id}",

@@ -135,12 +135,11 @@ class _FixedAgent:
         return list(self._action)
 
 
-def _make_env(blobs, *, player2=None, max_steps=100):
+def _make_env(blobs, *, max_steps=100):
     transport = ScriptedTransport(blobs)
     conn = P.Connection(transport)
     env = TankEnv(
         connection=conn,
-        player2=player2 if player2 is not None else _FixedAgent(),
         frame_shape=demo.FRAME_SHAPE,
         env_config=EnvConfig(max_steps=max_steps),
     )
@@ -160,6 +159,18 @@ class _MapRecordingAgent:
         self.got_map = layout
 
 
+class _RecordingAgent:
+    """Records the obs handed to its last ``act`` and returns a fixed action."""
+
+    def __init__(self, action=(0.0, 0.0, 0.0, 0.0, 0.0)):
+        self._action = [float(x) for x in action]
+        self.seen_obs = None
+
+    def act(self, obs):
+        self.seen_obs = obs
+        return list(self._action)
+
+
 # --- run_demo_episode --------------------------------------------------------------------
 
 
@@ -168,9 +179,31 @@ def test_run_demo_episode_hands_map_to_player1_set_map():
     states = [_flat_state(i) for i in range(3)]
     env, _ = _make_env(_episode_blobs_with_walls(states, done_last=True), max_steps=100)
     agent1 = _MapRecordingAgent()
-    result = demo.run_demo_episode(env, agent1, max_steps=100)
+    result = demo.run_demo_episode(env, agent1, _FixedAgent(), max_steps=100)
     assert result.map is not None
     assert agent1.got_map is result.map  # the tracked layout reached the agent's set_map
+
+
+def test_run_demo_episode_hands_map_to_player2_set_map():
+    # Both agents are driver-side now: a tracked walls layout reaches a map-aware agent2's set_map.
+    states = [_flat_state(i) for i in range(3)]
+    env, _ = _make_env(_episode_blobs_with_walls(states, done_last=True), max_steps=100)
+    agent2 = _MapRecordingAgent()
+    result = demo.run_demo_episode(env, _FixedAgent(), agent2, max_steps=100)
+    assert result.map is not None
+    assert agent2.got_map is result.map
+
+
+def test_run_demo_episode_hands_flipped_view_to_player2():
+    # The perspective flip lives in the driver: agent2 is handed split_state_for_opponent(vec) of
+    # the first state (the state it reacts to before any step).
+    raw0 = [float(i) for i in range(S.STATE_LEN)]
+    states = [raw0, _flat_state(7.0)]
+    env, _ = _make_env(_episode_blobs_with_walls(states, done_last=True), max_steps=100)
+    agent2 = _RecordingAgent()
+    demo.run_demo_episode(env, _FixedAgent(), agent2, max_steps=100)
+    expected_view = S.split_state_for_opponent(np.asarray(raw0))
+    np.testing.assert_array_equal(agent2.seen_obs, expected_view)
 
 
 def test_run_demo_episode_reaches_winner_terminal_and_tracks_map():
@@ -178,10 +211,11 @@ def test_run_demo_episode_reaches_winner_terminal_and_tracks_map():
     states = [_flat_state(i) for i in range(4)]
     env, _ = _make_env(
         _episode_blobs_with_walls(states, winner_last=S.PLAYER_1),
-        player2=agents.CoverageAgent.aggressive(seed=0),
         max_steps=100,
     )
-    result = demo.run_demo_episode(env, _FixedAgent(), max_steps=100)
+    result = demo.run_demo_episode(
+        env, _FixedAgent(), agents.CoverageAgent.aggressive(seed=0), max_steps=100
+    )
 
     assert result.steps == 3  # one step per state after the first
     assert result.terminated
@@ -201,7 +235,7 @@ def test_run_demo_episode_player2_loss_outcome():
         _episode_blobs_with_walls(states, winner_last=S.PLAYER_2),
         max_steps=100,
     )
-    result = demo.run_demo_episode(env, _FixedAgent(), max_steps=100)
+    result = demo.run_demo_episode(env, _FixedAgent(), _FixedAgent(), max_steps=100)
     assert result.terminated
     assert result.winner == S.PLAYER_2
     assert result.outcome == "loss"
@@ -211,7 +245,7 @@ def test_run_demo_episode_truncates_at_max_steps():
     # No terminal in the script; the loop stops at max_steps with truncated semantics.
     states = [_flat_state(i) for i in range(4)]
     env, _ = _make_env(_episode_blobs_with_walls(states), max_steps=3)
-    result = demo.run_demo_episode(env, _FixedAgent(), max_steps=3)
+    result = demo.run_demo_episode(env, _FixedAgent(), _FixedAgent(), max_steps=3)
     assert result.steps == 3
     assert not result.terminated
     assert result.truncated
@@ -228,7 +262,9 @@ def test_run_demo_episode_drives_player1_actions_on_the_wire():
     state[S.PLAYER_2 * S.PLAYER_STRIDE + S.POS_Y] = 4.0
     states = [state, state, state]
     env, transport = _make_env(_episode_blobs_with_walls(states, done_last=True), max_steps=100)
-    demo.run_demo_episode(env, agents.CoverageAgent.opponent_shadower(seed=0), max_steps=100)
+    demo.run_demo_episode(
+        env, agents.CoverageAgent.opponent_shadower(seed=0), _FixedAgent(), max_steps=100
+    )
     # Decode ONLY the first step message off the wire (sent holds several back to back); a
     # Connection over the sent bytes reads exactly one top-level object via its brace scan.
     step_start = bytes(transport.sent).index(b'{"1"')

@@ -380,139 +380,55 @@ def test_lost_connection_reconnects_via_factory():
     assert info2["state"] == raw_again
 
 
-def test_seeded_reset_makes_player2_action_reproducible():
-    # Two DEFAULT-player2 envs reset with the same seed must send byte-identical key "2"
-    # actions: this is the frozen-seam reproducibility contract (the built-in player2 draws
-    # from the env's single seeded np_random, exactly as the prior direct uniform draw did).
+# --- pure transport: both actions come from the caller ----------------------------------
+
+
+def test_step_transports_both_caller_actions_on_wire_and_info():
+    # THE key new proof: step(a1, a2) sends BOTH on the wire under keys "1"/"2" and captures both
+    # in info + on the env. The env owns neither player — a2 is the caller's opponent_action.
     raw0 = _flat_state()
     raw1 = _flat_state(1.0)
-
-    def run():
-        blobs = _reset_blobs(raw0) + [_state_and_frame_bytes(raw1)]
-        env, transport = _make_env(blobs)
-        env.reset(seed=123)
-        transport.sent.clear()
-        env.step(np.zeros(ACTION_DIM, dtype=np.float32))
-        return P.decode(bytes(transport.sent))["2"]
-
-    assert run() == run()
-
-
-# --- player2 injection ------------------------------------------------------------------
-
-
-class _FixedPlayer2:
-    """A test player2 returning a constant action (no ``agents`` import)."""
-
-    def __init__(self, action):
-        self.action = list(action)
-
-    def act(self, obs):
-        return self.action
-
-
-class _RecordingPlayer2:
-    """A test player2 that records the obs it was handed and returns a fixed action."""
-
-    def __init__(self, action):
-        self.action = list(action)
-        self.seen_obs = None
-
-    def act(self, obs):
-        self.seen_obs = obs
-        return self.action
-
-
-class _MapAwarePlayer2:
-    """A map-aware test player2: records the layout handed to its OPTIONAL ``set_map`` hook."""
-
-    def __init__(self, action):
-        self.action = list(action)
-        self.got_map = None
-
-    def act(self, obs):  # noqa: ARG002
-        return self.action
-
-    def set_map(self, layout):
-        self.got_map = layout
-
-
-def test_env_hands_map_to_map_aware_player2_set_map():
-    # When the handshake delivers a walls layout, the env forwards it to a map-aware player2's
-    # OPTIONAL set_map hook (probed via getattr — never required).
-    raw0 = _flat_state()
-    blobs = _reset_blobs_with_walls(raw0)
-    player2 = _MapAwarePlayer2([0.0, 0.0, 0.0, 0.0, 0.0])
-    env, _ = _make_env(blobs, player2=player2)
-    _, info = env.reset(seed=0)
-    assert player2.got_map is env.current_map
-    assert player2.got_map is info["map"]
-
-
-def test_env_does_not_require_set_map_on_player2():
-    # A map-agnostic player2 (no set_map) is never called with it — a walls reset must not crash.
-    raw0 = _flat_state()
-    blobs = _reset_blobs_with_walls(raw0)
-    env, _ = _make_env(blobs, player2=_FixedPlayer2([0.0, 0.0, 0.0, 0.0, 0.0]))
-    obs, info = env.reset(seed=0)  # must not raise though player2 has no set_map
-    assert info["map"] is not None
-
-
-def test_env_skips_player2_set_map_without_walls():
-    # No walls message: set_map is never invoked (the map is None).
-    raw0 = _flat_state()
-    player2 = _MapAwarePlayer2([0.0, 0.0, 0.0, 0.0, 0.0])
-    env, _ = _make_env(_reset_blobs(raw0), player2=player2)
-    env.reset(seed=0)
-    assert player2.got_map is None
-
-
-def test_injected_player2_drives_key2_action_and_info():
-    raw0 = _flat_state()
-    raw1 = _flat_state(1.0)
-    fixed = [0.2, -0.4, 0.6, -0.8, 1.0]
     blobs = _reset_blobs(raw0) + [_state_and_frame_bytes(raw1)]
-    env, transport = _make_env(blobs, player2=_FixedPlayer2(fixed))
+    env, transport = _make_env(blobs)
     env.reset(seed=0)
     transport.sent.clear()
     p1 = np.array([0.1, 0.1, 0.1, 0.1, 0.1], dtype=np.float32)
-    _, _, _, _, info = env.step(p1)
+    a2 = [0.2, -0.4, 0.6, -0.8, 1.0]
+    _, _, _, _, info = env.step(p1, a2)
 
-    # The wire "2" action is exactly the injected agent's fixed action.
     sent = P.decode(bytes(transport.sent))
-    assert sent["2"] == pytest.approx(fixed)
-    # Surfaced both actions: p2 is the agent's; p1 is the action passed to step.
-    assert info["p2_action"] == pytest.approx(fixed)
+    assert sent["1"] == pytest.approx(p1.tolist())
+    assert sent["2"] == pytest.approx(a2)
+    # Both actions surfaced in info and on the env.
     assert info["p1_action"] == pytest.approx(p1.tolist())
-    # Captured on the env too.
-    assert env.last_p2_action == pytest.approx(fixed)
+    assert info["p2_action"] == pytest.approx(a2)
     assert env.last_p1_action == pytest.approx(p1.tolist())
+    assert env.last_p2_action == pytest.approx(a2)
 
 
-def test_injected_player2_receives_flipped_state_view():
-    # player2 must be handed its FLIPPED 52-float view of the state it is reacting to (the
-    # state present BEFORE this step), proving the perspective flip is wired correctly.
-    raw0 = [float(i) for i in range(S.STATE_LEN)]
-    raw1 = _flat_state(7.0)
-    recorder = _RecordingPlayer2([0.0, 0.0, 0.0, 0.0, 0.0])
-    blobs = _reset_blobs(raw0) + [_state_and_frame_bytes(raw1)]
-    env, _ = _make_env(blobs, player2=recorder)
-    env.reset(seed=0)
-    env.step(np.zeros(ACTION_DIM, dtype=np.float32))
-
-    expected_view = S.split_state_for_opponent(np.asarray(raw0))
-    assert np.array_equal(recorder.seen_obs, expected_view)
-
-
-def test_injected_player2_action_is_clipped_and_length_fitted():
-    # An out-of-range / wrong-length player2 action is coerced to the [-1,1] length-5 wire shape.
+def test_step_default_opponent_action_sends_zero_a2():
+    # With opponent_action omitted the env sends a well-formed no-op zero action for player2.
     raw0 = _flat_state()
     raw1 = _flat_state(1.0)
     blobs = _reset_blobs(raw0) + [_state_and_frame_bytes(raw1)]
-    env, transport = _make_env(blobs, player2=_FixedPlayer2([5.0, -5.0, 0.3]))
+    env, transport = _make_env(blobs)
     env.reset(seed=0)
     transport.sent.clear()
-    env.step(np.zeros(ACTION_DIM, dtype=np.float32))
+    _, _, _, _, info = env.step(np.zeros(ACTION_DIM, dtype=np.float32))
+    sent = P.decode(bytes(transport.sent))
+    assert sent["2"] == [0.0, 0.0, 0.0, 0.0, 0.0]
+    assert info["p2_action"] == [0.0, 0.0, 0.0, 0.0, 0.0]
+
+
+def test_step_opponent_action_is_clipped_and_length_fitted():
+    # An out-of-range / wrong-length opponent_action is coerced to the [-1,1] length-5 wire shape.
+    raw0 = _flat_state()
+    raw1 = _flat_state(1.0)
+    blobs = _reset_blobs(raw0) + [_state_and_frame_bytes(raw1)]
+    env, transport = _make_env(blobs)
+    env.reset(seed=0)
+    transport.sent.clear()
+    env.step(np.zeros(ACTION_DIM, dtype=np.float32), [5.0, -5.0, 0.3])
     sent = P.decode(bytes(transport.sent))
     assert sent["2"] == pytest.approx([1.0, -1.0, 0.3, 0.0, 0.0])
 
@@ -589,20 +505,19 @@ def test_render_not_implemented():
 
 
 def test_default_seed_used_when_reset_seed_omitted():
-    # Two default-player2 envs constructed with the same default seed and reset() (no seed arg)
-    # must produce identical key "2" actions, proving the constructor seed is the fallback.
+    # The constructor seed is the fallback when reset() is called with no seed: the handshake +
+    # step must not crash and must send a well-formed message (the env owns neither player, so
+    # the default a2 is the zero no-op regardless of seed).
     raw0 = _flat_state()
     raw1 = _flat_state(1.0)
-
-    def run():
-        blobs = _reset_blobs(raw0) + [_state_and_frame_bytes(raw1)]
-        env, transport = _make_env(blobs, seed=99)
-        env.reset()  # no seed -> falls back to the constructor's default
-        transport.sent.clear()
-        env.step(np.zeros(ACTION_DIM, dtype=np.float32))
-        return P.decode(bytes(transport.sent))["2"]
-
-    assert run() == run()
+    blobs = _reset_blobs(raw0) + [_state_and_frame_bytes(raw1)]
+    env, transport = _make_env(blobs, seed=99)
+    env.reset()  # no seed -> falls back to the constructor's default
+    transport.sent.clear()
+    env.step(np.zeros(ACTION_DIM, dtype=np.float32))
+    sent = P.decode(bytes(transport.sent))
+    assert sent["1"] == [0.0, 0.0, 0.0, 0.0, 0.0]
+    assert sent["2"] == [0.0, 0.0, 0.0, 0.0, 0.0]
 
 
 def test_reset_reconnects_and_retries_once_on_dropped_handshake():

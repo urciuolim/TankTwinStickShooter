@@ -94,7 +94,7 @@ Flags (defaults shown), grounded in
 | Flag | Default | Meaning |
 |------|---------|---------|
 | `--player1` | `aggressive-coverage` | player1 selector (driven by the collection loop) |
-| `--player2` | `opponent-shadower` | player2 selector (injected into the env) |
+| `--player2` | `opponent-shadower` | player2 selector (driven by the collection loop) |
 | `--map` | `custom1` | map to collect on — **`custom1` is the only choice today** (Phase A is single-map) |
 | `--episodes` | `1` | episodes **per worker** |
 | `--max-steps` | `800` | per-episode step cap |

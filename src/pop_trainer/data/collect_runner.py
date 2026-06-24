@@ -3,17 +3,19 @@
 This is the APPLICATION layer over :mod:`pop_trainer.data.collect`. ``collect`` provides the
 PURE step loop + the spawn-safe orchestration but leaves the env/agent construction to injected
 factories; THIS module supplies the concrete factories that launch the live Unity build, connect
-a socket, and build the gymnasium env + the player1/player2 agents. It is a data-layer module, so
-it may import ``core`` (the launch + wire + config seams), ``env`` (``TankEnv``), and ``agents``
-(the coverage / random presets) — exactly the ``core <- {env, agents} <- data`` direction. No
-``models`` / ``pretraining`` / ``rl`` and nothing from ``tank_twin``.
+a socket, and build the bare gymnasium env + the driver-side player1/player2 agents. It is a
+data-layer module, so it may import ``core`` (the launch + wire + config seams), ``env``
+(``TankEnv``), and ``agents`` (the coverage / random presets) — exactly the
+``core <- {env, agents} <- data`` direction. No ``models`` / ``pretraining`` / ``rl`` and nothing
+from ``tank_twin``.
 
-SPAWN SAFETY. :func:`env_factory` / :func:`player1_factory` are MODULE-LEVEL plain functions (not
-closures / lambdas) so ``multiprocessing`` with the ``spawn`` start method can re-import them by
-qualified name in a fresh interpreter. Everything they need crosses the process boundary as plain
-data inside ``spec.extra`` (paths, ports, selector names, seeds) — never a live socket / env /
-agent. Each worker computes its OWN port (``base_port + worker_id``), launches its OWN build, and
-opens its OWN socket; nothing is inherited from the parent.
+SPAWN SAFETY. :func:`env_factory` / :func:`player1_factory` / :func:`player2_factory` are
+MODULE-LEVEL plain functions (not closures / lambdas) so ``multiprocessing`` with the ``spawn``
+start method can re-import them by qualified name in a fresh interpreter. Everything they need
+crosses the process boundary as plain data inside ``spec.extra`` (paths, ports, selector names,
+seeds) — never a live socket / env / agent. Each worker computes its OWN port
+(``base_port + worker_id``), launches its OWN build, and opens its OWN socket; nothing is
+inherited from the parent.
 
 LAUNCH-PROC REAPING. :func:`env_factory` stashes the live ``subprocess.Popen`` of the launched
 build on the env (``env._launch_proc``) and WRAPS ``env.close`` so that closing the env (which
@@ -58,6 +60,7 @@ __all__ = [
     "build_env_from_connection",
     "env_factory",
     "player1_factory",
+    "player2_factory",
     "build_specs",
     "main",
 ]
@@ -129,23 +132,20 @@ def make_agent(selector: str, *, seed: int | None = None) -> core_agent.Agent:
 def build_env_from_connection(
     connection: Connection,
     *,
-    player2_selector: str,
     seed: int | None,
     max_steps: int,
     frame_shape: tuple[int, int, int] = FRAME_SHAPE,
 ) -> TankEnv:
-    """Build a :class:`TankEnv` over an ALREADY-CONNECTED ``connection`` with its player2 agent.
+    """Build a bare pure-transport :class:`TankEnv` over an ALREADY-CONNECTED ``connection``.
 
-    The pure heart of :func:`env_factory`: it builds the player2 agent from a selector name +
-    seed and constructs the env around the injected ``connection`` (no socket / subprocess here).
-    Factored out so the env-build wiring is testable against an in-process fake transport with no
-    live build. ``frame_shape`` fixes the observation space and MUST match the build's rendered
-    frame.
+    The pure heart of :func:`env_factory`: it constructs the bare env around the injected
+    ``connection`` (no socket / subprocess here). The env owns neither player — both agents are
+    driver-side, built by :func:`player1_factory` / :func:`player2_factory`. Factored out so the
+    env-build wiring is testable against an in-process fake transport with no live build.
+    ``frame_shape`` fixes the observation space and MUST match the build's rendered frame.
     """
-    player2 = make_agent(player2_selector, seed=seed)
     return TankEnv(
         connection=connection,
-        player2=player2,
         frame_shape=frame_shape,
         env_config=EnvConfig(max_steps=max_steps),
         seed=seed,
@@ -156,23 +156,24 @@ def build_env_from_connection(
 
 
 def env_factory(spec: CollectionSpec) -> TankEnv:
-    """Launch the build, connect, and build the env (with its player2) for one worker.
+    """Launch the build, connect, and build the bare env for one worker.
 
     MODULE-LEVEL + plain (spawn can import it by qualified name). Reads its launch params from
-    ``spec.extra`` (``exe`` / ``config`` / ``base_port`` / ``frame_shape`` / ``player2`` selector),
-    computes ``port = base_port + spec.worker_id``, launches the build via
+    ``spec.extra`` (``exe`` / ``config`` / ``base_port`` / ``frame_shape``), computes
+    ``port = base_port + spec.worker_id``, launches the build via
     :func:`core.launch.build_launch_cmd` + ``subprocess.Popen``, connects via
     :func:`core.launch.connect`, wraps the socket in :class:`core.protocol.Connection`, and builds
-    the env via :func:`build_env_from_connection`. The live ``Popen`` is stashed and the env's
-    ``close`` is wrapped so :func:`collect.run_worker`'s ``finally`` reaps the build (see
-    :func:`_attach_launch_proc`). The chosen port is recorded back into ``spec.extra["port"]`` so
-    it is inspectable. Raises ``KeyError`` if a required ``extra`` key is missing.
+    the bare env via :func:`build_env_from_connection`. Both agents are driver-side (built by
+    :func:`player1_factory` / :func:`player2_factory`), so the env carries neither. The live
+    ``Popen`` is stashed and the env's ``close`` is wrapped so :func:`collect.run_worker`'s
+    ``finally`` reaps the build (see :func:`_attach_launch_proc`). The chosen port is recorded back
+    into ``spec.extra["port"]`` so it is inspectable. Raises ``KeyError`` if a required ``extra``
+    key is missing.
     """
     extra = spec.extra
     exe = extra["exe"]
     config = extra["config"]
     base_port = int(extra["base_port"])
-    player2_selector = extra["player2"]
     frame_shape = tuple(extra.get("frame_shape", FRAME_SHAPE))
 
     port = base_port + spec.worker_id
@@ -185,7 +186,6 @@ def env_factory(spec: CollectionSpec) -> TankEnv:
         connection = Connection(sock)
         env = build_env_from_connection(
             connection,
-            player2_selector=player2_selector,
             seed=spec.seed,
             max_steps=spec.max_steps,
             frame_shape=frame_shape,
@@ -206,6 +206,16 @@ def player1_factory(spec: CollectionSpec) -> core_agent.Agent:
     with ``spec.seed`` so a worker's player1 stream is reproducible.
     """
     return make_agent(spec.extra["player1"], seed=spec.seed)
+
+
+def player2_factory(spec: CollectionSpec) -> core_agent.Agent:
+    """Build the player2 agent from the selector name + seed carried in ``spec.extra``.
+
+    MODULE-LEVEL + plain (spawn-importable), symmetric with :func:`player1_factory`: player2 is now
+    a driver-side agent (the env owns neither player). Reads ``spec.extra["player2"]`` and seeds
+    the agent with ``spec.seed`` so a worker's player2 stream is reproducible.
+    """
+    return make_agent(spec.extra["player2"], seed=spec.seed)
 
 
 def _attach_launch_proc(env: TankEnv, proc: subprocess.Popen) -> None:
@@ -269,8 +279,9 @@ def build_specs(
     subdirectory so shard files never clash), the single Phase-A map repeated ``episodes`` times in
     ``map_ids`` (one episode per entry — the map's integer id), the shared ``max_steps``, a distinct
     ``seed`` (``base_seed + worker_id * stride``), and an ``extra`` carrying the launch params +
-    selector names. The module-level :func:`env_factory` / :func:`player1_factory` are wired onto
-    every spec. Validates the selector names and the map name up front (``ValueError``).
+    selector names. The module-level :func:`env_factory` / :func:`player1_factory` /
+    :func:`player2_factory` are wired onto every spec. Validates the selector names and the map name
+    up front (``ValueError``).
     """
     # Validate the selectors + map eagerly so a bad CLI fails before any launch.
     make_agent(player1, seed=seed)
@@ -296,6 +307,7 @@ def build_specs(
             seed=seed + worker_id * _SEED_STRIDE,
             env_factory=env_factory,
             player1_factory=player1_factory,
+            player2_factory=player2_factory,
             extra={
                 "exe": str(exe),
                 "config": str(config),
@@ -328,7 +340,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--player2",
         default=DEFAULT_PLAYER2,
         choices=sorted(AGENT_SELECTORS),
-        help="agent selector for player2 (injected into the env)",
+        help="agent selector for player2 (driven by the collection loop)",
     )
     parser.add_argument(
         "--map",

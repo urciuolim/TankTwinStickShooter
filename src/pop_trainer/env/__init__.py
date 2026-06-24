@@ -8,10 +8,12 @@ Boundary: imports ``core`` only (plus ``gymnasium`` + ``numpy``). Imports NOTHIN
 ``models`` / ``data`` / ``pretraining`` / ``rl`` and NOTHING from ``tank_twin``. No torch,
 no stable-baselines3.
 
-``player2`` is an INJECTED :class:`pop_trainer.core.agent.Agent`; when none is supplied the
-env uses a trivial built-in random player2 (so ``env`` never imports ``agents``). The env
-computes player2's own perspective-flipped view, calls ``player2.act``, and captures BOTH
-players' actions (``info["p1_action"]`` / ``info["p2_action"]``).
+The env owns NEITHER player — it is a PURE TRANSPORT. ``TankEnv.step(action,
+opponent_action=None)`` sends ``{1: a1, 2: a2}`` where BOTH actions come from the CALLER
+(``opponent_action=None`` defaults to a zero no-op). The DRIVER (collection / demo / the
+future training wrapper) runs both policies and computes player2's perspective-flipped view
+via :func:`pop_trainer.core.state.split_state_for_opponent`. BOTH actions are captured in
+``info["p1_action"]`` / ``info["p2_action"]``.
 
 Modules:
 

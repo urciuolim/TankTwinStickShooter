@@ -19,8 +19,11 @@ All in [`demo.py`](../../src/pop_trainer/demo.py):
   prints a trace, and tears down cleanly. (The launch + connect helpers moved to `core.launch` so
   the [data](data.md) collection runner shares them.)
 - [`run_demo_episode`](../../src/pop_trainer/demo.py) — the **pure** episode loop (an
-  already-built env + `agent1` in, a [`DemoResult`](../../src/pop_trainer/demo.py) out). Drives
-  `player1` off `info["state"]`; the env owns and acts `player2`. Unit-testable against a
+  already-built env + `agent1` + `agent2` in, a [`DemoResult`](../../src/pop_trainer/demo.py) out).
+  The env is a **pure transport that owns neither player**, so this loop drives **both**: each step
+  it computes `a1 = agent1.act(state_vec)` (player1's own unflipped view) and
+  `a2 = agent2.act(split_state_for_opponent(state_vec))` (player2's flipped first-person view,
+  computed here), then feeds both to `env.step(a1, a2)` (`demo.py:167-169`). Unit-testable against a
   fake-backed `TankEnv` — no subprocess, no live socket.
 - [`AGENT_SELECTORS`](../../src/pop_trainer/demo.py) / `make_agent` — the `--player1` /
   `--player2` selector surface. Four names (`demo.py:77`): `aggressive-coverage`, `wall-hugger`,

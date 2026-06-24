@@ -30,16 +30,20 @@ package is named `data` (not `datasets` — that name collides with the git-igno
   per-sample group index without loading frames.
 - [`data.collect`](../../src/pop_trainer/data/collect.py) — the **collection driver**.
   [`run_episode`](../../src/pop_trainer/data/collect.py) is the pure step loop over an injected
-  `env` (drives `player1`; the env owns `player2`), capturing the current `(frame, state)`
-  paired with both actions from `info`. After `env.reset` it hands the tracked map to a map-aware
-  `player1` via the `_maybe_set_map` helper — `getattr`-probing `player1.set_map(info["map"])`,
-  a no-op when `player1` is map-agnostic or the layout is `None` (`collect.py:119`); the env
-  handles `player2`'s map itself. [`collect_to_shards`](../../src/pop_trainer/data/collect.py)
+  bare `env` (a pure transport that owns neither player), so it drives **both** `player1` and
+  `player2`: each step it computes `a1 = player1.act(vec)` (player1's own unflipped view) and
+  `a2 = player2.act(split_state_for_opponent(vec))` (player2's flipped first-person view, computed
+  here via [`core.state`](core.md), `collect.py:193-195`), calls `env.step(a1, a2)`, and records the
+  current `(frame, state)` paired with both applied actions from `info`. After `env.reset` it hands
+  the tracked map to **both** map-aware agents via the `_maybe_set_map` helper —
+  `getattr`-probing `agent.set_map(info["map"])`, a no-op when an agent is map-agnostic or the
+  layout is `None` (`collect.py:119,174-175`). [`collect_to_shards`](../../src/pop_trainer/data/collect.py)
   wraps episodes into shards. [`CollectionSpec`](../../src/pop_trainer/data/collect.py) /
   [`run_worker`](../../src/pop_trainer/data/collect.py) /
   [`collect_parallel`](../../src/pop_trainer/data/collect.py) are the **spawn-based** (never
-  fork — a CLAUDE.md YOU MUST) parallel orchestration; each worker builds its own env + socket
-  inside the process, so nothing live crosses the spawn boundary.
+  fork — a CLAUDE.md YOU MUST) parallel orchestration; each worker builds its own bare env + socket
+  and **both** agents inside the process from the spec's factories, so nothing live crosses the
+  spawn boundary.
 - [`data.collect_runner`](../../src/pop_trainer/data/collect_runner.py) — the **live collection
   entry point** (`python -m pop_trainer.data.collect_runner`): the concrete factories + CLI riding
   on `collect`'s orchestration. It is **multi-worker, SINGLE-map** (Phase A — `custom1` only;
@@ -47,11 +51,15 @@ package is named `data` (not `datasets` — that name collides with the git-igno
   [`env_factory`](../../src/pop_trainer/data/collect_runner.py) is the module-level (spawn-safe,
   no closures) factory that launches one Unity build per worker via
   [`core.launch.build_launch_cmd`](core.md) + `subprocess.Popen` on `port = base_port + worker_id`,
-  connects via [`core.launch.connect`](core.md), and builds the
-  [`TankEnv`](env.md) (its player2 injected) — wrapping `env.close` so closing the env also reaps
-  the launched build.
-  [`player1_factory`](../../src/pop_trainer/data/collect_runner.py) builds the driver's player1
-  from a selector name. [`build_specs`](../../src/pop_trainer/data/collect_runner.py) is the pure
+  connects via [`core.launch.connect`](core.md), and builds the bare
+  [`TankEnv`](env.md) (which owns neither player) — wrapping `env.close` so closing the env also
+  reaps the launched build.
+  [`player1_factory`](../../src/pop_trainer/data/collect_runner.py) and
+  [`player2_factory`](../../src/pop_trainer/data/collect_runner.py) are the symmetric driver-side
+  hooks that build player1 / player2 from a selector name (`collect_runner.py:202-218`); both are
+  wired onto every spec (`collect_runner.py:308-310`) and **required** by `run_worker` (it raises
+  `ValueError` if either is `None`, `collect.py:343-348`).
+  [`build_specs`](../../src/pop_trainer/data/collect_runner.py) is the pure
   CLI-args→`list[CollectionSpec]` builder (one per worker, `--workers` clamped to `[1, 8]`, each
   worker an own `worker_<id>/` out-dir + a distinct seed `base + w*10000`).
   [`main`](../../src/pop_trainer/data/collect_runner.py) parses the flags, resolves `--map custom1`
@@ -92,8 +100,11 @@ graph LR
     specs --> par["collect_parallel (spawn)"]
     par --> ef["env_factory (per worker)"]
     ef -->|build_launch_cmd + connect| launch["core.launch"]
-    ef --> env["TankEnv (+ player2)"]
-    a1["player1 agent"] --> ep["run_episode"]
+    ef --> env["bare TankEnv (owns neither player)"]
+    p1f["player1_factory"] --> a1["player1 agent"]
+    p2f["player2_factory"] --> a2["player2 agent (flipped view)"]
+    a1 --> ep["run_episode (drives both)"]
+    a2 --> ep
     env --> ep
     ep --> samples["Sample[(frame,state,action)]"]
     samples --> shards["collect_to_shards → worker_<id>/*.npz"]

@@ -5,7 +5,8 @@ a scripted in-process fake feeding canned handshake acks, state JSON, and length
 frames through ``core.protocol.Connection`` — exactly the shape the env tests use — so
 ``run_episode`` / ``collect_to_shards`` are exercised end to end through the SAME gym observation
 pipeline RL trains on. Collection pairs a ``player1`` agent + a ``player2`` agent (both REAL
-:mod:`pop_trainer.agents`); ``player2`` is injected into the env at construction.
+:mod:`pop_trainer.agents`); the env is a bare pure transport and BOTH agents are driven by the
+collection loop (player2 acts on its driver-computed flipped view).
 """
 
 import math
@@ -134,6 +135,21 @@ class _FixedAgent:
         pass
 
 
+class _RecordingAgent:
+    """Records the obs handed to its last ``act`` and returns a fixed action."""
+
+    def __init__(self, action=(0.0, 0.0, 0.0, 0.0, 0.0)):
+        self._action = [float(x) for x in action]
+        self.seen_obs = None
+
+    def act(self, obs):
+        self.seen_obs = obs
+        return list(self._action)
+
+    def reset(self, *, seed=None):  # noqa: ARG002
+        pass
+
+
 class _CycleAgent:
     """Cycles a fixed list of actions on an internal counter (deterministic across steps)."""
 
@@ -150,10 +166,10 @@ class _CycleAgent:
         self._step = 0
 
 
-def _make_env(blobs, *, player2=None, **kwargs):
+def _make_env(blobs, **kwargs):
     transport = ScriptedTransport(blobs)
     conn = P.Connection(transport)
-    env = TankEnv(connection=conn, player2=player2, **kwargs)
+    env = TankEnv(connection=conn, **kwargs)
     return env, transport
 
 
@@ -175,10 +191,11 @@ def test_run_episode_records_all_steps_until_cap():
     states = [_flat_state(i) for i in range(5)]
     fills = [(i + 1, i + 1, i + 1) for i in range(5)]
     blobs = _step_episode_blobs(states, fills=fills)
-    env, transport = _make_env(blobs, player2=_FixedAgent(), env_config=EnvConfig(max_steps=5))
+    env, transport = _make_env(blobs, env_config=EnvConfig(max_steps=5))
     ep = collect.run_episode(
         env,
         player1=_FixedAgent(),
+        player2=_FixedAgent(),
         map_id=3,
         episode_id=0,
         max_steps=5,
@@ -205,10 +222,11 @@ def test_run_episode_records_all_steps_until_cap():
 
 def test_run_episode_stops_on_done():
     states = [_flat_state(0), _flat_state(1)]
-    env, _ = _make_env(_step_episode_blobs(states, done_last=True), player2=_FixedAgent())
+    env, _ = _make_env(_step_episode_blobs(states, done_last=True))
     ep = collect.run_episode(
         env,
         player1=_FixedAgent(),
+        player2=_FixedAgent(),
         map_id=0,
         episode_id=0,
         max_steps=100,  # cap not reached; the env's terminated boundary stops it
@@ -221,10 +239,11 @@ def test_run_episode_stops_on_done():
 def test_run_episode_stops_on_winner_terminal():
     # A reported winner terminates the env; the episode stops there before the cap.
     states = [_flat_state(0), _flat_state(1)]
-    env, _ = _make_env(_step_episode_blobs(states, winner_last=S.PLAYER_1), player2=_FixedAgent())
+    env, _ = _make_env(_step_episode_blobs(states, winner_last=S.PLAYER_1))
     ep = collect.run_episode(
         env,
         player1=_FixedAgent(),
+        player2=_FixedAgent(),
         map_id=0,
         episode_id=0,
         max_steps=100,
@@ -267,11 +286,42 @@ def test_run_episode_hands_map_to_player1_set_map():
     states = [_flat_state(0), _flat_state(1)]
     blobs = _step_episode_blobs(states, done_last=True)
     blobs.insert(2, _walls_bytes())  # restart ack, start ack, [walls], first state+frame, ...
-    env, _ = _make_env(blobs, player2=_FixedAgent())
+    env, _ = _make_env(blobs)
     agent1 = _MapRecordingAgent()
-    collect.run_episode(env, player1=agent1, map_id=0, episode_id=0, max_steps=100, seed=0)
+    collect.run_episode(
+        env, player1=agent1, player2=_FixedAgent(), map_id=0, episode_id=0, max_steps=100, seed=0
+    )
     assert agent1.got_map is not None
     assert agent1.got_map.map_id == "maps/center_block.json"
+
+
+def test_run_episode_hands_map_to_player2_set_map():
+    # The driver owns player2's map hook too (the env no longer does): a walls layout reaches a
+    # map-aware player2's OPTIONAL set_map.
+    states = [_flat_state(0), _flat_state(1)]
+    blobs = _step_episode_blobs(states, done_last=True)
+    blobs.insert(2, _walls_bytes())
+    env, _ = _make_env(blobs)
+    player2 = _MapRecordingAgent()
+    collect.run_episode(
+        env, player1=_FixedAgent(), player2=player2, map_id=0, episode_id=0, max_steps=100, seed=0
+    )
+    assert player2.got_map is not None
+    assert player2.got_map.map_id == "maps/center_block.json"
+
+
+def test_run_episode_hands_flipped_view_to_player2():
+    # The perspective flip moved from the env to the DRIVER: player2 must be handed
+    # split_state_for_opponent(vec) of the state it reacts to (the first state, before any step).
+    raw0 = [float(i) for i in range(S.STATE_LEN)]
+    raw1 = _flat_state(7.0)
+    recorder = _RecordingAgent()
+    env, _ = _make_env(_step_episode_blobs([raw0, raw1], done_last=True))
+    collect.run_episode(
+        env, player1=_FixedAgent(), player2=recorder, map_id=0, episode_id=0, max_steps=100, seed=0
+    )
+    expected_view = S.split_state_for_opponent(np.asarray(raw0))
+    np.testing.assert_array_equal(recorder.seen_obs, expected_view)
 
 
 def test_run_episode_captures_both_player_actions():
@@ -282,10 +332,11 @@ def test_run_episode_captures_both_player_actions():
     a1 = [1.0, 0.0, 0.0, 0.0, 1.0]
     a2 = [0.0, -1.0, 1.0, 0.0, 1.0]
     states = [_flat_state(0), _flat_state(1)]
-    env, transport = _make_env(_step_episode_blobs(states, done_last=True), player2=_FixedAgent(a2))
+    env, transport = _make_env(_step_episode_blobs(states, done_last=True))
     ep = collect.run_episode(
         env,
         player1=_FixedAgent(a1),
+        player2=_FixedAgent(a2),
         map_id=0,
         episode_id=0,
         max_steps=100,
@@ -305,10 +356,11 @@ def test_run_episode_records_applied_player1_action():
     # The action recorded on a non-terminal sample's player1 slot matches info["p1_action"].
     a1 = [0.5, -0.5, 0.0, 0.0, 1.0]
     states = [_flat_state(0), _flat_state(1)]
-    env, transport = _make_env(_step_episode_blobs(states, done_last=True), player2=_FixedAgent())
+    env, transport = _make_env(_step_episode_blobs(states, done_last=True))
     ep = collect.run_episode(
         env,
         player1=_FixedAgent(a1),
+        player2=_FixedAgent(),
         map_id=0,
         episode_id=0,
         max_steps=100,
@@ -327,12 +379,11 @@ def test_run_episode_supports_cycling_player1():
     # A cycling player1 advances an internal counter each act(); its actions cycle across steps.
     cycle = _CycleAgent([[1, 0, 0, 0, 0], [0, 1, 0, 0, 0]])
     states = [_flat_state(i) for i in range(3)]
-    env, _ = _make_env(
-        _step_episode_blobs(states), player2=_FixedAgent(), env_config=EnvConfig(max_steps=3)
-    )
+    env, _ = _make_env(_step_episode_blobs(states), env_config=EnvConfig(max_steps=3))
     ep = collect.run_episode(
         env,
         player1=cycle,
+        player2=_FixedAgent(),
         map_id=0,
         episode_id=0,
         max_steps=3,
@@ -348,12 +399,11 @@ def test_shadower_aim_as_player1_through_run_episode():
     # the swept aim). Static positions keep the vector checkable at every step.
     state = _positioned_state((0.0, 0.0), (3.0, 4.0))
     states = [state for _ in range(4)]
-    env, _ = _make_env(
-        _step_episode_blobs(states), player2=_FixedAgent(), env_config=EnvConfig(max_steps=4)
-    )
+    env, _ = _make_env(_step_episode_blobs(states), env_config=EnvConfig(max_steps=4))
     ep = collect.run_episode(
         env,
         player1=agents.CoverageAgent.opponent_shadower(seed=0),  # PLAYER_1 on its own view
+        player2=_FixedAgent(),
         map_id=0,
         episode_id=0,
         max_steps=4,
@@ -372,11 +422,12 @@ def test_shadower_aim_as_player1_through_run_episode():
 def test_run_episode_validates_state_width():
     # A short first state surfaces in info["state"] and must fail the schema validator.
     bad = [0.0] * (S.STATE_LEN - 1)
-    env, _ = _make_env(_reset_blobs(bad), player2=_FixedAgent())
+    env, _ = _make_env(_reset_blobs(bad))
     with pytest.raises(ValueError):
         collect.run_episode(
             env,
             player1=_FixedAgent(),
+            player2=_FixedAgent(),
             map_id=0,
             episode_id=0,
             max_steps=1,
@@ -392,12 +443,12 @@ def test_run_episode_is_deterministic_in_seed():
     def run():
         env, transport = _make_env(
             _step_episode_blobs(states),
-            player2=agents.RandomAgent(seed=7),
             env_config=EnvConfig(max_steps=3),
         )
         collect.run_episode(
             env,
             player1=agents.RandomAgent(seed=99),
+            player2=agents.RandomAgent(seed=7),
             map_id=0,
             episode_id=0,
             max_steps=3,
@@ -415,11 +466,17 @@ def test_run_episode_propagates_agent_typeerror():
             raise TypeError("genuine bug inside the agent body")
 
     states = [_flat_state(0), _flat_state(1)]
-    env, _ = _make_env(
-        _step_episode_blobs(states), player2=_FixedAgent(), env_config=EnvConfig(max_steps=5)
-    )
+    env, _ = _make_env(_step_episode_blobs(states), env_config=EnvConfig(max_steps=5))
     with pytest.raises(TypeError, match="genuine bug"):
-        collect.run_episode(env, player1=BuggyAgent(), map_id=0, episode_id=0, max_steps=5, seed=0)
+        collect.run_episode(
+            env,
+            player1=BuggyAgent(),
+            player2=_FixedAgent(),
+            map_id=0,
+            episode_id=0,
+            max_steps=5,
+            seed=0,
+        )
 
 
 # --- samples_to_shard --------------------------------------------------------------------
@@ -460,12 +517,13 @@ def test_collect_to_shards_writes_and_round_trips(tmp_path):
     # script holds both episodes back to back; each run_episode replays one reset handshake.
     ep0 = _step_episode_blobs([_flat_state(0), _flat_state(1), _flat_state(2)], done_last=True)
     ep1 = _step_episode_blobs([_flat_state(10), _flat_state(11), _flat_state(12)], done_last=True)
-    env, _ = _make_env(ep0 + ep1, player2=_FixedAgent(), env_config=EnvConfig(max_steps=3))
+    env, _ = _make_env(ep0 + ep1, env_config=EnvConfig(max_steps=3))
     written = collect.collect_to_shards(
         env,
         out_dir=tmp_path,
         map_ids=[5, 7],
         player1=_FixedAgent(),
+        player2=_FixedAgent(),
         max_steps=3,
         seed=0,
         shard_prefix="shard_w0",
@@ -489,14 +547,13 @@ def test_collect_to_shards_writes_and_round_trips(tmp_path):
 def test_collect_to_shards_respects_shard_size(tmp_path):
     # shard_size=2 over a 4-step episode -> multiple shards.
     states = [_flat_state(i) for i in range(4)]
-    env, _ = _make_env(
-        _step_episode_blobs(states), player2=_FixedAgent(), env_config=EnvConfig(max_steps=4)
-    )
+    env, _ = _make_env(_step_episode_blobs(states), env_config=EnvConfig(max_steps=4))
     written = collect.collect_to_shards(
         env,
         out_dir=tmp_path,
         map_ids=[1],
         player1=_FixedAgent(),
+        player2=_FixedAgent(),
         max_steps=4,
         seed=0,
         shard_size=2,
@@ -511,19 +568,21 @@ def test_collect_to_shards_respects_shard_size(tmp_path):
 
 def test_collect_parallel_single_spec_in_process(tmp_path):
     # The single-spec path runs in-process (no spawn), exercising run_worker via an injected
-    # env_factory that builds a real TankEnv (WITH its player2) over a fake transport — still
-    # NO live socket.
+    # env_factory that builds a BARE TankEnv over a fake transport — still NO live socket. Both
+    # agents are driver-side, built by player1_factory / player2_factory.
     states = [_flat_state(i) for i in range(3)]
 
     def env_factory(spec):
         transport = ScriptedTransport(_step_episode_blobs(states))
         return TankEnv(
             connection=P.Connection(transport),
-            player2=_FixedAgent(),
             env_config=EnvConfig(max_steps=3),
         )
 
     def player1_factory(spec):
+        return _FixedAgent()
+
+    def player2_factory(spec):
         return _FixedAgent()
 
     spec = collect.CollectionSpec(
@@ -534,6 +593,7 @@ def test_collect_parallel_single_spec_in_process(tmp_path):
         seed=0,
         env_factory=env_factory,
         player1_factory=player1_factory,
+        player2_factory=player2_factory,
     )
     results = collect.collect_parallel([spec])
     assert len(results) == 1
@@ -568,4 +628,18 @@ def test_run_worker_requires_player1_factory(tmp_path):
         env_factory=lambda spec: None,
     )
     with pytest.raises(ValueError, match="player1_factory"):
+        collect.run_worker(spec)
+
+
+def test_run_worker_requires_player2_factory(tmp_path):
+    # env_factory + player1_factory set but no player2_factory: the player2 check is what fires.
+    spec = collect.CollectionSpec(
+        worker_id=0,
+        out_dir=str(tmp_path),
+        map_ids=[0],
+        max_steps=1,
+        env_factory=lambda spec: None,
+        player1_factory=lambda spec: _FixedAgent(),
+    )
+    with pytest.raises(ValueError, match="player2_factory"):
         collect.run_worker(spec)

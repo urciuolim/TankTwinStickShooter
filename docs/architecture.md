@@ -49,7 +49,7 @@ graph TD
     end
 
     subgraph data["data"]
-        Runner["collect_runner.py<br/>env_factory / player1_factory /<br/>build_specs / main (CLI)"]
+        Runner["collect_runner.py<br/>env_factory / player1_factory /<br/>player2_factory / build_specs / main (CLI)"]
         Collect["collect.py<br/>run_episode / collect_to_shards /<br/>collect_parallel"]
         Shards["shards.py / schema.py"]
         Readers["readers.py<br/>split_groups / build_index"]
@@ -72,10 +72,9 @@ graph TD
     AgentImpls --> State
     AgentImpls --> Protocol
 
-    %% map hook: WallLayout reaches a map-aware agent via the optional set_map hook
-    TankEnv -.->|set_map player2| AgentImpls
-    Collect -.->|set_map player1| AgentImpls
-    Demo -.->|set_map player1| AgentImpls
+    %% map hook: WallLayout reaches a map-aware agent via the optional set_map hook (driver-side)
+    Collect -.->|set_map player1 + player2| AgentImpls
+    Demo -.->|set_map player1 + player2| AgentImpls
 
     %% models wiring
     Encoder -.->|leaf, no internal import| core
@@ -105,22 +104,27 @@ graph TD
 
 - **`TankEnv` is the hub.** It pulls every `core` module it needs (`protocol`, `state`,
   `config`, `agent`, plus its own `rewards`) and is the only thing that talks to Unity over the
-  socket. Both `data.collect` and `demo` run their episodes through it.
+  socket. It is a **pure symmetric transport** that owns neither player — `step(a1, a2)` takes both
+  actions from the caller. Both `data.collect` and `demo` run their episodes through it.
 - **The self-play seam** lives in `core.state` (`split_state_for_opponent` /
-  `flip_frame_perspective`): `TankEnv` flips perspective to feed the injected player2, and agents
-  read `PLAYER_1` out of whatever (possibly flipped) view they're handed.
+  `flip_frame_perspective`) and is owned **driver-side**: `data.collect` / `demo` flip player2's
+  perspective to compute its action `a2`, then pass it to `env.step(a1, a2)`. Agents read `PLAYER_1`
+  out of whatever (possibly flipped) view they're handed. `TankEnv` exposes `player2_frame()` /
+  `player2_state()` helpers but does not call them during `step`.
 - **The wall-message seam** flows `WallMessage` (Unity) → `protocol.parse_walls_message` →
   `WallLayout` → `TankEnv.current_map` → `info["map"]`, and from there into a map-aware agent via
-  the OPTIONAL `set_map` hook: `TankEnv` notifies `player2` directly, while `data.collect` /
-  `demo` call `set_map` on `player1` (all `getattr`-probed). A [`CoverageAgent`](components/agents.md)
-  rebuilds its coverage grid from the layout; `RandomAgent` does not implement the hook. See
+  the OPTIONAL `set_map` hook — called **driver-side** on **both** players: `data.collect` /
+  `demo` call `set_map` on player1 and player2 (all `getattr`-probed; the env notifies no agent). A
+  [`CoverageAgent`](components/agents.md) rebuilds its coverage grid from the layout; `RandomAgent`
+  does not implement the hook. See
   [core](components/core.md#the-wall-message--protocol-seam-walllayout--infomap).
 - **`core.launch` is the shared live seam.** Both the `demo` and `data.collect_runner` launch the
   build + open the socket through `build_launch_cmd` / `connect`; it is stdlib-only so `core` stays
   the leaf. `collect_runner.env_factory` calls it once per worker (`port = base_port + worker_id`).
 - **`data.collect_runner` is the collection CLI** (`python -m pop_trainer.data.collect_runner`):
-  the concrete `env_factory` / `player1_factory` + `build_specs` over `collect`'s spawn
-  orchestration — multi-worker, single-map (Phase A `custom1`).
+  the concrete `env_factory` / `player1_factory` / `player2_factory` (symmetric, both driver-side)
+  + `build_specs` over `collect`'s spawn orchestration — multi-worker, single-map (Phase A
+  `custom1`).
 - **`models` is detached** from the live loop today — it's the shared vision backbone the
   future `pretraining` / `rl` will consume, and the deployable ONNX artifact.
 

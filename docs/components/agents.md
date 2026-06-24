@@ -109,18 +109,17 @@ engine.
 
 ## Pushes to (downstream)
 
-- [env](env.md) — a `CoverageAgent` (or `RandomAgent`) is injected as `player2`; the env calls
-  `player2.set_map` at reset when a map is tracked.
-- [data](data.md) — collection pairs a `player1` + `player2` agent to drive episodes, and calls
-  `set_map` on `player1` via `_maybe_set_map`.
+- [data](data.md) — collection pairs a `player1` + `player2` agent to drive episodes (both
+  driver-side; the env owns neither player), and calls `set_map` on **both** via `_maybe_set_map`.
 - [demo](demo.md) — the `--player1` / `--player2` selectors (`aggressive-coverage` /
   `wall-hugger` / `opponent-shadower` / `random`) build agents from here.
 
 ## Where it sits in the run
 
-The opponents and data-collection drivers. Agents are what actually *play* — injected into the
-env as player2 and driven directly as player1 — so a recorded trajectory (or a demo episode) is
-the product of whichever pair of agents was chosen. The coverage family's job is to make those
+The opponents and data-collection drivers. Agents are what actually *play* — the driver
+([data](data.md) / [demo](demo.md)) advances **both** player1 and player2 (the env is a pure
+transport that owns neither), so a recorded trajectory (or a demo episode) is the product of
+whichever pair of agents was chosen. The coverage family's job is to make those
 trajectories sweep the map broadly, so the supervised-decode corpus sees the whole state space.
 
 ```mermaid

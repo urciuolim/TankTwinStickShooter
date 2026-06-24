@@ -3,9 +3,11 @@
 ``python -m pop_trainer.demo`` launches the real Unity build WINDOWED, opens a TCP socket to
 it, wraps that socket in :class:`pop_trainer.core.protocol.Connection`, constructs a
 :class:`pop_trainer.env.tank_env.TankEnv` over it, and runs ONE episode with two different
-policies so a human can watch the difference. player1 is driven by this module
-(``agent1.act(view1)`` each step, where ``view1`` is player1's 52-float first-person state);
-player2 is injected into the env, which flips perspective and calls it internally.
+policies so a human can watch the difference. BOTH policies are driven by this module: player1 by
+``agent1.act(view1)`` (``view1`` is player1's own UNFLIPPED 52-float state) and player2 by
+``agent2.act(view2)`` (``view2`` is player2's FLIPPED first-person view, computed here via
+:func:`core.state.split_state_for_opponent`); both actions are passed to ``env.step(a1, a2)`` —
+the env is a bare pure transport that owns neither player.
 
 This is an APPLICATION / entry point. It imports ``pop_trainer.env``, ``pop_trainer.agents``,
 and ``pop_trainer.core`` ONLY — never ``models`` / ``data`` / ``rl`` / ``pretraining`` and
@@ -36,8 +38,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
+
 from pop_trainer import agents
 from pop_trainer.core import agent as core_agent
+from pop_trainer.core import state as S
 from pop_trainer.core.config import EnvConfig
 from pop_trainer.core.launch import build_launch_cmd, connect
 from pop_trainer.core.protocol import Connection, WallLayout
@@ -119,32 +124,38 @@ class DemoResult:
 
 
 def run_demo_episode(
-    env: TankEnv, agent1: core_agent.Agent, *, max_steps: int = DEFAULT_MAX_STEPS
+    env: TankEnv,
+    agent1: core_agent.Agent,
+    agent2: core_agent.Agent,
+    *,
+    max_steps: int = DEFAULT_MAX_STEPS,
 ) -> DemoResult:
-    """Drive ONE episode of an already-built ``env`` with ``agent1`` as player1.
+    """Drive ONE episode of an already-built bare ``env`` with ``agent1`` / ``agent2``.
 
-    ``env`` MUST already be constructed with the desired player2 agent (the env owns player2
-    and acts it internally). This loop resets ``agent1`` and the env's player2 if they expose
-    ``reset``, calls ``env.reset()``, then steps: each step it computes player1's action from
-    the CURRENT 52-float state (``info["state"]`` — player1's own unflipped view) via
-    ``agent1.act`` and feeds it to ``env.step`` until ``terminated or truncated`` or
-    ``max_steps`` is reached. The transport lives inside ``env``, so this is unit-testable
-    against a fake-backed ``TankEnv`` with no subprocess and no live socket.
+    ``env`` is a bare pure-transport :class:`TankEnv` that owns neither player; this loop drives
+    BOTH agents. It resets ``agent1`` / ``agent2`` if they expose ``reset``, calls ``env.reset()``,
+    then steps: each step it computes player1's action from the CURRENT 52-float state
+    (``info["state"]`` — player1's own unflipped view) via ``agent1.act`` and player2's action from
+    its FLIPPED first-person view (``split_state_for_opponent`` of that state) via ``agent2.act``,
+    then feeds both to ``env.step(a1, a2)`` until ``terminated or truncated`` or ``max_steps`` is
+    reached. The transport lives inside ``env``, so this is unit-testable against a fake-backed
+    ``TankEnv`` with no subprocess and no live socket.
     """
     _maybe_reset(agent1)
-    _maybe_reset(getattr(env, "player2", None))
+    _maybe_reset(agent2)
 
     obs, info = env.reset()
     del obs  # the observation is the pixel frame; this loop drives off info["state"].
     state_vec = info["state"]
     tracked_map = info.get("map")
 
-    # Hand the static layout to a map-aware player1 (the OPTIONAL ``set_map`` hook); player2's
-    # map is handled inside the env. A map-agnostic agent1 does not expose ``set_map``.
+    # Hand the static layout to a map-aware agent (the OPTIONAL ``set_map`` hook); both agents are
+    # driver-side. A map-agnostic agent does not expose ``set_map``.
     if tracked_map is not None:
-        set_map = getattr(agent1, "set_map", None)
-        if callable(set_map):
-            set_map(tracked_map)
+        for agent in (agent1, agent2):
+            set_map = getattr(agent, "set_map", None)
+            if callable(set_map):
+                set_map(tracked_map)
 
     steps = 0
     total_reward = 0.0
@@ -154,7 +165,8 @@ def run_demo_episode(
 
     while steps < max_steps:
         action = agent1.act(state_vec)
-        _obs, reward, terminated, truncated, info = env.step(action)
+        a2 = agent2.act(S.split_state_for_opponent(np.asarray(state_vec)))
+        _obs, reward, terminated, truncated, info = env.step(action, a2)
         steps += 1
         total_reward += float(reward)
         if "map" in info and info["map"] is not None:
@@ -211,7 +223,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--player2",
         default=DEFAULT_PLAYER2,
         choices=sorted(AGENT_SELECTORS),
-        help="agent selector for player2 (injected into the env)",
+        help="agent selector for player2 (driven by this module)",
     )
     parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
@@ -257,12 +269,11 @@ def main(argv: list[str] | None = None) -> int:
         connection = Connection(connect(args.port))
         env = TankEnv(
             connection=connection,
-            player2=agent2,
             frame_shape=FRAME_SHAPE,
             env_config=EnvConfig(max_steps=args.max_steps),
             seed=args.seed,
         )
-        result = run_demo_episode(env, agent1, max_steps=args.max_steps)
+        result = run_demo_episode(env, agent1, agent2, max_steps=args.max_steps)
         _print_trace(result, player1=args.player1, player2=args.player2)
     finally:
         if env is not None:

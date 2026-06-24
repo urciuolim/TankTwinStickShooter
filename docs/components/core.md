@@ -12,8 +12,11 @@ from here instead of re-hardcoding them. All JSON is strict.
   frozen RL seam). Layout constants (`STATE_LEN = 52`, P1 = indices 0..25, P2 = 26..51),
   pure accessors (`position` / `velocity` / `aim` / `iter_bullets`), and the self-play
   **perspective transforms** `flip_frame_perspective` (R/B channel swap on a pixel frame) and
-  `split_state_for_opponent` (swap the two 26-float halves). The state is the supervised-decode
-  *objective*, NOT the policy observation — the observation is the pixel frame.
+  `split_state_for_opponent` (swap the two 26-float halves). These are consumed **driver-side**:
+  the [data](data.md) collection / [demo](demo.md) loops call `split_state_for_opponent` to build
+  player2's flipped first-person view before passing its action to `env.step` (the env is a pure
+  transport and does not flip perspective itself). The state is the supervised-decode *objective*,
+  NOT the policy observation — the observation is the pixel frame.
 - [`core.protocol`](../../src/pop_trainer/core/protocol.py) — the **strict TCP-JSON wire
   client** over an injected transport. `encode` / `decode` (pure, no socket), a frame-aware
   [`Connection`](../../src/pop_trainer/core/protocol.py) that reads exactly one top-level JSON

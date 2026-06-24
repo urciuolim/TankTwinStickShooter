@@ -3,9 +3,9 @@
 Per the data contract the LIVE socket / subprocess path stays UNTESTED: no real socket is opened
 and no real build is launched here. Two seams are exercised instead:
 
-* the PURE pieces — ``build_specs`` (CLI args -> specs), the selector surface, ``player1_factory``,
-  and ``build_env_from_connection`` (the env-build core) driven over an in-process fake transport
-  exactly like ``test_collect.py``;
+* the PURE pieces — ``build_specs`` (CLI args -> specs), the selector surface, ``player1_factory`` /
+  ``player2_factory``, and ``build_env_from_connection`` (the bare env-build core) driven over an
+  in-process fake transport exactly like ``test_collect.py``;
 * the launch GLUE — ``env_factory`` with ``subprocess.Popen`` + ``core.launch.connect`` monkey-
   patched to fakes, asserting the wiring (port = base + worker_id, the proc stashed) and that
   closing the env REAPS the stashed proc.
@@ -143,6 +143,7 @@ def test_build_specs_wires_module_level_factories():
     for spec in specs:
         assert spec.env_factory is R.env_factory
         assert spec.player1_factory is R.player1_factory
+        assert spec.player2_factory is R.player2_factory
 
 
 def test_build_specs_extra_carries_launch_params():
@@ -239,25 +240,56 @@ def test_player1_factory_seed_is_reproducible():
     np.testing.assert_array_equal(a.act(None), b.act(None))
 
 
+# --- player2_factory ---------------------------------------------------------------------
+
+
+def test_player2_factory_builds_the_selected_agent():
+    spec = CollectionSpec(
+        worker_id=0,
+        out_dir="out",
+        map_ids=[0],
+        max_steps=1,
+        seed=5,
+        extra={"player2": "random"},
+    )
+    agent = R.player2_factory(spec)
+    assert isinstance(agent, agents.RandomAgent)
+    assert hasattr(agent, "act")
+
+
+def test_player2_factory_seed_is_reproducible():
+    spec = CollectionSpec(
+        worker_id=0, out_dir="out", map_ids=[0], max_steps=1, seed=7, extra={"player2": "random"}
+    )
+    a = R.player2_factory(spec)
+    b = R.player2_factory(spec)
+    np.testing.assert_array_equal(a.act(None), b.act(None))
+
+
 # --- build_env_from_connection (the env-build core, fake transport) ----------------------
 
 
 def test_build_env_from_connection_runs_an_episode():
-    # The env-build core over an in-process fake transport: build the env (with its player2) and
-    # drive one episode through the real collect.run_episode — NO live socket.
+    # The bare env-build core over an in-process fake transport: build the env and drive one episode
+    # through the real collect.run_episode with both driver-side agents — NO live socket.
     from pop_trainer.data import collect
 
     states = [_flat_state(i) for i in range(3)]
     transport = ScriptedTransport(_episode_blobs(states, done_last=True))
     env = R.build_env_from_connection(
         P.Connection(transport),
-        player2_selector="random",
         seed=0,
         max_steps=3,
         frame_shape=R.FRAME_SHAPE,
     )
     ep = collect.run_episode(
-        env, player1=R.make_agent("random", seed=1), map_id=0, episode_id=0, max_steps=3, seed=0
+        env,
+        player1=R.make_agent("random", seed=1),
+        player2=R.make_agent("random", seed=2),
+        map_id=0,
+        episode_id=0,
+        max_steps=3,
+        seed=0,
     )
     assert len(ep) == 3
     assert ep.ended_done
@@ -265,13 +297,18 @@ def test_build_env_from_connection_runs_an_episode():
     assert ep.samples[0].frame.shape == R.FRAME_SHAPE
 
 
-def test_build_env_from_connection_injects_player2():
-    states = [_flat_state(0), _flat_state(1)]
-    transport = ScriptedTransport(_episode_blobs(states))
-    env = R.build_env_from_connection(
-        P.Connection(transport), player2_selector="aggressive-coverage", seed=0, max_steps=2
+def test_player2_factory_builds_the_right_agent_type():
+    # player2 is now a DRIVER-side agent (the env is bare); player2_factory builds it from the
+    # selector, mirroring player1_factory.
+    spec = CollectionSpec(
+        worker_id=0,
+        out_dir="out",
+        map_ids=[0],
+        max_steps=2,
+        seed=0,
+        extra={"player2": "aggressive-coverage"},
     )
-    assert isinstance(env.player2, agents.CoverageAgent)
+    assert isinstance(R.player2_factory(spec), agents.CoverageAgent)
 
 
 # --- env_factory wiring + proc reaping (Popen + connect monkeypatched) -------------------
@@ -334,6 +371,7 @@ def _spec(worker_id=2, base_port=50000, max_steps=2):
         seed=0,
         env_factory=R.env_factory,
         player1_factory=R.player1_factory,
+        player2_factory=R.player2_factory,
         extra={
             "exe": "build.exe",
             "config": "cfg.json",
@@ -407,6 +445,7 @@ def test_run_worker_finally_reaps_the_launch_proc(monkeypatch, tmp_path):
         seed=0,
         env_factory=R.env_factory,
         player1_factory=R.player1_factory,
+        player2_factory=R.player2_factory,
         extra={
             "exe": "build.exe",
             "config": "cfg.json",
