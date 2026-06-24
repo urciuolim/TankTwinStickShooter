@@ -19,9 +19,12 @@ Modules:
 * :mod:`pop_trainer.core.agent` — the Agent Protocol (``act(obs) -> action``), the
   type-only decision-maker interface ``agents`` implements and ``env`` consumes (keeping
   ``env`` torch-free).
+* :mod:`pop_trainer.core.launch` — stdlib-only live-build launch + socket-connect helpers
+  (the windowed ``Popen`` arg-list + a bounded connect retry/backoff) shared by the demo and
+  the collection runner.
 """
 
-from pop_trainer.core import agent, config, maps, protocol, state
+from pop_trainer.core import agent, config, launch, maps, protocol, state
 from pop_trainer.core.agent import Agent, StatefulAgent
 
-__all__ = ["state", "protocol", "config", "maps", "agent", "Agent", "StatefulAgent"]
+__all__ = ["state", "protocol", "config", "maps", "agent", "launch", "Agent", "StatefulAgent"]
