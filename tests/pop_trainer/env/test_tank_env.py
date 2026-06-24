@@ -48,6 +48,23 @@ def _ack(obj):
     return P.encode(obj)
 
 
+def _walls_bytes(map_id="maps/center_block.json", tile_id=7, dims=None, columns=None):
+    """A strict-JSON walls message blob in the exact Unity WallMessage shape (string keys)."""
+    if dims is None:
+        dims = {"minX": -1, "maxX": 1, "minY": -1, "maxY": 1}
+    if columns is None:
+        columns = {"0": [0, 1], "-1": [1]}
+    return P.encode(
+        {
+            "type": "walls",
+            "map_id": map_id,
+            "tileID": tile_id,
+            "dims": dims,
+            "columns": columns,
+        }
+    )
+
+
 def _flat_state(value=0.0):
     return [float(value)] * S.STATE_LEN
 
@@ -86,6 +103,19 @@ def _reset_blobs(first_state, *, fill=(10, 20, 30)):
     return [
         _ack({"restart": True}),
         _ack({"starting": True}),
+        _state_and_frame_bytes(first_state, fill=fill),
+    ]
+
+
+def _reset_blobs_with_walls(first_state, *, walls=None, fill=(10, 20, 30)):
+    """A reset script that includes the optional walls message after the start ack.
+
+    Mirrors the real handshake ordering: restart ack, start ack, WALLS, then state+frame.
+    """
+    return [
+        _ack({"restart": True}),
+        _ack({"starting": True}),
+        walls if walls is not None else _walls_bytes(),
         _state_and_frame_bytes(first_state, fill=fill),
     ]
 
@@ -143,6 +173,62 @@ def test_reset_returns_frame_obs_and_state_in_info():
     # The 52-float state is in info, NOT in the observation.
     assert info["state"] == raw
     assert len(info["state"]) == S.STATE_LEN
+
+
+def test_reset_tracks_walls_message_and_reads_real_first_state():
+    # Handshake delivers WALLS before the first state: the env parses + tracks the layout and
+    # the first observation/state is the REAL first state (frame/state flow undisturbed).
+    raw = [float(i) for i in range(S.STATE_LEN)]
+    blobs = _reset_blobs_with_walls(raw, fill=(7, 8, 9))
+    env, _ = _make_env(blobs)
+    obs, info = env.reset(seed=0)
+
+    # The walls message is parsed into the tracked current map.
+    assert isinstance(env.current_map, P.WallLayout)
+    assert env.current_map.map_id == "maps/center_block.json"
+    assert env.current_map.tile_id == 7
+    assert env.current_map.occupied == frozenset({(0, 0), (0, 1), (-1, 1)})
+    # Same WallLayout object surfaced in reset info.
+    assert info["map"] is env.current_map
+    # The first observation/state is the REAL first state, not the walls message.
+    assert info["state"] == raw
+    assert obs.shape == DEFAULT_FRAME_SHAPE
+    assert np.array_equal(obs[0, 0], [7, 8, 9])
+
+
+def test_reset_without_walls_message_leaves_current_map_none():
+    # No walls message (no arena configured): current_map stays None and the first state is
+    # read correctly (the optional-message handling does not consume a state by mistake).
+    raw = [float(i) for i in range(S.STATE_LEN)]
+    env, _ = _make_env(_reset_blobs(raw, fill=(3, 4, 5)))
+    obs, info = env.reset(seed=0)
+
+    assert env.current_map is None
+    assert info["map"] is None
+    assert info["state"] == raw
+    assert np.array_equal(obs[0, 0], [3, 4, 5])
+
+
+def test_step_after_walls_reset_returns_five_tuple_with_map():
+    # A normal step after a walls-carrying reset still returns the right 5-tuple, and the
+    # tracked map persists into step info.
+    raw0 = _flat_state(0.0)
+    raw1 = [float(i) for i in range(S.STATE_LEN)]
+    blobs = _reset_blobs_with_walls(raw0) + [_state_and_frame_bytes(raw1, fill=(1, 2, 3))]
+    env, _ = _make_env(blobs)
+    env.reset(seed=0)
+
+    out = env.step(np.zeros(ACTION_DIM, dtype=np.float32))
+    assert len(out) == 5
+    obs, reward, terminated, truncated, info = out
+    assert obs.shape == DEFAULT_FRAME_SHAPE
+    assert np.array_equal(obs[0, 0], [1, 2, 3])
+    assert info["state"] == raw1
+    # The map tracked at reset persists into step info.
+    assert info["map"] is env.current_map
+    assert isinstance(env.current_map, P.WallLayout)
+    assert terminated is False
+    assert truncated is False
 
 
 def test_reset_raises_on_unexpected_start_ack():

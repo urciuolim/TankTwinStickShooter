@@ -11,7 +11,7 @@ description: Contract + boundaries for the core/ component of src/pop_trainer. L
 
 **Contains:**
 - `state.py` — the 52-float state schema (single source of truth; the supervised objective signal).
-- `protocol.py` — the TCP-JSON wire client (framing/handshake) + the real pixel-frame channel (the actual obs input path).
+- `protocol.py` — the TCP-JSON wire client (framing/handshake) + the real pixel-frame channel (the actual obs input path) + the **wall-layout message parser** (`is_walls_message` / `parse_walls_message` → an immutable `WallLayout`): the one-time `{"type":"walls",...}` map-layout message Unity emits is recognized by its `"type"` tag and strict-parsed here (string column keys → int, derived `occupied` cell set). Pure parse; `env` does the tracking.
 - `config.py` — typed config dataclasses (run / env / reward).
 - `maps.py` — map selection / rotation (which map to play).
 - `agent.py` — the **Agent Protocol** (`act(obs) -> action`), the shared decision-maker interface that `player1` / `player2` satisfy. Pure / torch-free (a `typing.Protocol`); `agents/` implements it and `env` consumes it — which keeps `env` torch-free.
@@ -19,6 +19,6 @@ description: Contract + boundaries for the core/ component of src/pop_trainer. L
 
 **Boundaries:** imports nothing from `models / env / data / pretraining / rl`. No torch. No cycles.
 
-**Future (not built here):** the static map/wall layout will be sent by Unity as a one-time message on load/map-change and tracked as map-state — designed at `env/` integration with the Unity side, NOT via Python arena parsing.
+**Map-state (built):** the static wall layout is sent by Unity as a one-time `{"type":"walls",...}` message on load/map-change. `protocol.py` PARSES it (`WallLayout`); `env/` consumes + TRACKS it as map-state. Unity is the source of truth — never re-parse arena JSON in Python.
 
 **Inspiration (do NOT copy):** `src/tank_twin/{state,protocol,config,maps}.py`; the 2021 `PythonScripts/` originals. Build fresh — match the Unity wire contract exactly (52-float layout, JSON shape, big-endian frame header), but this is NEW code; it does not modify `src/tank_twin`'s frozen seam.

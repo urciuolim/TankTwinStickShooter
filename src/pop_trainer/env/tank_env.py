@@ -32,13 +32,21 @@ open, not built.
 
 Wire contract (byte-identical to the frozen RL seam; see ``core.protocol``):
 
-* handshake: ``{"restart": True}`` -> ack, ``{"start": True}`` -> a ``"starting"`` ack,
-  then the first ``{"state": [...52...]}`` + its trailing pixel frame.
+* handshake: ``{"restart": True}`` -> ack, ``{"start": True}`` -> a ``"starting"`` ack, then
+  an OPTIONAL one-time ``{"type": "walls", ...}`` map-layout message (sent only when an arena
+  with a "Walls" block is configured), then the first ``{"state": [...52...]}`` + its trailing
+  pixel frame.
 * step: ``{1: a1_list, 2: a2_list}`` (INTEGER keys; ``json.dumps`` coerces them to ``"1"`` /
   ``"2"``), then the next ``state`` + frame. ``a1`` is the player1 action passed to ``step``;
   ``a2`` is ``player2``'s action.
 * inbound state may carry ``"winner"`` (int: ``0`` == player1 won, ``1`` == player2, ``-1`` ==
   draw) and/or ``"done"``.
+
+Map-layout tracking: Unity is the source of truth for the static wall geometry. When the
+handshake delivers the optional walls message the env parses it (``core.protocol``) and stores
+it on ``self.current_map`` (a :class:`pop_trainer.core.protocol.WallLayout`), surfaced in the
+reset ``info`` as ``info["map"]`` (and in step ``info`` as ``info["map"]``). It stays ``None``
+when no arena is configured. The env NEVER re-parses arena JSON.
 
 Episode boundaries (gymnasium 5-tuple; see :mod:`pop_trainer.env.rewards`):
 
@@ -73,7 +81,12 @@ from gymnasium import spaces
 from pop_trainer.core import agent as core_agent
 from pop_trainer.core import state as S
 from pop_trainer.core.config import EnvConfig, RewardConfig
-from pop_trainer.core.protocol import Connection
+from pop_trainer.core.protocol import (
+    Connection,
+    WallLayout,
+    is_walls_message,
+    parse_walls_message,
+)
 from pop_trainer.env.rewards import shaped_step_reward, time_penalty_per_step
 
 # The action vector is 5 floats in [-1, 1]: [move_x, move_y, aim_x, aim_y, fire].
@@ -216,6 +229,9 @@ class TankEnv(gymnasium.Env):
         self._raw_state: list[float] | None = None
         self.step_counter = 0
         self.last_winner = -1
+        # The static wall layout of the current map, parsed from the optional one-time walls
+        # message in the handshake. None until a walls message arrives (no arena configured).
+        self.current_map: WallLayout | None = None
         # The actual length-5 actions sent on the wire on the most recent successful step.
         self.last_p1_action: list[float] | None = None
         self.last_p2_action: list[float] | None = None
@@ -247,7 +263,15 @@ class TankEnv(gymnasium.Env):
         return obs, info
 
     def _handshake_and_first_state(self):
-        """Send the restart/start handshake and read the first ``state`` + frame."""
+        """Send the restart/start handshake and read the first ``state`` + frame.
+
+        After the ``"starting"`` ack, the game MAY send a one-time ``{"type": "walls", ...}``
+        map-layout message (only when an arena with a "Walls" block is configured) as its own
+        discrete message BEFORE the first state. The env reads one JSON object and routes by
+        its ``"type"`` tag: a walls message is parsed + stored on ``self.current_map``, then the
+        first ``state`` + frame is read; otherwise the object already IS the first state and only
+        its trailing pixel frame is read (so an absent walls message never consumes a state).
+        """
         self.conn.send({"restart": True})
         self.conn.receive()  # restart ack
         self.conn.send({"start": True})
@@ -255,12 +279,21 @@ class TankEnv(gymnasium.Env):
         if "starting" not in ack:
             raise RuntimeError(f"unexpected start ack from game: {ack!r}")
 
-        received, frame = self.conn.receive_state_and_frame()  # first state + frame
+        # One JSON object: either the optional walls message or the first state itself.
+        message = self.conn.receive()
+        if is_walls_message(message):
+            self.current_map = parse_walls_message(message)
+            received, frame = self.conn.receive_state_and_frame()
+        else:
+            # The object already held is the first state; pair it with its trailing frame.
+            received = message
+            frame = self.conn.receive_frame()
+
         self._raw_state = list(received["state"])
         self._frame = np.asarray(frame, dtype=np.uint8)
         self.step_counter = 0
         self.last_winner = -1
-        return self._frame, {"state": self._raw_state}
+        return self._frame, {"state": self._raw_state, "map": self.current_map}
 
     def step(self, action):
         """Send ``{1: a1, 2: a2}``, read the next ``state`` + frame, return the gymnasium
@@ -335,7 +368,12 @@ class TankEnv(gymnasium.Env):
             max_steps_reached=max_steps_reached,
         )
 
-        info: dict = {"state": self._raw_state, "p1_action": a1, "p2_action": a2}
+        info: dict = {
+            "state": self._raw_state,
+            "p1_action": a1,
+            "p2_action": a2,
+            "map": self.current_map,
+        }
         if winner is not None:
             info["winner"] = winner
             self.last_winner = winner

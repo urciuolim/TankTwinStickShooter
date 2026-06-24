@@ -316,3 +316,135 @@ def test_frame_payload_over_max_frame_bytes_raises_before_reading_payload():
         conn.receive_frame()
     # Exactly the 10-byte header was read; the giant payload was never requested.
     assert sum(t.recv_sizes) <= P.FRAME_HEADER_LEN
+
+
+# --- wall-layout message ----------------------------------------------------------------
+
+
+def _walls_message(map_id="maps/center_block.json", tile_id=7, dims=None, columns=None):
+    """Build a realistic walls message dict in the exact Unity WallMessage shape.
+
+    Keys of ``columns`` are STRINGS of the column x integer (JSON object keys are strings),
+    exactly as they arrive over the wire after ``decode``.
+    """
+    if dims is None:
+        dims = {"minX": -2, "maxX": 2, "minY": -2, "maxY": 2}
+    if columns is None:
+        columns = {"0": [0, 1], "1": [-1], "-1": [2]}
+    return {
+        "type": "walls",
+        "map_id": map_id,
+        "tileID": tile_id,
+        "dims": dims,
+        "columns": columns,
+    }
+
+
+def test_is_walls_message_discriminates_walls_state_ack():
+    assert P.is_walls_message(_walls_message()) is True
+    # A state message and an ack are NOT walls messages.
+    assert P.is_walls_message({"state": [0.0] * S.STATE_LEN}) is False
+    assert P.is_walls_message({"starting": True}) is False
+    # Non-dicts / wrong tag are rejected without raising.
+    assert P.is_walls_message(None) is False
+    assert P.is_walls_message([1, 2, 3]) is False
+    assert P.is_walls_message({"type": "state"}) is False
+
+
+def test_parse_walls_message_realistic_occupied_set():
+    layout = P.parse_walls_message(_walls_message())
+    assert isinstance(layout, P.WallLayout)
+    assert layout.map_id == "maps/center_block.json"
+    assert layout.tile_id == 7
+    assert (layout.dims.min_x, layout.dims.max_x) == (-2, 2)
+    assert (layout.dims.min_y, layout.dims.max_y) == (-2, 2)
+    # String keys are converted to int columns; occupied set is the cross product.
+    assert layout.columns == {0: (0, 1), 1: (-1,), -1: (2,)}
+    assert layout.occupied == frozenset({(0, 0), (0, 1), (1, -1), (-1, 2)})
+
+
+def test_parse_walls_message_negative_x_keys():
+    """Negative-x JSON object keys (e.g. "-3") round-trip to int columns and cells."""
+    msg = _walls_message(columns={"-3": [-5, 4], "-1": [0]})
+    layout = P.parse_walls_message(msg)
+    assert layout.columns == {-3: (-5, 4), -1: (0,)}
+    assert (-3, -5) in layout.occupied
+    assert (-3, 4) in layout.occupied
+    assert (-1, 0) in layout.occupied
+
+
+def test_parse_walls_message_empty_columns_is_wall_free_map():
+    layout = P.parse_walls_message(_walls_message(columns={}))
+    assert layout.columns == {}
+    assert layout.occupied == frozenset()
+
+
+def test_parse_walls_message_empty_map_id_ok():
+    layout = P.parse_walls_message(_walls_message(map_id=""))
+    assert layout.map_id == ""
+
+
+def test_parse_walls_message_accepts_integral_float_cells():
+    # Strict JSON for an int-valued field may decode as a float; an integral float narrows.
+    layout = P.parse_walls_message(_walls_message(columns={"0": [1.0, 2.0]}))
+    assert layout.columns == {0: (1, 2)}
+
+
+def test_parse_walls_message_rejects_wrong_tag():
+    with pytest.raises(ValueError):
+        P.parse_walls_message({"state": [0.0] * S.STATE_LEN})
+    with pytest.raises(ValueError):
+        P.parse_walls_message({"type": "state", "dims": {}, "columns": {}})
+
+
+def test_parse_walls_message_rejects_missing_dims_keys():
+    bad = _walls_message(dims={"minX": 0, "maxX": 1, "minY": 0})  # no maxY
+    with pytest.raises(ValueError):
+        P.parse_walls_message(bad)
+
+
+def test_parse_walls_message_rejects_non_int_dims():
+    bad = _walls_message(dims={"minX": 0.5, "maxX": 1, "minY": 0, "maxY": 1})
+    with pytest.raises(ValueError):
+        P.parse_walls_message(bad)
+
+
+def test_parse_walls_message_rejects_non_int_cell():
+    with pytest.raises(ValueError):
+        P.parse_walls_message(_walls_message(columns={"0": [1, "x"]}))
+
+
+def test_parse_walls_message_rejects_non_int_tile_id():
+    bad = _walls_message(tile_id="seven")
+    with pytest.raises(ValueError):
+        P.parse_walls_message(bad)
+
+
+def test_parse_walls_message_rejects_non_int_column_key():
+    with pytest.raises(ValueError):
+        P.parse_walls_message(_walls_message(columns={"notanint": [0]}))
+
+
+def test_parse_walls_message_rejects_non_list_column_value():
+    with pytest.raises(ValueError):
+        P.parse_walls_message(_walls_message(columns={"0": 5}))
+
+
+def test_parse_walls_message_rejects_bool_cell():
+    # A JSON bool is an int subclass but is never a valid coordinate.
+    with pytest.raises(ValueError):
+        P.parse_walls_message(_walls_message(columns={"0": [True]}))
+
+
+def test_wall_layout_is_frozen():
+    layout = P.parse_walls_message(_walls_message())
+    with pytest.raises(Exception):
+        layout.tile_id = 99  # frozen dataclass
+
+
+def test_walls_message_round_trips_through_strict_json():
+    """A walls message survives encode -> decode (string keys preserved) and parses."""
+    msg = _walls_message()
+    decoded = P.decode(P.encode(msg))
+    layout = P.parse_walls_message(decoded)
+    assert layout.occupied == P.parse_walls_message(msg).occupied

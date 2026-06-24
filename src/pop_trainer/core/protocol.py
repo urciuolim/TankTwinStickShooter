@@ -41,11 +41,21 @@ one length-prefixed binary RGB frame on the SAME socket IMMEDIATELY AFTER each s
 reads + reshapes the payload into a ``(H, W, 3)`` uint8 array (vertically flipped to a
 top-left origin). numpy is used ONLY on this frame path; the JSON path stays numpy-free in
 behavior.
+
+WALL-LAYOUT MESSAGE (additive). On a map load / change Unity sends ONE strict-JSON object
+tagged ``{"type": "walls", ...}`` as its own discrete write (AFTER the handshake-confirmation
+write, never bundled with it; skipped entirely when no arena is configured). It carries the
+static wall layout so Python tracks map-state instead of re-parsing the arena JSON.
+:func:`is_walls_message` discriminates it by the ``"type"`` tag and :func:`parse_walls_message`
+strict-parses it into an immutable :class:`WallLayout`. The ``columns`` keys are STRINGS of the
+column x integer (JSON object keys are always strings) and are converted back to ints; only
+occupied columns are present. This is a PURE parse (no socket, no numpy).
 """
 
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -78,6 +88,9 @@ _BACKSLASH = 0x5C  # \
 _OPEN_BRACE = 0x7B  # {
 _CLOSE_BRACE = 0x7D  # }
 
+# --- wall-layout message wire contract (additive; matches the Unity WallMessage writer) ---
+WALLS_TYPE_TAG = "walls"  # the fixed value of the top-level "type" tag on a walls message
+
 __all__ = [
     "RECV_BUFSIZE",
     "DEFAULT_MAX_OBJECT_BYTES",
@@ -85,11 +98,16 @@ __all__ = [
     "FRAME_TAG",
     "FRAME_CHANNELS",
     "FRAME_HEADER_LEN",
+    "WALLS_TYPE_TAG",
     "encode",
     "decode",
     "parse_frame_header",
     "Connection",
     "state_message_is_valid",
+    "WallDims",
+    "WallLayout",
+    "is_walls_message",
+    "parse_walls_message",
 ]
 
 
@@ -358,3 +376,115 @@ def state_message_is_valid(message) -> bool:
     """
     state = message.get("state") if isinstance(message, dict) else None
     return isinstance(state, list | tuple) and len(state) == STATE_LEN
+
+
+# --- wall-layout message (additive; the one-time map-layout message from Unity) ----------
+
+
+@dataclass(frozen=True)
+class WallDims:
+    """The integer grid bounds of a map's wall layout (inclusive cell ranges)."""
+
+    min_x: int
+    max_x: int
+    min_y: int
+    max_y: int
+
+
+@dataclass(frozen=True)
+class WallLayout:
+    """An immutable parsed wall-layout message (the static map geometry Unity emits).
+
+    ``columns`` maps a column x (int) to the ascending tuple of occupied y-cells in that
+    column; only OCCUPIED columns are present (a wall-free map yields an empty mapping). The
+    derived :attr:`occupied` set of ``(x, y)`` cells is computed once at construction.
+    """
+
+    map_id: str
+    tile_id: int
+    dims: WallDims
+    columns: dict[int, tuple[int, ...]]
+    occupied: frozenset[tuple[int, int]] = field(init=False)
+
+    def __post_init__(self) -> None:
+        cells = frozenset((x, y) for x, ys in self.columns.items() for y in ys)
+        # frozen dataclass: bypass the immutability guard to cache the derived set once.
+        object.__setattr__(self, "occupied", cells)
+
+
+def is_walls_message(message) -> bool:
+    """Whether ``message`` is a wall-layout message, by its ``"type"`` tag.
+
+    ``True`` iff ``message`` is a dict whose ``"type"`` equals :data:`WALLS_TYPE_TAG`
+    (``"walls"``). Mirrors :func:`state_message_is_valid`: it discriminates by tag only and
+    does NOT validate the full shape (that is :func:`parse_walls_message`'s job). Does not
+    mutate or raise.
+    """
+    return isinstance(message, dict) and message.get("type") == WALLS_TYPE_TAG
+
+
+def _require_int(value, what: str) -> int:
+    """Coerce a JSON number to ``int`` for a wall-message field, rejecting non-ints.
+
+    Wall coordinates are INTS on the wire. A JSON bool is an ``int`` subclass but is never a
+    valid coordinate, so it is rejected; a float with a fractional part is rejected. An exact
+    integral float (``5.0``) is accepted and narrowed, since strict JSON for an int-valued
+    field may still decode as a float. Raises ``ValueError`` on anything else.
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"{what} must be an int, got bool {value!r}")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    raise ValueError(f"{what} must be an int, got {value!r}")
+
+
+def parse_walls_message(message) -> WallLayout:
+    """Strict-parse a wall-layout message dict into an immutable :class:`WallLayout`.
+
+    Expects the exact Unity ``WallMessage`` shape::
+
+        {"type": "walls", "map_id": <str>, "tileID": <int>,
+         "dims": {"minX": <int>, "maxX": <int>, "minY": <int>, "maxY": <int>},
+         "columns": {"<x>": [y0, y1, ...], ...}}
+
+    The ``columns`` keys are STRINGS of the column x integer (JSON object keys are always
+    strings, so a negative column is ``"-1"``) and are converted back to int. All cell
+    coordinates must be ints. Raises ``ValueError`` on any malformed walls message (wrong
+    tag, missing/!int ``tileID`` or ``dims`` keys, a non-int column key, a non-list column
+    value, or a non-int cell).
+    """
+    if not is_walls_message(message):
+        raise ValueError(f"not a walls message (missing type=={WALLS_TYPE_TAG!r}): {message!r}")
+
+    map_id = message.get("map_id", "")
+    if not isinstance(map_id, str):
+        raise ValueError(f"walls map_id must be a string, got {map_id!r}")
+
+    tile_id = _require_int(message.get("tileID"), "walls tileID")
+
+    dims_raw = message.get("dims")
+    if not isinstance(dims_raw, dict):
+        raise ValueError(f"walls dims must be an object, got {dims_raw!r}")
+    dims = WallDims(
+        min_x=_require_int(dims_raw.get("minX"), "walls dims.minX"),
+        max_x=_require_int(dims_raw.get("maxX"), "walls dims.maxX"),
+        min_y=_require_int(dims_raw.get("minY"), "walls dims.minY"),
+        max_y=_require_int(dims_raw.get("maxY"), "walls dims.maxY"),
+    )
+
+    columns_raw = message.get("columns")
+    if not isinstance(columns_raw, dict):
+        raise ValueError(f"walls columns must be an object, got {columns_raw!r}")
+    columns: dict[int, tuple[int, ...]] = {}
+    for key, ys in columns_raw.items():
+        try:
+            x = int(key)  # JSON object keys are strings; negative x like "-1" parses
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"walls column key is not an int: {key!r}") from exc
+        if not isinstance(ys, list):
+            raise ValueError(f"walls column {key!r} value must be a list, got {ys!r}")
+        columns[x] = tuple(_require_int(y, f"walls column {key!r} cell") for y in ys)
+
+    return WallLayout(map_id=map_id, tile_id=tile_id, dims=dims, columns=columns)
