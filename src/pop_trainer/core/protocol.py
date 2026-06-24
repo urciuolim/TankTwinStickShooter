@@ -50,6 +50,16 @@ static wall layout so Python tracks map-state instead of re-parsing the arena JS
 strict-parses it into an immutable :class:`WallLayout`. The ``columns`` keys are STRINGS of the
 column x integer (JSON object keys are always strings) and are converted back to ints; only
 occupied columns are present. This is a PURE parse (no socket, no numpy).
+
+SWITCH-ARENA HANDSHAKE (additive OUTBOUND, reset-time only). Between the restart ack and the
+``{"start": True}`` send (Unity's ``!ingame`` window) the caller MAY request a map change with
+``{"switch_arena": <arena_path>}``. Unity replies ``{"arena_switched": true}`` FIRST, THEN (only
+when the NEW arena carries a "Walls" block) writes a walls message as its own discrete write —
+identical ordering to the start branch. :meth:`Connection.switch_arena` sends the request and
+reads + validates ONLY the ack; the OPTIONAL trailing walls message is left for the caller to
+route with the SAME :meth:`receive` + :func:`is_walls_message` logic used after the start ack, so
+a walls-absent switch never consumes the following state. This is the one additive write on the
+otherwise-frozen wire; the per-step state/frame/action path is untouched.
 """
 
 from __future__ import annotations
@@ -91,6 +101,10 @@ _CLOSE_BRACE = 0x7D  # }
 # --- wall-layout message wire contract (additive; matches the Unity WallMessage writer) ---
 WALLS_TYPE_TAG = "walls"  # the fixed value of the top-level "type" tag on a walls message
 
+# --- switch-arena handshake wire contract (additive OUTBOUND; matches DriverController) ---
+SWITCH_ARENA_KEY = "switch_arena"  # outbound request key; value is the arena path (a str)
+ARENA_SWITCHED_KEY = "arena_switched"  # the bool ack key Unity replies with (must be True)
+
 __all__ = [
     "RECV_BUFSIZE",
     "DEFAULT_MAX_OBJECT_BYTES",
@@ -99,6 +113,8 @@ __all__ = [
     "FRAME_CHANNELS",
     "FRAME_HEADER_LEN",
     "WALLS_TYPE_TAG",
+    "SWITCH_ARENA_KEY",
+    "ARENA_SWITCHED_KEY",
     "encode",
     "decode",
     "parse_frame_header",
@@ -219,6 +235,37 @@ class Connection:
         translated to ``ConnectionError``.
         """
         return decode(self._receive_one_json())
+
+    def switch_arena(self, arena_path: str) -> dict:
+        """Request a map change and read + validate the ``{"arena_switched": true}`` ack.
+
+        Sends ``{"switch_arena": <arena_path>}`` (strict JSON; the value is a string, so the
+        encoder needs no special handling) and reads EXACTLY one JSON object: Unity's
+        ``{"arena_switched": true}`` confirmation. Returns the decoded ack dict.
+
+        WIRE CONTRACT (see ``DriverController.cs`` ``switch_arena`` branch): Unity writes the
+        ``{"arena_switched": true}`` ack FIRST and ONLY THEN — and ONLY when the NEW arena
+        carries a "Walls" block — writes a walls message as its OWN discrete write. This method
+        deliberately reads ONLY the ack: the OPTIONAL trailing walls message is left in the wire
+        for the caller to route with the SAME :meth:`receive` + :func:`is_walls_message` logic it
+        already uses after the start ack. Reading the ack alone is what guarantees a walls-ABSENT
+        switch never consumes the following ``state``.
+
+        Unity handles ``switch_arena`` only while ``!ingame`` — i.e. AFTER the restart ack and
+        BEFORE the ``{"start": True}`` send. Calling it outside that window desyncs the wire.
+
+        Raises ``ValueError`` if the ack is missing the ``arena_switched`` key or it is not
+        truthy (a clear protocol error). A ``socket.timeout`` is translated to ``ConnectionError``
+        via the underlying send/receive, consistent with the rest of the class.
+        """
+        self.send({SWITCH_ARENA_KEY: arena_path})
+        ack = self.receive()
+        if not (isinstance(ack, dict) and ack.get(ARENA_SWITCHED_KEY)):
+            raise ValueError(
+                f"expected {{{ARENA_SWITCHED_KEY!r}: true}} ack after {SWITCH_ARENA_KEY!r}, "
+                f"got {ack!r}"
+            )
+        return ack
 
     # --- pixel frame channel (additive; shares ``self._buffer`` with the JSON read) ------
 

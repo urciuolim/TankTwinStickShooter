@@ -33,44 +33,91 @@ package is named `data` (not `datasets` — that name collides with the git-igno
   bare `env` (a pure transport that owns neither player), so it drives **both** `player1` and
   `player2`: each step it computes `a1 = player1.act(vec)` (player1's own unflipped view) and
   `a2 = player2.act(split_state_for_opponent(vec))` (player2's flipped first-person view, computed
-  here via [`core.state`](core.md), `collect.py:193-195`), calls `env.step(a1, a2)`, and records the
-  current `(frame, state)` paired with both applied actions from `info`. After `env.reset` it hands
-  the tracked map to **both** map-aware agents via the `_maybe_set_map` helper —
-  `getattr`-probing `agent.set_map(info["map"])`, a no-op when an agent is map-agnostic or the
-  layout is `None` (`collect.py:119,174-175`). [`collect_to_shards`](../../src/pop_trainer/data/collect.py)
-  wraps episodes into shards. [`CollectionSpec`](../../src/pop_trainer/data/collect.py) /
+  here via [`core.state`](core.md), `collect.py:299-300`), calls `env.step(a1, a2)`, and records the
+  current `(frame, state)` paired with both applied actions from `info`. When `switch_arena` is set
+  it resets via `env.reset(seed=seed, options={"switch_arena": ...})` so Unity rotates to that
+  arena first; `switch_arena=None` is the byte-identical no-switch reset (`collect.py:269-272`).
+  After reset it hands the tracked map to **both** map-aware agents via `_maybe_set_map`
+  (`getattr`-probing `agent.set_map(info["map"])`, a no-op when map-agnostic or the layout is
+  `None`, `collect.py:200-211,275-276`).
+  [`collect_to_shards`](../../src/pop_trainer/data/collect.py) drives an `episode_plan` (a
+  round-robin of (map × pairing) [`EpisodePlan`](../../src/pop_trainer/data/collect.py)s) on ONE
+  long-lived env, pairing each episode's two selectors from an `agent_pool`
+  (`selector → agent` dict the worker builds once), and flushes samples to shards.
+  [`CollectionSpec`](../../src/pop_trainer/data/collect.py) /
   [`run_worker`](../../src/pop_trainer/data/collect.py) /
   [`collect_parallel`](../../src/pop_trainer/data/collect.py) are the **spawn-based** (never
   fork — a CLAUDE.md YOU MUST) parallel orchestration; each worker builds its own bare env + socket
-  and **both** agents inside the process from the spec's factories, so nothing live crosses the
-  spawn boundary.
+  and the agent pool inside the process from the spec's `env_factory` / `agent_pool_factory`, so
+  only plain data (the `episode_plan`, the `map_index`, `extra`) crosses the spawn boundary.
 - [`data.collect_runner`](../../src/pop_trainer/data/collect_runner.py) — the **live collection
   entry point** (`python -m pop_trainer.data.collect_runner`): the concrete factories + CLI riding
-  on `collect`'s orchestration. It is **multi-worker, SINGLE-map** (Phase A — `custom1` only;
-  rotation is Phase B, not built).
+  on `collect`'s orchestration. It is **multi-worker** and runs either a single map or a
+  **map × pairing rotation** (the `--maps` / `--map-rotation` flag).
   [`env_factory`](../../src/pop_trainer/data/collect_runner.py) is the module-level (spawn-safe,
   no closures) factory that launches one Unity build per worker via
   [`core.launch.build_launch_cmd`](core.md) + `subprocess.Popen` on `port = base_port + worker_id`,
   connects via [`core.launch.connect`](core.md), and builds the bare
   [`TankEnv`](env.md) (which owns neither player) — wrapping `env.close` so closing the env also
-  reaps the launched build.
-  [`player1_factory`](../../src/pop_trainer/data/collect_runner.py) and
-  [`player2_factory`](../../src/pop_trainer/data/collect_runner.py) are the symmetric driver-side
-  hooks that build player1 / player2 from a selector name (`collect_runner.py:202-218`); both are
-  wired onto every spec (`collect_runner.py:308-310`) and **required** by `run_worker` (it raises
-  `ValueError` if either is `None`, `collect.py:343-348`).
+  reaps the launched build. The build is launched **once** per worker on the boot config and rotates
+  arenas at runtime via `switch_arena`.
+  [`agent_pool_factory`](../../src/pop_trainer/data/collect_runner.py) is the module-level (spawn-safe)
+  factory that builds the worker's `{selector → agent}` pool once up front — covering every selector
+  its plan pairs — so each selector's RNG stream is continuous across the episodes it plays
+  (`collect_runner.py:403-413`); both factories are wired onto every spec and **required** by
+  `run_worker` (it raises `ValueError` if either is `None`).
   [`build_specs`](../../src/pop_trainer/data/collect_runner.py) is the pure
-  CLI-args→`list[CollectionSpec]` builder (one per worker, `--workers` clamped to `[1, 8]`, each
-  worker an own `worker_<id>/` out-dir + a distinct seed `base + w*10000`).
-  [`main`](../../src/pop_trainer/data/collect_runner.py) parses the flags, resolves `--map custom1`
-  to the obs_pixels-enabled `demo_config.json`, and drives `collect_parallel`. See the
-  [runbook](../runbook.md#4-collect-a-dataset-cli) for the flags.
+  CLI-args→`list[CollectionSpec]` builder (one per worker, `--workers` clamped to `[1, MAX_WORKERS=8]`,
+  each worker an own `worker_<id>/` out-dir + a distinct seed `base + w*10000`, and either a
+  single-map no-switch plan or its slice of the round-robin via `round_robin_plan`).
+  [`main`](../../src/pop_trainer/data/collect_runner.py) parses the flags, resolves the boot
+  `--map` config to the obs_pixels-enabled `demo_config.json`, writes the `maps.json` sidecar, and
+  drives `collect_parallel`. See the [runbook](../runbook.md#4-collect-a-dataset-cli) for the flags.
+
+## The rotation scheduler + map tagging
+
+A run is a deterministic **round-robin over the (map × pairing) grid**. The rotation set comes from
+`--maps` (resolved by [`core.maps.resolve_map_rotation`](core.md), mapped to each config's
+`arena_path`); the pairing set is `--pairing` (default `DEFAULT_PAIRINGS`, the coverage family vs
+each other + vs random).
+
+- [`round_robin_plan(rotation, pairings, *, episodes, worker_id, n_workers, map_index)`](../../src/pop_trainer/data/collect_runner.py)
+  (`collect_runner.py:246-292`) — the **pure** per-worker scheduler (unit-tested, no live build).
+  The grid is `rotation × pairings` enumerated **map-major**: cell `g` decodes to
+  `(map = rotation[g // P], pairing = pairings[g % P])` for `P = len(pairings)`, giving
+  `G = M * P` cells. Worker `w` episode `i` picks cell **`(worker_id + i*n_workers) % G`**. Across
+  all `n_workers` the chosen global indices `w + i*n_workers` form a **bijection** onto
+  `[0, n_workers*episodes)`, so the union of every worker's episodes covers the grid evenly (each
+  cell `floor`/`ceil` of `n_workers*episodes / G` times) and no two workers run identical episodes
+  at the same step `i`.
+- [`EpisodePlan`](../../src/pop_trainer/data/collect.py) (`switch_arena` / `player1` / `player2` /
+  `intended_map_id`, `collect.py:133-153`) — one scheduled episode as **plain, spawn-safe data**
+  (selector names + an arena-path string + an int). A whole plan crosses the spawn boundary inside
+  `CollectionSpec.episode_plan` with no live agent / env. `switch_arena=None` is a no-switch reset
+  (single-map mode); `intended_map_id` is the int used only when the echo is missing / unknown.
+- [`resolve_map_tag(layout, *, intended_map_id, map_index)`](../../src/pop_trainer/data/collect.py)
+  (`collect.py:156-185`) — the **F5 echo-wins** tagging. The on-disk `map_id` int must reflect the
+  arena Unity **actually loaded**, not the runner's intent. The echoed arena path is
+  `info["map"].map_id`; looked up in `map_index` (the `arena-path → int` index over the rotation
+  set), it wins. `tag_source` is one of:
+  - `"echo"` — the echo's path was in the index (the authoritative case);
+  - `"fallback_unknown_echo"` — an echo arrived but its path was NOT in the index (a runner↔Unity
+    desync) → the intended int, **flagged** (treat the run as suspect);
+  - `"fallback_no_echo"` — no echo (`info["map"]` was `None`, e.g. a walls-absent arena) → the
+    intended int;
+  - `"intended"` — `map_index is None` (single-map / no-rotation), always the intended int.
+
+  Both `tag_source` and `echoed_map_id` are recorded on
+  [`EpisodeResult`](../../src/pop_trainer/data/collect.py) so a fallback is **never silently
+  mis-tagged**. The arena is static within an episode, so the tag is resolved **once** after reset
+  and stamped on every sample (`collect.py:277-281`).
 
 ## Pulls from (upstream)
 
 - [core](core.md) — `state` (`STATE_LEN`, `validate`), `config.EnvConfig`,
-  `protocol.Connection`, `agent.Agent`, and `launch` (`build_launch_cmd` / `connect` — the shared
-  build-launch + socket-connect seam `collect_runner` uses per worker).
+  `protocol.Connection`, `agent.Agent`, `launch` (`build_launch_cmd` / `connect` — the shared
+  build-launch + socket-connect seam `collect_runner` uses per worker), and
+  `maps.resolve_map_rotation` (the shared `--maps` rotation-resolution contract).
 - [env](env.md) — `TankEnv` (collection drives episodes through it).
 - [agents](agents.md) — the `player1` / `player2` policies (the coverage / random presets), and
   `validate_action`.
@@ -96,18 +143,21 @@ episodes, and writes shards to disk — producing the supervised-pretraining cor
 
 ```mermaid
 graph LR
-    cli["collect_runner.main (CLI)"] --> specs["build_specs → CollectionSpec[]"]
+    cli["collect_runner.main (CLI)"] --> rr["round_robin_plan → EpisodePlan[]"]
+    cli --> sidecar["write_maps_sidecar → maps.json"]
+    rr --> specs["build_specs → CollectionSpec[]"]
     specs --> par["collect_parallel (spawn)"]
     par --> ef["env_factory (per worker)"]
     ef -->|build_launch_cmd + connect| launch["core.launch"]
     ef --> env["bare TankEnv (owns neither player)"]
-    p1f["player1_factory"] --> a1["player1 agent"]
-    p2f["player2_factory"] --> a2["player2 agent (flipped view)"]
-    a1 --> ep["run_episode (drives both)"]
-    a2 --> ep
-    env --> ep
-    ep --> samples["Sample[(frame,state,action)]"]
-    samples --> shards["collect_to_shards → worker_<id>/*.npz"]
+    apf["agent_pool_factory"] --> pool["{selector → agent} pool"]
+    par --> apf
+    pool --> cts["collect_to_shards (episode_plan)"]
+    env --> cts
+    cts --> ep["run_episode (switch_arena + tag-from-echo)"]
+    ep -->|reset switch_arena| env
+    ep --> samples["Sample[(frame,state,action), map_id]"]
+    samples --> shards["worker_<id>/*.npz + maps.json"]
     shards --> idx["build_index → DatasetIndex"]
     idx --> split["split_groups (map-aware)"]
 ```

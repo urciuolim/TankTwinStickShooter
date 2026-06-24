@@ -10,7 +10,9 @@ nothing from `models` / `data` / `agents` / the Unity-side code.
 ## Key classes / entry points
 
 - [`TankEnv`](../../src/pop_trainer/env/tank_env.py) — the single-agent, pixel-observation
-  `gymnasium.Env` over the Unity socket. `reset()` runs the restart/start/first-state handshake;
+  `gymnasium.Env` over the Unity socket. `reset(*, seed=None, options=None)` runs the
+  restart/(switch)/start/first-state handshake (`options={"switch_arena": <path>}` rotates the
+  arena — see [Map rotation](#map-rotation-resetoptionsswitch_arena));
   `step(action, opponent_action=None)` returns the Gymnasium 5-tuple
   `(obs, reward, terminated, truncated, info)`.
   - **Observation = the real rendered pixel frame** (`(H, W, 3)` uint8) read via
@@ -31,17 +33,17 @@ The env owns **neither** player — it is a pure symmetric transport. `step(acti
 takes **two** actions, BOTH from the **caller**: it sends the wire message `{1: a1, 2: a2}` where
 `a1` is the player1 `action` (sent as `np.asarray(action, np.float32).tolist()`, the unchanged
 player1 path) and `a2` is the caller's `opponent_action` coerced to the `[-1, 1]` length-5 wire
-shape via `_coerce_action` (`tank_env.py:288-294`). When `opponent_action` is `None` the env sends
+shape via `_coerce_action` (`tank_env.py:112-125`). When `opponent_action` is `None` the env sends
 a **no-op zero action** `[0.0, 0.0, 0.0, 0.0, 0.0]`. Both wire actions are captured on the env
 (`self.last_p1_action` / `self.last_p2_action`) and surfaced in `info["p1_action"]` /
-`info["p2_action"]` (`tank_env.py:317-337`).
+`info["p2_action"]` (`tank_env.py:344-387`).
 
 The **driver** ([data](data.md) collection / [demo](demo.md)) owns each agent and the player2
 **perspective flip** — it computes player2's first-person view via
 `core.state.split_state_for_opponent` and passes the resulting `a2` into `env.step(a1, a2)`. The
 env exposes self-play perspective **helpers** the driver MAY use — `player2_frame()` (R/B channel
 swap) and `player2_state()` (`split_state_for_opponent` on the latest raw state,
-`tank_env.py:385-402`) — but the env does NOT call them itself during `step`.
+`tank_env.py:433-450`) — but the env does NOT call them itself during `step`.
 
 > **Seam unchanged.** The wire shape is **byte-identical** to the frozen RL seam — only the
 > *source* of `a2` moved from env-internal to the caller. Integer keys `1` / `2`, length-5 `[-1, 1]`
@@ -52,13 +54,39 @@ swap) and `player2_state()` (`split_state_for_opponent` on the latest raw state,
 During the handshake the env reads the optional one-time `{"type": "walls", ...}` message
 (routed by its `"type"` tag), parses it via `core.protocol.parse_walls_message`, and stores the
 [`WallLayout`](core.md) on `self.current_map` — surfaced in both reset and step `info` as
-`info["map"]` (`tank_env.py:258,338`). It stays `None` when no arena is configured; the env never
+`info["map"]` (`tank_env.py:292,386`). It stays `None` when no arena is configured; the env never
 re-parses arena JSON. See the [core](core.md) seam writeup for the full Unity → Python path.
+
+The routing itself lives in **`_drain_optional_walls()`** (`tank_env.py:294-306`): it reads JSON
+objects one at a time, and for each, routes by its `"type"` tag — a **walls** message is parsed +
+stored on `self.current_map` (**LAST wins**, via `parse_walls_message`) and the loop continues; the
+**first non-walls** object is **returned** (the next handshake message — a `starting` ack or the
+first `state` — is never mis-read as walls). Because an absent walls message never consumes a
+state, this is correct across **all four cases** (switch / no-switch × walls present / absent). It
+is called **twice** in the handshake: once after the start send to reach the `starting` ack, then
+again to reach the first `state` (`tank_env.py:279,285`).
 
 The env surfaces the `WallLayout` in `info["map"]` but does **not** itself notify any agent — both
 players are driver-side, so the [data](data.md) collection and [demo](demo.md) loops hand the
 layout to a map-aware [agent](agents.md) (e.g. a `CoverageAgent`) via the OPTIONAL `set_map` hook.
 The env stays `agents`-free.
+
+## Map rotation (`reset(options={"switch_arena": ...})`)
+
+Additive, **reset-time only**. `reset(options={"switch_arena": <arena_path>})` fires a map change
+in Unity's `!ingame` window — **after the restart ack and before the `{"start": True}` send** — via
+[`core.protocol.Connection.switch_arena`](core.md#the-switch-arena-handshake-seam-connectionswitch_arena)
+(`tank_env.py:273-274`). The env reads the `{"arena_switched": true}` ack (inside `switch_arena`),
+then the optional walls message Unity emits after it (present only for a walls arena) is drained by
+the **same** `"type"`-tag routing (`_drain_optional_walls`) used after the start ack. The
+`WallLayout` last received — after the switch ack or the start ack — is stored on
+`self.current_map`, so `info["map"]` (a `WallLayout` or `None`) reflects the **switched** arena.
+
+A reset **without** this option is **byte-identical** to the no-switch handshake: the switch is
+purely additive and never touches the per-step wire. The deterministic Unity wire ordering for a
+switch-to-walls reset is `arena_switched`, `walls` (switch), `starting`, `walls` (start), `state`,
+`frame` — with the start ack interleaved between the two walls messages; `_drain_optional_walls`
+routes every inbound object by tag regardless of read order (`tank_env.py:239-306`).
 
 ## Episode boundaries
 
@@ -70,12 +98,14 @@ The env stays `agents`-free.
 ## Pulls from (upstream)
 
 - [core](core.md) — `state` (schema + `split_state_for_opponent` / `flip_frame_perspective`),
-  `protocol` (`Connection`, `WallLayout`, `is_walls_message`, `parse_walls_message`), `config`
-  (`EnvConfig` / `RewardConfig`), `agent.Agent`. Plus `gymnasium` + `numpy`.
+  `protocol` (`Connection` incl. `switch_arena`, `WallLayout`, `is_walls_message`,
+  `parse_walls_message`), `config` (`EnvConfig` / `RewardConfig`), `agent.Agent`. Plus
+  `gymnasium` + `numpy`.
 
 ## Pushes to (downstream)
 
-- [data](data.md) — collection drives `TankEnv` (the same observation pipeline RL trains on).
+- [data](data.md) — collection drives `TankEnv` (the same observation pipeline RL trains on), and
+  rotates the arena per episode via `reset(options={"switch_arena": ...})`.
 - [demo](demo.md) — constructs a `TankEnv` over a live socket and runs one episode.
 - (Future `rl` consumes `TankEnv` as its training env — not yet built.)
 

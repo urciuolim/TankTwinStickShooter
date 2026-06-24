@@ -22,8 +22,10 @@ from here instead of re-hardcoding them. All JSON is strict.
   [`Connection`](../../src/pop_trainer/core/protocol.py) that reads exactly one top-level JSON
   object via a brace-depth scan and buffers trailing bytes, the length-prefixed binary
   **pixel-frame channel** (`parse_frame_header` / `Connection.receive_frame` →
-  `(H, W, 3)` uint8), and the **wall-layout message** seam: `is_walls_message` /
-  `parse_walls_message` → an immutable [`WallLayout`](../../src/pop_trainer/core/protocol.py).
+  `(H, W, 3)` uint8), the **wall-layout message** seam (`is_walls_message` /
+  `parse_walls_message` → an immutable [`WallLayout`](../../src/pop_trainer/core/protocol.py)),
+  and the **switch-arena handshake** (`Connection.switch_arena` — the one additive outbound
+  write; see below).
 - [`core.config`](../../src/pop_trainer/core/config.py) — frozen, strict-JSON config
   dataclasses [`RunConfig`](../../src/pop_trainer/core/config.py) /
   [`EnvConfig`](../../src/pop_trainer/core/config.py) /
@@ -65,6 +67,34 @@ Unity is the source of truth for the static map geometry. The end-to-end path:
    surfaces it as `info["map"]`. So Python tracks map-state without ever re-parsing the arena
    JSON.
 
+## The switch-arena handshake seam (`Connection.switch_arena`)
+
+The **one additive outbound write** on the otherwise-frozen wire — reset-time only. Between the
+restart ack and the `{"start": True}` send (Unity's `!ingame` window) the caller MAY request a
+map change, so a long-lived build can rotate arenas without relaunching. The per-step `{1: a1,
+2: a2}` integer-keyed wire and the 52-float state are **unchanged**; a reset that does NOT switch
+is **byte-identical** to today.
+
+- [`Connection.switch_arena(arena_path)`](../../src/pop_trainer/core/protocol.py) sends
+  `{"switch_arena": <arena_path>}` (the request key is the constant `SWITCH_ARENA_KEY`; the value
+  is the arena-path string), then reads **exactly one** JSON object and validates the
+  `{"arena_switched": true}` ack (key constant `ARENA_SWITCHED_KEY`). It raises **`ValueError`**
+  if the ack is not a dict, is missing the `arena_switched` key, or that value is falsy
+  (`protocol.py:261-268`). Returns the decoded ack dict.
+- **It reads ONLY the ack.** Unity writes the `arena_switched` ack first, then — *only* when the
+  NEW arena carries a "Walls" block — writes a `{"type": "walls", ...}` message as its own discrete
+  write (identical ordering to the start branch). `switch_arena` deliberately leaves that OPTIONAL
+  trailing walls message **on the wire** for the caller to route with the **same** `receive` +
+  `is_walls_message` logic used after the start ack (`protocol.py:246-252`). Reading the ack alone
+  is what guarantees a **walls-absent** switch never consumes the following `state`.
+- **Window discipline.** Unity handles `switch_arena` only while `!ingame` — i.e. after the
+  restart ack and before the `{"start": True}` send. Calling it outside that window desyncs the
+  wire. A `socket.timeout` is translated to `ConnectionError` (consistent with the rest of the
+  class).
+
+The caller is [`env`](env.md): `TankEnv.reset(options={"switch_arena": <path>})` fires this in the
+`!ingame` window and then drains the optional walls message. See the [env](env.md#map-rotation-resetoptionsswitch_arena) page for the reset hook.
+
 ## Pulls from (upstream)
 
 Nothing internal. **`core` is the dependency-free root** — stdlib + numpy only.
@@ -74,12 +104,13 @@ Nothing internal. **`core` is the dependency-free root** — stdlib + numpy only
 Every other component depends on `core`:
 
 - [models](models.md) — shares `core`'s leaf position (but imports nothing from it today).
-- [env](env.md) — `state` (schema + transforms), `protocol` (`Connection`, `WallLayout`),
-  `config`, `agent.Agent`.
+- [env](env.md) — `state` (schema + transforms), `protocol` (`Connection` incl.
+  `switch_arena`, `WallLayout`, `is_walls_message` / `parse_walls_message`), `config`,
+  `agent.Agent`.
 - [agents](agents.md) — `agent.Agent` Protocol + the `state` schema.
 - [data](data.md) — `state` (`STATE_LEN` + `validate`), `config.EnvConfig`,
-  `protocol.Connection`, `agent.Agent`, and `launch` (the collection runner launches + connects
-  one build per worker).
+  `protocol.Connection`, `agent.Agent`, `launch` (the collection runner launches + connects one
+  build per worker), and `maps.resolve_map_rotation` (the shared `--maps` rotation contract).
 - [demo](demo.md) — `protocol.Connection` / `WallLayout`, `config.EnvConfig`, `agent.Agent`, and
   `launch` (`build_launch_cmd` / `connect`).
 

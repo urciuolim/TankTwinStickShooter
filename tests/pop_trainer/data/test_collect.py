@@ -96,6 +96,41 @@ def _reset_blobs(first_state, *, fill=(10, 20, 30)):
     ]
 
 
+def _walls_for(map_id, *, tile_id=7, columns=None):
+    """A strict-JSON walls message echoing ``map_id`` (the switched arena path Unity loaded)."""
+    return P.encode(
+        {
+            "type": "walls",
+            "map_id": map_id,
+            "tileID": tile_id,
+            "dims": {"minX": -1, "maxX": 1, "minY": -1, "maxY": 1},
+            "columns": columns if columns is not None else {"0": [0]},
+        }
+    )
+
+
+def _switch_reset_blobs(first_state, *, switch_walls=None, start_walls=None, fill=(10, 20, 30)):
+    """Byte script for a switch_arena reset (mirrors the env test): restart ack, arena_switched ack
+    (+ optional walls), start ack (+ optional walls), then state+frame."""
+    blobs = [_ack({"restart": True}), _ack({"arena_switched": True})]
+    if switch_walls is not None:
+        blobs.append(switch_walls)
+    blobs.append(_ack({"starting": True}))
+    if start_walls is not None:
+        blobs.append(start_walls)
+    blobs.append(_state_and_frame_bytes(first_state, fill=fill))
+    return blobs
+
+
+def _switch_episode_blobs(states, *, switch_walls=None, start_walls=None, done_last=True):
+    """A switch-reset handshake on ``states[0]`` then a step per remaining state."""
+    blobs = _switch_reset_blobs(states[0], switch_walls=switch_walls, start_walls=start_walls)
+    for i in range(1, len(states)):
+        last = i == len(states) - 1
+        blobs.append(_state_and_frame_bytes(states[i], fill=(i, i, i), done=done_last and last))
+    return blobs
+
+
 def _step_episode_blobs(states, *, fills=None, winner_last=None, done_last=False):
     """Byte script for one episode: a reset handshake on ``states[0]`` then a step per remaining.
 
@@ -479,6 +514,154 @@ def test_run_episode_propagates_agent_typeerror():
         )
 
 
+# --- switch_arena + tag-from-echo (F5) ---------------------------------------------------
+
+
+def test_run_episode_no_switch_is_byte_identical_to_today():
+    # SEAM RE-PROOF: run_episode with switch_arena=None (the default) sends EXACTLY the no-switch
+    # bytes — bare restart + start per reset, NO switch_arena — exactly as before this change.
+    states = [_flat_state(0), _flat_state(1)]
+    env_a, transport_a = _make_env(_step_episode_blobs(states, done_last=True))
+    collect.run_episode(
+        env_a,
+        player1=_FixedAgent(),
+        player2=_FixedAgent(),
+        map_id=0,
+        episode_id=0,
+        max_steps=100,
+        seed=0,
+    )
+    # The handshake portion (before the first step) carries restart + start and NO switch_arena.
+    sent = bytes(transport_a.sent)
+    assert P.encode({"restart": True}) in sent
+    assert P.encode({"start": True}) in sent
+    assert b"switch_arena" not in sent
+
+
+def test_run_episode_switch_sends_target_and_tags_from_echo():
+    # The switch target reaches the wire AND the echoed arena (NOT the target) drives the int tag.
+    states = [_flat_state(0), _flat_state(1)]
+    walls = _walls_for("Arenas/four_pillars.json")
+    blobs = _switch_episode_blobs(states, switch_walls=walls, start_walls=walls, done_last=True)
+    env, transport = _make_env(blobs)
+    map_index = {"Arenas/center_block.json": 0, "Arenas/four_pillars.json": 6}
+    ep = collect.run_episode(
+        env,
+        player1=_FixedAgent(),
+        player2=_FixedAgent(),
+        map_id=0,  # the INTENDED int (the fallback) — must lose to the echo
+        episode_id=0,
+        max_steps=100,
+        seed=0,
+        switch_arena="Arenas/four_pillars.json",
+        map_index=map_index,
+    )
+    assert P.encode({"switch_arena": "Arenas/four_pillars.json"}) in bytes(transport.sent)
+    # Every sample is tagged from the ECHO (index 6), not the intended map_id 0.
+    assert ep.tag_source == "echo"
+    assert ep.echoed_map_id == "Arenas/four_pillars.json"
+    assert all(s.map_id == 6 for s in ep.samples)
+
+
+def test_run_episode_echo_wins_over_a_mismatched_intended_target():
+    # A DELIBERATE desync: the runner targeted center_block (intended int 0) but Unity echoes
+    # four_pillars (int 6). The ECHO wins — the samples carry 6, never the intended 0.
+    states = [_flat_state(0), _flat_state(1)]
+    walls = _walls_for("Arenas/four_pillars.json")
+    blobs = _switch_episode_blobs(states, switch_walls=walls, start_walls=walls, done_last=True)
+    env, _ = _make_env(blobs)
+    map_index = {"Arenas/center_block.json": 0, "Arenas/four_pillars.json": 6}
+    ep = collect.run_episode(
+        env,
+        player1=_FixedAgent(),
+        player2=_FixedAgent(),
+        map_id=0,  # intended center_block
+        episode_id=0,
+        max_steps=100,
+        seed=0,
+        switch_arena="Arenas/center_block.json",  # asked for center_block...
+        map_index=map_index,
+    )
+    # ...but Unity loaded four_pillars; the echo (6) wins, the intended (0) loses.
+    assert ep.tag_source == "echo"
+    assert all(s.map_id == 6 for s in ep.samples)
+
+
+def test_run_episode_falls_back_when_echo_missing():
+    # A walls-ABSENT switch arena: no echo (info["map"] is None) -> the intended int is used and
+    # the fallback is FLAGGED (fallback_no_echo), so a desync is detectable rather than silent.
+    states = [_flat_state(0), _flat_state(1)]
+    blobs = _switch_episode_blobs(states, switch_walls=None, start_walls=None, done_last=True)
+    env, _ = _make_env(blobs)
+    map_index = {"Arenas/center_block.json": 0, "Arenas/empty.json": 8}
+    ep = collect.run_episode(
+        env,
+        player1=_FixedAgent(),
+        player2=_FixedAgent(),
+        map_id=8,  # intended empty (walls-absent arena)
+        episode_id=0,
+        max_steps=100,
+        seed=0,
+        switch_arena="Arenas/empty.json",
+        map_index=map_index,
+    )
+    assert ep.tag_source == "fallback_no_echo"
+    assert ep.echoed_map_id is None
+    assert all(s.map_id == 8 for s in ep.samples)
+
+
+def test_run_episode_flags_unknown_echo_fallback():
+    # An echo whose arena is NOT in the index (a desync): fall back to the intended int but FLAG it
+    # as fallback_unknown_echo so the run is treated as suspect, never silently mis-tagged.
+    states = [_flat_state(0), _flat_state(1)]
+    walls = _walls_for("Arenas/some_unmapped_arena.json")
+    blobs = _switch_episode_blobs(states, switch_walls=walls, start_walls=walls, done_last=True)
+    env, _ = _make_env(blobs)
+    map_index = {"Arenas/center_block.json": 0}
+    ep = collect.run_episode(
+        env,
+        player1=_FixedAgent(),
+        player2=_FixedAgent(),
+        map_id=0,
+        episode_id=0,
+        max_steps=100,
+        seed=0,
+        switch_arena="Arenas/center_block.json",
+        map_index=map_index,
+    )
+    assert ep.tag_source == "fallback_unknown_echo"
+    assert ep.echoed_map_id == "Arenas/some_unmapped_arena.json"
+    assert all(s.map_id == 0 for s in ep.samples)
+
+
+def test_resolve_map_tag_table():
+    # The pure tag resolver: echo-wins, both fallbacks, and the no-index single-map path.
+    idx = {"a.json": 1, "b.json": 2}
+    layout_a = P.WallLayout(map_id="a.json", tile_id=0, dims=None, columns={})
+    layout_x = P.WallLayout(map_id="x.json", tile_id=0, dims=None, columns={})
+    assert collect.resolve_map_tag(layout_a, intended_map_id=9, map_index=idx) == (
+        1,
+        "echo",
+        "a.json",
+    )
+    assert collect.resolve_map_tag(None, intended_map_id=9, map_index=idx) == (
+        9,
+        "fallback_no_echo",
+        None,
+    )
+    assert collect.resolve_map_tag(layout_x, intended_map_id=9, map_index=idx) == (
+        9,
+        "fallback_unknown_echo",
+        "x.json",
+    )
+    # No index (single-map / no rotation) -> always the intended int, source "intended".
+    assert collect.resolve_map_tag(layout_a, intended_map_id=9, map_index=None) == (
+        9,
+        "intended",
+        "a.json",
+    )
+
+
 # --- samples_to_shard --------------------------------------------------------------------
 
 
@@ -512,18 +695,23 @@ def test_samples_to_shard_rejects_empty():
 # --- collect_to_shards -------------------------------------------------------------------
 
 
+def _plan(switch_arena, p1="p1", p2="p2", intended_map_id=0):
+    return collect.EpisodePlan(
+        switch_arena=switch_arena, player1=p1, player2=p2, intended_map_id=intended_map_id
+    )
+
+
 def test_collect_to_shards_writes_and_round_trips(tmp_path):
-    # Two episodes on two maps, each reset() starting a fresh round on the same env. The env
-    # script holds both episodes back to back; each run_episode replays one reset handshake.
+    # Two no-switch episodes (single-map mode), each reset() starting a fresh round on the same env.
+    # The env script holds both episodes back to back; each run_episode replays one reset handshake.
     ep0 = _step_episode_blobs([_flat_state(0), _flat_state(1), _flat_state(2)], done_last=True)
     ep1 = _step_episode_blobs([_flat_state(10), _flat_state(11), _flat_state(12)], done_last=True)
     env, _ = _make_env(ep0 + ep1, env_config=EnvConfig(max_steps=3))
     written = collect.collect_to_shards(
         env,
         out_dir=tmp_path,
-        map_ids=[5, 7],
-        player1=_FixedAgent(),
-        player2=_FixedAgent(),
+        episode_plan=[_plan(None, intended_map_id=5), _plan(None, intended_map_id=7)],
+        agent_pool={"p1": _FixedAgent(), "p2": _FixedAgent()},
         max_steps=3,
         seed=0,
         shard_prefix="shard_w0",
@@ -533,6 +721,7 @@ def test_collect_to_shards_writes_and_round_trips(tmp_path):
     out = shards.read_shard(written[0])
     # 3 samples per episode, two episodes -> 6 samples
     assert out[schema.ARRAY_MAP_IDS].shape[0] == 6
+    # No map_index supplied -> the intended ids are used (5, then 7).
     np.testing.assert_array_equal(
         out[schema.ARRAY_MAP_IDS], np.array([5, 5, 5, 7, 7, 7], dtype=np.int32)
     )
@@ -551,9 +740,8 @@ def test_collect_to_shards_respects_shard_size(tmp_path):
     written = collect.collect_to_shards(
         env,
         out_dir=tmp_path,
-        map_ids=[1],
-        player1=_FixedAgent(),
-        player2=_FixedAgent(),
+        episode_plan=[_plan(None, intended_map_id=1)],
+        agent_pool={"p1": _FixedAgent(), "p2": _FixedAgent()},
         max_steps=4,
         seed=0,
         shard_size=2,
@@ -563,13 +751,62 @@ def test_collect_to_shards_respects_shard_size(tmp_path):
     assert total == 4
 
 
+def test_collect_to_shards_switches_arena_per_episode(tmp_path):
+    # Two episodes, each switching to a DISTINCT arena. The env scripts a switch-reset per episode
+    # whose walls echo the switched arena; map_index decodes the echo to the on-disk int.
+    walls_a = _walls_for("Arenas/center_block.json")
+    walls_b = _walls_for("Arenas/empty.json")
+    ep0 = _switch_episode_blobs(
+        [_flat_state(0), _flat_state(1)], switch_walls=walls_a, start_walls=walls_a, done_last=True
+    )
+    ep1 = _switch_episode_blobs(
+        [_flat_state(2), _flat_state(3)], switch_walls=walls_b, start_walls=walls_b, done_last=True
+    )
+    env, transport = _make_env(ep0 + ep1, env_config=EnvConfig(max_steps=2))
+    map_index = {"Arenas/center_block.json": 3, "Arenas/empty.json": 8}
+    written = collect.collect_to_shards(
+        env,
+        out_dir=tmp_path,
+        episode_plan=[
+            _plan("Arenas/center_block.json", intended_map_id=3),
+            _plan("Arenas/empty.json", intended_map_id=8),
+        ],
+        agent_pool={"p1": _FixedAgent(), "p2": _FixedAgent()},
+        max_steps=2,
+        seed=0,
+        map_index=map_index,
+    )
+    out = shards.read_shard(written[0])
+    # The switch targets reached the wire for both episodes.
+    sent = bytes(transport.sent)
+    assert P.encode({"switch_arena": "Arenas/center_block.json"}) in sent
+    assert P.encode({"switch_arena": "Arenas/empty.json"}) in sent
+    # Each episode tagged from its echoed arena's index (3 then 8).
+    np.testing.assert_array_equal(out[schema.ARRAY_MAP_IDS], np.array([3, 3, 8, 8], dtype=np.int32))
+
+
+def test_collect_to_shards_raises_on_missing_pool_selector(tmp_path):
+    env, _ = _make_env(
+        _step_episode_blobs([_flat_state(0), _flat_state(1)]), env_config=EnvConfig(max_steps=2)
+    )
+    with pytest.raises(KeyError):
+        collect.collect_to_shards(
+            env,
+            out_dir=tmp_path,
+            episode_plan=[_plan(None, p1="missing")],
+            agent_pool={"p2": _FixedAgent()},
+            max_steps=2,
+            seed=0,
+        )
+
+
 # --- collect_parallel (single-spec in-process path) --------------------------------------
 
 
 def test_collect_parallel_single_spec_in_process(tmp_path):
     # The single-spec path runs in-process (no spawn), exercising run_worker via an injected
-    # env_factory that builds a BARE TankEnv over a fake transport — still NO live socket. Both
-    # agents are driver-side, built by player1_factory / player2_factory.
+    # env_factory that builds a BARE TankEnv over a fake transport — still NO live socket. The
+    # agents are driver-side, built by agent_pool_factory.
     states = [_flat_state(i) for i in range(3)]
 
     def env_factory(spec):
@@ -579,21 +816,17 @@ def test_collect_parallel_single_spec_in_process(tmp_path):
             env_config=EnvConfig(max_steps=3),
         )
 
-    def player1_factory(spec):
-        return _FixedAgent()
-
-    def player2_factory(spec):
-        return _FixedAgent()
+    def agent_pool_factory(spec):
+        return {"p1": _FixedAgent(), "p2": _FixedAgent()}
 
     spec = collect.CollectionSpec(
         worker_id=0,
         out_dir=str(tmp_path),
-        map_ids=[2],
+        episode_plan=[_plan(None, intended_map_id=2)],
         max_steps=3,
         seed=0,
         env_factory=env_factory,
-        player1_factory=player1_factory,
-        player2_factory=player2_factory,
+        agent_pool_factory=agent_pool_factory,
     )
     results = collect.collect_parallel([spec])
     assert len(results) == 1
@@ -611,35 +844,21 @@ def test_run_worker_requires_env_factory(tmp_path):
     spec = collect.CollectionSpec(
         worker_id=0,
         out_dir=str(tmp_path),
-        map_ids=[0],
+        episode_plan=[_plan(None)],
         max_steps=1,
-        player1_factory=lambda spec: _FixedAgent(),
+        agent_pool_factory=lambda spec: {"p1": _FixedAgent(), "p2": _FixedAgent()},
     )
     with pytest.raises(ValueError, match="env_factory"):
         collect.run_worker(spec)
 
 
-def test_run_worker_requires_player1_factory(tmp_path):
+def test_run_worker_requires_agent_pool_factory(tmp_path):
     spec = collect.CollectionSpec(
         worker_id=0,
         out_dir=str(tmp_path),
-        map_ids=[0],
+        episode_plan=[_plan(None)],
         max_steps=1,
         env_factory=lambda spec: None,
     )
-    with pytest.raises(ValueError, match="player1_factory"):
-        collect.run_worker(spec)
-
-
-def test_run_worker_requires_player2_factory(tmp_path):
-    # env_factory + player1_factory set but no player2_factory: the player2 check is what fires.
-    spec = collect.CollectionSpec(
-        worker_id=0,
-        out_dir=str(tmp_path),
-        map_ids=[0],
-        max_steps=1,
-        env_factory=lambda spec: None,
-        player1_factory=lambda spec: _FixedAgent(),
-    )
-    with pytest.raises(ValueError, match="player2_factory"):
+    with pytest.raises(ValueError, match="agent_pool_factory"):
         collect.run_worker(spec)

@@ -47,6 +47,16 @@ it on ``self.current_map`` (a :class:`pop_trainer.core.protocol.WallLayout`), su
 reset ``info`` as ``info["map"]`` (and in step ``info`` as ``info["map"]``). It stays ``None``
 when no arena is configured. The env NEVER re-parses arena JSON.
 
+Map rotation (additive, reset-time only): ``reset(options={"switch_arena": <arena_path>})``
+requests a map change in Unity's ``!ingame`` window — AFTER the restart ack and BEFORE the
+``{"start": True}`` send. The env sends the switch via
+:meth:`pop_trainer.core.protocol.Connection.switch_arena`, reads the ``{"arena_switched": true}``
+ack, then routes the OPTIONAL walls message Unity emits after the ack (present only when the new
+arena has a "Walls" block) with the same ``"type"``-tag routing used after the start ack. A reset
+WITHOUT this option is byte-identical to the no-switch handshake; the switch is purely additive
+and never touches the per-step wire. The walls layout last received (after the switch ack or the
+start ack) is stored on ``self.current_map`` so ``info["map"]`` reflects the switched arena.
+
 Episode boundaries (gymnasium 5-tuple; see :mod:`pop_trainer.env.rewards`):
 
 * ``terminated`` — the game decided the round (a winner or a bare ``done``).
@@ -216,46 +226,84 @@ class TankEnv(gymnasium.Env):
             seed = self._default_seed
         super().reset(seed=seed)
 
+        switch_target = options.get("switch_arena") if options else None
+
         try:
-            obs, info = self._handshake_and_first_state()
+            obs, info = self._handshake_and_first_state(switch_target)
         except ConnectionError:
             # A dropped connection during reset: reconnect (if possible) and retry once.
             self._reconnect()
-            obs, info = self._handshake_and_first_state()
+            obs, info = self._handshake_and_first_state(switch_target)
         return obs, info
 
-    def _handshake_and_first_state(self):
-        """Send the restart/start handshake and read the first ``state`` + frame.
+    def _handshake_and_first_state(self, switch_target=None):
+        """Send the restart/(switch)/start handshake and read the first ``state`` + frame.
 
-        After the ``"starting"`` ack, the game MAY send a one-time ``{"type": "walls", ...}``
-        map-layout message (only when an arena with a "Walls" block is configured) as its own
-        discrete message BEFORE the first state. The env reads one JSON object and routes by
-        its ``"type"`` tag: a walls message is parsed + stored on ``self.current_map``, then the
-        first ``state`` + frame is read; otherwise the object already IS the first state and only
-        its trailing pixel frame is read (so an absent walls message never consumes a state).
+        With ``switch_target`` ``None`` (a plain reset) this is the byte-identical no-switch
+        handshake: ``{"restart": True}`` ack, ``{"start": True}`` -> ``"starting"`` ack, then the
+        OPTIONAL one-time walls message (present only when an arena with a "Walls" block is
+        configured) followed by the first ``state`` + frame.
+
+        With ``switch_target`` set (a map-rotation reset) the env requests the map change in
+        Unity's ``!ingame`` window — AFTER the restart ack and BEFORE the ``{"start": True}`` send.
+        The Unity wire ordering is DETERMINISTIC per case (see ``DriverController.cs``):
+
+        * the switch branch writes ``{"arena_switched": true}`` then (only for a walls arena) a
+          walls message — BEFORE the start send;
+        * the start branch then writes ``{"starting": true}`` then (only for a walls arena) a walls
+          message, then the state + frame.
+
+        So the wire for a switch-to-walls reset is: ``arena_switched``, ``walls`` (switch),
+        ``starting``, ``walls`` (start), ``state``, ``frame`` — with the start ack INTERLEAVED
+        between the two walls messages. The switch branch's walls is written BEFORE the start ack
+        but is read AFTER the start send (the read order does not have to match the per-branch
+        write boundary — TCP is a stream). Each inbound object is routed by its ``"type"`` tag via
+        :meth:`_drain_optional_walls`: a walls message is parsed + stored (last wins), the first
+        non-walls object is the next handshake message. An absent walls message never consumes a
+        state, so this is correct for every switch/no-switch x walls-present/absent combination.
         """
         self.conn.send({"restart": True})
         self.conn.receive()  # restart ack
+
+        # !ingame window (after the restart ack, before the start send): optional map change.
+        # switch_arena reads ONLY the {"arena_switched": true} ack. The switch branch's optional
+        # walls message (present only for a walls arena) is left on the wire and drained below,
+        # AFTER the start send, ahead of the start ack — a walls-absent switch wrote nothing there,
+        # so nothing is mis-consumed.
+        if switch_target is not None:
+            self.conn.switch_arena(switch_target)
+
         self.conn.send({"start": True})
-        ack = self.conn.receive()  # start ack
+
+        # Drain the switch branch's optional walls (if any) then the start ack it stops on.
+        ack = self._drain_optional_walls()
         if "starting" not in ack:
             raise RuntimeError(f"unexpected start ack from game: {ack!r}")
 
-        # One JSON object: either the optional walls message or the first state itself.
-        message = self.conn.receive()
-        if is_walls_message(message):
-            self.current_map = parse_walls_message(message)
-            received, frame = self.conn.receive_state_and_frame()
-        else:
-            # The object already held is the first state; pair it with its trailing frame.
-            received = message
-            frame = self.conn.receive_frame()
+        # Drain the start branch's optional walls (if any) then the first state it stops on; pair
+        # the state with its trailing pixel frame.
+        received = self._drain_optional_walls()
+        frame = self.conn.receive_frame()
 
         self._raw_state = list(received["state"])
         self._frame = np.asarray(frame, dtype=np.uint8)
         self.step_counter = 0
         self.last_winner = -1
         return self._frame, {"state": self._raw_state, "map": self.current_map}
+
+    def _drain_optional_walls(self):
+        """Read JSON objects, storing any leading walls message(s), and return the first non-walls.
+
+        Reads one object at a time and routes by its ``"type"`` tag: a walls message is parsed +
+        stored on ``self.current_map`` (the LAST one wins) and the loop continues; the FIRST
+        non-walls object is RETURNED (the next handshake message — a ``starting`` ack or the first
+        state — never mis-read as walls). An absent walls message therefore never consumes a state.
+        """
+        while True:
+            message = self.conn.receive()
+            if not is_walls_message(message):
+                return message
+            self.current_map = parse_walls_message(message)
 
     def step(self, action, opponent_action=None):
         """Send ``{1: a1, 2: a2}``, read the next ``state`` + frame, return the gymnasium

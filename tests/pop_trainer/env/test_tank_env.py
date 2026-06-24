@@ -120,6 +120,26 @@ def _reset_blobs_with_walls(first_state, *, walls=None, fill=(10, 20, 30)):
     ]
 
 
+def _switch_reset_blobs(first_state, *, switch_walls=None, start_walls=None, fill=(10, 20, 30)):
+    """Byte script for a switch_arena reset: restart ack, arena_switched ack (+ optional walls),
+    start ack (+ optional walls), then state+frame.
+
+    Mirrors the Unity flow: the switch branch and the start branch BOTH emit an optional walls
+    message after their respective acks (present only when the new arena has a "Walls" block).
+    """
+    blobs = [
+        _ack({"restart": True}),
+        _ack({"arena_switched": True}),
+    ]
+    if switch_walls is not None:
+        blobs.append(switch_walls)
+    blobs.append(_ack({"starting": True}))
+    if start_walls is not None:
+        blobs.append(start_walls)
+    blobs.append(_state_and_frame_bytes(first_state, fill=fill))
+    return blobs
+
+
 def _make_env(blobs, **kwargs):
     transport = ScriptedTransport(blobs)
     conn = P.Connection(transport)
@@ -250,6 +270,108 @@ def test_reset_sends_restart_then_start_handshake():
     sent = bytes(transport.sent)
     assert P.encode({"restart": True}) in sent
     assert P.encode({"start": True}) in sent
+
+
+# --- switch_arena map rotation (additive, reset-time only) ------------------------------
+
+
+def test_reset_switch_arena_with_walls_tracks_switched_map():
+    # Switching to a walls arena: Unity emits walls after BOTH the arena_switched ack AND the
+    # start ack. The env drains both and current_map / info["map"] reflect the switched arena.
+    raw = [float(i) for i in range(S.STATE_LEN)]
+    new_walls = _walls_bytes(
+        map_id="maps/four_pillars.json",
+        tile_id=9,
+        columns={"2": [2], "-2": [-2]},
+    )
+    blobs = _switch_reset_blobs(raw, switch_walls=new_walls, start_walls=new_walls, fill=(7, 8, 9))
+    env, transport = _make_env(blobs)
+    obs, info = env.reset(seed=0, options={"switch_arena": "maps/four_pillars.json"})
+
+    # The switch request was sent on the wire with the arena path as a string value.
+    sent = bytes(transport.sent)
+    assert P.encode({"switch_arena": "maps/four_pillars.json"}) in sent
+    # The switched arena's walls are tracked (the LAST walls message wins; both name the arena).
+    assert isinstance(env.current_map, P.WallLayout)
+    assert env.current_map.map_id == "maps/four_pillars.json"
+    assert env.current_map.tile_id == 9
+    assert env.current_map.occupied == frozenset({(2, 2), (-2, -2)})
+    assert info["map"] is env.current_map
+    # The first observation/state is the REAL first state, not a walls message.
+    assert info["state"] == raw
+    assert np.array_equal(obs[0, 0], [7, 8, 9])
+
+
+def test_reset_switch_arena_without_walls_does_not_consume_state():
+    # Switching to a walls-ABSENT arena: NO walls after either ack. The env must read straight
+    # through to the first state without mis-consuming it.
+    raw = [float(i) for i in range(S.STATE_LEN)]
+    blobs = _switch_reset_blobs(raw, switch_walls=None, start_walls=None, fill=(3, 4, 5))
+    env, _ = _make_env(blobs)
+    obs, info = env.reset(seed=0, options={"switch_arena": "maps/empty.json"})
+
+    # No walls arrived -> current_map stays whatever it was (None here).
+    assert env.current_map is None
+    assert info["map"] is None
+    # The first state is intact (not eaten by the optional-walls routing).
+    assert info["state"] == raw
+    assert np.array_equal(obs[0, 0], [3, 4, 5])
+
+
+def test_reset_switch_arena_sends_switch_in_ingame_window_order():
+    # The switch must be sent AFTER restart and BEFORE start (Unity's !ingame window).
+    raw = _flat_state()
+    blobs = _switch_reset_blobs(raw, switch_walls=_walls_bytes(), start_walls=_walls_bytes())
+    env, transport = _make_env(blobs)
+    env.reset(seed=0, options={"switch_arena": "maps/center_block.json"})
+    sent = bytes(transport.sent)
+    i_restart = sent.find(P.encode({"restart": True}))
+    i_switch = sent.find(P.encode({"switch_arena": "maps/center_block.json"}))
+    i_start = sent.find(P.encode({"start": True}))
+    assert i_restart != -1 and i_switch != -1 and i_start != -1
+    assert i_restart < i_switch < i_start
+
+
+def test_reset_without_switch_is_byte_identical_to_today():
+    # SEAM RE-PROOF: a reset WITHOUT a switch target sends EXACTLY the bytes a no-switch reset
+    # sent before this change (bare restart + start, no switch_arena), regardless of options.
+    raw = _flat_state()
+    env_a, transport_a = _make_env(_reset_blobs(raw))
+    env_a.reset(seed=0)
+
+    env_b, transport_b = _make_env(_reset_blobs(raw))
+    env_b.reset(seed=0, options={"unrelated": "ignored"})
+
+    expected = P.encode({"restart": True}) + P.encode({"start": True})
+    assert bytes(transport_a.sent) == expected
+    assert bytes(transport_b.sent) == expected
+    # No switch_arena byte leaks onto the wire on a plain reset.
+    assert b"switch_arena" not in bytes(transport_a.sent)
+    assert b"switch_arena" not in bytes(transport_b.sent)
+
+
+def test_step_after_switch_reset_persists_switched_map_in_info():
+    # A normal step after a switch reset still returns the 5-tuple and info["map"] reflects the
+    # switched arena (the per-step wire is unchanged: integer-keyed {1,2}).
+    raw0 = _flat_state(0.0)
+    raw1 = [float(i) for i in range(S.STATE_LEN)]
+    new_walls = _walls_bytes(map_id="maps/four_pillars.json", tile_id=9, columns={"2": [2]})
+    blobs = _switch_reset_blobs(raw0, switch_walls=new_walls, start_walls=new_walls) + [
+        _state_and_frame_bytes(raw1, fill=(1, 2, 3))
+    ]
+    env, transport = _make_env(blobs)
+    env.reset(seed=0, options={"switch_arena": "maps/four_pillars.json"})
+    transport.sent.clear()
+
+    _, _, terminated, truncated, info = env.step(np.zeros(ACTION_DIM, dtype=np.float32))
+    # The step wire is still the integer-keyed step message (frozen seam).
+    sent = P.decode(bytes(transport.sent))
+    assert set(sent) == {"1", "2"}
+    assert info["state"] == raw1
+    assert info["map"] is env.current_map
+    assert env.current_map.map_id == "maps/four_pillars.json"
+    assert terminated is False
+    assert truncated is False
 
 
 # --- step -------------------------------------------------------------------------------

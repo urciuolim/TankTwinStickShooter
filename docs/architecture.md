@@ -49,8 +49,8 @@ graph TD
     end
 
     subgraph data["data"]
-        Runner["collect_runner.py<br/>env_factory / player1_factory /<br/>player2_factory / build_specs / main (CLI)"]
-        Collect["collect.py<br/>run_episode / collect_to_shards /<br/>collect_parallel"]
+        Runner["collect_runner.py<br/>env_factory / agent_pool_factory /<br/>round_robin_plan / build_specs / main (CLI)"]
+        Collect["collect.py<br/>run_episode / collect_to_shards /<br/>resolve_map_tag / collect_parallel"]
         Shards["shards.py / schema.py"]
         Readers["readers.py<br/>split_groups / build_index"]
     end
@@ -61,11 +61,12 @@ graph TD
 
     %% env wiring
     TankEnv --> Protocol
+    TankEnv -->|"reset(switch_arena)<br/>→ Connection.switch_arena"| Protocol
     TankEnv --> State
     TankEnv --> Config
     TankEnv --> AgentProto
     TankEnv --> Rewards
-    TankEnv <-->|TCP-JSON + pixel frames| Unity
+    TankEnv <-->|TCP-JSON + pixel frames + switch_arena| Unity
 
     %% agents wiring
     AgentImpls --> AgentProto
@@ -82,9 +83,11 @@ graph TD
     %% data wiring
     Runner --> Collect
     Runner --> Launch
+    Runner -->|"resolve_map_rotation<br/>(rotation contract)"| Maps
     Runner --> TankEnv
     Runner --> AgentImpls
-    Collect --> TankEnv
+    Runner -.->|"round_robin_plan →<br/>EpisodePlan[]"| Collect
+    Collect -->|"collect_to_shards →<br/>run_episode → reset(switch)"| TankEnv
     Collect --> AgentImpls
     Collect --> State
     Collect --> Shards
@@ -122,9 +125,16 @@ graph TD
   build + open the socket through `build_launch_cmd` / `connect`; it is stdlib-only so `core` stays
   the leaf. `collect_runner.env_factory` calls it once per worker (`port = base_port + worker_id`).
 - **`data.collect_runner` is the collection CLI** (`python -m pop_trainer.data.collect_runner`):
-  the concrete `env_factory` / `player1_factory` / `player2_factory` (symmetric, both driver-side)
-  + `build_specs` over `collect`'s spawn orchestration — multi-worker, single-map (Phase A
-  `custom1`).
+  the concrete `env_factory` + `agent_pool_factory` (module-level, spawn-safe) + `build_specs` over
+  `collect`'s spawn orchestration — multi-worker, single-map **or** a map × pairing rotation.
+- **The rotation seam.** `--maps` resolves through `core.maps.resolve_map_rotation` (the shared
+  rotation contract) to a set of arenas; `round_robin_plan` slices the (map × pairing) grid per
+  worker (cell `(worker_id + i*n_workers) % G`) into `EpisodePlan[]`. Each episode rotates the
+  long-lived build's arena via `collect.run_episode → env.reset(options={"switch_arena": ...}) →
+  core.Connection.switch_arena` (the additive outbound seam), and `collect.resolve_map_tag` tags
+  each sample's `map_id` from the arena Unity **echoed** (the F5 tag-from-echo), decoded through the
+  `maps.json` sidecar / `map_index`. See
+  [data](components/data.md#the-rotation-scheduler--map-tagging).
 - **`models` is detached** from the live loop today — it's the shared vision backbone the
   future `pretraining` / `rl` will consume, and the deployable ONNX artifact.
 

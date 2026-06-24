@@ -26,13 +26,16 @@ LAYERING for testability:
   ``info``) — stopping on ``terminated or truncated`` or the step cap. The transport lives inside
   the env, so this loop is unit-testable against a real ``TankEnv`` built over an in-process fake
   connection with NO live socket.
-* :func:`collect_to_shards` wraps a sequence of episodes on one env into
+* :func:`collect_to_shards` drives an ``episode_plan`` (a deterministic round-robin of
+  (map x pairing) :class:`EpisodePlan` episodes) on ONE long-lived env — each episode switches
+  to its arena and pairs its two selectors from a ``selector -> agent`` pool — into
   :mod:`pop_trainer.data.shards` shards on disk (pure given a fake-backed env).
 * :class:`CollectionSpec` / :func:`run_worker` / :func:`collect_parallel` are the LIVE,
   parallel-safe orchestration (multiprocessing with the SPAWN start method — never fork; this
-  is a YOU MUST in CLAUDE.md). The bare env and BOTH agents are built INSIDE the worker via
+  is a YOU MUST in CLAUDE.md). The bare env and the agent pool are built INSIDE the worker via
   injected factories, so the live path is isolated and NOT unit-tested. The worker target is
-  module-level + takes plain data (picklable for spawn).
+  module-level + takes plain data (the ``episode_plan`` + ``map_index`` are plain; picklable for
+  spawn).
 
 An episode ends when the env reports ``terminated or truncated`` (its own boundary) or the step
 cap is reached; the final pair for that step is recorded with the zero ``(2, 5)`` action (no
@@ -62,6 +65,7 @@ from pop_trainer.env.tank_env import TankEnv
 __all__ = [
     "Sample",
     "EpisodeResult",
+    "EpisodePlan",
     "run_episode",
     "collect_to_shards",
     "CollectionSpec",
@@ -82,7 +86,10 @@ class Sample:
       (player2's applied action, the ``a2`` the driver passed). On the LAST recorded step of an
       episode (the boundary step) no further action is applied, so the whole ``(2, 5)`` is the
       zero action.
-    * ``map_id`` / ``episode_id`` / ``step_idx`` — provenance / the split group key.
+    * ``map_id`` — the int index (into the dataset ``maps`` list) of the arena Unity ACTUALLY
+      loaded this episode (resolved from the ECHOED walls layout; see :func:`resolve_map_tag`).
+      It is the split GROUP KEY — a whole map never crosses a train/val boundary.
+    * ``episode_id`` / ``step_idx`` — provenance.
     """
 
     frame: np.ndarray
@@ -95,13 +102,87 @@ class Sample:
 
 @dataclass
 class EpisodeResult:
-    """The samples captured in one episode, plus whether it ended on the env's boundary."""
+    """The samples captured in one episode, plus how it ended and HOW the map was tagged.
+
+    * ``ended_done`` — whether the episode ended on the env's own boundary (vs the step cap).
+    * ``tag_source`` — how each sample's ``map_id`` was resolved (the F5 tag-from-echo audit):
+
+      * ``"echo"`` — the int came from the ECHOED ``info["map"].map_id`` looked up in the
+        rotation index (the normal, authoritative case: Unity confirmed which arena it loaded);
+      * ``"fallback_no_echo"`` — no echo was available (``info["map"]`` was ``None``, e.g. a
+        walls-absent arena) so the INTENDED ``map_id`` was used;
+      * ``"fallback_unknown_echo"`` — an echo arrived but its path was NOT in the rotation index
+        (a desync between what the runner targeted and what Unity loaded) so the INTENDED
+        ``map_id`` was used. A run seeing this should be treated as suspect, not silently trusted.
+
+      With no index supplied at all (``map_index=None``, the single-map / no-rotation path) the
+      tag is always the intended ``map_id`` and ``tag_source`` is ``"intended"``.
+    * ``echoed_map_id`` — the raw echoed arena path (``info["map"].map_id``) when one arrived,
+      else ``None``; recorded for debugging a desync.
+    """
 
     samples: list[Sample] = field(default_factory=list)
     ended_done: bool = False
+    tag_source: str = "intended"
+    echoed_map_id: str | None = None
 
     def __len__(self) -> int:
         return len(self.samples)
+
+
+@dataclass
+class EpisodePlan:
+    """One scheduled episode: switch to ``switch_arena`` and pair ``player1`` vs ``player2``.
+
+    A round-robin (map x pairing) schedule is a list of these — each describes exactly one
+    episode :func:`collect_to_shards` runs in order. It is PLAIN data (selector names + an
+    arena-path string + the intended int), so a whole plan crosses the spawn boundary inside
+    ``CollectionSpec.extra`` with no live agent / env.
+
+    * ``switch_arena`` — the arena-path string handed to ``env.reset(options={"switch_arena":
+      ...})``; ``None`` means a no-switch reset (today's single-map behavior, byte-identical).
+    * ``player1`` / ``player2`` — agent SELECTOR NAMES (looked up in an agent pool the worker
+      builds once); the pairing for this episode.
+    * ``intended_map_id`` — the int this episode WOULD be tagged with if the echo is missing /
+      unknown (the documented fallback); the echo, when present + known, wins over it.
+    """
+
+    switch_arena: str | None
+    player1: str
+    player2: str
+    intended_map_id: int
+
+
+def resolve_map_tag(
+    layout: object,
+    *,
+    intended_map_id: int,
+    map_index: dict[str, int] | None,
+) -> tuple[int, str, str | None]:
+    """Resolve an episode's int ``map_id`` from the ECHOED walls layout (the F5 tag-from-echo).
+
+    The F5 rule: the on-disk ``map_id`` int MUST reflect the arena Unity ACTUALLY loaded, not the
+    runner's intent. ``layout`` is ``info["map"]`` (a :class:`core.protocol.WallLayout` or
+    ``None``); its ``.map_id`` is the echoed arena path. With a ``map_index`` (a ``path -> int``
+    map over the rotation set) the echo wins:
+
+    * echo present AND its path is in the index -> ``(index[echo], "echo", echo)``;
+    * echo present but its path is NOT in the index -> the intended int with
+      ``"fallback_unknown_echo"`` (a desync — flagged, never silently mis-tagged);
+    * no echo (``layout is None`` or it has no ``.map_id``) -> the intended int with
+      ``"fallback_no_echo"``.
+
+    With ``map_index is None`` (single-map / no rotation) the tag is always the intended int and
+    the source is ``"intended"``. Returns ``(map_id, tag_source, echoed_map_id)``.
+    """
+    echoed = getattr(layout, "map_id", None) if layout is not None else None
+    if map_index is None:
+        return intended_map_id, "intended", echoed
+    if echoed is None:
+        return intended_map_id, "fallback_no_echo", None
+    if echoed in map_index:
+        return map_index[echoed], "echo", echoed
+    return intended_map_id, "fallback_unknown_echo", echoed
 
 
 def _maybe_reset(agent: object, seed: int | None) -> None:
@@ -144,13 +225,30 @@ def run_episode(
     episode_id: int,
     max_steps: int,
     seed: int | None = None,
+    switch_arena: str | None = None,
+    map_index: dict[str, int] | None = None,
 ) -> EpisodeResult:
     """PURE step loop: drive ONE bare ``TankEnv`` for an episode and capture time-aligned samples.
 
     ``env`` is a bare pure-transport :class:`TankEnv`; this loop drives BOTH ``player1`` and
-    ``player2``. It resets both agents (if either exposes ``reset``) and calls
-    ``env.reset(seed=seed)`` to start a fresh round, so the whole trajectory is a deterministic
-    function of (player1, player2, seed). Then each step:
+    ``player2``. It resets both agents (if either exposes ``reset``) and resets the env to start a
+    fresh round, so the whole trajectory is a deterministic function of (player1, player2, seed).
+
+    Arena switching (additive, reset-time only): when ``switch_arena`` is a path string the reset
+    is ``env.reset(seed=seed, options={"switch_arena": switch_arena})`` so Unity rotates to that
+    arena before the first state. When ``switch_arena is None`` the reset is the byte-identical
+    no-switch ``env.reset(seed=seed)`` (today's behavior exactly). This calls ONLY the Layer-1
+    seam; no new wire message is introduced here.
+
+    Tag-from-echo (F5): each sample's int ``map_id`` is resolved via :func:`resolve_map_tag` from
+    the ECHOED ``info["map"].map_id`` (what Unity actually loaded) looked up in ``map_index`` (a
+    ``path -> int`` map over the rotation set) — NOT the runner's intended target. The echo wins;
+    a missing echo or an echo whose path is not in the index falls back to ``map_id`` and the
+    fallback is recorded on the result (``tag_source`` / ``echoed_map_id``) so a desync is
+    detectable. With ``map_index is None`` the tag is always the intended ``map_id``. The arena is
+    static within an episode, so the tag is resolved ONCE after reset and applied to every sample.
+
+    Then each step:
 
     1. records nothing yet — it computes player1's action ``a1 = player1.act(vec)`` from the
        CURRENT 52-float state (player1's own UNFLIPPED view), validates it, computes player2's
@@ -168,11 +266,19 @@ def run_episode(
     result = EpisodeResult()
     _maybe_reset(player1, seed)
     _maybe_reset(player2, seed)
-    obs, info = env.reset(seed=seed)
+    if switch_arena is None:
+        obs, info = env.reset(seed=seed)
+    else:
+        obs, info = env.reset(seed=seed, options={"switch_arena": switch_arena})
     # Hand the static layout to a map-aware agent (the OPTIONAL ``set_map`` hook); both agents are
     # driver-side now. A map-agnostic agent does not expose ``set_map``.
     _maybe_set_map(player1, info.get("map"))
     _maybe_set_map(player2, info.get("map"))
+    # F5 tag-from-echo: the arena is static for the episode, so resolve the int tag ONCE from the
+    # echoed layout and stamp every sample with it.
+    tagged_map_id, result.tag_source, result.echoed_map_id = resolve_map_tag(
+        info.get("map"), intended_map_id=map_id, map_index=map_index
+    )
     frame = obs
     vec = info["state"]
     step_idx = 0
@@ -182,7 +288,7 @@ def run_episode(
         if done or at_cap:
             # Final recorded step: no further action is applied; record the zero action.
             result.samples.append(
-                _make_sample(frame, vec, _zero_action(), map_id, episode_id, step_idx)
+                _make_sample(frame, vec, _zero_action(), tagged_map_id, episode_id, step_idx)
             )
             result.ended_done = done
             return result
@@ -195,7 +301,7 @@ def run_episode(
         next_obs, _reward, terminated, truncated, info = env.step(a1, a2)
 
         action = np.array([info["p1_action"], info["p2_action"]], dtype=np.float32)
-        result.samples.append(_make_sample(frame, vec, action, map_id, episode_id, step_idx))
+        result.samples.append(_make_sample(frame, vec, action, tagged_map_id, episode_id, step_idx))
 
         frame = next_obs
         vec = info["state"]
@@ -244,24 +350,30 @@ def collect_to_shards(
     env: TankEnv,
     *,
     out_dir: str | Path,
-    map_ids: Sequence[int],
-    player1: core_agent.Agent,
-    player2: core_agent.Agent,
+    episode_plan: Sequence[EpisodePlan],
+    agent_pool: dict[str, core_agent.Agent],
     max_steps: int,
     seed: int | None = None,
+    map_index: dict[str, int] | None = None,
     shard_prefix: str = "shard_w0",
     shard_size: int = 10_000,
     with_actions: bool = True,
 ) -> list[Path]:
-    """Run one episode per entry of ``map_ids`` on ``env`` and write shards to ``out_dir``.
+    """Run the ``episode_plan`` (a round-robin of (map x pairing) episodes) on ONE long-lived env.
 
-    ``env`` is a bare pure-transport env; this drives ``player1`` + ``player2`` against it. Each
-    episode calls ``env.reset`` (via :func:`run_episode`) to start a fresh round; ``map_ids`` tags
-    each episode's samples with its map. The per-episode seed is ``seed + episode_id`` (when a base
-    ``seed`` is given) so each episode resets BOTH agents to a distinct yet reproducible state.
-    Samples accumulate and flush to a shard every ``shard_size``, plus a final flush. Returns the
-    list of written shard paths. Pure given a fake-backed ``env`` (the live socket path lives in
-    :func:`run_worker`).
+    ``env`` is a bare pure-transport env launched ONCE on a boot map; each :class:`EpisodePlan`
+    rotates it to its ``switch_arena`` and pairs its ``player1`` / ``player2`` selectors. The two
+    agents are taken from ``agent_pool`` (a ``selector -> agent`` dict the worker builds ONCE up
+    front — so no live agent crosses the spawn boundary and a selector's RNG stream is continuous
+    across the episodes it plays). Each episode runs through :func:`run_episode`, which switches the
+    arena at reset and tags samples from the ECHOED layout via ``map_index`` (the F5 rule). The
+    per-episode seed is ``seed + episode_id`` (when a base ``seed`` is given) so each episode resets
+    BOTH agents to a distinct yet reproducible state. Samples accumulate and flush to a shard every
+    ``shard_size``, plus a final flush. Returns the list of written shard paths. Pure given a
+    fake-backed ``env`` (the live socket path lives in :func:`run_worker`).
+
+    Raises ``KeyError`` if a plan names a selector absent from ``agent_pool`` (an eager wiring bug,
+    not a silent skip).
     """
     out_dir = Path(out_dir)
     buffer: list[Sample] = []
@@ -278,16 +390,18 @@ def collect_to_shards(
         shard_index += 1
         buffer = []
 
-    for episode_id, map_id in enumerate(map_ids):
+    for episode_id, plan in enumerate(episode_plan):
         episode_seed = None if seed is None else seed + episode_id
         ep = run_episode(
             env,
-            player1=player1,
-            player2=player2,
-            map_id=map_id,
+            player1=agent_pool[plan.player1],
+            player2=agent_pool[plan.player2],
+            map_id=plan.intended_map_id,
             episode_id=episode_id,
             max_steps=max_steps,
             seed=episode_seed,
+            switch_arena=plan.switch_arena,
+            map_index=map_index,
         )
         buffer.extend(ep.samples)
         while len(buffer) >= shard_size:
@@ -308,26 +422,29 @@ class CollectionSpec:
     """Plain, picklable data one worker needs to collect (spawn-safe: no live handles).
 
     Holds ONLY plain data + import-able factory names. The bare env (and its socket) is constructed
-    INSIDE the worker via ``env_factory`` (a picklable callable, e.g. a module-level function); the
-    ``player1`` and ``player2`` agents are built inside the worker from ``player1_factory`` /
-    ``player2_factory`` (both driver-side, symmetric). So NO socket / env / agent crosses the spawn
-    boundary.
+    INSIDE the worker via ``env_factory``; the agent POOL (a ``selector -> agent`` dict covering
+    every selector this worker's plan pairs) is built inside the worker via ``agent_pool_factory``.
+    So NO socket / env / agent crosses the spawn boundary — only the plain ``episode_plan`` (a list
+    of :class:`EpisodePlan`), the ``map_index`` (``arena-path -> int``), and ``extra`` do.
+
+    The ``episode_plan`` is this worker's slice of the deterministic round-robin (map x pairing)
+    schedule; ``map_index`` decodes the echoed arena path to the on-disk int (the F5 tag-from-echo
+    source) and is persisted to a sidecar so the int is reversible to the arena path.
     """
 
     worker_id: int
     out_dir: str
-    map_ids: list[int]
+    episode_plan: list[EpisodePlan]
     max_steps: int
     seed: int | None = None
+    map_index: dict[str, int] = field(default_factory=dict)
     shard_size: int = 10_000
     with_actions: bool = True
     # Picklable factories, called INSIDE the worker process:
     #   env_factory(spec) -> a bare TankEnv (socket opened in-worker).
-    #   player1_factory(spec) -> the player1 agent the driver advances.
-    #   player2_factory(spec) -> the player2 agent the driver advances (symmetric with player1).
+    #   agent_pool_factory(spec) -> a {selector -> agent} dict covering the plan's pairings.
     env_factory: Callable[[CollectionSpec], object] | None = None
-    player1_factory: Callable[[CollectionSpec], core_agent.Agent] | None = None
-    player2_factory: Callable[[CollectionSpec], core_agent.Agent] | None = None
+    agent_pool_factory: Callable[[CollectionSpec], dict[str, core_agent.Agent]] | None = None
     extra: dict = field(default_factory=dict)
 
 
@@ -335,29 +452,27 @@ def run_worker(spec: CollectionSpec) -> dict:
     """Module-level worker entry point (picklable for spawn). Builds the env IN-WORKER.
 
     Builds the bare ``TankEnv`` via ``spec.env_factory`` (its socket opened HERE, never inherited)
-    and BOTH agents via ``spec.player1_factory`` / ``spec.player2_factory``, then delegates to
-    :func:`collect_to_shards`. Closes the env in a ``finally`` so the worker that opened the
-    socket also releases it. Returns a small result dict (worker id, shard file names, count).
-    Live path — exercised by the orchestrator, not the unit tests.
+    and the agent pool via ``spec.agent_pool_factory`` (built ONCE so each selector's RNG stream is
+    continuous across the episodes it plays), then delegates the worker's ``episode_plan`` to
+    :func:`collect_to_shards`. Closes the env in a ``finally`` so the worker that opened the socket
+    also releases it. Returns a small result dict (worker id, shard file names, count). Live path —
+    exercised by the orchestrator, not the unit tests.
     """
     if spec.env_factory is None:
         raise ValueError("run_worker needs an env_factory")
-    if spec.player1_factory is None:
-        raise ValueError("run_worker needs a player1_factory")
-    if spec.player2_factory is None:
-        raise ValueError("run_worker needs a player2_factory")
+    if spec.agent_pool_factory is None:
+        raise ValueError("run_worker needs an agent_pool_factory")
     env = spec.env_factory(spec)
-    player1 = spec.player1_factory(spec)
-    player2 = spec.player2_factory(spec)
+    agent_pool = spec.agent_pool_factory(spec)
     try:
         written = collect_to_shards(
             env,
             out_dir=spec.out_dir,
-            map_ids=spec.map_ids,
-            player1=player1,
-            player2=player2,
+            episode_plan=spec.episode_plan,
+            agent_pool=agent_pool,
             max_steps=spec.max_steps,
             seed=spec.seed,
+            map_index=spec.map_index or None,
             shard_prefix=f"shard_w{spec.worker_id}",
             shard_size=spec.shard_size,
             with_actions=spec.with_actions,

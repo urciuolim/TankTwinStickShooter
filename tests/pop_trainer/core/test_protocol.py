@@ -448,3 +448,71 @@ def test_walls_message_round_trips_through_strict_json():
     decoded = P.decode(P.encode(msg))
     layout = P.parse_walls_message(decoded)
     assert layout.occupied == P.parse_walls_message(msg).occupied
+
+
+# --- switch_arena handshake (additive OUTBOUND seam) ------------------------------------
+
+
+def test_switch_arena_sends_request_and_reads_ack():
+    """switch_arena encodes {"switch_arena": path}, reads the {"arena_switched": true} ack."""
+    path = "maps/center_block.json"
+    t = FakeTransport(recv_chunks=[P.encode({P.ARENA_SWITCHED_KEY: True})])
+    conn = P.Connection(t)
+    ack = conn.switch_arena(path)
+    # The exact bytes on the wire are the strict-JSON switch request (string value).
+    assert bytes(t.sent) == P.encode({P.SWITCH_ARENA_KEY: path})
+    assert ack == {P.ARENA_SWITCHED_KEY: True}
+
+
+def test_switch_arena_walls_present_does_not_consume_walls_or_state():
+    """The ack is read alone; a trailing walls message + state stay on the wire for the caller.
+
+    Unity writes ack THEN (walls-present arena) a walls message as its own write. switch_arena
+    must read ONLY the ack so the caller routes the optional walls + the following state itself.
+    """
+    path = "maps/center_block.json"
+    ack_bytes = P.encode({P.ARENA_SWITCHED_KEY: True})
+    walls_bytes = P.encode(_walls_message())
+    state_bytes = P.encode({"state": [0.0] * S.STATE_LEN})
+    # All three coalesced into one recv (TCP can glue back-to-back writes).
+    t = FakeTransport(recv_chunks=[ack_bytes + walls_bytes + state_bytes])
+    conn = P.Connection(t)
+    ack = conn.switch_arena(path)
+    assert ack == {P.ARENA_SWITCHED_KEY: True}
+    # The walls message is still on the wire (NOT consumed by switch_arena).
+    nxt = conn.receive()
+    assert P.is_walls_message(nxt)
+    # And the state after it is intact too.
+    assert conn.receive() == {"state": [0.0] * S.STATE_LEN}
+
+
+def test_switch_arena_walls_absent_does_not_consume_state():
+    """A walls-ABSENT switch (ack then straight to the next message) does not eat a state."""
+    path = "maps/empty.json"
+    ack_bytes = P.encode({P.ARENA_SWITCHED_KEY: True})
+    state_bytes = P.encode({"state": [1.0] * S.STATE_LEN})
+    t = FakeTransport(recv_chunks=[ack_bytes + state_bytes])
+    conn = P.Connection(t)
+    conn.switch_arena(path)
+    # The next message is the state, untouched by switch_arena.
+    assert conn.receive() == {"state": [1.0] * S.STATE_LEN}
+
+
+def test_switch_arena_rejects_missing_or_false_ack():
+    # A missing arena_switched key is a protocol error.
+    t = FakeTransport(recv_chunks=[P.encode({"starting": True})])
+    conn = P.Connection(t)
+    with pytest.raises(ValueError):
+        conn.switch_arena("maps/center_block.json")
+    # An explicit false ack is also rejected.
+    t2 = FakeTransport(recv_chunks=[P.encode({P.ARENA_SWITCHED_KEY: False})])
+    conn2 = P.Connection(t2)
+    with pytest.raises(ValueError):
+        conn2.switch_arena("maps/center_block.json")
+
+
+def test_switch_arena_recv_timeout_translated_to_connection_error():
+    t = FakeTransport(raise_timeout_on_recv=True)
+    conn = P.Connection(t)
+    with pytest.raises(ConnectionError):
+        conn.switch_arena("maps/center_block.json")

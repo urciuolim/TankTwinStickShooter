@@ -70,16 +70,25 @@ Useful flags (defaults shown): `--exe build/TankTwinStickShooter.exe`,
 
 ## 4. Collect a dataset (CLI)
 
-Phase A ships a **multi-worker, single-map** collection runner:
+The **multi-worker** collection runner:
 [`python -m pop_trainer.data.collect_runner`](../src/pop_trainer/data/collect_runner.py)
 ([`main`](../src/pop_trainer/data/collect_runner.py)). It builds one
 [`CollectionSpec`](../src/pop_trainer/data/collect.py) per worker and drives them through the
 [`data.collect`](../src/pop_trainer/data/collect.py) orchestration
 ([`collect_parallel`](../src/pop_trainer/data/collect.py), spawn-based), each worker launching its
-**own** Unity build + socket and writing `.npz` shards to a `worker_<id>/` subdir of `--out-dir`:
+**own** Unity build + socket and writing `.npz` shards to a `worker_<id>/` subdir of `--out-dir`.
+
+A run is either a **single map** (no `--maps`) or a **map × pairing rotation** (round-robin via the
+runtime `switch_arena` seam). Single-map:
 
 ```bash
 uv run python -m pop_trainer.data.collect_runner --out-dir runs/collect-demo
+```
+
+Rotate over the shipped 10 maps, default pairing mix:
+
+```bash
+uv run python -m pop_trainer.data.collect_runner --out-dir runs/collect-rot --maps
 ```
 
 See the full flag surface:
@@ -93,22 +102,46 @@ Flags (defaults shown), grounded in
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `--player1` | `aggressive-coverage` | player1 selector (driven by the collection loop) |
-| `--player2` | `opponent-shadower` | player2 selector (driven by the collection loop) |
-| `--map` | `custom1` | map to collect on — **`custom1` is the only choice today** (Phase A is single-map) |
+| `--maps` / `--map-rotation` | *(absent)* | rotation set. **No value** → the shipped 10 `exp-configs/maps/*.json`; **a directory** → its `*.json` (sorted); **a list of paths** → that order. **Absent** → no rotation (single `--map`). |
+| `--pairing P1:P2` | `DEFAULT_PAIRINGS` mix | a `(player1:player2)` selector pairing; **repeatable**. Omitted → the default coverage-family mix (coverage vs each other + vs random). |
+| `--map` | `custom1` | single-map (no-rotation) config; the **boot** + only arena when `--maps` is absent. |
 | `--episodes` | `1` | episodes **per worker** |
 | `--max-steps` | `800` | per-episode step cap |
 | `--out-dir` | *(required)* | root output dir; worker `w` writes shards to `worker_<w>/` under it |
-| `--workers` | `2` | parallel workers, one build per worker (**clamped to `[1, 8]`**) |
+| `--workers` | `2` | parallel workers, one build per worker (**clamped to `[1, MAX_WORKERS=8]`**) |
 | `--exe` | `build/TankTwinStickShooter.exe` | path to the Unity build |
 | `--base-port` | `50000` | base TCP port; worker `w` connects on `base_port + w` |
 | `--seed` | `0` | base seed; worker `w` uses `base + w*10000` |
 
-Each worker resolves `--map custom1` to the obs_pixels-enabled
-`Assets/StreamingAssets/demo_config.json` (the **same** config the demo launches with — 640×360
-pixels on, arena `Arenas/custom1.json`), so the captured `(frame, state)` rows are byte-for-byte
-the demo's / RL's observation pipeline. `main` exits `2` if the build exe or the resolved config
-is missing. Map / pairing **rotation** is Phase B — not built yet.
+Selectors for `--pairing` (and `--map`'s default boot): `aggressive-coverage`, `wall-hugger`,
+`opponent-shadower`, `random`.
+
+### The `maps.json` sidecar (reversible map ids)
+
+On-disk `map_ids` stay `int32`; `main` writes a **`maps.json`** sidecar (constant
+`MAPS_SIDECAR_NAME`) so each int is reversible to the arena it names. It is written **per-worker-dir
+AND at the run root**, with shape:
+
+```json
+{"schema_version": 1, "maps": ["Arenas/center_block.json", "..."]}
+```
+
+`maps[i]` is the arena for on-disk int `i`. The int is the **echo-tagged** id: it comes from the
+arena path Unity actually loaded (echoed as `WallLayout.map_id`), decoded through the
+`arena-path → int` index built from this same list (the F5 tag-from-echo; see
+[data](components/data.md#the-rotation-scheduler--map-tagging)).
+
+### The obs_pixels gotcha
+
+Collection **must** receive pixel frames (the env reads a length-prefixed frame after every state;
+a build without `obs_pixels` would leave the env blocking on bytes that never arrive). So the build
+**boots** on the obs_pixels-enabled `--map` config (`custom1` → `Assets/StreamingAssets/demo_config.json`,
+the **same** config the demo launches with — 640×360 pixels on, arena `Arenas/custom1.json`) and
+rotates the arena via `switch_arena` at runtime. The shipped `exp-configs/maps` rotation configs
+supply **switch targets only** (their `arena_path`) and do **not** enable `obs_pixels`, so they are
+never used as the boot config. Either way the captured `(frame, state)` rows are byte-for-byte the
+demo's / RL's observation pipeline. `main` exits `2` if the build exe or the resolved boot config is
+missing.
 
 > **Episode budget.** The coverage family fully sweeps a map only by ~800 decisions on the live
 > engine — which is why `--max-steps` defaults to `800` — so keep it long enough to cover the map

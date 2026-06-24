@@ -3,19 +3,33 @@
 This is the APPLICATION layer over :mod:`pop_trainer.data.collect`. ``collect`` provides the
 PURE step loop + the spawn-safe orchestration but leaves the env/agent construction to injected
 factories; THIS module supplies the concrete factories that launch the live Unity build, connect
-a socket, and build the bare gymnasium env + the driver-side player1/player2 agents. It is a
-data-layer module, so it may import ``core`` (the launch + wire + config seams), ``env``
+a socket, and build the bare gymnasium env + the driver-side agent pool. It is a data-layer
+module, so it may import ``core`` (the launch + wire + config + map-rotation seams), ``env``
 (``TankEnv``), and ``agents`` (the coverage / random presets) — exactly the
 ``core <- {env, agents} <- data`` direction. No ``models`` / ``pretraining`` / ``rl`` and nothing
 from ``tank_twin``.
 
-SPAWN SAFETY. :func:`env_factory` / :func:`player1_factory` / :func:`player2_factory` are
-MODULE-LEVEL plain functions (not closures / lambdas) so ``multiprocessing`` with the ``spawn``
-start method can re-import them by qualified name in a fresh interpreter. Everything they need
-crosses the process boundary as plain data inside ``spec.extra`` (paths, ports, selector names,
-seeds) — never a live socket / env / agent. Each worker computes its OWN port
-(``base_port + worker_id``), launches its OWN build, and opens its OWN socket; nothing is
-inherited from the parent.
+ROUND-ROBIN (map x pairing). A run is a deterministic round-robin over the grid of the ``--maps``
+rotation set crossed with the ``--pairings`` set. :func:`round_robin_plan` (PURE, unit-tested with
+no live build) computes each WORKER's slice of the grid: worker ``w`` episode ``i`` picks grid cell
+``(w + i * n_workers) % G`` (``G`` = maps x pairings), which spreads the grid across workers so the
+union covers it evenly and no two workers run identical episodes at the same step. The build is
+launched ONCE per worker on a boot config and rotates between arenas via ``switch_arena`` between
+episodes (the long-lived-build model; 8 long-lived builds is the end state).
+
+TAG-FROM-ECHO (F5). The on-disk ``map_ids`` stay int32 (the group-split key in ``readers.py``); the
+int is a STABLE index into the rotation set's ``maps`` list, resolved from the ECHOED arena path
+Unity actually loaded (``info["map"].map_id``) — not the runner's intent — via ``map_index`` (see
+:func:`collect.resolve_map_tag`). The int -> arena-path mapping is persisted to a ``maps.json``
+sidecar (:func:`write_maps_sidecar`) next to the shards so the ints are reversible.
+
+SPAWN SAFETY. :func:`env_factory` / :func:`agent_pool_factory` are MODULE-LEVEL plain functions
+(not closures / lambdas) so ``multiprocessing`` with the ``spawn`` start method can re-import them
+by qualified name in a fresh interpreter. Everything they need crosses the process boundary as
+plain data inside ``spec`` (the ``episode_plan`` of :class:`collect.EpisodePlan`, the ``map_index``,
+and ``extra`` with paths / ports / selector names / seeds) — never a live socket / env / agent.
+Each worker computes its OWN port (``base_port + worker_id``), launches its OWN build, and opens
+its OWN socket; nothing is inherited from the parent.
 
 LAUNCH-PROC REAPING. :func:`env_factory` stashes the live ``subprocess.Popen`` of the launched
 build on the env (``env._launch_proc``) and WRAPS ``env.close`` so that closing the env (which
@@ -24,43 +38,55 @@ release and THEN terminates the build process (terminate -> wait(10) -> kill on 
 ``TankEnv`` seam itself is untouched — this is caller-side wrapping only.
 
 PIXELS. Collection MUST receive pixel frames (the env reads a length-prefixed frame after every
-state; a build without ``obs_pixels`` would leave the env blocking on bytes that never arrive).
-The default ``--map`` resolves to ``Assets/StreamingAssets/demo_config.json`` — the SAME
+state; a build without ``obs_pixels`` would leave the env blocking on bytes that never arrive). The
+no-rotation default ``--map`` resolves to ``Assets/StreamingAssets/demo_config.json`` — the SAME
 obs_pixels-enabled config the demo launches with (640x360, arena ``Arenas/custom1.json`` resolved
 against the config dir) — so the captured ``(frame, state)`` rows are byte-for-byte the demo's /
-RL's observation pipeline, with no drift. The env is built with the matching ``frame_shape``.
+RL's observation pipeline, with no drift. For a rotation run the boot config is the FIRST rotation
+map config (it must likewise enable ``obs_pixels``). The env is built with the matching
+``frame_shape`` either way.
 """
 
 from __future__ import annotations
 
 import argparse
 import contextlib
+import json
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from pop_trainer import agents
 from pop_trainer.core import agent as core_agent
 from pop_trainer.core import launch
+from pop_trainer.core import maps as core_maps
 from pop_trainer.core.config import EnvConfig
 from pop_trainer.core.protocol import Connection
-from pop_trainer.data.collect import CollectionSpec, collect_parallel
+from pop_trainer.data.collect import CollectionSpec, EpisodePlan, collect_parallel
 from pop_trainer.env.tank_env import TankEnv
 
 __all__ = [
     "AGENT_SELECTORS",
     "DEFAULT_PLAYER1",
     "DEFAULT_PLAYER2",
+    "DEFAULT_PAIRINGS",
     "MAX_WORKERS",
     "DEFAULT_MAP",
     "MAP_CONFIGS",
+    "MAPS_SIDECAR_NAME",
     "FRAME_SHAPE",
     "make_agent",
+    "arena_path_for_config",
+    "build_rotation",
+    "build_map_index",
+    "round_robin_plan",
+    "parse_pairing",
+    "write_maps_sidecar",
+    "read_maps_sidecar",
     "build_env_from_connection",
+    "agent_pool_factory",
     "env_factory",
-    "player1_factory",
-    "player2_factory",
     "build_specs",
     "main",
 ]
@@ -75,18 +101,20 @@ FRAME_HEIGHT = 360
 # TankEnv frame_shape is (H, W, 3).
 FRAME_SHAPE = (FRAME_HEIGHT, FRAME_WIDTH, 3)
 
-# Map name -> the obs_pixels-enabled build config it launches with. Phase A ships a single map.
-# Reusing the demo config keeps collection's frames byte-identical to the demo's / RL's pipeline
-# (640x360 pixels on, arena Arenas/custom1.json resolved against the config dir).
+# Map name -> the obs_pixels-enabled build config it launches with (the single-map / no-rotation
+# default). Reusing the demo config keeps collection's frames byte-identical to the demo's / RL's
+# pipeline (640x360 pixels on, arena Arenas/custom1.json resolved against the config dir).
 _STREAMING_ASSETS = _REPO_ROOT / "Assets" / "StreamingAssets"
 MAP_CONFIGS: dict[str, Path] = {
     "custom1": _STREAMING_ASSETS / "demo_config.json",
 }
 DEFAULT_MAP = "custom1"
-# Map name -> the integer map_id tagged onto every captured sample for that map.
-_MAP_IDS: dict[str, int] = {
-    "custom1": 0,
-}
+# The single-map arena path Unity echoes for the default --map (its config's arena_path).
+_DEFAULT_MAP_ARENA = "Arenas/custom1.json"
+
+# The maps-list sidecar: the int -> arena-path mapping written next to the shards so the on-disk
+# int32 ``map_ids`` are decodable back to the arena Unity loaded (the F5 persistence requirement).
+MAPS_SIDECAR_NAME = "maps.json"
 
 DEFAULT_MAX_STEPS = 800
 DEFAULT_BASE_PORT = 50000
@@ -113,6 +141,19 @@ AGENT_SELECTORS: dict[str, Callable[[int | None], core_agent.Agent]] = {
 DEFAULT_PLAYER1 = "aggressive-coverage"
 DEFAULT_PLAYER2 = "opponent-shadower"
 
+# The default pairing MIX for a rotating run: the coverage family vs each other (the three round-
+# robin orderings) plus the coverage family vs the random baseline. A "pairing" is a
+# (player1-selector, player2-selector) tuple. This covers the coverage policies against one another
+# AND against random, which is the sensible-coverage default the contract asks for.
+DEFAULT_PAIRINGS: list[tuple[str, str]] = [
+    ("aggressive-coverage", "opponent-shadower"),
+    ("opponent-shadower", "wall-hugger"),
+    ("wall-hugger", "aggressive-coverage"),
+    ("aggressive-coverage", "random"),
+    ("opponent-shadower", "random"),
+    ("wall-hugger", "random"),
+]
+
 
 def make_agent(selector: str, *, seed: int | None = None) -> core_agent.Agent:
     """Build the agent named by ``selector`` (see :data:`AGENT_SELECTORS`).
@@ -124,6 +165,165 @@ def make_agent(selector: str, *, seed: int | None = None) -> core_agent.Agent:
         valid = ", ".join(sorted(AGENT_SELECTORS))
         raise ValueError(f"unknown agent selector {selector!r}; choose one of: {valid}")
     return factory(seed)
+
+
+# --- map rotation: config path -> (build config, switch_arena path) + the int index ----------
+#
+# A rotation entry is a map-CONFIG path (e.g. exp-configs/maps/center_block.json). Two distinct
+# things come off it:
+#   * the BUILD CONFIG to launch a worker on (the config path itself — it carries obs_pixels + the
+#     boot arena);
+#   * the SWITCH_ARENA path the env hands to ``env.reset(options={"switch_arena": ...})`` between
+#     episodes, which Unity resolves and ECHOES back as ``WallLayout.map_id``. That echoed string
+#     is the F5 tag source, so the int index is keyed on the SAME arena-path string.
+# The arena path is the config's ``arena_path`` field. Unity echoes that verbatim resolved string,
+# so keying the index on ``arena_path`` makes the echo decode to the right int.
+
+
+def arena_path_for_config(config_path: str | Path) -> str:
+    """Read a map-config JSON and return its ``arena_path`` (the switch_arena / echo string).
+
+    The ``arena_path`` field is the arena the build resolves AND the verbatim string Unity echoes
+    back as ``WallLayout.map_id`` after a switch. Strict ``json`` (Python-parsed). Raises
+    ``ValueError`` if the field is missing or not a string.
+    """
+    with open(config_path, encoding="utf-8") as fh:
+        config = json.load(fh)
+    arena = config.get("arena_path")
+    if not isinstance(arena, str):
+        raise ValueError(f"map config {config_path} has no string 'arena_path' (got {arena!r})")
+    return arena
+
+
+def build_rotation(map_values: list[str] | None) -> list[str]:
+    """Resolve the ``--maps`` flag value into the ROTATION SET of arena-path strings.
+
+    Delegates to :func:`core.maps.resolve_map_rotation` (the shared rotation contract: ``None`` ->
+    single-map, ``[]`` / sentinel -> all 10 shipped exp-configs/maps sorted, a dir -> its *.json
+    sorted, a list -> given order) and then maps each resolved map-config path to its
+    ``arena_path`` (:func:`arena_path_for_config`). The returned list is the ordered rotation set;
+    its INDEX in this list is the on-disk int for that arena (the dataset ``maps`` list). A ``None``
+    flag value (single-map mode) yields ``[]`` — the caller uses the no-rotation path.
+    """
+    configs = core_maps.resolve_map_rotation(map_values)
+    if configs is None:
+        return []
+    return [arena_path_for_config(p) for p in configs]
+
+
+def build_map_index(rotation: Sequence[str]) -> dict[str, int]:
+    """Build the deterministic ``arena-path -> int`` index over the rotation set.
+
+    The int is the entry's position in ``rotation`` (the dataset ``maps`` list order), so it is a
+    stable, reversible key. This is the index :func:`collect.resolve_map_tag` looks the ECHOED
+    arena path up in (the F5 tag-from-echo). Raises ``ValueError`` on a duplicate arena path (an
+    ambiguous index).
+    """
+    index: dict[str, int] = {}
+    for i, arena in enumerate(rotation):
+        if arena in index:
+            raise ValueError(f"duplicate arena path in rotation: {arena!r}")
+        index[arena] = i
+    return index
+
+
+def parse_pairing(value: str) -> tuple[str, str]:
+    """Parse a ``--pairing`` value ``"p1:p2"`` into a validated ``(player1, player2)`` pair.
+
+    Splits on the single ``:`` and validates BOTH selectors against :data:`AGENT_SELECTORS`
+    eagerly (:func:`make_agent` raises on an unknown name). Raises ``ValueError`` on a malformed
+    value (not exactly one ``:``).
+    """
+    parts = value.split(":")
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        raise ValueError(f"pairing must be 'player1:player2', got {value!r}")
+    p1, p2 = parts[0], parts[1]
+    make_agent(p1)  # validates / raises ValueError on an unknown selector
+    make_agent(p2)
+    return p1, p2
+
+
+def round_robin_plan(
+    rotation: Sequence[str],
+    pairings: Sequence[tuple[str, str]],
+    *,
+    episodes: int,
+    worker_id: int,
+    n_workers: int,
+    map_index: dict[str, int],
+) -> list[EpisodePlan]:
+    """The PURE per-worker round-robin over the (rotation x pairing) grid (no live build).
+
+    The grid is ``rotation x pairings`` enumerated in a FIXED order (map-major: grid cell ``g``
+    is ``(map = rotation[g // P], pairing = pairings[g % P])`` for ``P = len(pairings)``), giving
+    ``G = M * P`` cells. Worker ``w`` runs ``episodes`` episodes; its episode ``i`` picks grid cell
+    ``(w + i * n_workers) % G``.
+
+    WORKER SPREAD: across all ``n_workers`` the chosen global indices ``w + i * n_workers`` form a
+    BIJECTION onto ``[0, n_workers * episodes)``, so the union of every worker's episodes is exactly
+    ``{ k % G : k in [0, n_workers * episodes) }`` — each grid cell appears ``floor / ceil`` of
+    ``n_workers * episodes / G`` times (balanced), and at a fixed ``i`` two distinct workers
+    (``w < n_workers <= ...``) always pick DIFFERENT cells, so no two workers do identical episodes
+    while the union still covers the whole grid evenly.
+
+    Each :class:`EpisodePlan` carries the cell's switch_arena (the arena-path string), its pairing's
+    two selectors, and the cell's intended int (``map_index[arena]``) for the documented
+    tag-from-echo fallback. ``rotation`` empty (single-map mode) is handled by the caller, not here
+    (this asserts a non-empty grid). Returns the worker's ordered ``episode_plan``.
+    """
+    grid_size = len(rotation) * len(pairings)
+    if grid_size == 0:
+        raise ValueError("round_robin_plan needs a non-empty rotation x pairing grid")
+    n_workers = max(1, n_workers)
+    n_pairings = len(pairings)
+    plan: list[EpisodePlan] = []
+    for i in range(episodes):
+        cell = (worker_id + i * n_workers) % grid_size
+        arena = rotation[cell // n_pairings]
+        p1, p2 = pairings[cell % n_pairings]
+        plan.append(
+            EpisodePlan(
+                switch_arena=arena,
+                player1=p1,
+                player2=p2,
+                intended_map_id=map_index[arena],
+            )
+        )
+    return plan
+
+
+def write_maps_sidecar(out_dir: str | Path, rotation: Sequence[str]) -> Path:
+    """Write the maps-list sidecar (the int -> arena-path mapping) next to the shards.
+
+    The on-disk ``map_ids`` are int32 indices into the dataset ``maps`` list; this sidecar IS that
+    list, so the ints are reversible to the arena Unity loaded. Strict JSON (Python-parsed)::
+
+        {"schema_version": 1, "maps": ["Arenas/center_block.json", ...]}
+
+    where ``maps[i]`` is the arena path for int ``i``. Pure (stdlib ``json`` + ``pathlib``); writes
+    ``maps.json`` (:data:`MAPS_SIDECAR_NAME`) into ``out_dir`` and returns its path.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / MAPS_SIDECAR_NAME
+    payload = {"schema_version": 1, "maps": list(rotation)}
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+    return path
+
+
+def read_maps_sidecar(path: str | Path) -> list[str]:
+    """Read a maps-list sidecar and return the ``maps`` list (int ``i`` -> arena path ``maps[i]``).
+
+    The inverse of :func:`write_maps_sidecar`. Strict ``json``. Raises ``ValueError`` if the
+    ``maps`` key is missing or is not a list of strings.
+    """
+    with open(path, encoding="utf-8") as fh:
+        payload = json.load(fh)
+    maps_list = payload.get("maps")
+    if not isinstance(maps_list, list) or not all(isinstance(m, str) for m in maps_list):
+        raise ValueError(f"maps sidecar {path} has no 'maps' list of strings")
+    return maps_list
 
 
 # --- the env-build core (pure given a connection; unit-testable with a fake transport) -------
@@ -140,8 +340,8 @@ def build_env_from_connection(
 
     The pure heart of :func:`env_factory`: it constructs the bare env around the injected
     ``connection`` (no socket / subprocess here). The env owns neither player — both agents are
-    driver-side, built by :func:`player1_factory` / :func:`player2_factory`. Factored out so the
-    env-build wiring is testable against an in-process fake transport with no live build.
+    driver-side, built per episode from the pool :func:`agent_pool_factory` builds. Factored out so
+    the env-build wiring is testable against an in-process fake transport with no live build.
     ``frame_shape`` fixes the observation space and MUST match the build's rendered frame.
     """
     return TankEnv(
@@ -164,8 +364,9 @@ def env_factory(spec: CollectionSpec) -> TankEnv:
     :func:`core.launch.build_launch_cmd` + ``subprocess.Popen``, connects via
     :func:`core.launch.connect`, wraps the socket in :class:`core.protocol.Connection`, and builds
     the bare env via :func:`build_env_from_connection`. Both agents are driver-side (built by
-    :func:`player1_factory` / :func:`player2_factory`), so the env carries neither. The live
-    ``Popen`` is stashed and the env's ``close`` is wrapped so :func:`collect.run_worker`'s
+    :func:`agent_pool_factory`), so the env carries neither. The build is launched ONCE per worker
+    on the boot config and rotates between arenas via ``switch_arena`` (the long-lived-build model).
+    The live ``Popen`` is stashed and the env's ``close`` is wrapped so :func:`collect.run_worker`'s
     ``finally`` reaps the build (see :func:`_attach_launch_proc`). The chosen port is recorded back
     into ``spec.extra["port"]`` so it is inspectable. Raises ``KeyError`` if a required ``extra``
     key is missing.
@@ -199,23 +400,17 @@ def env_factory(spec: CollectionSpec) -> TankEnv:
     return env
 
 
-def player1_factory(spec: CollectionSpec) -> core_agent.Agent:
-    """Build the player1 agent from the selector name + seed carried in ``spec.extra``.
+def agent_pool_factory(spec: CollectionSpec) -> dict[str, core_agent.Agent]:
+    """Build the worker's ``selector -> agent`` pool covering every selector its plan pairs.
 
-    MODULE-LEVEL + plain (spawn-importable). Reads ``spec.extra["player1"]`` and seeds the agent
-    with ``spec.seed`` so a worker's player1 stream is reproducible.
+    MODULE-LEVEL + plain (spawn-importable). The worker's ``episode_plan`` is a round-robin over
+    pairings, so a selector recurs across episodes; building ONE agent per selector (seeded with
+    ``spec.seed``) keeps that selector's RNG stream CONTINUOUS across the episodes it plays and
+    avoids rebuilding it every episode. The pool's selectors are taken from ``spec.extra["pool"]``
+    (the union of all selectors the plan names). The driver picks each episode's pairing's two
+    agents out of this pool by name.
     """
-    return make_agent(spec.extra["player1"], seed=spec.seed)
-
-
-def player2_factory(spec: CollectionSpec) -> core_agent.Agent:
-    """Build the player2 agent from the selector name + seed carried in ``spec.extra``.
-
-    MODULE-LEVEL + plain (spawn-importable), symmetric with :func:`player1_factory`: player2 is now
-    a driver-side agent (the env owns neither player). Reads ``spec.extra["player2"]`` and seeds
-    the agent with ``spec.seed`` so a worker's player2 stream is reproducible.
-    """
-    return make_agent(spec.extra["player2"], seed=spec.seed)
+    return {name: make_agent(name, seed=spec.seed) for name in spec.extra["pool"]}
 
 
 def _attach_launch_proc(env: TankEnv, proc: subprocess.Popen) -> None:
@@ -259,8 +454,8 @@ def _terminate(proc: subprocess.Popen) -> None:
 
 def build_specs(
     *,
-    player1: str,
-    player2: str,
+    map_values: list[str] | None,
+    pairings: Sequence[tuple[str, str]],
     map_name: str,
     config: Path,
     exe: Path,
@@ -274,48 +469,100 @@ def build_specs(
 ) -> list[CollectionSpec]:
     """Turn collection params into a list of N :class:`CollectionSpec` (one per worker).
 
-    Pure: builds plain spec data, NO live launch. ``workers`` is CLAMPED to ``[1, MAX_WORKERS]``.
-    Each worker gets a distinct ``worker_id`` (0..N-1), its own ``out_dir`` (per-worker
-    subdirectory so shard files never clash), the single Phase-A map repeated ``episodes`` times in
-    ``map_ids`` (one episode per entry — the map's integer id), the shared ``max_steps``, a distinct
-    ``seed`` (``base_seed + worker_id * stride``), and an ``extra`` carrying the launch params +
-    selector names. The module-level :func:`env_factory` / :func:`player1_factory` /
-    :func:`player2_factory` are wired onto every spec. Validates the selector names and the map name
-    up front (``ValueError``).
+    Pure: builds plain spec data + reads map-config JSON for arena paths, NO live launch.
+
+    Map resolution: ``map_values`` is the ``--maps`` flag value resolved by
+    :func:`core.maps.resolve_map_rotation`. ``None`` (flag absent) -> SINGLE-MAP mode (today's
+    behavior): no ``switch_arena``, every episode tagged int ``0``, paired with the SINGLE default
+    pairing (``pairings[0]``). A non-``None`` value -> ROTATION mode: the rotation set of arena
+    paths, a deterministic round-robin over (rotation x ``pairings``) per worker
+    (:func:`round_robin_plan`), and each episode switches to its arena + is tagged from the echo.
+
+    BOOT CONFIG (the obs_pixels gotcha): the build is launched ONCE per worker on the ``--map``
+    config (``config``) in BOTH modes, then rotates via ``switch_arena``. ``obs_pixels`` is a
+    LAUNCH-time config flag (the env blocks on a frame that never arrives without it), and the
+    shipped ``exp-configs/maps`` rotation configs do NOT enable it — so they are used ONLY to
+    extract each arena's ``arena_path`` (the switch targets), never as the boot config. The
+    ``--map`` config (the demo config) enables obs_pixels, so the build boots correctly and the
+    runtime ``switch_arena`` changes only the arena, not the pixel channel.
+
+    ``workers`` is CLAMPED to ``[1, MAX_WORKERS]``. Each worker gets a distinct ``worker_id``
+    (0..N-1), its own ``out_dir`` subdir (so shard files never clash), its slice of the round-robin
+    as ``episode_plan``, the shared ``max_steps`` + ``map_index``, a distinct ``seed``
+    (``base + worker_id * stride``), and an ``extra`` carrying the launch params + the agent pool
+    (the union of selectors its plan names). The module-level :func:`env_factory` /
+    :func:`agent_pool_factory` are wired onto every spec. Validates the selectors + episodes up
+    front (``ValueError``). The maps-list sidecar (int -> arena path) is written by
+    :func:`main` from each spec's ``extra["maps"]`.
     """
-    # Validate the selectors + map eagerly so a bad CLI fails before any launch.
-    make_agent(player1, seed=seed)
-    make_agent(player2, seed=seed)
-    if map_name not in _MAP_IDS:
-        valid = ", ".join(sorted(_MAP_IDS))
-        raise ValueError(f"unknown map {map_name!r}; choose one of: {valid}")
     if episodes < 1:
         raise ValueError(f"episodes must be >= 1, got {episodes}")
+    if not pairings:
+        raise ValueError("at least one pairing is required")
+    # Validate every selector named by any pairing eagerly so a bad CLI fails before launch.
+    for p1, p2 in pairings:
+        make_agent(p1, seed=seed)
+        make_agent(p2, seed=seed)
+    if map_name not in MAP_CONFIGS:
+        valid = ", ".join(sorted(MAP_CONFIGS))
+        raise ValueError(f"unknown map {map_name!r}; choose one of: {valid}")
+
+    rotation = build_rotation(map_values)  # [] in single-map mode
+    # The build always boots on the obs_pixels-enabled --map config; switch_arena rotates the arena.
+    boot_config = config
+
+    if rotation:
+        # Rotation mode: the int index is the position in the rotation set; the round-robin over
+        # the grid is sliced per worker. The echo decodes through map_index.
+        map_index = build_map_index(rotation)
+        sidecar_maps = rotation
+    else:
+        # Single-map mode: one arena, int 0, no switch. The sole pairing is pairings[0].
+        single_arena = arena_path_for_config(boot_config)
+        map_index = {}  # no echo lookup -> the intended int 0 is used (tag_source "intended")
+        sidecar_maps = [single_arena]
+        pairings = [pairings[0]]
 
     n_workers = max(1, min(int(workers), MAX_WORKERS))
-    map_id = _MAP_IDS[map_name]
     out_root = Path(out_dir)
+    pool = sorted({s for pairing in pairings for s in pairing})
 
     specs: list[CollectionSpec] = []
     for worker_id in range(n_workers):
         worker_out = out_root / f"worker_{worker_id}"
+        if rotation:
+            episode_plan = round_robin_plan(
+                rotation,
+                pairings,
+                episodes=episodes,
+                worker_id=worker_id,
+                n_workers=n_workers,
+                map_index=map_index,
+            )
+        else:
+            # Single-map: every episode is the sole pairing on the no-switch arena, tagged int 0.
+            p1, p2 = pairings[0]
+            episode_plan = [
+                EpisodePlan(switch_arena=None, player1=p1, player2=p2, intended_map_id=0)
+                for _ in range(episodes)
+            ]
         spec = CollectionSpec(
             worker_id=worker_id,
             out_dir=str(worker_out),
-            map_ids=[map_id] * episodes,  # one episode per entry; single Phase-A map.
+            episode_plan=episode_plan,
             max_steps=max_steps,
             seed=seed + worker_id * _SEED_STRIDE,
+            map_index=dict(map_index),
             env_factory=env_factory,
-            player1_factory=player1_factory,
-            player2_factory=player2_factory,
+            agent_pool_factory=agent_pool_factory,
             extra={
                 "exe": str(exe),
-                "config": str(config),
+                "config": str(boot_config),
                 "base_port": int(base_port),
                 "frame_shape": tuple(frame_shape),
-                "player1": player1,
-                "player2": player2,
+                "pool": pool,
                 "map": map_name,
+                "maps": list(sidecar_maps),
             },
         )
         specs.append(spec)
@@ -331,22 +578,33 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         description="Collect (frame, state, action) samples by driving live Unity builds.",
     )
     parser.add_argument(
-        "--player1",
-        default=DEFAULT_PLAYER1,
-        choices=sorted(AGENT_SELECTORS),
-        help="agent selector for player1 (driven by the collection loop)",
+        "--pairing",
+        dest="pairings",
+        action="append",
+        metavar="P1:P2",
+        help=(
+            "a (player1:player2) selector pairing; repeat for several. Omitted -> the default "
+            "coverage-family mix (the coverage policies vs each other + vs random)."
+        ),
     )
     parser.add_argument(
-        "--player2",
-        default=DEFAULT_PLAYER2,
-        choices=sorted(AGENT_SELECTORS),
-        help="agent selector for player2 (driven by the collection loop)",
+        "--maps",
+        "--map-rotation",
+        dest="maps",
+        nargs="*",
+        default=None,
+        metavar="MAP_CONFIG",
+        help=(
+            "Rotate over a set of map configs (round-robin map x pairing, via switch_arena). "
+            "No value -> the shipped 10 exp-configs/maps; a directory -> its *.json configs "
+            "(sorted); a list of paths -> that order. Absent -> no rotation (single --map)."
+        ),
     )
     parser.add_argument(
         "--map",
         default=DEFAULT_MAP,
         choices=sorted(MAP_CONFIGS),
-        help="map to collect on (resolves to an obs_pixels-enabled build config)",
+        help="single-map (no-rotation) config; the boot + only arena when --maps is absent",
     )
     parser.add_argument("--episodes", type=int, default=1, help="episodes PER worker")
     parser.add_argument(
@@ -383,9 +641,10 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     """Build the specs from the CLI and drive :func:`collect.collect_parallel`; print a summary.
 
-    Resolves ``--map`` to its obs_pixels-enabled config, validates the build / config exist, builds
-    the per-worker specs, runs collection in parallel (spawn), and prints a short per-worker result
-    line. Returns ``0`` on success, ``2`` on a missing build / config.
+    Resolves the boot config + the pairing set, validates the build / config exist, builds the
+    per-worker round-robin specs, writes the maps-list sidecar (int -> arena path) per worker out
+    dir AND at the run root, runs collection in parallel (spawn), and prints a short per-worker
+    result line. Returns ``0`` on success, ``2`` on a missing build / config.
     """
     args = _parse_args(argv)
     config = MAP_CONFIGS[args.map]
@@ -397,10 +656,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: config not found at {config}", file=sys.stderr)
         return 2
 
+    # Resolve the pairing set: each --pairing "p1:p2" parsed + validated, else the default mix.
+    pairings = [parse_pairing(p) for p in args.pairings] if args.pairings else DEFAULT_PAIRINGS
+
     requested = args.workers
     specs = build_specs(
-        player1=args.player1,
-        player2=args.player2,
+        map_values=args.maps,
+        pairings=pairings,
         map_name=args.map,
         config=config,
         exe=args.exe,
@@ -414,8 +676,18 @@ def main(argv: list[str] | None = None) -> int:
     if requested > len(specs):
         print(f"note: clamped --workers {requested} to {len(specs)} (MAX_WORKERS={MAX_WORKERS})")
 
+    # Persist the maps-list sidecar (int -> arena path) so on-disk map_ids are decodable. The
+    # rotation set is identical across workers; write it at the run root AND into each worker dir
+    # (a worker dir is a self-describing dataset slice).
+    sidecar_maps = specs[0].extra["maps"]
+    write_maps_sidecar(args.out_dir, sidecar_maps)
+    for spec in specs:
+        write_maps_sidecar(spec.out_dir, sidecar_maps)
+
+    rotating = args.maps is not None
+    mode = f"rotation over {len(sidecar_maps)} arenas" if rotating else f"single map={args.map}"
     print(
-        f"collecting: player1={args.player1} vs player2={args.player2} on map={args.map} "
+        f"collecting: {mode}, {len(pairings)} pairing(s) "
         f"({len(specs)} worker(s), {args.episodes} episode(s) each, max_steps={args.max_steps})"
     )
     results = collect_parallel(specs)

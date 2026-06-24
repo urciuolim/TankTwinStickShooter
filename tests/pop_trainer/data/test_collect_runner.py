@@ -11,6 +11,8 @@ and no real build is launched here. Two seams are exercised instead:
   closing the env REAPS the stashed proc.
 """
 
+import collections
+
 import numpy as np
 import pytest
 
@@ -96,8 +98,8 @@ def _episode_blobs(states, *, done_last=True):
 
 def _build(**overrides):
     kwargs = dict(
-        player1="aggressive-coverage",
-        player2="opponent-shadower",
+        map_values=None,  # single-map (no rotation) by default
+        pairings=[("aggressive-coverage", "opponent-shadower")],
         map_name="custom1",
         config=R.MAP_CONFIGS["custom1"],
         exe=R.DEFAULT_EXE,
@@ -128,13 +130,20 @@ def test_build_specs_seeds_are_distinct_per_worker():
     assert all(gap >= 1000 for gap in gaps)
 
 
-def test_build_specs_per_worker_out_dir_and_map_ids_and_max_steps():
+def test_build_specs_single_map_plan_has_no_switch_and_intended_zero():
     specs = _build(workers=2, episodes=3, max_steps=800, out_dir="root")
     for worker_id, spec in enumerate(specs):
         assert spec.out_dir.endswith(f"worker_{worker_id}")
         assert spec.max_steps == 800
-        # One episode per map_ids entry; the single Phase-A map (id 0) repeated per episode.
-        assert spec.map_ids == [0, 0, 0]
+        # One EpisodePlan per episode; single-map mode -> no switch, intended int 0.
+        assert len(spec.episode_plan) == 3
+        for plan in spec.episode_plan:
+            assert plan.switch_arena is None
+            assert plan.intended_map_id == 0
+            assert plan.player1 == "aggressive-coverage"
+            assert plan.player2 == "opponent-shadower"
+        # No rotation -> empty map_index (the echo lookup is skipped, the intended int wins).
+        assert spec.map_index == {}
 
 
 def test_build_specs_wires_module_level_factories():
@@ -142,20 +151,22 @@ def test_build_specs_wires_module_level_factories():
     specs = _build()
     for spec in specs:
         assert spec.env_factory is R.env_factory
-        assert spec.player1_factory is R.player1_factory
-        assert spec.player2_factory is R.player2_factory
+        assert spec.agent_pool_factory is R.agent_pool_factory
 
 
-def test_build_specs_extra_carries_launch_params():
+def test_build_specs_extra_carries_launch_params_and_pool():
     specs = _build(workers=1, base_port=50000)
     extra = specs[0].extra
     assert extra["base_port"] == 50000
-    assert extra["player1"] == "aggressive-coverage"
-    assert extra["player2"] == "opponent-shadower"
+    # The pool is the union of the pairing's selectors.
+    assert set(extra["pool"]) == {"aggressive-coverage", "opponent-shadower"}
     assert extra["map"] == "custom1"
     assert extra["exe"] == str(R.DEFAULT_EXE)
+    # Single-map boot config is the --map config.
     assert extra["config"] == str(R.MAP_CONFIGS["custom1"])
     assert tuple(extra["frame_shape"]) == R.FRAME_SHAPE
+    # The maps-list (int -> arena) is carried for the sidecar; single map -> the boot arena.
+    assert extra["maps"] == ["Arenas/custom1.json"]
 
 
 def test_build_specs_clamps_workers_to_max():
@@ -171,7 +182,7 @@ def test_build_specs_clamps_workers_floor_to_one():
 
 def test_build_specs_rejects_unknown_selector():
     with pytest.raises(ValueError, match="unknown agent selector"):
-        _build(player1="not-a-real-agent")
+        _build(pairings=[("not-a-real-agent", "random")])
 
 
 def test_build_specs_rejects_unknown_map():
@@ -182,6 +193,36 @@ def test_build_specs_rejects_unknown_map():
 def test_build_specs_rejects_zero_episodes():
     with pytest.raises(ValueError, match="episodes"):
         _build(episodes=0)
+
+
+def test_build_specs_rejects_empty_pairings():
+    with pytest.raises(ValueError, match="pairing"):
+        _build(pairings=[])
+
+
+# --- build_specs in ROTATION mode --------------------------------------------------------
+
+
+def test_build_specs_rotation_mode_switches_and_indexes():
+    # A rotation over two explicit map configs x one pairing: every plan switches to a rotation
+    # arena, the map_index decodes both, and the boot config is the FIRST rotation map config.
+    from pop_trainer.core import maps as core_maps
+
+    cfgs = [
+        str(core_maps.DEFAULT_MAPS_DIR / "center_block.json"),
+        str(core_maps.DEFAULT_MAPS_DIR / "empty.json"),
+    ]
+    specs = _build(map_values=cfgs, episodes=4, workers=2)
+    # The rotation arenas are the two configs' arena_path values, indexed by rotation order.
+    for spec in specs:
+        assert spec.map_index == {"Arenas/center_block.json": 0, "Arenas/empty.json": 1}
+        assert spec.extra["maps"] == ["Arenas/center_block.json", "Arenas/empty.json"]
+        # The build boots on the obs_pixels-enabled --map config in BOTH modes; switch_arena
+        # rotates the arena (the rotation configs do not enable obs_pixels).
+        assert spec.extra["config"] == str(R.MAP_CONFIGS["custom1"])
+        for plan in spec.episode_plan:
+            assert plan.switch_arena in {"Arenas/center_block.json", "Arenas/empty.json"}
+            assert plan.intended_map_id == spec.map_index[plan.switch_arena]
 
 
 # --- selector surface --------------------------------------------------------------------
@@ -214,56 +255,31 @@ def test_make_agent_builds_the_right_types():
     assert isinstance(R.make_agent("random"), agents.RandomAgent)
 
 
-# --- player1_factory ---------------------------------------------------------------------
+# --- agent_pool_factory ------------------------------------------------------------------
 
 
-def test_player1_factory_builds_the_selected_agent():
-    spec = CollectionSpec(
+def _pool_spec(pool, seed=5):
+    return CollectionSpec(
         worker_id=0,
         out_dir="out",
-        map_ids=[0],
+        episode_plan=[],
         max_steps=1,
-        seed=5,
-        extra={"player1": "random"},
+        seed=seed,
+        extra={"pool": pool},
     )
-    agent = R.player1_factory(spec)
-    assert isinstance(agent, agents.RandomAgent)
-    assert hasattr(agent, "act")
 
 
-def test_player1_factory_seed_is_reproducible():
-    spec = CollectionSpec(
-        worker_id=0, out_dir="out", map_ids=[0], max_steps=1, seed=7, extra={"player1": "random"}
-    )
-    a = R.player1_factory(spec)
-    b = R.player1_factory(spec)
-    np.testing.assert_array_equal(a.act(None), b.act(None))
+def test_agent_pool_factory_builds_one_agent_per_selector():
+    pool = R.agent_pool_factory(_pool_spec(["random", "aggressive-coverage"]))
+    assert set(pool) == {"random", "aggressive-coverage"}
+    assert isinstance(pool["random"], agents.RandomAgent)
+    assert isinstance(pool["aggressive-coverage"], agents.CoverageAgent)
 
 
-# --- player2_factory ---------------------------------------------------------------------
-
-
-def test_player2_factory_builds_the_selected_agent():
-    spec = CollectionSpec(
-        worker_id=0,
-        out_dir="out",
-        map_ids=[0],
-        max_steps=1,
-        seed=5,
-        extra={"player2": "random"},
-    )
-    agent = R.player2_factory(spec)
-    assert isinstance(agent, agents.RandomAgent)
-    assert hasattr(agent, "act")
-
-
-def test_player2_factory_seed_is_reproducible():
-    spec = CollectionSpec(
-        worker_id=0, out_dir="out", map_ids=[0], max_steps=1, seed=7, extra={"player2": "random"}
-    )
-    a = R.player2_factory(spec)
-    b = R.player2_factory(spec)
-    np.testing.assert_array_equal(a.act(None), b.act(None))
+def test_agent_pool_factory_seed_is_reproducible():
+    a = R.agent_pool_factory(_pool_spec(["random"], seed=7))
+    b = R.agent_pool_factory(_pool_spec(["random"], seed=7))
+    np.testing.assert_array_equal(a["random"].act(None), b["random"].act(None))
 
 
 # --- build_env_from_connection (the env-build core, fake transport) ----------------------
@@ -295,20 +311,6 @@ def test_build_env_from_connection_runs_an_episode():
     assert ep.ended_done
     # The frame shape matches what we asked for (the build's rendered frame).
     assert ep.samples[0].frame.shape == R.FRAME_SHAPE
-
-
-def test_player2_factory_builds_the_right_agent_type():
-    # player2 is now a DRIVER-side agent (the env is bare); player2_factory builds it from the
-    # selector, mirroring player1_factory.
-    spec = CollectionSpec(
-        worker_id=0,
-        out_dir="out",
-        map_ids=[0],
-        max_steps=2,
-        seed=0,
-        extra={"player2": "aggressive-coverage"},
-    )
-    assert isinstance(R.player2_factory(spec), agents.CoverageAgent)
 
 
 # --- env_factory wiring + proc reaping (Popen + connect monkeypatched) -------------------
@@ -363,22 +365,24 @@ def _patch_launch(monkeypatch, *, blobs, capture):
 
 
 def _spec(worker_id=2, base_port=50000, max_steps=2):
+    from pop_trainer.data.collect import EpisodePlan
+
     return CollectionSpec(
         worker_id=worker_id,
         out_dir="out",
-        map_ids=[0],
+        episode_plan=[
+            EpisodePlan(switch_arena=None, player1="random", player2="random", intended_map_id=0)
+        ],
         max_steps=max_steps,
         seed=0,
         env_factory=R.env_factory,
-        player1_factory=R.player1_factory,
-        player2_factory=R.player2_factory,
+        agent_pool_factory=R.agent_pool_factory,
         extra={
             "exe": "build.exe",
             "config": "cfg.json",
             "base_port": base_port,
             "frame_shape": R.FRAME_SHAPE,
-            "player1": "random",
-            "player2": "random",
+            "pool": ["random"],
             "map": "custom1",
         },
     )
@@ -430,6 +434,7 @@ def test_run_worker_finally_reaps_the_launch_proc(monkeypatch, tmp_path):
     # The integration of the reaping with collect.run_worker's finally: drive a full worker over
     # the fake build + transport and assert the proc was reaped after run_worker returns.
     from pop_trainer.data import collect
+    from pop_trainer.data.collect import EpisodePlan
 
     capture = {}
     proc, _ = _patch_launch(
@@ -440,19 +445,19 @@ def test_run_worker_finally_reaps_the_launch_proc(monkeypatch, tmp_path):
     spec = CollectionSpec(
         worker_id=0,
         out_dir=str(tmp_path),
-        map_ids=[0],
+        episode_plan=[
+            EpisodePlan(switch_arena=None, player1="random", player2="random", intended_map_id=0)
+        ],
         max_steps=3,
         seed=0,
         env_factory=R.env_factory,
-        player1_factory=R.player1_factory,
-        player2_factory=R.player2_factory,
+        agent_pool_factory=R.agent_pool_factory,
         extra={
             "exe": "build.exe",
             "config": "cfg.json",
             "base_port": 50000,
             "frame_shape": R.FRAME_SHAPE,
-            "player1": "random",
-            "player2": "random",
+            "pool": ["random"],
             "map": "custom1",
         },
     )
@@ -477,3 +482,161 @@ def test_env_factory_reaps_proc_when_connect_fails(monkeypatch):
     with pytest.raises(ConnectionError):
         R.env_factory(_spec())
     assert proc.terminated
+
+
+# --- round-robin scheduler (pure; deterministic; balanced worker spread) ------------------
+
+_ROT = ["m0", "m1", "m2"]  # a 3-map rotation
+_PAIRS = [("a", "b"), ("c", "d")]  # 2 pairings -> a 3x2 = 6-cell grid
+_IDX = {"m0": 0, "m1": 1, "m2": 2}
+
+
+def _cells(plan):
+    """The (map, pairing) cells a plan visited (the schedule as an auditable multiset)."""
+    return [(p.switch_arena, (p.player1, p.player2)) for p in plan]
+
+
+def test_round_robin_plan_is_deterministic():
+    a = R.round_robin_plan(_ROT, _PAIRS, episodes=5, worker_id=1, n_workers=3, map_index=_IDX)
+    b = R.round_robin_plan(_ROT, _PAIRS, episodes=5, worker_id=1, n_workers=3, map_index=_IDX)
+    assert _cells(a) == _cells(b)
+    assert len(a) == 5
+
+
+def test_round_robin_plan_single_worker_covers_the_whole_grid():
+    # One worker over exactly G = 6 episodes visits every (map x pairing) cell once.
+    plan = R.round_robin_plan(_ROT, _PAIRS, episodes=6, worker_id=0, n_workers=1, map_index=_IDX)
+    grid = {(m, pr) for m in _ROT for pr in _PAIRS}
+    assert set(_cells(plan)) == grid
+    assert len(_cells(plan)) == 6  # each cell exactly once
+
+
+def test_round_robin_plan_tags_intended_from_index():
+    plan = R.round_robin_plan(_ROT, _PAIRS, episodes=6, worker_id=0, n_workers=1, map_index=_IDX)
+    for p in plan:
+        assert p.intended_map_id == _IDX[p.switch_arena]
+
+
+def test_round_robin_union_across_workers_is_balanced_and_distinct():
+    # Across N workers the UNION covers the grid evenly and no two workers do the same episode at
+    # the same step (the spread guarantee). G = 6, N = 3, episodes = 4 -> N*episodes = 12 = 2*G,
+    # so every cell appears EXACTLY twice across all workers.
+    n_workers, episodes = 3, 4
+    plans = [
+        R.round_robin_plan(
+            _ROT, _PAIRS, episodes=episodes, worker_id=w, n_workers=n_workers, map_index=_IDX
+        )
+        for w in range(n_workers)
+    ]
+    # Balanced union: each of the 6 cells appears N*episodes/G = 2 times.
+    union = collections.Counter(c for plan in plans for c in _cells(plan))
+    assert len(union) == 6
+    assert set(union.values()) == {2}
+    # Distinct work: at a fixed step i, all workers pick DIFFERENT cells.
+    for i in range(episodes):
+        step_cells = [_cells(plans[w])[i] for w in range(n_workers)]
+        assert len(set(step_cells)) == n_workers
+
+
+def test_round_robin_balanced_when_grid_does_not_divide_evenly():
+    # G = 6, N = 2, episodes = 5 -> N*episodes = 10; cells get floor/ceil of 10/6 = {1, 2}.
+    plans = [
+        R.round_robin_plan(_ROT, _PAIRS, episodes=5, worker_id=w, n_workers=2, map_index=_IDX)
+        for w in range(2)
+    ]
+    union = collections.Counter(c for plan in plans for c in _cells(plan))
+    assert sum(union.values()) == 10
+    assert set(union.values()) <= {1, 2}  # within one of perfectly balanced
+
+
+def test_round_robin_rejects_empty_grid():
+    with pytest.raises(ValueError):
+        R.round_robin_plan([], _PAIRS, episodes=1, worker_id=0, n_workers=1, map_index={})
+
+
+# --- arena-path resolution + rotation + map index ----------------------------------------
+
+
+def test_arena_path_for_config_reads_arena_path():
+    from pop_trainer.core import maps as core_maps
+
+    cfg = core_maps.DEFAULT_MAPS_DIR / "center_block.json"
+    assert R.arena_path_for_config(cfg) == "Arenas/center_block.json"
+
+
+def test_build_rotation_all_maps_yields_ten_arena_paths():
+    rotation = R.build_rotation([])  # the ALL_MAPS sentinel (flag with no value)
+    assert len(rotation) == 10
+    assert all(a.startswith("Arenas/") for a in rotation)
+    # Sorted by config path -> a stable, deterministic order.
+    assert rotation == sorted(rotation, key=lambda a: a)  # the configs are sorted by name
+
+
+def test_build_rotation_none_is_single_map():
+    assert R.build_rotation(None) == []
+
+
+def test_build_map_index_is_position_in_rotation():
+    idx = R.build_map_index(["Arenas/a.json", "Arenas/b.json", "Arenas/c.json"])
+    assert idx == {"Arenas/a.json": 0, "Arenas/b.json": 1, "Arenas/c.json": 2}
+
+
+def test_build_map_index_rejects_duplicates():
+    with pytest.raises(ValueError, match="duplicate"):
+        R.build_map_index(["Arenas/a.json", "Arenas/a.json"])
+
+
+# --- pairing parsing ---------------------------------------------------------------------
+
+
+def test_parse_pairing_valid():
+    assert R.parse_pairing("aggressive-coverage:random") == ("aggressive-coverage", "random")
+
+
+def test_parse_pairing_rejects_malformed():
+    with pytest.raises(ValueError, match="pairing"):
+        R.parse_pairing("just-one")
+
+
+def test_parse_pairing_rejects_unknown_selector():
+    with pytest.raises(ValueError, match="unknown agent selector"):
+        R.parse_pairing("random:not-a-real-agent")
+
+
+def test_default_pairings_cover_coverage_vs_each_other_and_random():
+    selectors = {s for pairing in R.DEFAULT_PAIRINGS for s in pairing}
+    assert "random" in selectors
+    # The coverage family is all present in the default mix.
+    assert {"aggressive-coverage", "opponent-shadower", "wall-hugger"} <= selectors
+
+
+# --- maps-list sidecar round-trip --------------------------------------------------------
+
+
+def test_maps_sidecar_round_trips(tmp_path):
+    rotation = ["Arenas/center_block.json", "Arenas/empty.json", "Arenas/four_pillars.json"]
+    path = R.write_maps_sidecar(tmp_path, rotation)
+    assert path.name == R.MAPS_SIDECAR_NAME
+    decoded = R.read_maps_sidecar(path)
+    assert decoded == rotation
+    # The int -> path mapping is reversible: maps[i] decodes int i back to the arena path.
+    for i, arena in enumerate(rotation):
+        assert decoded[i] == arena
+
+
+def test_maps_sidecar_is_strict_json(tmp_path):
+    import json
+
+    path = R.write_maps_sidecar(tmp_path, ["Arenas/empty.json"])
+    payload = json.loads(path.read_text(encoding="utf-8"))  # strict json.loads must accept it
+    assert payload["maps"] == ["Arenas/empty.json"]
+    assert payload["schema_version"] == 1
+
+
+def test_read_maps_sidecar_rejects_bad_payload(tmp_path):
+    import json
+
+    bad = tmp_path / "maps.json"
+    bad.write_text(json.dumps({"not_maps": []}), encoding="utf-8")
+    with pytest.raises(ValueError, match="maps"):
+        R.read_maps_sidecar(bad)
