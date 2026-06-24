@@ -85,7 +85,7 @@ Sequencing recommendation: **Step 1 first** (proof of life on 2019.4) is cheap, 
 
 ## Addendum (2026-06-17): board session 02 outcome + pixel-observation constraint
 
-**Decisions:** architecture **deferred to the M1 gate**; M0 sequencing = **upgrade to Unity 6 first**; M0 plan **approved**, Game & sim squad started. See `unity6-upgrade-runbook.md`.
+**Decisions:** architecture **deferred to the M1 gate**; M0 sequencing = **upgrade to Unity 6 first**; M0 plan **approved**, Game & sim squad started.
 
 **New CTO constraint — agents observe pixels, not state.** A 2021 state-based MLP "didn't work"; a CNN over a small RGB grid did. Verified in code: this grid is **synthesized in Python from the 52-float state** (`tank_env.py` `draw_state`), NOT a Unity camera render (`GameController.cs` has no ScreenCapture/RenderTexture). The grid (~36×60×3 uint8) encodes self in the R channel, opponent in B, walls in G, with intensity distinguishing position/velocity/aim/bullets. Consequences:
 - The headless-on-GCP **GO** verdict still holds — the R2 "visual observations force Xvfb" caveat was about *camera frames*, which this is not.

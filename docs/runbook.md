@@ -41,10 +41,8 @@ Output goes to `build/TankTwinStickShooter.exe` (git-ignored). `StreamingAssets`
 (`config.json` + `Arenas/*.json` + the demo config) ships into the player automatically.
 `BuildScript` exits non-zero on failure so the batchmode caller can detect it.
 
-> The editor upgrade itself is a one-time GUI step — see the
-> [Unity 6 upgrade runbook](unity6-upgrade-runbook.md). For how the built game runs (it is a
-> **Python-clocked simulator** with no standalone human mode), see
-> [game architecture](game-architecture.md).
+> For how the built game runs (it is a **Python-clocked simulator** with no standalone human
+> mode), see [game architecture](game-architecture.md).
 
 ## 3. Run the demo (live build + two agents)
 

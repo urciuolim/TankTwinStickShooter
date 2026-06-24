@@ -61,8 +61,11 @@ internal — it only shares `core`'s place as a leaf the future `pretraining` / 
 - [Architecture](architecture.md) — the cross-component class-to-class interaction map.
 - [Runbook](runbook.md) — clone → `uv sync` → build the Unity game → run the demo / collection.
 
+## How this gets built
+
+- [Agent team](agent-team.md) — how the research / engineering / platform teams (and the Director, under the CTO) build, gate, and document this repo.
+
 ## Unity side (still relevant)
 
 - [Game architecture](game-architecture.md) — how the Unity build actually runs (Python-clocked simulator, no standalone human mode).
 - [Input controls](input-controls.md) — the New Input System wiring for human tanks.
-- [Unity 6 upgrade runbook](unity6-upgrade-runbook.md) — the editor upgrade procedure.
