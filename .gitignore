@@ -99,3 +99,7 @@ __pycache__/
 # Unity headless test outputs
 /editmode-results.xml
 /editmode-run.log
+
+# research-lane byproducts
+.scratch/
+cleanrl/
