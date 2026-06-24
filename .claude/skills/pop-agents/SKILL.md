@@ -27,6 +27,37 @@ exposes it (`getattr`/`hasattr` — never required); the demo / collection do th
 
 **Contains:**
 - `RandomAgent` — uniform random actions (seeded). The map-agnostic baseline; KEPT.
+- `HumanAgent` (`agents/human_agent.py`) — a KEYBOARD-driven `core.Agent` for live human play
+  (human-vs-human, two players on ONE keyboard). Contract:
+  - Implements `core.Agent` (`act(obs) -> action`); **`act` IGNORES `obs`** — the action comes
+    from the keyboard, not the observation. Returns the env's 5-float
+    `[move_x, move_y, aim_x, aim_y, fire]` (move/aim in `[-1, 1]`, fire 0/1).
+  - Constructed with a **`KeyMapping`** (this player's move/aim/fire keys) and a SHARED
+    pressed-key source (a keyboard-state object both players read). `act` reads the CURRENT
+    pressed-key set and maps THIS player's keys: `move_x = right−left`, `move_y = up−down`,
+    same for aim; `fire = 1.0` iff the fire key is down. Diagonals may leave `(1,1)`
+    un-normalized — the wire/`validate_action` coerces to `[-1, 1]`.
+  - **Two players, ONE listener:** a SINGLE shared keyboard listener tracks the pressed-key
+    set; TWO `HumanAgent`s (P1 keymap, P2 keymap) read the SAME state object. The demo builds
+    one listener and both agents share it (start on play, stop on teardown).
+  - **`pynput` is an OPTIONAL, LAZY dependency** (pyproject `[project.optional-dependencies]`
+    extra `human`; pin `pynput>=1.8,<2`). Imported INSIDE the listener/HumanAgent constructor,
+    NEVER at module top — so `import pop_trainer.agents` and `agents/human_agent` stay
+    importable core-only WITHOUT pynput. Constructing the live listener (or a HumanAgent that
+    needs it) without pynput raises a CLEAR, actionable error naming the `[human]` extra.
+  - **Numpad-by-vk (load-bearing):** the P2 numpad keys must be detected by VIRTUAL-KEY CODE
+    (`pynput` `KeyCode.vk`), NOT by character — so numpad-8/4/5/6 work regardless of Num Lock
+    (with Num Lock OFF a numpad key arrives as an arrow/`Key`, not a digit char). Map the numpad
+    set by `.vk`. This is the seam that MUST be fake-tested (inject a pressed-key set, no
+    hardware). Windows VKs: NUMPAD4=100, NUMPAD5=101, NUMPAD6=102, NUMPAD8=104; numpad-Enter
+    shares VK_RETURN (13) with main Enter on Windows and is NOT separable via pynput's public
+    API — treat numpad-Enter == Enter (`Key.enter`) for P2 fire, and make the fire-key match
+    configurable so the keymap, not hard-coded logic, decides it.
+  - **Boundary:** imports `core` (Agent + action contract) + `pynput` (LAZY) ONLY. **NO torch.**
+    The pressed-key→action MAPPING is a PURE function of (keymap, pressed-key set) and is unit
+    tested without any listener/hardware. `agents/__init__` must stay importable without pynput;
+    do NOT import `human_agent` eagerly in `agents/__init__` if that would force a pynput import
+    (the lazy guard inside the module is the safeguard either way).
 - **One coverage family** — occupancy-biased coverage (the design is load-bearing, do NOT
   re-derive; it comes from the 2026 research report):
   - Maintain a **visit-count grid** over the FREE cells.
