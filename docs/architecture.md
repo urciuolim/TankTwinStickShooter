@@ -39,7 +39,7 @@ graph TD
     end
 
     subgraph agents["agents (model-free policies)"]
-        AgentImpls["Agent implementations<br/>(redesign in flight)"]
+        AgentImpls["CoverageAgent (+ presets) /<br/>AimFireSchedule / RandomAgent /<br/>measure_coverage"]
     end
 
     subgraph env["env"]
@@ -68,6 +68,12 @@ graph TD
     %% agents wiring
     AgentImpls --> AgentProto
     AgentImpls --> State
+    AgentImpls --> Protocol
+
+    %% map hook: WallLayout reaches a map-aware agent via the optional set_map hook
+    TankEnv -.->|set_map player2| AgentImpls
+    Collect -.->|set_map player1| AgentImpls
+    Demo -.->|set_map player1| AgentImpls
 
     %% models wiring
     Encoder -.->|leaf, no internal import| core
@@ -97,7 +103,11 @@ graph TD
   `flip_frame_perspective`): `TankEnv` flips perspective to feed the injected player2, and agents
   read `PLAYER_1` out of whatever (possibly flipped) view they're handed.
 - **The wall-message seam** flows `WallMessage` (Unity) → `protocol.parse_walls_message` →
-  `WallLayout` → `TankEnv.current_map` → `info["map"]`. See [core](components/core.md#the-wall-message--protocol-seam-walllayout--infomap).
+  `WallLayout` → `TankEnv.current_map` → `info["map"]`, and from there into a map-aware agent via
+  the OPTIONAL `set_map` hook: `TankEnv` notifies `player2` directly, while `data.collect` /
+  `demo` call `set_map` on `player1` (all `getattr`-probed). A [`CoverageAgent`](components/agents.md)
+  rebuilds its coverage grid from the layout; `RandomAgent` does not implement the hook. See
+  [core](components/core.md#the-wall-message--protocol-seam-walllayout--infomap).
 - **`models` is detached** from the live loop today — it's the shared vision backbone the
   future `pretraining` / `rl` will consume, and the deployable ONNX artifact.
 

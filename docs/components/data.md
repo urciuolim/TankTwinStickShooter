@@ -31,7 +31,10 @@ package is named `data` (not `datasets` — that name collides with the git-igno
 - [`data.collect`](../../src/pop_trainer/data/collect.py) — the **collection driver**.
   [`run_episode`](../../src/pop_trainer/data/collect.py) is the pure step loop over an injected
   `env` (drives `player1`; the env owns `player2`), capturing the current `(frame, state)`
-  paired with both actions from `info`. [`collect_to_shards`](../../src/pop_trainer/data/collect.py)
+  paired with both actions from `info`. After `env.reset` it hands the tracked map to a map-aware
+  `player1` via the `_maybe_set_map` helper — `getattr`-probing `player1.set_map(info["map"])`,
+  a no-op when `player1` is map-agnostic or the layout is `None` (`collect.py:119`); the env
+  handles `player2`'s map itself. [`collect_to_shards`](../../src/pop_trainer/data/collect.py)
   wraps episodes into shards. [`CollectionSpec`](../../src/pop_trainer/data/collect.py) /
   [`run_worker`](../../src/pop_trainer/data/collect.py) /
   [`collect_parallel`](../../src/pop_trainer/data/collect.py) are the **spawn-based** (never
@@ -57,6 +60,11 @@ On-disk `.npz` shard artifacts + a dataset index — **not** via imports:
 The data-generation arm. It pairs two [agents](agents.md) inside a [`TankEnv`](env.md), runs
 episodes, and writes shards to disk — producing the supervised-pretraining corpus whose
 `(frame, state)` rows are byte-for-byte the observations the policy will later see.
+
+> **Episode length matters for coverage.** The coverage family fully sweeps a map only by
+> ~800 decisions on the live engine (see the [agents operational note](agents.md#operational-note--coverage-is-step-budget-dependent-on-the-real-engine)),
+> so collection episodes must run long enough to cover the map — short episodes record only a
+> partial traversal.
 
 ```mermaid
 graph LR

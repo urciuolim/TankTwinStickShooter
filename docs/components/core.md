@@ -29,9 +29,14 @@ from here instead of re-hardcoding them. All JSON is strict.
   `resolve_map_rotation` turns a `--maps` flag value into a list of map-config paths.
 - [`core.agent`](../../src/pop_trainer/core/agent.py) — the **Agent Protocol** (`act(obs) →
   action`), type-only. [`Agent`](../../src/pop_trainer/core/agent.py) is `@runtime_checkable`
-  (declares only `act`); [`StatefulAgent`](../../src/pop_trainer/core/agent.py) adds an optional
-  `reset`. It lives here so `env` can be typed against an agent without importing `agents` or
-  torch.
+  (declares only `act`); [`StatefulAgent`](../../src/pop_trainer/core/agent.py) adds the OPTIONAL
+  `reset(*, seed=None)` and the **`set_map(layout)` map hook** — how a map-aware agent receives the
+  static `WallLayout` once per episode (`agent.py:80`). Those optional methods are consumed by
+  probing with `getattr`/`hasattr` (never `isinstance`): folding either into the runtime-checkable
+  surface would wrongly reject a valid `act`-only agent, so they live in the separate static-typing
+  Protocol. It lives here so `env` can be
+  typed against an agent without importing `agents` or torch. See [agents](agents.md) for who
+  implements `set_map`.
 
 ## The wall-message / protocol seam (`WallLayout` → `info["map"]`)
 

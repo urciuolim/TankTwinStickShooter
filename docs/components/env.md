@@ -39,8 +39,14 @@ the self-play path.
 During the handshake the env reads the optional one-time `{"type": "walls", ...}` message
 (routed by its `"type"` tag), parses it via `core.protocol.parse_walls_message`, and stores the
 [`WallLayout`](core.md) on `self.current_map` — surfaced in both reset and step `info` as
-`info["map"]`. It stays `None` when no arena is configured; the env never re-parses arena JSON.
-See the [core](core.md) seam writeup for the full Unity → Python path.
+`info["map"]` (`tank_env.py:299`). It stays `None` when no arena is configured; the env never
+re-parses arena JSON. See the [core](core.md) seam writeup for the full Unity → Python path.
+
+When a walls message is tracked the env also **notifies the injected `player2`**: `_notify_player2_map`
+probes for `player2.set_map` via `getattr` and calls it with `self.current_map`, so a map-aware
+[agent](agents.md) (e.g. a `CoverageAgent`) rebuilds its coverage grid (`tank_env.py:446`). A
+map-agnostic player2 (or the built-in random fallback) does not expose the hook and is skipped —
+the env stays `agents`-free and the hook is never required.
 
 ## Episode boundaries
 

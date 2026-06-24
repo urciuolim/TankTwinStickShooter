@@ -21,8 +21,11 @@ All in [`demo.py`](../../src/pop_trainer/demo.py):
   `player1` off `info["state"]`; the env owns and acts `player2`. Unit-testable against a
   fake-backed `TankEnv` — no subprocess, no live socket.
 - [`AGENT_SELECTORS`](../../src/pop_trainer/demo.py) / `make_agent` — the `--player1` /
-  `--player2` selector surface (e.g. `aim-at-player2`, `explorer`, `spray`, `perimeter`,
-  `random`). Default pairing: `player1 = aim-at-player2` vs `player2 = explorer`.
+  `--player2` selector surface. Four names (`demo.py:77`): `aggressive-coverage`, `wall-hugger`,
+  `opponent-shadower` (the three [`CoverageAgent`](agents.md) presets), and `random` (the
+  map-agnostic baseline). Default pairing: `player1 = aggressive-coverage` (sweeps the arena,
+  aim-sweeps + fires) vs `player2 = opponent-shadower` (the same coverage movement but the aim
+  tracks player1) — two visibly different policies (`demo.py:84`).
 
 ## Pixels must be on
 

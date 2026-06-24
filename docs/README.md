@@ -24,7 +24,7 @@ graph TD
     core["core<br/>contract layer (dep-free root)"]
     models["models<br/>vision encoders (torch)"]
     env["env<br/>TankEnv gym wrapper"]
-    agents["agents<br/>scripted policies"]
+    agents["agents<br/>map-aware coverage policies"]
     data["data<br/>dataset pipeline"]
     demo["demo<br/>runnable entry point"]
     unity["Unity sim<br/>(TCP-JSON + pixel frames)"]
@@ -54,7 +54,7 @@ internal — it only shares `core`'s place as a leaf the future `pretraining` / 
 | [core](components/core.md) | The dependency-free contract: state schema, wire protocol, configs, maps, Agent Protocol. |
 | [models](components/models.md) | Composable, ablation-ready vision encoders + Sentis-clean ONNX export (torch). |
 | [env](components/env.md) | `TankEnv` — the Gymnasium wrapper over the Unity socket; the simulator swap point. |
-| [agents](components/agents.md) | The model-free decision-makers that fill `player1` / `player2`. **(stub — redesign in flight)** |
+| [agents](components/agents.md) | The model-free decision-makers: the map-aware `CoverageAgent` family (+ presets) + the `RandomAgent` baseline + the coverage-measurement harness. |
 | [data](components/data.md) | The dataset pipeline: collect `(frame, state, action)` samples → shards → map-aware splits. |
 | [demo](components/demo.md) | `python -m pop_trainer.demo` — launch the live build and watch two agents play. |
 

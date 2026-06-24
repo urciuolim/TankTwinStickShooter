@@ -55,7 +55,7 @@ uv run python -m pop_trainer.demo
 This launches `build/TankTwinStickShooter.exe` **windowed** with
 `Assets/StreamingAssets/demo_config.json` (which enables `obs_pixels` at 640×360 — required,
 since the env always reads a pixel frame each step), connects over TCP, runs one episode of
-`player1 = aim-at-player2` vs `player2 = explorer`, prints a trace, and tears down.
+`player1 = aggressive-coverage` vs `player2 = opponent-shadower`, prints a trace, and tears down.
 
 See the full flag surface:
 
@@ -65,9 +65,8 @@ uv run python -m pop_trainer.demo --help
 
 Useful flags (defaults shown): `--exe build/TankTwinStickShooter.exe`,
 `--config Assets/StreamingAssets/demo_config.json`, `--port 50000`, `--player1` / `--player2`
-(any of: `aim-at-player2`, `aim-sweep`, `constant`, `explorer`, `idle`, `perimeter`, `random`,
-`scripted-cycle`, `spray`), `--max-steps 600`, `--seed 0`. The demo exits `2` if the build exe
-or config is missing.
+(any of: `aggressive-coverage`, `wall-hugger`, `opponent-shadower`, `random`), `--max-steps 600`,
+`--seed 0`. The demo exits `2` if the build exe or config is missing.
 
 ## 4. Collect a dataset (programmatic)
 
@@ -77,6 +76,32 @@ There is **no collection CLI entry point yet** — data collection is driven thr
 [`collect_parallel`](../src/pop_trainer/data/collect.py)) with caller-supplied env + agent
 factories, writing `.npz` shards to disk. See the [data component page](components/data.md) for
 the shape of the pipeline. (A thin CLI lands with the agent redesign.)
+
+> **Episode budget.** The coverage family fully sweeps a map only by ~800 decisions on the live
+> engine, so set the collection `max_steps` long enough to cover the map (see the
+> [agents operational note](components/agents.md#operational-note--coverage-is-step-budget-dependent-on-the-real-engine)).
+
+## 5. Validate coverage (no Unity required)
+
+The [`measure_coverage`](../src/pop_trainer/agents/coverage_metrics.py) harness runs a
+deterministic kinematic rollout of an agent on a `WallLayout` and reports coverage-fraction +
+occupancy-entropy — the in-tree check that the coverage family beats `RandomAgent`. No live build
+needed:
+
+```bash
+uv run python -c "
+from pop_trainer.core.protocol import WallLayout, WallDims
+from pop_trainer.agents import CoverageAgent, RandomAgent, measure_coverage
+layout = WallLayout(map_id='open', tile_id=0, dims=WallDims(min_x=-6, max_x=5, min_y=-6, max_y=5), columns={})
+cov = measure_coverage(CoverageAgent.aggressive(seed=0), layout)
+rnd = measure_coverage(RandomAgent(seed=0), layout)
+print(f'coverage  cov={cov.coverage_fraction:.2f} entropy={cov.occupancy_entropy:.2f}')
+print(f'random    cov={rnd.coverage_fraction:.2f} entropy={rnd.occupancy_entropy:.2f}')
+"
+```
+
+On this 12×12 open map the coverage agent reaches `cov≈0.85` vs the baseline `cov≈0.33`. (The
+kinematic harness is optimistic vs the live engine — see the operational note above.)
 
 ---
 [← back to index](README.md)
