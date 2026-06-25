@@ -55,6 +55,7 @@ import json
 import subprocess
 import sys
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -66,7 +67,7 @@ from pop_trainer.core import launch
 from pop_trainer.core import maps as core_maps
 from pop_trainer.core.config import EnvConfig
 from pop_trainer.core.protocol import Connection
-from pop_trainer.data import collect
+from pop_trainer.data import collect, readers
 from pop_trainer.data.collect import CollectionSpec, EpisodePlan, collect_parallel
 from pop_trainer.env.tank_env import TankEnv
 
@@ -93,6 +94,8 @@ __all__ = [
     "agent_pool_factory",
     "env_factory",
     "build_specs",
+    "CollectionSummary",
+    "summarize_collection",
     "main",
 ]
 
@@ -587,6 +590,101 @@ def build_specs(
     return specs
 
 
+# --- end-of-run summary (PURE counting + format-only assembly) -------------------------------
+
+
+@dataclass(frozen=True)
+class CollectionSummary:
+    """A scannable end-of-run rollup of what collection wrote (counts only, no filenames).
+
+    * ``total_shards`` / ``total_samples`` — run-wide totals.
+    * ``worker_samples`` — ``[(worker_id, samples)]`` in worker order (a worker that wrote nothing
+      is ``(id, 0)``).
+    * ``map_samples`` — ``[(map_id, arena_path, samples)]`` aligned to the ``maps`` list, ONE row
+      per arena including arenas with zero samples (shown as 0).
+    """
+
+    total_shards: int
+    total_samples: int
+    worker_samples: list[tuple[int, int]]
+    map_samples: list[tuple[int, str, int]]
+
+
+def summarize_collection(
+    worker_map_ids: Sequence[tuple[int, np.ndarray]],
+    maps: Sequence[str],
+    *,
+    total_shards: int,
+) -> CollectionSummary:
+    """PURE counting (no disk I/O): per-worker + per-map sample counts from per-sample ``map_ids``.
+
+    ``worker_map_ids`` is ``[(worker_id, map_ids)]`` where ``map_ids`` is that worker's per-sample
+    int group-key array (the :attr:`readers.DatasetIndex.map_ids` slice). ``maps`` is the maps-list
+    sidecar (``maps[i]`` is the arena path for int ``i``). ``total_shards`` is known from the worker
+    results. Returns a :class:`CollectionSummary` whose ``map_samples`` has ONE row per entry in
+    ``maps`` (arenas with no samples reported as 0), so the per-map table is complete and aligned to
+    the maps list. Map ids outside ``range(len(maps))`` are counted into the totals but omitted from
+    the per-map table (a defensive guard; the on-disk ints are always valid indices).
+    """
+    per_map: dict[int, int] = {}
+    worker_samples: list[tuple[int, int]] = []
+    total_samples = 0
+    for worker_id, map_ids in worker_map_ids:
+        ids = np.asarray(map_ids)
+        n = int(ids.shape[0])
+        worker_samples.append((worker_id, n))
+        total_samples += n
+        if n:
+            values, counts = np.unique(ids, return_counts=True)
+            for value, count in zip(values, counts, strict=True):
+                per_map[int(value)] = per_map.get(int(value), 0) + int(count)
+
+    map_samples = [(i, arena, per_map.get(i, 0)) for i, arena in enumerate(maps)]
+    return CollectionSummary(
+        total_shards=int(total_shards),
+        total_samples=total_samples,
+        worker_samples=worker_samples,
+        map_samples=map_samples,
+    )
+
+
+def _read_worker_map_ids(out_dir: str | Path) -> np.ndarray:
+    """Per-sample ``map_ids`` written into a worker's out dir (empty array if it wrote no shards).
+
+    Thin disk wrapper over :func:`readers.build_index`, which scans the worker dir's ``shard_*.npz``
+    (the runner's ``shard_w{id}_*`` prefix matches that glob) reading only the cheap per-sample
+    arrays. A worker that wrote nothing has no shards and ``build_index`` raises ``ValueError`` — we
+    treat that as zero samples so the summary never crashes on an empty worker.
+    """
+    try:
+        return readers.build_index(out_dir).map_ids
+    except ValueError:
+        return np.empty(0, dtype=np.int32)
+
+
+def _format_summary(
+    summary: CollectionSummary,
+    out_dir: str | Path,
+    worker_shards: dict[int, int],
+) -> list[str]:
+    """Render a :class:`CollectionSummary` into the concise multi-line printout (format only).
+
+    ``worker_shards`` maps ``worker_id -> num_shards`` (from the worker results) so each terse
+    per-worker line reports both its shard and sample counts. NO filenames are printed.
+    """
+    lines = [
+        f"done: {summary.total_shards} shards, {summary.total_samples:,} samples, "
+        f"{len(summary.worker_samples)} workers -> {out_dir}"
+    ]
+    lines.extend(
+        f"worker {worker_id}: {worker_shards.get(worker_id, 0)} shards, {samples:,} samples"
+        for worker_id, samples in summary.worker_samples
+    )
+    for map_id, arena, samples in summary.map_samples:
+        lines.append(f"map {map_id}  {arena}  {samples:,}")
+    return lines
+
+
 # --- CLI -------------------------------------------------------------------------------------
 
 
@@ -681,7 +779,9 @@ def main(argv: list[str] | None = None) -> int:
     per-worker round-robin specs, runs the PRE-FLIGHT MEMORY GUARD (always printing the peak-buffer
     estimate at startup; aborting before launch when the estimate blows the budget unless
     ``--allow-oversized``), writes the maps-list sidecar (int -> arena path) per worker out dir AND
-    at the run root, runs collection in parallel (spawn), and prints a short per-worker result line.
+    at the run root, runs collection in parallel (spawn), and prints a concise end-of-run summary
+    (an aggregate line, a terse shard+sample count per worker, and a per-map sample-count table —
+    no filename dumps; counts derived by :func:`summarize_collection` over each worker's map_ids).
     Returns ``0`` on success, ``2`` on a missing build / config OR a pre-flight memory abort.
     """
     args = _parse_args(argv)
@@ -753,15 +853,20 @@ def main(argv: list[str] | None = None) -> int:
         f"({len(specs)} worker(s), {args.episodes} episode(s) each, max_steps={args.max_steps})"
     )
     results = collect_parallel(specs)
-    for result in results:
-        # The port a worker used is base_port + worker_id (env_factory records it into the
-        # worker's own spec.extra, but under spawn that mutation stays in the child; recompute it
-        # here so the parent's summary is correct without relying on the child's mutation).
-        port = args.base_port + result["worker_id"]
-        print(
-            f"worker {result['worker_id']}: port={port} "
-            f"shards={result['num_shards']} files={result['shards']}"
-        )
+
+    # Concise end-of-run summary: read back each worker's per-sample map_ids (cheap — only the small
+    # per-sample arrays, not frame bytes) to derive sample + per-map counts, then count PURELY via
+    # summarize_collection. The worker result dict carries only shards/num_shards, so the sample and
+    # per-map numbers come from build_index over each worker dir (empty workers read as 0 samples).
+    out_dir_by_worker = {spec.worker_id: spec.out_dir for spec in specs}
+    worker_shards = {r["worker_id"]: r["num_shards"] for r in results}
+    total_shards = sum(r["num_shards"] for r in results)
+    worker_map_ids = [
+        (r["worker_id"], _read_worker_map_ids(out_dir_by_worker[r["worker_id"]])) for r in results
+    ]
+    summary = summarize_collection(worker_map_ids, sidecar_maps, total_shards=total_shards)
+    for line in _format_summary(summary, args.out_dir, worker_shards):
+        print(line)
     return 0
 
 

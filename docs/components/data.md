@@ -92,8 +92,18 @@ package is named `data` (not `datasets` — that name collides with the git-igno
   [`main`](../../src/pop_trainer/data/collect_runner.py) parses the flags, resolves the boot
   `--map` config to the obs_pixels-enabled `demo_config.json`, runs the **pre-flight memory guard**
   (the new `--shard-size` / `--allow-oversized` flags, see [Memory safety](#memory-safety-the-pre-flight-guard)),
-  writes the `maps.json` sidecar, and drives `collect_parallel`. See the
-  [runbook](../runbook.md#4-collect-a-dataset-cli) for the flags.
+  writes the `maps.json` sidecar, drives `collect_parallel`, and prints a **concise end-of-run
+  summary** (an aggregate line, a terse shard+sample count per worker, and a per-map sample-count
+  table — counts only, no filename dumps). See the
+  [runbook](../runbook.md#4-collect-a-dataset-cli) for the flags + the printout.
+- [`summarize_collection(worker_map_ids, maps, *, total_shards)`](../../src/pop_trainer/data/collect_runner.py)
+  / [`CollectionSummary`](../../src/pop_trainer/data/collect_runner.py)
+  (`collect_runner.py:596-648`) — the **pure** (no disk I/O) end-of-run counter: it rolls up
+  per-worker + per-map sample counts from each worker's per-sample `map_ids`, returning a frozen
+  `CollectionSummary` (`total_shards` / `total_samples` / `worker_samples` / `map_samples`, with ONE
+  `map_samples` row per arena in the `maps` sidecar — arenas with zero samples shown as `0`). `main`
+  feeds it the per-worker `map_ids` read back through `readers.build_index` (a thin disk wrapper,
+  `collect_runner.py:651-662`) and renders it with a format-only helper (`collect_runner.py:665-685`).
 
 ## The rotation scheduler + map tagging
 

@@ -197,6 +197,22 @@ when `stderr` is **not** a TTY (`disable=not sys.stderr.isatty()`, `collect.py:5
 captured / piped run emits **zero** progress bytes, so logs stay clean. The bar is a pure
 observability side-channel — it does not affect a single shard byte.
 
+### End-of-run summary
+
+After collection finishes (the bar closes), `main` prints a **concise summary** — counts only, no
+filename dumps (`collect_runner.py:856-869`). Three parts:
+
+1. an **aggregate** line —
+   `done: <N> shards, <N,NNN> samples, <K> workers -> <out-dir>`;
+2. one **terse per-worker** line — `worker <id>: <n> shards, <n> samples` (no filenames);
+3. a **per-map sample-count table** aligned to the `maps.json` sidecar — one row
+   `map <id>  <arena>  <count>` per arena, **including arenas that got zero samples**.
+
+The sample + per-map counts come from a **pure** counter
+([`summarize_collection`](../src/pop_trainer/data/collect_runner.py), `collect_runner.py:613-648`)
+over each worker's per-sample `map_ids` (read back via `readers.build_index`); the worker result
+dict supplies only the shard counts.
+
 ### The `maps.json` sidecar (reversible map ids)
 
 On-disk `map_ids` stay `int32`; `main` writes a **`maps.json`** sidecar (constant

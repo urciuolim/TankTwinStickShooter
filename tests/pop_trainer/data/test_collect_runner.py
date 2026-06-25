@@ -640,3 +640,62 @@ def test_read_maps_sidecar_rejects_bad_payload(tmp_path):
     bad.write_text(json.dumps({"not_maps": []}), encoding="utf-8")
     with pytest.raises(ValueError, match="maps"):
         R.read_maps_sidecar(bad)
+
+
+# --- summarize_collection (PURE end-of-run counting; no disk I/O) -------------------------
+
+_SUMMARY_MAPS = ["Arenas/center_block.json", "Arenas/empty.json", "Arenas/four_pillars.json"]
+
+
+def test_summarize_collection_totals_and_per_worker_counts():
+    # Two workers; map 2 (four_pillars) gets ZERO samples from anyone -> a zero row in the table.
+    worker_map_ids = [
+        (0, np.array([0, 0, 1], dtype=np.int32)),  # 3 samples
+        (1, np.array([0, 1, 1, 1], dtype=np.int32)),  # 4 samples
+    ]
+    s = R.summarize_collection(worker_map_ids, _SUMMARY_MAPS, total_shards=11)
+    assert s.total_shards == 11
+    assert s.total_samples == 7
+    assert s.worker_samples == [(0, 3), (1, 4)]
+
+
+def test_summarize_collection_per_map_aligned_to_maps_with_zero_row():
+    worker_map_ids = [
+        (0, np.array([0, 0, 1], dtype=np.int32)),
+        (1, np.array([0, 1, 1, 1], dtype=np.int32)),
+    ]
+    s = R.summarize_collection(worker_map_ids, _SUMMARY_MAPS, total_shards=11)
+    # ONE row per arena in the maps list, in maps order, including the zero-sample map.
+    assert s.map_samples == [
+        (0, "Arenas/center_block.json", 3),  # 2 from w0 + 1 from w1
+        (1, "Arenas/empty.json", 4),  # 1 from w0 + 3 from w1
+        (2, "Arenas/four_pillars.json", 0),  # never collected -> 0, still shown
+    ]
+    # The per-map table covers every map in the list (no map dropped, none invented).
+    assert [m for _, m, _ in s.map_samples] == _SUMMARY_MAPS
+    # Per-map counts reconcile with the grand total.
+    assert sum(n for _, _, n in s.map_samples) == s.total_samples
+
+
+def test_summarize_collection_worker_with_no_samples_is_zero_not_a_crash():
+    # A worker that wrote nothing contributes an empty map_ids array -> (id, 0), no exception.
+    worker_map_ids = [
+        (0, np.array([0, 1, 2], dtype=np.int32)),
+        (1, np.empty(0, dtype=np.int32)),  # wrote no shards
+    ]
+    s = R.summarize_collection(worker_map_ids, _SUMMARY_MAPS, total_shards=3)
+    assert s.worker_samples == [(0, 3), (1, 0)]
+    assert s.total_samples == 3
+    assert s.map_samples == [
+        (0, "Arenas/center_block.json", 1),
+        (1, "Arenas/empty.json", 1),
+        (2, "Arenas/four_pillars.json", 1),
+    ]
+
+
+def test_summarize_collection_single_map_run():
+    # Single-map mode: one arena, all samples tagged int 0.
+    worker_map_ids = [(0, np.zeros(5, dtype=np.int32)), (1, np.zeros(2, dtype=np.int32))]
+    s = R.summarize_collection(worker_map_ids, ["Arenas/custom1.json"], total_shards=2)
+    assert s.total_samples == 7
+    assert s.map_samples == [(0, "Arenas/custom1.json", 7)]
