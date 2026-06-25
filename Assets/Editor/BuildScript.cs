@@ -15,6 +15,7 @@ using UnityEngine;
 public static class BuildScript
 {
     private const string ProductExe = "TankTwinStickShooter.exe";
+    private const string ProductApp = "TankTwinStickShooter.app";
 
     [MenuItem("Build/Build Windows (Standalone)")]
     public static void BuildWindows()
@@ -42,6 +43,51 @@ public static class BuildScript
             scenes = scenes,
             locationPathName = locationPathName,
             target = BuildTarget.StandaloneWindows64,
+            targetGroup = BuildTargetGroup.Standalone,
+            options = BuildOptions.None
+        };
+
+        var report = BuildPipeline.BuildPlayer(options);
+        var summary = report.summary;
+
+        Debug.Log("BuildScript: result=" + summary.result
+            + " totalErrors=" + summary.totalErrors
+            + " sizeBytes=" + summary.totalSize
+            + " output=" + summary.outputPath);
+
+        if (summary.result != UnityEditor.Build.Reporting.BuildResult.Succeeded)
+        {
+            // Non-zero exit so -batchmode callers can detect failure.
+            EditorApplication.Exit(1);
+        }
+    }
+
+    [MenuItem("Build/Build macOS (Standalone)")]
+    public static void BuildOSX()
+    {
+        string projectRoot = Directory.GetParent(Application.dataPath).FullName;
+        string outputDir = Path.Combine(projectRoot, "build");
+        string locationPathName = Path.Combine(outputDir, ProductApp);
+
+        Directory.CreateDirectory(outputDir);
+
+        string[] scenes = EditorBuildSettings.scenes
+            .Where(s => s.enabled)
+            .Select(s => s.path)
+            .ToArray();
+
+        if (scenes.Length == 0)
+            throw new Exception("BuildScript: no enabled scenes in EditorBuildSettings; aborting.");
+
+        Debug.Log("BuildScript: building " + scenes.Length + " scene(s) -> " + locationPathName);
+        foreach (string s in scenes)
+            Debug.Log("BuildScript: scene -> " + s);
+
+        BuildPlayerOptions options = new BuildPlayerOptions
+        {
+            scenes = scenes,
+            locationPathName = locationPathName,
+            target = BuildTarget.StandaloneOSX,
             targetGroup = BuildTargetGroup.Standalone,
             options = BuildOptions.None
         };

@@ -16,6 +16,7 @@ trivially testable on its own.
 from __future__ import annotations
 
 import socket
+import sys
 import time
 from pathlib import Path
 
@@ -25,9 +26,57 @@ __all__ = [
     "DEFAULT_CONNECT_ATTEMPTS",
     "DEFAULT_CONNECT_BACKOFF_SEC",
     "DEFAULT_SOCK_TIMEOUT_SEC",
+    "default_build_path",
     "build_launch_cmd",
     "connect",
 ]
+
+# The Unity player product name as shipped; the conventional launchable-binary basename on every
+# OS. On macOS it is also the conventional name INSIDE the .app bundle, but the actual inner name
+# comes from PlayerSettings and may differ — :func:`default_build_path` probes the bundle rather
+# than trusting this for the inner executable.
+_PRODUCT_NAME = "TankTwinStickShooter"
+
+
+def default_build_path(repo_root: str | Path) -> Path:
+    """The default path to the launchable build binary for the CURRENT OS (``sys.platform``).
+
+    Every live consumer needs ONE OS-aware default for the build's executable so the launch
+    arg-list is runnable on whatever host it spawns on. This resolves under ``repo_root/build``:
+
+    - ``win32``: ``build/TankTwinStickShooter.exe``.
+    - ``darwin``: the executable INSIDE the ``build/TankTwinStickShooter.app`` bundle, at
+      ``Contents/MacOS/<ProductName>``. ``<ProductName>`` comes from Unity PlayerSettings and is
+      NOT assumed to equal the bundle name, so when the bundle exists its ``Contents/MacOS/``
+      directory is globbed: a single entry there is the inner binary and is returned as-is. With
+      nothing built yet (or an ambiguous bundle), the conventional
+      ``Contents/MacOS/TankTwinStickShooter`` path is returned so the default is still a usable
+      string.
+    - else (Linux/other): the bare ``build/TankTwinStickShooter`` binary, preferring an existing
+      ``.x86_64`` sibling (Unity's Linux convention) when present.
+
+    PURE: it does not require the build to exist — it returns a path and callers handle a missing
+    file. Stdlib only (``pathlib`` / ``sys``), so ``core`` stays the dependency-free leaf.
+    """
+    build_dir = Path(repo_root) / "build"
+
+    if sys.platform == "win32":
+        return build_dir / f"{_PRODUCT_NAME}.exe"
+
+    if sys.platform == "darwin":
+        macos_dir = build_dir / f"{_PRODUCT_NAME}.app" / "Contents" / "MacOS"
+        conventional = macos_dir / _PRODUCT_NAME
+        if macos_dir.is_dir():
+            entries = sorted(p for p in macos_dir.iterdir() if p.is_file())
+            if len(entries) == 1:
+                return entries[0]
+        return conventional
+
+    bare = build_dir / _PRODUCT_NAME
+    x86_64 = build_dir / f"{_PRODUCT_NAME}.x86_64"
+    if x86_64.exists():
+        return x86_64
+    return bare
 
 # Windowed-launch screen size (the build is launched as a watchable window, never fullscreen,
 # never batchmode). 1280x720 is 16:9 and comfortably visible.

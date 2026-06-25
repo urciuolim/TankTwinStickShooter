@@ -1,8 +1,10 @@
 # Runbook — end to end
 
 Clone → set up the Python env → build the Unity game → watch two agents play. Every command
-below is verified against this repo. Commands assume the repo root
-(`C:\src\TankTwinStickShooter`). The Python env is managed by **`uv`** — never the system Python.
+below is verified against this repo. Commands run from the repo root; Windows and macOS hosts are
+both supported (the build step and the launcher are OS-aware — see §2 / §3). Replace the example
+repo-root paths (`C:\src\TankTwinStickShooter` / `/Users/<you>/.../TankTwinStickShooter`) with
+yours. The Python env is managed by **`uv`** — never the system Python.
 
 ## 1. Python environment
 
@@ -34,9 +36,16 @@ uv run pytest -m e2e
 
 ## 2. Build the Unity game
 
-The trainer/demo needs a standalone Windows build of the simulator. The headless build entry
-point is [`BuildScript.BuildWindows`](../Assets/Editor/BuildScript.cs), invoked via the Unity
-6.5 editor in batchmode:
+The trainer/demo needs a standalone build of the simulator for the host OS. The headless build
+entry points live in [`BuildScript`](../Assets/Editor/BuildScript.cs): one method per platform,
+each invoked via the Unity 6.5 editor in batchmode. Both build the enabled scenes, exit non-zero
+on failure (so the batchmode caller can detect it), and ship `StreamingAssets` (`config.json` +
+`Arenas/*.json` + the demo / human configs) into the player automatically.
+
+### Windows
+
+[`BuildScript.BuildWindows`](../Assets/Editor/BuildScript.cs) → `build/TankTwinStickShooter.exe`
+(git-ignored):
 
 ```bash
 "C:\Program Files\Unity\Hub\Editor\6000.5.0f1\Editor\Unity.exe" \
@@ -45,9 +54,23 @@ point is [`BuildScript.BuildWindows`](../Assets/Editor/BuildScript.cs), invoked 
   -executeMethod BuildScript.BuildWindows
 ```
 
-Output goes to `build/TankTwinStickShooter.exe` (git-ignored). `StreamingAssets`
-(`config.json` + `Arenas/*.json` + the demo config) ships into the player automatically.
-`BuildScript` exits non-zero on failure so the batchmode caller can detect it.
+### macOS
+
+[`BuildScript.BuildOSX`](../Assets/Editor/BuildScript.cs) targets `StandaloneOSX` and writes the
+`build/TankTwinStickShooter.app` bundle (git-ignored). The Unity 6.5 editor binary on macOS is
+inside the editor `.app`:
+
+```bash
+/Applications/Unity/Hub/Editor/6000.5.0f1/Unity.app/Contents/MacOS/Unity \
+  -batchmode -quit -accept-apiupdate -logFile - \
+  -projectPath "/Users/<you>/path/to/TankTwinStickShooter" \
+  -executeMethod BuildScript.BuildOSX
+```
+
+The launchable binary lives *inside* the bundle at `Contents/MacOS/`; you never type its name —
+the OS-aware default resolver
+([`core.launch.default_build_path`](../src/pop_trainer/core/launch.py)) globs the bundle and
+hands the inner binary to the launcher (see §3).
 
 > For how the built game runs (it is a **Python-clocked simulator** with no standalone human
 > mode), see [game architecture](game-architecture.md).
@@ -60,10 +83,19 @@ With the build in place, watch two visibly-different policies play one episode:
 uv run python -m pop_trainer.demo
 ```
 
-This launches `build/TankTwinStickShooter.exe` **windowed** with
-`Assets/StreamingAssets/demo_config.json` (which enables `obs_pixels` at 640×360 — required,
-since the env always reads a pixel frame each step), connects over TCP, runs one episode of
-`player1 = aggressive-coverage` vs `player2 = opponent-shadower`, prints a trace, and tears down.
+This launches the build **windowed** with `Assets/StreamingAssets/demo_config.json` (which enables
+`obs_pixels` at 640×360 — required, since the env always reads a pixel frame each step), connects
+over TCP, runs one episode of `player1 = aggressive-coverage` vs `player2 = opponent-shadower`,
+prints a trace, and tears down.
+
+**No `--exe` needed on any OS.** The default executable is resolved for the current platform by
+[`core.launch.default_build_path`](../src/pop_trainer/core/launch.py)
+([`demo.DEFAULT_EXE`](../src/pop_trainer/demo.py)): on **Windows** it is
+`build/TankTwinStickShooter.exe`; on **macOS** it is the binary *inside* the
+`build/TankTwinStickShooter.app` bundle (`Contents/MacOS/`, discovered by globbing the bundle —
+you don't type the inner name); on **Linux** the bare `build/TankTwinStickShooter` binary. So
+`python -m pop_trainer.demo` works as-is once the platform build from §2 is present — pass `--exe`
+only to point at a build elsewhere.
 
 See the full flag surface:
 
@@ -71,7 +103,7 @@ See the full flag surface:
 uv run python -m pop_trainer.demo --help
 ```
 
-Useful flags (defaults shown): `--exe build/TankTwinStickShooter.exe`,
+Useful flags (defaults shown): `--exe` (the OS-resolved build path above),
 `--config Assets/StreamingAssets/demo_config.json`, `--port 50000`, `--player1` / `--player2`
 (any of: `aggressive-coverage`, `wall-hugger`, `opponent-shadower`, `random`, `human`),
 `--max-steps 600`, `--seed 0`. The demo exits `2` if the build exe or config is missing.
