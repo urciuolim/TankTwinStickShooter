@@ -66,6 +66,12 @@ from pop_trainer.data import schema, shards
 from pop_trainer.env.tank_env import TankEnv
 
 __all__ = [
+    "SHARD_BYTES_BUDGET",
+    "SPIKE_FACTOR",
+    "MARGIN",
+    "default_shard_size",
+    "estimate_peak_buffer_bytes",
+    "check_memory_budget",
     "Sample",
     "EpisodeResult",
     "EpisodePlan",
@@ -75,6 +81,93 @@ __all__ = [
     "run_worker",
     "collect_parallel",
 ]
+
+
+# ===========================================================================================
+# MEMORY SAFETY — the per-worker in-RAM buffer is the OOM surface, not the on-disk shard.
+# ===========================================================================================
+# Each buffered sample holds an UNCOMPRESSED (H, W, 3) uint8 frame. ``collect_to_shards``
+# buffers up to ``shard_size`` samples per worker before flushing, so a worker's live buffer
+# peaks at ``frame.nbytes * shard_size`` bytes — independent of how tiny the shards deflate to
+# on disk (flat frames compress ~140x, so disk size badly under-reports RAM cost). A literal
+# ``shard_size`` (e.g. 10_000) at a 0.69 MB frame is a ~6.9 GB-per-worker buffer, which OOMs a
+# multi-worker box. We bound the BUFFER by a BYTE budget instead of a sample count, so the cap
+# auto-adapts to the frame resolution: smaller frames -> more samples per shard, larger frames
+# -> fewer, but the per-worker buffer stays ~budget bytes regardless.
+SHARD_BYTES_BUDGET = 384 * 1024 * 1024  # ~384 MB per-worker in-RAM buffer ceiling.
+
+# The ``savez_compressed`` flush copies/compresses the whole buffer, so peak RAM transiently
+# exceeds the buffer itself. SPIKE_FACTOR folds that compress transient into the pre-flight
+# estimate so the guard reasons about the true peak, not just the steady-state buffer.
+SPIKE_FACTOR = 2
+
+# The pre-flight estimate EXCLUDES the ~1 GB/worker live Unity instances + the OS, so the guard
+# only lets the estimate consume a conservative fraction of available RAM, leaving headroom for
+# everything it does not model.
+MARGIN = 0.6
+
+
+def default_shard_size(frame_nbytes: int) -> int:
+    """The frame-size-aware default shard size from the byte budget (>= 1).
+
+    Returns ``SHARD_BYTES_BUDGET // frame_nbytes`` (floored, clamped to at least 1) so a
+    worker's in-RAM buffer (``frame_nbytes * shard_size``) is bounded to ~``SHARD_BYTES_BUDGET``
+    regardless of frame resolution. For the 360x640x3 (= 691200 B) pixel frame this yields ~582
+    samples per shard — far under the count-based default that caused the OOM, while keeping the
+    on-disk schema byte-compatible (just MORE, SMALLER shards). Raises ``ValueError`` on a
+    non-positive ``frame_nbytes``.
+    """
+    if frame_nbytes <= 0:
+        raise ValueError(f"frame_nbytes must be positive, got {frame_nbytes}")
+    return max(1, SHARD_BYTES_BUDGET // int(frame_nbytes))
+
+
+def estimate_peak_buffer_bytes(frame_nbytes: int, shard_size: int, workers: int) -> int:
+    """Estimate the PEAK in-RAM bytes a collection run buffers across all workers.
+
+    ``frame_nbytes * shard_size`` is one worker's steady-state buffer ceiling; ``* workers``
+    sums the concurrent per-worker buffers; ``* SPIKE_FACTOR`` folds in the ``savez_compressed``
+    flush transient. Pure + unit-testable (no allocation). This is the quantity the pre-flight
+    guard compares against available RAM.
+    """
+    return int(frame_nbytes) * int(shard_size) * int(workers) * SPIKE_FACTOR
+
+
+def check_memory_budget(
+    *,
+    frame_nbytes: int,
+    shard_size: int,
+    workers: int,
+    available_bytes: int,
+    allow_oversized: bool = False,
+) -> str:
+    """Pre-flight memory guard. Returns the human-readable estimate line; may raise ``MemoryError``.
+
+    Computes the peak buffer estimate (:func:`estimate_peak_buffer_bytes`) and compares it to a
+    conservative fraction (:data:`MARGIN`) of ``available_bytes`` (INJECTED by the caller — this
+    pure function never touches psutil). When the estimate exceeds the threshold and
+    ``allow_oversized`` is ``False`` it raises ``MemoryError`` with an ACTIONABLE message (the
+    estimate, the available RAM, the budget threshold, and the literal guidance to reduce
+    ``--workers`` or ``--shard-size`` or pass ``--allow-oversized``). When within budget — or when
+    overridden — it returns the estimate line so the caller can ALWAYS print it at startup.
+    """
+    estimate = estimate_peak_buffer_bytes(frame_nbytes, shard_size, workers)
+    threshold = int(available_bytes * MARGIN)
+    gib = 1024**3
+    line = (
+        f"memory estimate: peak buffer ~{estimate / gib:.2f} GB "
+        f"({workers} worker(s) x {shard_size} samples x {frame_nbytes / 1024**2:.2f} MB/frame "
+        f"x {SPIKE_FACTOR}x compress spike); "
+        f"available {available_bytes / gib:.2f} GB, "
+        f"budget {MARGIN:.0%} = {threshold / gib:.2f} GB"
+    )
+    if estimate > threshold and not allow_oversized:
+        raise MemoryError(
+            f"{line}. ABORT: estimated peak buffer ~{estimate / gib:.2f} GB exceeds the "
+            f"{MARGIN:.0%} budget ({threshold / gib:.2f} GB of {available_bytes / gib:.2f} GB "
+            f"available). reduce --workers or --shard-size (or pass --allow-oversized to override)."
+        )
+    return line
 
 
 @dataclass
@@ -359,7 +452,7 @@ def collect_to_shards(
     seed: int | None = None,
     map_index: dict[str, int] | None = None,
     shard_prefix: str = "shard_w0",
-    shard_size: int = 10_000,
+    shard_size: int | None = None,
     with_actions: bool = True,
     on_episode_done: Callable[[int], None] | None = None,
 ) -> list[Path]:
@@ -372,9 +465,16 @@ def collect_to_shards(
     across the episodes it plays). Each episode runs through :func:`run_episode`, which switches the
     arena at reset and tags samples from the ECHOED layout via ``map_index`` (the F5 rule). The
     per-episode seed is ``seed + episode_id`` (when a base ``seed`` is given) so each episode resets
-    BOTH agents to a distinct yet reproducible state. Samples accumulate and flush to a shard every
-    ``shard_size``, plus a final flush. Returns the list of written shard paths. Pure given a
-    fake-backed ``env`` (the live socket path lives in :func:`run_worker`).
+    BOTH agents to a distinct yet reproducible state. Returns the list of written shard paths. Pure
+    given a fake-backed ``env`` (the live socket path lives in :func:`run_worker`).
+
+    SHARD SIZE = the in-RAM BUFFER bound (the OOM surface), NOT a file-size knob. Samples
+    accumulate and flush to a shard every ``shard_size`` rows, plus a final flush. When
+    ``shard_size is None`` (the default) it is derived ONCE from the FIRST captured sample's
+    ``frame.nbytes`` via :func:`default_shard_size`, so the per-worker buffer auto-adapts to the
+    actual frame resolution and stays bounded to ~:data:`SHARD_BYTES_BUDGET` bytes (the OOM fix). A
+    concrete int overrides that (the CLI's ``--shard-size``). The on-disk schema is unchanged either
+    way — a smaller bound just yields MORE, SMALLER shards with byte-identical contents.
 
     ``on_episode_done`` is an OPTIONAL pure observability side-channel: when given, it is called
     once per COMPLETED episode with that episode's sample count (``len(ep)``) — the parent uses it
@@ -390,6 +490,9 @@ def collect_to_shards(
     buffer: list[Sample] = []
     written: list[Path] = []
     shard_index = 0
+    # ``None`` -> derive the buffer bound from the first sample's frame size (set on first flush
+    # check, once a sample exists). A concrete int is used as-is.
+    effective_shard_size = shard_size
 
     def flush() -> None:
         nonlocal shard_index, buffer
@@ -417,8 +520,12 @@ def collect_to_shards(
         buffer.extend(ep.samples)
         if on_episode_done is not None:
             on_episode_done(len(ep))
-        while len(buffer) >= shard_size:
-            chunk, buffer = buffer[:shard_size], buffer[shard_size:]
+        if effective_shard_size is None and buffer:
+            # Derive the byte-budget buffer bound from the actual frame size, ONCE. After this the
+            # per-worker buffer never exceeds ~SHARD_BYTES_BUDGET regardless of frame resolution.
+            effective_shard_size = default_shard_size(int(buffer[0].frame.nbytes))
+        while effective_shard_size is not None and len(buffer) >= effective_shard_size:
+            chunk, buffer = buffer[:effective_shard_size], buffer[effective_shard_size:]
             shard = samples_to_shard(chunk, with_actions=with_actions)
             path = out_dir / f"{shard_prefix}_{shard_index:04d}.npz"
             written.append(shards.write_shard(path, shard))
@@ -451,7 +558,11 @@ class CollectionSpec:
     max_steps: int
     seed: int | None = None
     map_index: dict[str, int] = field(default_factory=dict)
-    shard_size: int = 10_000
+    # The in-RAM BUFFER bound (the OOM surface), NOT a file-size knob. ``None`` (the default) means
+    # AUTO: :func:`collect_to_shards` derives the byte-budget bound from the first frame's size so
+    # the per-worker buffer stays ~SHARD_BYTES_BUDGET. ``None`` pickles, so the spec stays plain /
+    # spawn-safe. A concrete int (from ``--shard-size``) overrides the auto bound.
+    shard_size: int | None = None
     with_actions: bool = True
     # Picklable factories, called INSIDE the worker process:
     #   env_factory(spec) -> a bare TankEnv (socket opened in-worker).

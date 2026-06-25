@@ -43,7 +43,12 @@ package is named `data` (not `datasets` — that name collides with the git-igno
   [`collect_to_shards`](../../src/pop_trainer/data/collect.py) drives an `episode_plan` (a
   round-robin of (map × pairing) [`EpisodePlan`](../../src/pop_trainer/data/collect.py)s) on ONE
   long-lived env, pairing each episode's two selectors from an `agent_pool`
-  (`selector → agent` dict the worker builds once), and flushes samples to shards.
+  (`selector → agent` dict the worker builds once), and flushes samples to shards. Its `shard_size`
+  is the **in-RAM BUFFER bound (the OOM surface), NOT a file-size knob**: default now **AUTO**
+  (`None` → derived ONCE from the first captured sample's `frame.nbytes` via the byte budget, see
+  [Memory safety](#memory-safety-the-pre-flight-guard)), not the old count-based `10000`. A smaller
+  bound just yields **more, smaller** shards with **byte-identical** on-disk contents — the
+  [`schema`](../../src/pop_trainer/data/schema.py) is unchanged (`collect.py:471-477`).
   [`CollectionSpec`](../../src/pop_trainer/data/collect.py) /
   [`run_worker`](../../src/pop_trainer/data/collect.py) /
   [`collect_parallel`](../../src/pop_trainer/data/collect.py) (`collect.py:574-612`) are the
@@ -85,8 +90,10 @@ package is named `data` (not `datasets` — that name collides with the git-igno
   each worker an own `worker_<id>/` out-dir + a distinct seed `base + w*10000`, and either a
   single-map no-switch plan or its slice of the round-robin via `round_robin_plan`).
   [`main`](../../src/pop_trainer/data/collect_runner.py) parses the flags, resolves the boot
-  `--map` config to the obs_pixels-enabled `demo_config.json`, writes the `maps.json` sidecar, and
-  drives `collect_parallel`. See the [runbook](../runbook.md#4-collect-a-dataset-cli) for the flags.
+  `--map` config to the obs_pixels-enabled `demo_config.json`, runs the **pre-flight memory guard**
+  (the new `--shard-size` / `--allow-oversized` flags, see [Memory safety](#memory-safety-the-pre-flight-guard)),
+  writes the `maps.json` sidecar, and drives `collect_parallel`. See the
+  [runbook](../runbook.md#4-collect-a-dataset-cli) for the flags.
 
 ## The rotation scheduler + map tagging
 
@@ -125,6 +132,34 @@ each other + vs random).
   [`EpisodeResult`](../../src/pop_trainer/data/collect.py) so a fallback is **never silently
   mis-tagged**. The arena is static within an episode, so the tag is resolved **once** after reset
   and stamped on every sample (`collect.py:277-281`).
+
+## Memory safety (the pre-flight guard)
+
+The per-worker **in-RAM buffer** — each buffered sample holds an UNCOMPRESSED `(H, W, 3)` uint8
+frame — is the OOM surface, **not** the (≈140× compressed) on-disk shard. Three **pure**,
+unit-tested functions in [`data.collect`](../../src/pop_trainer/data/collect.py) bound it
+(`collect.py:86-170`):
+
+- [`default_shard_size(frame_nbytes)`](../../src/pop_trainer/data/collect.py)
+  (`collect.py:110-122`) — the frame-size-aware default: `SHARD_BYTES_BUDGET // frame_nbytes`
+  (floored, ≥ 1). For the 360×640×3 = 691200-byte (~0.69 MB) pixel frame → **~582 frames/shard**
+  (vs the old count-based `10000` ≈ 6.9 GB/worker that OOMed).
+- [`estimate_peak_buffer_bytes(frame_nbytes, shard_size, workers)`](../../src/pop_trainer/data/collect.py)
+  (`collect.py:125-133`) — the peak estimate:
+  `peak buffer ~= frame_bytes × shard_size × workers × spike`.
+- [`check_memory_budget(..., available_bytes, allow_oversized)`](../../src/pop_trainer/data/collect.py)
+  (`collect.py:136-170`) — raises `MemoryError` when `estimate > available_bytes × MARGIN and not
+  allow_oversized`; otherwise returns the human-readable estimate line (the CLI ALWAYS prints it at
+  startup).
+
+Constants (`collect.py:97-107`): `SHARD_BYTES_BUDGET ≈ 384 MB` (per-worker buffer ceiling),
+`SPIKE_FACTOR = 2` (the `savez_compressed` flush transient), `MARGIN = 0.6` (the guard only lets the
+estimate consume 60% of available RAM, leaving headroom for the unmodeled ~1 GB/worker Unity
+instances + the OS). These functions take `available_bytes` as an **injected argument** — `psutil`
+is read ONLY in [`collect_runner.main`](../../src/pop_trainer/data/collect_runner.py)
+(`collect_runner.py:718-739`, the CLI glue), which resolves the effective `shard_size`, reads
+`psutil.virtual_memory().available`, calls `check_memory_budget`, and on `MemoryError` aborts with
+exit code `2` BEFORE launching any build (unless `--allow-oversized`).
 
 ## Pulls from (upstream)
 

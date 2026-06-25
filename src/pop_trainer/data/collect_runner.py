@@ -57,12 +57,16 @@ import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
+import numpy as np
+import psutil
+
 from pop_trainer import agents
 from pop_trainer.core import agent as core_agent
 from pop_trainer.core import launch
 from pop_trainer.core import maps as core_maps
 from pop_trainer.core.config import EnvConfig
 from pop_trainer.core.protocol import Connection
+from pop_trainer.data import collect
 from pop_trainer.data.collect import CollectionSpec, EpisodePlan, collect_parallel
 from pop_trainer.env.tank_env import TankEnv
 
@@ -76,6 +80,7 @@ __all__ = [
     "MAP_CONFIGS",
     "MAPS_SIDECAR_NAME",
     "FRAME_SHAPE",
+    "frame_nbytes",
     "make_agent",
     "arena_path_for_config",
     "build_rotation",
@@ -100,6 +105,16 @@ FRAME_WIDTH = 640
 FRAME_HEIGHT = 360
 # TankEnv frame_shape is (H, W, 3).
 FRAME_SHAPE = (FRAME_HEIGHT, FRAME_WIDTH, 3)
+
+
+def frame_nbytes(frame_shape: Sequence[int]) -> int:
+    """The uncompressed byte size of ONE uint8 frame of ``frame_shape`` (the in-RAM cost/sample).
+
+    uint8 is 1 byte/element, so this is just the element product. It is the per-sample buffer cost
+    the memory guard + the byte-budget shard-size reason about (see :mod:`collect`).
+    """
+    return int(np.prod(frame_shape))
+
 
 # Map name -> the obs_pixels-enabled build config it launches with (the single-map / no-rotation
 # default). Reusing the demo config keeps collection's frames byte-identical to the demo's / RL's
@@ -466,6 +481,7 @@ def build_specs(
     base_port: int,
     seed: int,
     frame_shape: tuple[int, int, int] = FRAME_SHAPE,
+    shard_size: int | None = None,
 ) -> list[CollectionSpec]:
     """Turn collection params into a list of N :class:`CollectionSpec` (one per worker).
 
@@ -489,8 +505,9 @@ def build_specs(
     ``workers`` is CLAMPED to ``[1, MAX_WORKERS]``. Each worker gets a distinct ``worker_id``
     (0..N-1), its own ``out_dir`` subdir (so shard files never clash), its slice of the round-robin
     as ``episode_plan``, the shared ``max_steps`` + ``map_index``, a distinct ``seed``
-    (``base + worker_id * stride``), and an ``extra`` carrying the launch params + the agent pool
-    (the union of selectors its plan names). The module-level :func:`env_factory` /
+    (``base + worker_id * stride``), the ``shard_size`` in-RAM buffer bound (``None`` -> the worker
+    auto-derives it from the byte budget), and an ``extra`` carrying the launch params + the agent
+    pool (the union of selectors its plan names). The module-level :func:`env_factory` /
     :func:`agent_pool_factory` are wired onto every spec. Validates the selectors + episodes up
     front (``ValueError``). The maps-list sidecar (int -> arena path) is written by
     :func:`main` from each spec's ``extra["maps"]`.
@@ -553,6 +570,7 @@ def build_specs(
             max_steps=max_steps,
             seed=seed + worker_id * _SEED_STRIDE,
             map_index=dict(map_index),
+            shard_size=shard_size,
             env_factory=env_factory,
             agent_pool_factory=agent_pool_factory,
             extra={
@@ -635,6 +653,24 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--seed", type=int, default=0, help="base seed; worker w uses base + w*stride"
     )
+    parser.add_argument(
+        "--shard-size",
+        type=int,
+        default=None,
+        help=(
+            "in-RAM BUFFER bound (samples per worker before a flush), NOT a file-size knob. "
+            "Omitted -> auto: derived from the byte budget so the per-worker buffer stays bounded "
+            "regardless of frame resolution (the OOM-safe default)."
+        ),
+    )
+    parser.add_argument(
+        "--allow-oversized",
+        action="store_true",
+        help=(
+            "skip the pre-flight memory abort (the estimate is still printed). Use only when you "
+            "know the box has the RAM the guard's conservative estimate does not account for."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -642,9 +678,11 @@ def main(argv: list[str] | None = None) -> int:
     """Build the specs from the CLI and drive :func:`collect.collect_parallel`; print a summary.
 
     Resolves the boot config + the pairing set, validates the build / config exist, builds the
-    per-worker round-robin specs, writes the maps-list sidecar (int -> arena path) per worker out
-    dir AND at the run root, runs collection in parallel (spawn), and prints a short per-worker
-    result line. Returns ``0`` on success, ``2`` on a missing build / config.
+    per-worker round-robin specs, runs the PRE-FLIGHT MEMORY GUARD (always printing the peak-buffer
+    estimate at startup; aborting before launch when the estimate blows the budget unless
+    ``--allow-oversized``), writes the maps-list sidecar (int -> arena path) per worker out dir AND
+    at the run root, runs collection in parallel (spawn), and prints a short per-worker result line.
+    Returns ``0`` on success, ``2`` on a missing build / config OR a pre-flight memory abort.
     """
     args = _parse_args(argv)
     config = MAP_CONFIGS[args.map]
@@ -672,9 +710,33 @@ def main(argv: list[str] | None = None) -> int:
         workers=args.workers,
         base_port=args.base_port,
         seed=args.seed,
+        shard_size=args.shard_size,
     )
     if requested > len(specs):
         print(f"note: clamped --workers {requested} to {len(specs)} (MAX_WORKERS={MAX_WORKERS})")
+
+    # PRE-FLIGHT MEMORY GUARD (psutil only here, the CLI glue). The per-worker in-RAM buffer — not
+    # the on-disk shard — is the OOM surface. Resolve the EFFECTIVE shard_size (auto -> the byte
+    # budget for this frame, so the printed estimate matches what the workers will actually buffer),
+    # estimate the peak across all workers, ALWAYS print the estimate, then abort BEFORE launching
+    # any build if it blows the budget (unless --allow-oversized).
+    fb = frame_nbytes(FRAME_SHAPE)
+    effective_shard_size = (
+        args.shard_size if args.shard_size is not None else collect.default_shard_size(fb)
+    )
+    available = psutil.virtual_memory().available
+    try:
+        estimate_line = collect.check_memory_budget(
+            frame_nbytes=fb,
+            shard_size=effective_shard_size,
+            workers=len(specs),
+            available_bytes=available,
+            allow_oversized=args.allow_oversized,
+        )
+    except MemoryError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    print(estimate_line)
 
     # Persist the maps-list sidecar (int -> arena path) so on-disk map_ids are decodable. The
     # rotation set is identical across workers; write it at the run root AND into each worker dir

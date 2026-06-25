@@ -51,6 +51,13 @@ dependencies = [
     # Linux cluster). Upper-bounded to the resolved minor line (repo "pin it" etiquette).
     "onnx>=1.22,<1.23",
     "tqdm>=4.68.3",
+    # psutil: the pre-flight memory guard in pop_trainer.data.collect_runner reads the box's
+    # available RAM (psutil.virtual_memory().available) to abort a collection run BEFORE it OOMs.
+    # NOT in the pure-logic path: the estimator + guard in pop_trainer.data.collect take available
+    # bytes as an argument; psutil is imported ONLY at the collect_runner CLI glue. abi3 wheels ship
+    # for win_amd64 (cp37-abi3) + manylinux x86_64 (cp36-abi3), covering this box + the GCP Linux
+    # cluster on cp312. Upper-bounded to the resolved major line (repo "pin it" etiquette).
+    "psutil>=7.2,<8",
 ]
 
 [project.optional-dependencies]
@@ -117,7 +124,7 @@ testpaths = ["tests"]
 norecursedirs = ["reference", "PythonScripts"]
 markers = [
     "integration: tests requiring a live Unity build or socket (opt-in; deselect with -m 'not integration')",
-    "e2e: end-to-end pipeline tests that import torch/sb3 (no Unity; run with -m e2e, skip with -m 'not e2e')",
+    "e2e: end-to-end pipeline tests; either import torch/sb3 OR need a live Unity build; run with -m e2e, skip with -m 'not e2e'",
 ]
 
 [tool.coverage.run]

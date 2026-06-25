@@ -693,6 +693,103 @@ def test_samples_to_shard_rejects_empty():
         collect.samples_to_shard([])
 
 
+# --- memory safety: byte-budget shard size + the pre-flight guard (the OOM class) ----------
+#
+# These reproduce the OOM-incident class in MILLISECONDS with NO real allocation: the estimator
+# and the guard are pure functions over injected numbers, and the buffer-boundedness test only
+# observes WRITTEN shard lengths over the fake-transport env. The 0.69 MB frame is the live
+# 360x640x3 pixel frame whose count-based 10_000 buffer caused the 71% crash.
+
+_INCIDENT_FRAME_NBYTES = 360 * 640 * 3  # 691200 B (~0.69 MB), the live pixel frame.
+
+
+def test_estimate_peak_buffer_bytes_is_the_exact_product():
+    # The estimator is frame_nbytes * shard_size * workers * SPIKE_FACTOR, exactly.
+    frame_nbytes = 691200
+    shard_size = 500
+    workers = 4
+    expected = frame_nbytes * shard_size * workers * collect.SPIKE_FACTOR
+    assert collect.estimate_peak_buffer_bytes(frame_nbytes, shard_size, workers) == expected
+    # SPIKE_FACTOR is the documented 2x compress transient.
+    assert collect.SPIKE_FACTOR == 2
+
+
+def test_default_shard_size_keeps_per_worker_buffer_under_budget():
+    # The byte-budget default yields a shard_size whose per-worker buffer (frame_nbytes *
+    # shard_size) stays at/under SHARD_BYTES_BUDGET for the live 0.69 MB frame — far under the
+    # 10_000 that OOMed.
+    shard_size = collect.default_shard_size(_INCIDENT_FRAME_NBYTES)
+    assert shard_size >= 1
+    assert shard_size * _INCIDENT_FRAME_NBYTES <= collect.SHARD_BYTES_BUDGET
+    # And it is materially smaller than the count-based default that caused the crash.
+    assert shard_size < 10_000
+    # ~384 MB / 0.69 MB ~= 582 frames.
+    assert shard_size == collect.SHARD_BYTES_BUDGET // _INCIDENT_FRAME_NBYTES
+
+
+def test_default_shard_size_floors_to_one_and_rejects_nonpositive():
+    # A frame larger than the whole budget still yields a usable shard_size of 1 (never 0).
+    assert collect.default_shard_size(collect.SHARD_BYTES_BUDGET * 2) == 1
+    with pytest.raises(ValueError):
+        collect.default_shard_size(0)
+
+
+def test_memory_guard_within_budget_returns_estimate_line():
+    # Under budget: the guard does NOT raise and returns a human-readable estimate line carrying
+    # the GB estimate, the available GB, and the budget threshold (the always-printed startup line).
+    line = collect.check_memory_budget(
+        frame_nbytes=_INCIDENT_FRAME_NBYTES,
+        shard_size=collect.default_shard_size(_INCIDENT_FRAME_NBYTES),
+        workers=8,
+        available_bytes=64 * 1024**3,
+        allow_oversized=False,
+    )
+    assert "memory estimate" in line
+    assert "GB" in line
+    assert "available" in line
+    assert "budget" in line
+
+
+def test_memory_guard_reproduces_the_oom_incident_and_aborts():
+    # INCIDENT REPRODUCTION (no allocation): the EXACT crash config — 8 workers, the count-based
+    # 10_000 buffer, the live 0.69 MB frame -> ~8 * 10000 * 691200 * 2 ~= 110 GB estimate — with
+    # only 16 GB available MUST abort with an actionable MemoryError.
+    workers = 8
+    shard_size = 10_000
+    frame_nbytes = 360 * 640 * 3  # the live pixel frame
+    available_bytes = 16 * 1024**3  # 16 GB
+    # Sanity: the estimate is the ~110 GB that overran the box.
+    assert (
+        collect.estimate_peak_buffer_bytes(frame_nbytes, shard_size, workers)
+        == 8 * 10000 * 691200 * 2
+    )
+    with pytest.raises(MemoryError) as excinfo:
+        collect.check_memory_budget(
+            frame_nbytes=frame_nbytes,
+            shard_size=shard_size,
+            workers=workers,
+            available_bytes=available_bytes,
+            allow_oversized=False,
+        )
+    message = str(excinfo.value)
+    assert "ABORT" in message
+    assert "reduce --workers or --shard-size" in message
+    assert "--allow-oversized" in message
+
+
+def test_memory_guard_allow_oversized_overrides_abort():
+    # The same overrunning config does NOT raise when allow_oversized is set; the estimate line is
+    # still returned so the caller can print it.
+    line = collect.check_memory_budget(
+        frame_nbytes=360 * 640 * 3,
+        shard_size=10_000,
+        workers=8,
+        available_bytes=16 * 1024**3,
+        allow_oversized=True,
+    )
+    assert "memory estimate" in line
+
+
 # --- collect_to_shards -------------------------------------------------------------------
 
 
@@ -750,6 +847,78 @@ def test_collect_to_shards_respects_shard_size(tmp_path):
     assert len(written) == 2
     total = sum(shards.shard_length(p) for p in written)
     assert total == 4
+
+
+def test_collect_to_shards_buffer_stays_bounded_by_shard_size(tmp_path, monkeypatch):
+    # OOM-CLASS (boundedness): with a small shard_size the in-RAM buffer never grows without bound.
+    # Observe every chunk handed to samples_to_shard: each WRITTEN shard must be <= shard_size, and
+    # the live buffer never exceeds shard_size + one max-len episode (the residual carried between
+    # flushes). Many short episodes accumulate, so without the flush the buffer would grow with the
+    # run; the bound proves it does not. No real OOM — only lengths are observed.
+    shard_size = 3
+    n_episodes = 6
+    ep_len = 2  # each episode contributes 2 samples (done_last on the 2nd state)
+    plan = []
+    blobs = []
+    for i in range(n_episodes):
+        blobs += _step_episode_blobs([_flat_state(i), _flat_state(i + 1)], done_last=True)
+        plan.append(_plan(None, intended_map_id=0))
+    env, _ = _make_env(blobs, env_config=EnvConfig(max_steps=100))
+
+    chunk_lengths: list[int] = []
+    real_samples_to_shard = collect.samples_to_shard
+
+    def spy(samples, **kwargs):
+        chunk_lengths.append(len(samples))
+        return real_samples_to_shard(samples, **kwargs)
+
+    monkeypatch.setattr(collect, "samples_to_shard", spy)
+    written = collect.collect_to_shards(
+        env,
+        out_dir=tmp_path,
+        episode_plan=plan,
+        agent_pool={"p1": _FixedAgent(), "p2": _FixedAgent()},
+        max_steps=100,
+        seed=0,
+        shard_size=shard_size,
+    )
+    # Every full-shard flush wrote exactly shard_size; the final residual flush is <= shard_size.
+    full_flushes = chunk_lengths[:-1]
+    residual = chunk_lengths[-1]
+    assert all(length == shard_size for length in full_flushes)
+    assert residual <= shard_size
+    # Boundedness ceiling: no chunk ever exceeds shard_size + one max-len episode.
+    assert all(length <= shard_size + ep_len for length in chunk_lengths)
+    # All samples were written (no loss): 6 episodes x 2 = 12 samples.
+    assert sum(shards.shard_length(p) for p in written) == n_episodes * ep_len
+
+
+def test_collect_to_shards_auto_shard_size_bounds_buffer_by_byte_budget(tmp_path, monkeypatch):
+    # The DEFAULT (shard_size=None) derives the buffer bound from the first frame's byte budget, so
+    # the per-worker buffer stays bounded with no caller knob. Use a tiny budget so the small test
+    # frames trip the auto bound, and assert every written shard length <= the derived bound.
+    monkeypatch.setattr(collect, "SHARD_BYTES_BUDGET", FRAME_H * FRAME_W * 3 * 2)
+    derived = collect.default_shard_size(FRAME_H * FRAME_W * 3)  # == 2 frames per shard
+    n_episodes = 4
+    blobs = []
+    plan = []
+    for i in range(n_episodes):
+        blobs += _step_episode_blobs([_flat_state(i), _flat_state(i + 1)], done_last=True)
+        plan.append(_plan(None, intended_map_id=0))
+    env, _ = _make_env(blobs, env_config=EnvConfig(max_steps=100))
+    written = collect.collect_to_shards(
+        env,
+        out_dir=tmp_path,
+        episode_plan=plan,
+        agent_pool={"p1": _FixedAgent(), "p2": _FixedAgent()},
+        max_steps=100,
+        seed=0,
+        # shard_size omitted -> auto from the byte budget.
+    )
+    assert derived == 2
+    assert all(shards.shard_length(p) <= derived for p in written)
+    # No samples lost: 4 episodes x 2 = 8.
+    assert sum(shards.shard_length(p) for p in written) == n_episodes * 2
 
 
 def test_collect_to_shards_switches_arena_per_episode(tmp_path):

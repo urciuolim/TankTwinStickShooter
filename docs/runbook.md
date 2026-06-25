@@ -18,10 +18,18 @@ uv run python --version              # -> Python 3.12.x
 uv run python -c "import pop_trainer; print('ok')"
 ```
 
-Run the tests (pure-logic + contracts; Unity-needing tests are opt-in `integration`):
+Run the tests (pure-logic + contracts; Unity-needing tests are opt-in `integration` / `e2e`):
 
 ```bash
 uv run pytest -m "not integration and not e2e"
+```
+
+The **Tier-1 live e2e** (`test_e2e_collection.py`) drives a small real collection against a live
+Unity build. It is opt-in (the `e2e` marker, excluded above) and **auto-skips** when no build is
+present at `collect_runner.DEFAULT_EXE`, so a buildless run stays green. Run it with a build present:
+
+```bash
+uv run pytest -m e2e
 ```
 
 ## 2. Build the Unity game
@@ -140,9 +148,44 @@ Flags (defaults shown), grounded in
 | `--exe` | `build/TankTwinStickShooter.exe` | path to the Unity build |
 | `--base-port` | `50000` | base TCP port; worker `w` connects on `base_port + w` |
 | `--seed` | `0` | base seed; worker `w` uses `base + w*10000` |
+| `--shard-size` | *(auto)* | in-RAM **BUFFER** bound (samples per worker before a flush), **NOT a file-size knob**. Omitted → auto: derived from the byte budget so the per-worker buffer stays bounded regardless of frame resolution (the OOM-safe default). See [Memory safety](#memory-safety-the-pre-flight-guard). |
+| `--allow-oversized` | *(off)* | skip the pre-flight memory **abort** (the estimate is still printed). Use only when the box has RAM the guard's conservative estimate does not account for. |
 
 Selectors for `--pairing` (and `--map`'s default boot): `aggressive-coverage`, `wall-hugger`,
 `opponent-shadower`, `random`.
+
+### Memory safety (the pre-flight guard)
+
+`--shard-size` is the **in-RAM BUFFER bound** (samples a worker buffers before a flush), **not a
+file-size knob**. Each buffered sample holds an UNCOMPRESSED `(H, W, 3)` uint8 frame, so the
+buffer — not the tiny on-disk shard — is the OOM surface (flat frames compress ~140×, so disk size
+badly under-reports RAM cost). A smaller bound just yields **more, smaller** shards with
+**byte-identical** on-disk contents (`collect.py:471-477`).
+
+The peak across all workers is (`estimate_peak_buffer_bytes`, `collect.py:125-133`):
+
+```
+peak buffer ~= frame_bytes × shard_size × workers × spike   (spike = SPIKE_FACTOR = 2)
+```
+
+`SPIKE_FACTOR=2` folds in the `savez_compressed` flush transient (`collect.py:99-102`). Default
+`--shard-size` is **auto**: a per-worker BYTE budget (`SHARD_BYTES_BUDGET ≈ 384 MB`,
+`collect.py:97`) is divided by the frame size (`default_shard_size`, `collect.py:110-122`). For the
+360×640×3 = 691200-byte (~0.69 MB) pixel frame this yields **~582 frames/shard** — far under the old
+count-based default of `10000` (a ~6.9 GB/worker buffer that OOMed a multi-worker box,
+`collect.py:93`).
+
+`main` runs a **pre-flight guard** before launching any build (`collect_runner.py:718-739`): it
+reads `psutil.virtual_memory().available`, computes the estimate, and **always prints the estimate
+line at startup**. When the estimate exceeds `MARGIN` (`0.6` → 60%) of available RAM it **aborts
+with exit code `2` BEFORE any build launches** (`check_memory_budget`, `collect.py:136-170`) —
+unless `--allow-oversized` (which still prints the estimate, then proceeds). The margin leaves
+headroom for the ~1 GB/worker live Unity instances + the OS, which the estimate does not model
+(`collect.py:104-107`).
+
+**Worker × RAM guideline.** More `--workers` × bigger `--shard-size` raises the peak **linearly**
+(both are factors in the formula). If the guard aborts, reduce `--workers` or `--shard-size`
+(or pass `--allow-oversized` only if you know the box has the headroom).
 
 ### Live progress
 
