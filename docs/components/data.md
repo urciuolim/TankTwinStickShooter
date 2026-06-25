@@ -46,10 +46,24 @@ package is named `data` (not `datasets` — that name collides with the git-igno
   (`selector → agent` dict the worker builds once), and flushes samples to shards.
   [`CollectionSpec`](../../src/pop_trainer/data/collect.py) /
   [`run_worker`](../../src/pop_trainer/data/collect.py) /
-  [`collect_parallel`](../../src/pop_trainer/data/collect.py) are the **spawn-based** (never
-  fork — a CLAUDE.md YOU MUST) parallel orchestration; each worker builds its own bare env + socket
-  and the agent pool inside the process from the spec's `env_factory` / `agent_pool_factory`, so
-  only plain data (the `episode_plan`, the `map_index`, `extra`) crosses the spawn boundary.
+  [`collect_parallel`](../../src/pop_trainer/data/collect.py) (`collect.py:574-612`) are the
+  **spawn-based** (never fork — a CLAUDE.md YOU MUST) parallel orchestration; each worker builds its
+  own bare env + socket and the agent pool inside the process from the spec's `env_factory` /
+  `agent_pool_factory`, so only plain data (the `episode_plan`, the `map_index`, `extra`) crosses the
+  spawn boundary. `collect_parallel` also drives a **single aggregate live progress bar**
+  ([`_Progress`](../../src/pop_trainer/data/collect.py), tqdm) owned by the **parent** — never
+  one-bar-per-worker. It is **per-episode** granularity (one tick per completed episode); its `total`
+  is `sum(len(spec.episode_plan) for spec in specs)`, the episode count across ALL workers known
+  upfront (`collect.py:604`), `unit="ep"`, with a running `samples=…` postfix and tqdm's default
+  ETA/remaining field. It is **auto-silent off-TTY** (`disable=not sys.stderr.isatty()`,
+  `collect.py:559`) — a redirected / captured / piped run emits zero progress bytes. **Spawn-safe:**
+  each completed episode pushes a plain `(worker_id, n_samples)` message onto a `Manager().Queue()`
+  handed to children via the Pool `initializer` ([`_init_worker`](../../src/pop_trainer/data/collect.py),
+  `collect.py:473`) — never pickled onto `CollectionSpec`; the parent drains the queue, advancing the
+  one bar, until every `AsyncResult` is `.ready()` and the queue is empty (the single-spec in-process
+  path drives the SAME bar via a `_DirectBarQueue` shim). It is a **pure observability side-channel** —
+  workers report only an int count, so collecting with vs without it yields byte-identical shards
+  (`collect.py:379-384,418-419`).
 - [`data.collect_runner`](../../src/pop_trainer/data/collect_runner.py) — the **live collection
   entry point** (`python -m pop_trainer.data.collect_runner`): the concrete factories + CLI riding
   on `collect`'s orchestration. It is **multi-worker** and runs either a single map or a

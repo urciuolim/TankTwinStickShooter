@@ -144,6 +144,16 @@ Flags (defaults shown), grounded in
 Selectors for `--pairing` (and `--map`'s default boot): `aggressive-coverage`, `wall-hugger`,
 `opponent-shadower`, `random`.
 
+### Live progress
+
+On a terminal (TTY) the runner shows a **single aggregate progress bar** (one line, tqdm) that
+ticks **per completed episode** across ALL workers — its total is the run's total episode count, so
+it carries an ETA / remaining-time and a running `samples=…` count
+([`collect_parallel`](../src/pop_trainer/data/collect.py), `collect.py:574-612`). It **auto-silences**
+when `stderr` is **not** a TTY (`disable=not sys.stderr.isatty()`, `collect.py:559`): a redirected /
+captured / piped run emits **zero** progress bytes, so logs stay clean. The bar is a pure
+observability side-channel — it does not affect a single shard byte.
+
 ### The `maps.json` sidecar (reversible map ids)
 
 On-disk `map_ids` stay `int32`; `main` writes a **`maps.json`** sidecar (constant

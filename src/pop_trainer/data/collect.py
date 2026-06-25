@@ -50,11 +50,14 @@ models, no pretraining, no rl, no tank_twin.
 from __future__ import annotations
 
 import multiprocessing as mp
+import queue as queue_mod
+import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
+from tqdm import tqdm
 
 from pop_trainer import agents
 from pop_trainer.core import agent as core_agent
@@ -358,6 +361,7 @@ def collect_to_shards(
     shard_prefix: str = "shard_w0",
     shard_size: int = 10_000,
     with_actions: bool = True,
+    on_episode_done: Callable[[int], None] | None = None,
 ) -> list[Path]:
     """Run the ``episode_plan`` (a round-robin of (map x pairing) episodes) on ONE long-lived env.
 
@@ -371,6 +375,13 @@ def collect_to_shards(
     BOTH agents to a distinct yet reproducible state. Samples accumulate and flush to a shard every
     ``shard_size``, plus a final flush. Returns the list of written shard paths. Pure given a
     fake-backed ``env`` (the live socket path lives in :func:`run_worker`).
+
+    ``on_episode_done`` is an OPTIONAL pure observability side-channel: when given, it is called
+    once per COMPLETED episode with that episode's sample count (``len(ep)``) — the parent uses it
+    to advance a progress bar (in-process) or push a "done" message onto a multiprocessing queue
+    (the spawn workers). ``None`` (the default) is a no-op and is the byte-identical, today's exact
+    behavior. The callback fires AFTER the episode's samples are buffered but is purely a notify; it
+    cannot perturb the shards (it returns nothing and is handed only an int count).
 
     Raises ``KeyError`` if a plan names a selector absent from ``agent_pool`` (an eager wiring bug,
     not a silent skip).
@@ -404,6 +415,8 @@ def collect_to_shards(
             map_index=map_index,
         )
         buffer.extend(ep.samples)
+        if on_episode_done is not None:
+            on_episode_done(len(ep))
         while len(buffer) >= shard_size:
             chunk, buffer = buffer[:shard_size], buffer[shard_size:]
             shard = samples_to_shard(chunk, with_actions=with_actions)
@@ -448,6 +461,27 @@ class CollectionSpec:
     extra: dict = field(default_factory=dict)
 
 
+# The progress queue is passed to a spawn worker NOT through the (plain, picklable)
+# ``CollectionSpec`` but through the Pool's ``initializer`` — it lands in this module-level global
+# in the child interpreter, and :func:`run_worker` reads it to build its per-episode
+# ``on_episode_done``. A global is the spawn-clean way to hand a live ``Manager().Queue()`` proxy to
+# every Pool task without pickling it as a task argument (proxies are picklable through ``initargs``
+# but NOT cleanly as a normal ``apply_async`` arg). The in-process paths never set it (stays None).
+_WORKER_PROGRESS_QUEUE: object | None = None
+
+
+def _init_worker(queue: object) -> None:
+    """Pool ``initializer``: stash the shared progress queue in this child's module global.
+
+    Runs ONCE per spawned worker process (in the fresh child interpreter), before any task. The
+    ``queue`` is a ``Manager().Queue()`` proxy created in the parent from the SAME spawn context and
+    passed via ``initargs`` — the spawn-safe channel for a live handle (it never rides on the plain
+    ``CollectionSpec``). :func:`run_worker` reads it to emit per-episode "done" messages.
+    """
+    global _WORKER_PROGRESS_QUEUE
+    _WORKER_PROGRESS_QUEUE = queue
+
+
 def run_worker(spec: CollectionSpec) -> dict:
     """Module-level worker entry point (picklable for spawn). Builds the env IN-WORKER.
 
@@ -457,11 +491,25 @@ def run_worker(spec: CollectionSpec) -> dict:
     :func:`collect_to_shards`. Closes the env in a ``finally`` so the worker that opened the socket
     also releases it. Returns a small result dict (worker id, shard file names, count). Live path —
     exercised by the orchestrator, not the unit tests.
+
+    PROGRESS: if the Pool set this module's ``_WORKER_PROGRESS_QUEUE`` (via :func:`_init_worker`),
+    each completed episode pushes a plain ``(worker_id, n_samples)`` message onto it so the PARENT's
+    single bar advances. With no queue set (an in-process call outside :func:`collect_parallel`) no
+    per-episode reporting happens here. The message is plain data — the queue carries no shard
+    bytes, only a count.
     """
     if spec.env_factory is None:
         raise ValueError("run_worker needs an env_factory")
     if spec.agent_pool_factory is None:
         raise ValueError("run_worker needs an agent_pool_factory")
+    queue = _WORKER_PROGRESS_QUEUE
+    on_episode_done = None
+    if queue is not None:
+        worker_id = spec.worker_id
+
+        def on_episode_done(n_samples: int) -> None:
+            queue.put((worker_id, n_samples))
+
     env = spec.env_factory(spec)
     agent_pool = spec.agent_pool_factory(spec)
     try:
@@ -476,6 +524,7 @@ def run_worker(spec: CollectionSpec) -> dict:
             shard_prefix=f"shard_w{spec.worker_id}",
             shard_size=spec.shard_size,
             with_actions=spec.with_actions,
+            on_episode_done=on_episode_done,
         )
     finally:
         # The worker built the env, so the worker closes it (releases the socket).
@@ -489,22 +538,165 @@ def run_worker(spec: CollectionSpec) -> dict:
     }
 
 
+class _Progress:
+    """The ONE aggregate collection bar + its running sample total (the only tqdm config site).
+
+    Wraps a single :class:`tqdm.tqdm` so the TTY-disable decision and the per-episode advance live
+    in one testable place. ``advance(n_samples)`` ticks the bar by ONE episode and folds
+    ``n_samples`` into a running total shown in the postfix. The bar:
+
+    * counts EPISODES (``unit="ep"``) — the bounded, accurate unit (step counts are unbounded);
+    * is DISABLED on a non-TTY (``disable=not sys.stderr.isatty()``) so a redirected / captured run
+      emits NOTHING (no progress noise in logs / pipes);
+    * writes to ``sys.stderr`` and keeps tqdm's default in-place ``\r`` overwrite (one line, no
+      competing ``print``).
+    """
+
+    def __init__(self, total: int):
+        self.total_samples = 0
+        self.bar = tqdm(
+            total=total,
+            disable=not sys.stderr.isatty(),
+            file=sys.stderr,
+            unit="ep",
+            desc="collecting",
+        )
+
+    def advance(self, n_samples: int) -> None:
+        self.total_samples += int(n_samples)
+        self.bar.update(1)
+        self.bar.set_postfix(samples=self.total_samples, refresh=False)
+
+    def close(self) -> None:
+        self.bar.close()
+
+
 def collect_parallel(specs: Sequence[CollectionSpec]) -> list[dict]:
     """Run worker specs in parallel using the SPAWN start method (never fork; Windows-safe).
 
     Uses ``multiprocessing.get_context("spawn")`` explicitly so behavior is identical on Windows
-    and POSIX and no parent file descriptors / sockets are inherited. A single spec runs
-    in-process (simpler, still spawn-safe). Each ``CollectionSpec`` builds its own env (and socket)
-    inside its worker; nothing live crosses the process boundary. Returns the per-worker result
-    dicts, sorted by worker id.
+    and POSIX and no parent file descriptors / sockets are inherited. A single spec runs in-process
+    (simpler, still spawn-safe). Each ``CollectionSpec`` builds its own env (and socket) inside its
+    worker; nothing live crosses the process boundary. Returns the per-worker result dicts, sorted
+    by worker id.
+
+    PROGRESS (the ONE aggregate bar; per-episode granularity): the parent owns a single
+    :class:`_Progress` bar whose ``total`` is ``sum(len(spec.episode_plan))`` — the episode count
+    known upfront across ALL workers. It is the only bar (never one-per-worker) and is a pure
+    observability side-channel: it cannot alter a single shard byte (workers report only an int
+    count). How the bar is advanced differs by path:
+
+    * SINGLE-SPEC (in-process): :func:`run_worker` runs in this process, so the queue stays ``None``
+      and the worker's ``on_episode_done`` advances the bar DIRECTLY. A tiny shim object (one with
+      ``put``) is set into the module global so the SAME ``run_worker`` code path drives the bar in
+      process with no second process; it is restored to ``None`` after.
+    * MULTI-SPEC (spawn): a ``Manager().Queue()`` (from the SAME spawn context) is handed to every
+      child via the Pool ``initializer`` (NOT pickled into the spec; a Manager queue is the spawn-
+      safe, initializer-passable proxy — a raw ``ctx.Queue()`` cannot be passed as a normal task
+      arg). Workers are submitted with ``apply_async`` (NOT blocking ``map``) and the parent DRAINS
+      the queue, advancing the bar per "done" message, until every ``AsyncResult`` is ``.ready()``
+      AND the queue is empty. A short ``get`` timeout bounds the poll so the loop neither deadlocks
+      nor busy-spins. The bar is CLOSED before returning so the caller's summary prints cleanly.
     """
     specs = list(specs)
     if not specs:
         return []
-    if len(specs) == 1:
-        results = [run_worker(specs[0])]
-    else:
-        ctx = mp.get_context("spawn")
-        with ctx.Pool(processes=len(specs)) as pool:
-            results = pool.map(run_worker, specs)
+    progress = _Progress(total=sum(len(spec.episode_plan) for spec in specs))
+    try:
+        if len(specs) == 1:
+            results = [_run_single_spec(specs[0], progress)]
+        else:
+            results = _run_multi_spec(specs, progress)
+    finally:
+        progress.close()
     return sorted(results, key=lambda r: r["worker_id"])
+
+
+class _DirectBarQueue:
+    """In-process shim with a ``put`` matching the spawn queue's, draining straight into the bar.
+
+    Lets the single-spec path reuse the SAME :func:`run_worker` reporting code (which writes
+    ``(worker_id, n_samples)`` to whatever sits in ``_WORKER_PROGRESS_QUEUE``) while advancing the
+    parent's bar directly — no real multiprocessing queue, no second process.
+    """
+
+    def __init__(self, progress: _Progress):
+        self._progress = progress
+
+    def put(self, message: tuple[int, int]) -> None:
+        _worker_id, n_samples = message
+        self._progress.advance(n_samples)
+
+
+def _run_single_spec(spec: CollectionSpec, progress: _Progress) -> dict:
+    """Run the single spec in-process, advancing ``progress`` directly per completed episode.
+
+    Installs a :class:`_DirectBarQueue` into the module global so ``run_worker``'s per-episode
+    reporting drives the parent's bar, then restores the global to ``None`` so no live handle
+    lingers.
+    """
+    global _WORKER_PROGRESS_QUEUE
+    previous = _WORKER_PROGRESS_QUEUE
+    _WORKER_PROGRESS_QUEUE = _DirectBarQueue(progress)
+    try:
+        return run_worker(spec)
+    finally:
+        _WORKER_PROGRESS_QUEUE = previous
+
+
+# The drain poll timeout: short enough that the loop reacts promptly when the last worker finishes,
+# long enough that an idle parent is not busy-spinning on an empty queue.
+_DRAIN_POLL_TIMEOUT = 0.1
+
+
+def _run_multi_spec(specs: list[CollectionSpec], progress: _Progress) -> list[dict]:
+    """Submit every worker async on a spawn Pool and DRAIN the progress queue into ``progress``.
+
+    The queue is a ``Manager().Queue()`` from the spawn context, handed to children via the Pool
+    ``initializer`` (:func:`_init_worker`) — never pickled into a spec. Workers are submitted with
+    ``apply_async`` (so the parent drains WHILE they run, unlike blocking ``map``). The drain loop
+    polls the queue with a short timeout, advancing the bar one tick per per-episode message, and
+    exits only once every ``AsyncResult`` is ``.ready()`` AND the queue is fully drained — so no
+    message is lost and the loop neither deadlocks nor busy-spins.
+    """
+    ctx = mp.get_context("spawn")
+    manager = ctx.Manager()
+    queue = manager.Queue()
+    try:
+        with ctx.Pool(processes=len(specs), initializer=_init_worker, initargs=(queue,)) as pool:
+            async_results = [pool.apply_async(run_worker, (spec,)) for spec in specs]
+            while True:
+                drained = _drain_progress_queue(queue, progress, block=True)
+                if not drained and all(r.ready() for r in async_results):
+                    # A final non-blocking sweep catches any message enqueued between the last
+                    # drain's timeout and the ready() check, then we stop.
+                    _drain_progress_queue(queue, progress, block=False)
+                    break
+            # ``get`` re-raises any worker exception; collect the results in submission order.
+            results = [r.get() for r in async_results]
+    finally:
+        manager.shutdown()
+    return results
+
+
+def _drain_progress_queue(queue: object, progress: _Progress, *, block: bool) -> bool:
+    """Pull every currently-available message off ``queue``, advancing ``progress`` per message.
+
+    With ``block=True`` the first pull waits up to :data:`_DRAIN_POLL_TIMEOUT` for a message (so an
+    idle parent does not busy-spin); subsequent pulls are non-blocking until the queue is empty.
+    With ``block=False`` every pull is non-blocking. Returns whether ANY message was drained.
+    """
+    drained = False
+    first = True
+    while True:
+        try:
+            if first and block:
+                message = queue.get(timeout=_DRAIN_POLL_TIMEOUT)
+            else:
+                message = queue.get_nowait()
+        except queue_mod.Empty:
+            return drained
+        first = False
+        _worker_id, n_samples = message
+        progress.advance(n_samples)
+        drained = True

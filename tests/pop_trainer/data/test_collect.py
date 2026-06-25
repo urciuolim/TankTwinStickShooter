@@ -10,6 +10,7 @@ collection loop (player2 acts on its driver-computed flipped view).
 """
 
 import math
+import sys
 
 import numpy as np
 import pytest
@@ -862,3 +863,281 @@ def test_run_worker_requires_agent_pool_factory(tmp_path):
     )
     with pytest.raises(ValueError, match="agent_pool_factory"):
         collect.run_worker(spec)
+
+
+# --- progress reporting (the live bar is a pure observability side-channel) ---------------
+#
+# These exercise the progress plumbing WITHOUT spawning real workers or opening a live socket:
+# the per-episode callback counting (driven through the fake-transport env), the TTY-disable
+# logic on the bar helper, and the spawn-safety invariants on CollectionSpec. The byte-identical
+# guarantee is proven by collecting twice (callback vs no callback) and diffing the shard arrays.
+
+
+def test_on_episode_done_fires_once_per_episode_with_sample_count(tmp_path):
+    # Drive collect_to_shards over the fake transport with an on_episode_done that appends the
+    # reported count to a list. Two episodes of 3 samples each (cap=3, no early done) -> two calls,
+    # each carrying that episode's len(ep) == 3.
+    ep0 = _step_episode_blobs([_flat_state(0), _flat_state(1), _flat_state(2)])
+    ep1 = _step_episode_blobs([_flat_state(10), _flat_state(11), _flat_state(12)])
+    env, _ = _make_env(ep0 + ep1, env_config=EnvConfig(max_steps=3))
+    reported: list[int] = []
+    collect.collect_to_shards(
+        env,
+        out_dir=tmp_path,
+        episode_plan=[_plan(None, intended_map_id=0), _plan(None, intended_map_id=0)],
+        agent_pool={"p1": _FixedAgent(), "p2": _FixedAgent()},
+        max_steps=3,
+        seed=0,
+        on_episode_done=reported.append,
+    )
+    assert reported == [3, 3]
+
+
+def test_on_episode_done_count_matches_len_ep_on_early_done(tmp_path):
+    # An episode that ends on the env's own boundary records fewer than the cap; the reported count
+    # must equal that actual len(ep), not the cap.
+    ep0 = _step_episode_blobs([_flat_state(0), _flat_state(1)], done_last=True)  # 2 samples
+    env, _ = _make_env(ep0, env_config=EnvConfig(max_steps=100))
+    reported: list[int] = []
+    collect.collect_to_shards(
+        env,
+        out_dir=tmp_path,
+        episode_plan=[_plan(None, intended_map_id=0)],
+        agent_pool={"p1": _FixedAgent(), "p2": _FixedAgent()},
+        max_steps=100,
+        seed=0,
+        on_episode_done=reported.append,
+    )
+    assert reported == [2]
+
+
+def test_on_episode_done_default_is_noop(tmp_path):
+    # The default on_episode_done=None must not raise and must collect normally (today's behavior).
+    env, _ = _make_env(
+        _step_episode_blobs([_flat_state(0), _flat_state(1)], done_last=True),
+        env_config=EnvConfig(max_steps=100),
+    )
+    written = collect.collect_to_shards(
+        env,
+        out_dir=tmp_path,
+        episode_plan=[_plan(None, intended_map_id=0)],
+        agent_pool={"p1": _FixedAgent(), "p2": _FixedAgent()},
+        max_steps=100,
+        seed=0,
+    )
+    assert len(written) == 1
+
+
+def test_progress_bar_disabled_off_tty(monkeypatch):
+    # The bar helper disables tqdm when sys.stderr is NOT a TTY: a redirected/captured run emits
+    # nothing. The helper reads sys.stderr.isatty() at construction.
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: False, raising=False)
+    progress = collect._Progress(total=5)
+    try:
+        assert progress.bar.disable is True
+    finally:
+        progress.close()
+
+
+def test_progress_bar_enabled_on_tty(monkeypatch):
+    # The bar helper ENABLES tqdm when sys.stderr.isatty() is True.
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True, raising=False)
+    progress = collect._Progress(total=5)
+    try:
+        assert progress.bar.disable is False
+    finally:
+        progress.close()
+
+
+def _spy_progress(monkeypatch, captured):
+    # Patch collect._Progress with a spy that records the instance AND its construction-time
+    # ``disable`` flag (tqdm flips ``disable`` True on close, so the post-run flag is unreliable).
+    real_cls = collect._Progress
+
+    def spy(total):
+        progress = real_cls(total)
+        captured["progress"] = progress
+        captured["disable_at_construction"] = progress.bar.disable
+        return progress
+
+    monkeypatch.setattr(collect, "_Progress", spy)
+
+
+def _single_spec_factories(states, max_steps=3):
+    def env_factory(spec):  # noqa: ARG001
+        return TankEnv(
+            connection=P.Connection(ScriptedTransport(_step_episode_blobs(states))),
+            env_config=EnvConfig(max_steps=max_steps),
+        )
+
+    def agent_pool_factory(spec):  # noqa: ARG001
+        return {"p1": _FixedAgent(), "p2": _FixedAgent()}
+
+    return env_factory, agent_pool_factory
+
+
+def test_collect_parallel_single_spec_disables_bar_off_tty(tmp_path, monkeypatch):
+    # End-to-end through the single-spec in-process path with a non-TTY stderr: the run completes
+    # and the constructed bar was DISABLED (no progress output leaks into a captured / redirected
+    # run). _Progress reads sys.stderr.isatty() at construction.
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: False, raising=False)
+    env_factory, agent_pool_factory = _single_spec_factories([_flat_state(i) for i in range(3)])
+    captured = {}
+    _spy_progress(monkeypatch, captured)
+    spec = collect.CollectionSpec(
+        worker_id=0,
+        out_dir=str(tmp_path),
+        episode_plan=[_plan(None, intended_map_id=0)],
+        max_steps=3,
+        seed=0,
+        env_factory=env_factory,
+        agent_pool_factory=agent_pool_factory,
+    )
+    results = collect.collect_parallel([spec])
+    assert results[0]["num_shards"] == 1
+    # The bar was disabled off-TTY and still folded the episode's 3 samples into its running total.
+    assert captured["disable_at_construction"] is True
+    assert captured["progress"].total_samples == 3
+
+
+def test_collect_parallel_single_spec_advances_bar_on_tty(tmp_path, monkeypatch):
+    # On a TTY the single-spec path ENABLES the bar and advances it once per episode; the running
+    # sample total folds in each episode's len(ep).
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True, raising=False)
+    env_factory, agent_pool_factory = _single_spec_factories([_flat_state(i) for i in range(3)])
+    captured = {}
+    _spy_progress(monkeypatch, captured)
+    spec = collect.CollectionSpec(
+        worker_id=0,
+        out_dir=str(tmp_path),
+        episode_plan=[_plan(None, intended_map_id=0)],
+        max_steps=3,
+        seed=0,
+        env_factory=env_factory,
+        agent_pool_factory=agent_pool_factory,
+    )
+    collect.collect_parallel([spec])
+    assert captured["disable_at_construction"] is False
+    assert captured["progress"].bar.n == 1  # one episode ticked
+    assert captured["progress"].total_samples == 3
+
+
+def test_single_spec_clears_worker_progress_global(tmp_path, monkeypatch):
+    # The single-spec path installs a shim into the module global; after the run the global must be
+    # restored to None so no live handle lingers in the module.
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: False, raising=False)
+    states = [_flat_state(0), _flat_state(1)]
+
+    def env_factory(spec):  # noqa: ARG001
+        return TankEnv(
+            connection=P.Connection(ScriptedTransport(_step_episode_blobs(states, done_last=True))),
+            env_config=EnvConfig(max_steps=100),
+        )
+
+    def agent_pool_factory(spec):  # noqa: ARG001
+        return {"p1": _FixedAgent(), "p2": _FixedAgent()}
+
+    spec = collect.CollectionSpec(
+        worker_id=0,
+        out_dir=str(tmp_path),
+        episode_plan=[_plan(None, intended_map_id=0)],
+        max_steps=100,
+        seed=0,
+        env_factory=env_factory,
+        agent_pool_factory=agent_pool_factory,
+    )
+    collect.collect_parallel([spec])
+    assert collect._WORKER_PROGRESS_QUEUE is None
+
+
+# --- spawn-safety: the spec stays plain/picklable, no live queue handle leaks into it ------
+
+
+def test_collection_spec_pickles_round_trip():
+    # A spec like build_specs makes (module-level factories, plain extra) must pickle + unpickle.
+    import pickle
+
+    from pop_trainer.data import collect_runner
+
+    spec = collect.CollectionSpec(
+        worker_id=1,
+        out_dir="out/worker_1",
+        episode_plan=[_plan("Arenas/center_block.json", intended_map_id=0)],
+        max_steps=800,
+        seed=10_000,
+        map_index={"Arenas/center_block.json": 0},
+        env_factory=collect_runner.env_factory,
+        agent_pool_factory=collect_runner.agent_pool_factory,
+        extra={"exe": "build.exe", "config": "demo.json", "base_port": 50000, "pool": ["random"]},
+    )
+    restored = pickle.loads(pickle.dumps(spec))
+    assert restored.worker_id == 1
+    assert restored.episode_plan[0].switch_arena == "Arenas/center_block.json"
+    assert restored.map_index == {"Arenas/center_block.json": 0}
+
+
+def test_collection_spec_carries_no_queue_or_live_handle():
+    # No field of CollectionSpec is a multiprocessing queue / live handle: the spec is plain data,
+    # and the progress queue rides the Pool initializer, never the spec.
+    from dataclasses import fields
+
+    field_names = {f.name for f in fields(collect.CollectionSpec)}
+    assert "queue" not in field_names
+    assert "progress" not in field_names
+    spec = collect.CollectionSpec(
+        worker_id=0,
+        out_dir="out",
+        episode_plan=[_plan(None)],
+        max_steps=1,
+    )
+    for f in fields(collect.CollectionSpec):
+        value = getattr(spec, f.name)
+        assert not hasattr(value, "get_nowait"), f"{f.name} looks like a queue handle"
+
+
+# --- byte-unchanged shards: the callback path does not perturb the artifact ----------------
+
+
+def test_shards_byte_identical_with_and_without_callback(tmp_path):
+    # Collect the SAME deterministic episodes twice over identical fake transports: once with
+    # on_episode_done=None and once with a real recording callback. Every shard array (frames,
+    # states, actions, map_ids, episode_ids, step_idxs) must read back array-equal — the callback
+    # is a pure observability side-channel and touches no shard byte.
+    states_a = [_flat_state(0), _flat_state(1), _flat_state(2)]
+    states_b = [_flat_state(5), _flat_state(6), _flat_state(7)]
+
+    def collect_once(out_dir, on_episode_done):
+        env, _ = _make_env(
+            _step_episode_blobs(states_a) + _step_episode_blobs(states_b),
+            env_config=EnvConfig(max_steps=3),
+        )
+        return collect.collect_to_shards(
+            env,
+            out_dir=out_dir,
+            episode_plan=[_plan(None, intended_map_id=4), _plan(None, intended_map_id=9)],
+            agent_pool={"p1": _FixedAgent((1.0, 0.0, 0.0, 0.0, 1.0)), "p2": _FixedAgent()},
+            max_steps=3,
+            seed=0,
+            shard_prefix="shard_w0",
+            shard_size=10_000,
+            on_episode_done=on_episode_done,
+        )
+
+    reported: list[int] = []
+    without = collect_once(tmp_path / "without", None)
+    with_cb = collect_once(tmp_path / "with", reported.append)
+    assert reported == [3, 3]  # the callback really ran
+    assert len(without) == len(with_cb) == 1
+
+    a = shards.read_shard(without[0])
+    b = shards.read_shard(with_cb[0])
+    assert set(a) == set(b)
+    for name in (
+        schema.ARRAY_FRAMES,
+        schema.ARRAY_STATES,
+        schema.ARRAY_ACTIONS,
+        schema.ARRAY_MAP_IDS,
+        schema.ARRAY_EPISODE_IDS,
+        schema.ARRAY_STEP_IDXS,
+    ):
+        np.testing.assert_array_equal(a[name], b[name], err_msg=f"{name} differs with callback")
