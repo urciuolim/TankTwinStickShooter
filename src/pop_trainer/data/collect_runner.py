@@ -101,7 +101,8 @@ __all__ = [
 
 # The repo root is three parents up from this file (src/pop_trainer/data/collect_runner.py).
 _REPO_ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_EXE = _REPO_ROOT / "build" / "TankTwinStickShooter.exe"
+# OS-aware default to the launchable build binary (.exe / .app inner / bare); --exe overrides it.
+DEFAULT_EXE = launch.default_build_path(_REPO_ROOT)
 
 # Rendered pixel-frame dimensions (W x H) — MUST match the launched config's obs_pixels_*.
 FRAME_WIDTH = 640

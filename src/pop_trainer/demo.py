@@ -51,7 +51,7 @@ from pop_trainer import agents
 from pop_trainer.core import agent as core_agent
 from pop_trainer.core import state as S
 from pop_trainer.core.config import EnvConfig
-from pop_trainer.core.launch import build_launch_cmd, connect
+from pop_trainer.core.launch import build_launch_cmd, connect, default_build_path
 from pop_trainer.core.protocol import Connection, WallLayout
 from pop_trainer.env.tank_env import TankEnv
 
@@ -59,7 +59,8 @@ from pop_trainer.env.tank_env import TankEnv
 
 # The repo root is three parents up from this file (src/pop_trainer/demo.py -> repo).
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_EXE = _REPO_ROOT / "build" / "TankTwinStickShooter.exe"
+# OS-aware default to the launchable build binary (.exe / .app inner / bare); --exe overrides it.
+DEFAULT_EXE = default_build_path(_REPO_ROOT)
 # The demo config enables obs_pixels and lives in StreamingAssets so its relative arena_path
 # resolves against the config directory (DriverController.ResolveArenaPath).
 DEFAULT_CONFIG = _REPO_ROOT / "Assets" / "StreamingAssets" / "demo_config.json"
