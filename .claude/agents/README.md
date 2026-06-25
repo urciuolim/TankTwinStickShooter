@@ -21,6 +21,24 @@
 - **Infra / platform agents are read-only verdict-emitters** — they produce GO / NO-GO conclusions against explicit criteria and never write code; a NO-GO routes back to engineering. `repo-steward` earns its slot by *objective isolation*: a dedicated repo-health objective a builder would deprioritize. Deterministic boundary checks via CI tooling (e.g. import-linter) are its instrument, not its replacement.
 - **The one writer on the platform team is the `documentarian`** — it writes documentation only (`./docs/` Markdown, never `src/`). It is the post-GO tail of the pipeline: build → platform gate, and **on GO the infra-manager dispatches the documentarian and accuracy-checks its docs, returning GO _with_ docs** → the Director commits code + docs together. Separation of duties holds: the documentarian documents code it didn't write and that already passed the gate; the infra-manager verifies the docs against the source. (Running the doc agent is the infra-manager's job at GO, not the Director's after it.)
 
+## Live / e2e test runs — the time-budget ladder
+Unit tests run on every change; **live runs** (anything that launches the Unity build — e2e smokes, collection validation) cost wall-clock, so they are tiered and budget-gated. **No agent autonomously starts a long run.**
+
+**Test tiers**
+- **Tier 0** — UTs + contracts. Every change, fast, in the default `pytest` run.
+- **Tier 1** — fast e2e smoke (`@pytest.mark.e2e`, EXCLUDED from the default run, auto-skips with no `build/` exe): a small live collection (~2 workers, 1-2 episodes, one `switch_arena`), ~1-3 min. The FUNCTIONAL / integration net for the `data`/`env`/`protocol`/Unity live seam that UTs structurally can't reach. Run by `evaluation` at the gate for live-seam changes, and by the Director in the commit smoke.
+- **Tier 2** — full / scale collection or soak (the ~1 hr kind). Ad-hoc, never automatic.
+
+**An e2e is NOT a scale net.** A 2-worker smoke never reproduces a resource blow-up (e.g. the shard-buffer OOM). Scale / resource bugs are caught by a *static* net instead — a pre-flight memory-estimate guard plus fast OOM-class unit tests that mock low RAM. A green e2e ≠ "scales fine."
+
+**The escalation ladder (wall-clock per live run).** An agent self-estimates (`workers × episodes × ~3 s/episode`) and checks BEFORE launching. A run estimated over the actor's tier STOPS and bubbles up a written ask (what changed, why a live run is warranted, est. time):
+- **Worker ≤ 3 min** — autonomous.
+- **Manager ≤ 10 min** — the dispatching manager signs off.
+- **Director ≤ 30 min** — bubble up to the Director.
+- **> 30 min** — the CTO signs off.
+
+Budgets are wall-clock; tune as the engine's throughput changes.
+
 ## This is a deliberate bet — so it's instrumented
 The field is immature and the recent evidence is contested. We are establishing this org model ahead of settled practice, on purpose. Leading indicators we watch to know if it's working (else we collapse layers):
 1. **Delegation actually happens** — large tasks go to the team, not the main session. (Small SWE tasks the Director may do directly.)

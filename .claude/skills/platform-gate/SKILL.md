@@ -39,6 +39,11 @@ The platform team is the cross-team adversarial gate on engineering. It emits VE
 - The test bar is **contract-aware**: pure functions/contracts MUST be covered; framework/trainer glue is exempt (we do not test the trainer). **Uncovered pure-contract logic is a blocking finding; uncovered glue is advisory.**
 - Soft target (tunable): pure-logic components (e.g. `core`) ~90%+. Not a blunt global cutoff — tie a low number to *which* untested lines actually matter.
 
+## Live / e2e (evaluation)
+- For a change touching the **live seam** (`data`/`env`/`protocol`/Unity), run the **Tier-1 e2e** (`uv run pytest -m e2e`, needs a `build/` exe) — the functional net UTs can't reach. It auto-skips with no build, so a buildless run stays green.
+- Stay within the **run-budget ladder** (worker ≤3 min / manager ≤10 / Director ≤30 / CTO >30 — see the [agent charter](../../agents/README.md)). A run estimated over your tier bubbles up; never auto-launch a long run.
+- **An e2e is not a scale net.** For collection / resource-sensitive changes, the pre-flight memory-estimate guard + the OOM-class unit tests (mock-low-RAM) must be green — the e2e smoke does NOT cover the resource/scale class.
+
 ## C# / Unity deliverables (the same four gates apply)
 - **Tests:** Unity Test Framework EditMode tests for pure logic (extracted from MonoBehaviours). `evaluation` runs them **headless**: `Unity.exe -batchmode -runTests -testPlatform EditMode -testResults <path> -quit` (editor at `C:\Program Files\Unity\Hub\Editor\6000.5.0f1\Editor\Unity.exe`). Expect minutes — C# gates are slower (editor launch).
 - **Coverage:** measured + reported via the Unity Code Coverage package (same expectation as Python).
