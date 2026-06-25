@@ -20,6 +20,7 @@ from pop_trainer import agents
 from pop_trainer.core import protocol as P
 from pop_trainer.core import state as S
 from pop_trainer.data import collect_runner as R
+from pop_trainer.data import schema, shards
 from pop_trainer.data.collect import CollectionSpec
 
 FRAME_H, FRAME_W = R.FRAME_HEIGHT, R.FRAME_WIDTH
@@ -699,3 +700,68 @@ def test_summarize_collection_single_map_run():
     s = R.summarize_collection(worker_map_ids, ["Arenas/custom1.json"], total_shards=2)
     assert s.total_samples == 7
     assert s.map_samples == [(0, "Arenas/custom1.json", 7)]
+
+
+# --- _read_worker_map_ids (the summary disk-read path; lazy per-member, NEVER touches frames) ---
+
+
+def _write_real_shard(out_dir, *, prefix, index, n, map_ids, frame_hw=(180, 320)):
+    """Write a real production shard with a deliberately heavy ``frames`` array via the writer.
+
+    ``frames`` is sized so that decompressing it would dominate (n x H x W x 3 uint8), proving the
+    summary read stays cheap only if it never inflates that member. The shard is built and written
+    by the SAME ``Shard`` + ``write_shard`` path collection uses, so its byte layout is authentic.
+    """
+    h, w = frame_hw
+    shard = shards.Shard(
+        frames=np.zeros((n, h, w, schema.FRAME_CHANNELS), dtype=np.uint8),
+        states=np.zeros((n, S.STATE_LEN), dtype=np.float32),
+        map_ids=np.asarray(map_ids, dtype=np.int32),
+        episode_ids=np.zeros(n, dtype=np.int32),
+        step_idxs=np.arange(n, dtype=np.int32),
+    )
+    return shards.write_shard(out_dir / f"{prefix}_{index:04d}.npz", shard)
+
+
+def test_read_worker_map_ids_returns_concatenated_ids_in_shard_order(tmp_path):
+    # Two real shards (the runner's shard_w{id}_NNNN.npz names) -> ids concatenated in sorted order.
+    _write_real_shard(tmp_path, prefix="shard_w0", index=0, n=3, map_ids=[0, 0, 1])
+    _write_real_shard(tmp_path, prefix="shard_w0", index=1, n=2, map_ids=[2, 1])
+    ids = R._read_worker_map_ids(tmp_path)
+    assert ids.dtype == np.int32
+    np.testing.assert_array_equal(ids, np.array([0, 0, 1, 2, 1], dtype=np.int32))
+
+
+def test_read_worker_map_ids_empty_worker_returns_empty_not_raise(tmp_path):
+    # A worker that wrote no shards -> empty int32 array, NOT a crash (summary must survive it).
+    ids = R._read_worker_map_ids(tmp_path)
+    assert ids.dtype == np.int32
+    assert ids.shape == (0,)
+
+
+def test_read_worker_map_ids_never_decompresses_frames(tmp_path, monkeypatch):
+    # REGRESSION (perf): the summary read must inflate ONLY the tiny map_ids member, never the big
+    # frames array. We spy on NpzFile member access and assert "frames" is NEVER requested while
+    # "map_ids" IS. The frames array here is large enough that the OLD build_index path (which
+    # materializes every member via read_shard) would record a "frames" access and fail this test.
+    from numpy.lib.npyio import NpzFile
+
+    _write_real_shard(tmp_path, prefix="shard_w0", index=0, n=400, map_ids=[7] * 400)
+
+    accessed: list[str] = []
+    orig_getitem = NpzFile.__getitem__
+
+    def spy_getitem(self, key):
+        accessed.append(key)
+        return orig_getitem(self, key)
+
+    monkeypatch.setattr(NpzFile, "__getitem__", spy_getitem)
+
+    ids = R._read_worker_map_ids(tmp_path)
+
+    # The spy actually fired (guards against a silently-broken patch passing the negative assert).
+    assert schema.ARRAY_MAP_IDS in accessed
+    # The whole point: the big frames member is NEVER inflated by the summary read path.
+    assert schema.ARRAY_FRAMES not in accessed
+    # Correctness, not just the I/O guard: the ids round-trip exactly.
+    np.testing.assert_array_equal(ids, np.full(400, 7, dtype=np.int32))

@@ -102,8 +102,10 @@ package is named `data` (not `datasets` — that name collides with the git-igno
   per-worker + per-map sample counts from each worker's per-sample `map_ids`, returning a frozen
   `CollectionSummary` (`total_shards` / `total_samples` / `worker_samples` / `map_samples`, with ONE
   `map_samples` row per arena in the `maps` sidecar — arenas with zero samples shown as `0`). `main`
-  feeds it the per-worker `map_ids` read back through `readers.build_index` (a thin disk wrapper,
-  `collect_runner.py:651-662`) and renders it with a format-only helper (`collect_runner.py:665-685`).
+  feeds it the per-worker `map_ids` read back by `_read_worker_map_ids`, which globs each worker dir's
+  `shard_*.npz` in sorted filename order and lazily reads ONLY each shard's tiny `map_ids` member (the
+  big `frames` array is never inflated — NOT via `build_index`, `collect_runner.py:651-666`), and
+  renders it with a format-only helper (`collect_runner.py:669-685`).
 
 ## The rotation scheduler + map tagging
 

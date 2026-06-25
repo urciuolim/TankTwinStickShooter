@@ -67,7 +67,7 @@ from pop_trainer.core import launch
 from pop_trainer.core import maps as core_maps
 from pop_trainer.core.config import EnvConfig
 from pop_trainer.core.protocol import Connection
-from pop_trainer.data import collect, readers
+from pop_trainer.data import collect, schema
 from pop_trainer.data.collect import CollectionSpec, EpisodePlan, collect_parallel
 from pop_trainer.env.tank_env import TankEnv
 
@@ -651,15 +651,19 @@ def summarize_collection(
 def _read_worker_map_ids(out_dir: str | Path) -> np.ndarray:
     """Per-sample ``map_ids`` written into a worker's out dir (empty array if it wrote no shards).
 
-    Thin disk wrapper over :func:`readers.build_index`, which scans the worker dir's ``shard_*.npz``
-    (the runner's ``shard_w{id}_*`` prefix matches that glob) reading only the cheap per-sample
-    arrays. A worker that wrote nothing has no shards and ``build_index`` raises ``ValueError`` — we
-    treat that as zero samples so the summary never crashes on an empty worker.
+    Globs the worker dir's ``shard_*.npz`` (the runner's ``shard_w{id}_*`` prefix matches) in
+    SORTED filename order and reads ONLY each shard's ``map_ids`` member. Accessing a single
+    member of a lazy ``NpzFile`` decompresses ONLY that member, so the big ``frames`` array is
+    NEVER inflated — the summary needs only the tiny group-key array. A worker that wrote no
+    shards (empty glob) returns an empty int32 array so the summary never crashes on it.
     """
-    try:
-        return readers.build_index(out_dir).map_ids
-    except ValueError:
+    parts: list[np.ndarray] = []
+    for path in sorted(Path(out_dir).glob("shard_*.npz")):
+        with np.load(path) as npz:
+            parts.append(np.asarray(npz[schema.ARRAY_MAP_IDS], dtype=np.int32))
+    if not parts:
         return np.empty(0, dtype=np.int32)
+    return np.concatenate(parts).astype(np.int32, copy=False)
 
 
 def _format_summary(
@@ -854,10 +858,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     results = collect_parallel(specs)
 
-    # Concise end-of-run summary: read back each worker's per-sample map_ids (cheap — only the small
-    # per-sample arrays, not frame bytes) to derive sample + per-map counts, then count PURELY via
-    # summarize_collection. The worker result dict carries only shards/num_shards, so the sample and
-    # per-map numbers come from build_index over each worker dir (empty workers read as 0 samples).
+    # Concise end-of-run summary: read back each worker's per-sample map_ids to derive sample +
+    # per-map counts, then count PURELY via summarize_collection. _read_worker_map_ids inflates ONLY
+    # the tiny map_ids member of each shard (never the big frames array), so this stays cheap even
+    # over hundreds of shards. The worker result dict carries only shards/num_shards (empty workers
+    # read as 0 samples).
     out_dir_by_worker = {spec.worker_id: spec.out_dir for spec in specs}
     worker_shards = {r["worker_id"]: r["num_shards"] for r in results}
     total_shards = sum(r["num_shards"] for r in results)

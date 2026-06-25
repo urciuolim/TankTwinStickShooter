@@ -210,8 +210,9 @@ filename dumps (`collect_runner.py:856-869`). Three parts:
 
 The sample + per-map counts come from a **pure** counter
 ([`summarize_collection`](../src/pop_trainer/data/collect_runner.py), `collect_runner.py:613-648`)
-over each worker's per-sample `map_ids` (read back via `readers.build_index`); the worker result
-dict supplies only the shard counts.
+over each worker's per-sample `map_ids` (read back by globbing each worker dir's `shard_*.npz` in
+sorted order and lazily reading ONLY each shard's `map_ids` member — the big `frames` array is never
+decompressed, `collect_runner.py:651-666`); the worker result dict supplies only the shard counts.
 
 ### The `maps.json` sidecar (reversible map ids)
 
