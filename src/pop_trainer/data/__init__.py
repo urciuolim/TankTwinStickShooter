@@ -22,8 +22,10 @@ Modules:
 * :mod:`pop_trainer.data.collect` — the collection driver: a pure, env-injectable step loop
   pairing a ``player1`` + ``player2`` agent, plus spawn-based (never fork) parallel
   orchestration whose live socket path is isolated.
+* :mod:`pop_trainer.data.manifest` — pure assembly + validation of the run-root provenance +
+  machine manifest that makes a (non-byte-reproducible) dataset identifiable.
 """
 
-from pop_trainer.data import collect, readers, schema, shards
+from pop_trainer.data import collect, manifest, readers, schema, shards
 
-__all__ = ["schema", "shards", "readers", "collect"]
+__all__ = ["schema", "shards", "readers", "collect", "manifest"]
