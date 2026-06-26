@@ -347,6 +347,8 @@ Flags (defaults shown), grounded in [`_parse_args`](../src/pop_trainer/rl/train.
 | `--checkpoint-freq` | `10000` | env-steps between checkpoints (the sidecar rides this cadence) (`train.py:753-755`). |
 | `--port` | `50000` | base TCP port → `game_port`. Training env `i` listens on `game_port + i` for `i` in `0..n_envs-1` (at `--n-envs 1` that is just `--port`) (`train.py:1069-1071`; `training_ports`, `train.py:487-489`). |
 | `--eval-port` | *(absent → `game_port + n_envs`)* | TCP port the **dedicated eval** build listens on → `eval_port`. When omitted the effective eval port is `game_port + n_envs` — the **first port AFTER the training range** `[game_port, game_port + n_envs - 1]` (so at `--n-envs 1` it is `port + 1` as before; at `--n-envs 7 --port 50000` it is `50007`) (`effective_eval_port` property, `train.py:228-236`). When set it **must differ from `--port`** AND **must NOT fall inside the training range** — either is rejected by `TrainConfig.__post_init__` with a `ValueError` (`train.py:1072-1077`; rejection `train.py:211-226`). |
+| `--log-dir` | *(absent → `run_dir/logs`)* | directory for the per-process observability logs (the JSONL `training-system.log` + `env-<role>-<port>.log` + the paired Unity `unity-<role>-<port>.log`). See [Observability logs](#observability-logs) (`train.py:1280-1285`; `effective_log_dir` property, `train.py:256-259`). |
+| `--debug` | *(off → INFO)* | the SINGLE switch: crank ALL observability logs to DEBUG (per-step send/recv/step). Equivalent to setting `POP_LOG_LEVEL=DEBUG`; resolved via `level_from_env` (`train.py:1286-1291,1312-1316`). |
 
 **Knobs NOT on the CLI** (they use `TrainConfig` dataclass defaults — override in code, not the
 command line): `frame_shape` (the 640×360×3 frame), the PPO hyperparameters other than `--n-steps`
@@ -425,6 +427,54 @@ raises `FileNotFoundError` (`train.py:598-601`).
 > `--checkpoint-freq` you pass (with the default that means `--total-timesteps >= 10000`); treat
 > anything below the cadence as a **smoke-only, non-resumable** run. You can lower `--checkpoint-freq`
 > to force an earlier checkpoint on a short run.
+
+### Observability logs
+
+Every run writes a per-process **structured-JSONL** log trail into the log dir (default
+`run_dir/logs`, override with `--log-dir`). This is the operator's guide to reading them when
+diagnosing the multi-env hang. The logging is **purely observational** — it does not touch the TCP
+wire, the 52-float state, message ordering, or control flow; the Python side is off by default on
+any unwired path and the C# side is gated on the build's `verbose` config flag (see
+[game architecture](game-architecture.md#observability-logging-verbose-gated-zero-wire-impact)).
+
+**Per-process file routing.** A run is many processes (the main process, each `SubprocVecEnv`
+worker, the eval env behind the eval callback), and each writes its OWN file so concurrent writers
+never contend:
+
+- `training-system.log` — the main process (`role=system`, `port=null`, `layer=train`).
+- `env-<role>-<port>.log` — one per env connection (`role` = `train`/`eval`, `port` = that env's
+  TCP port). This file is **SHARED** by the env layer (`layer=env`) and the protocol layer
+  (`layer=protocol`) for that one socket.
+- `unity-<role>-<port>.log` — one per Unity build (the build's `-logFile` output), paired to the
+  Python `env-*.log` by the same `(role, port)`.
+
+So a **1-train + 1-eval run** (the default `--n-envs 1`, ports 50000/50001) produces **5 files**:
+
+```
+training-system.log
+env-train-50000.log    unity-train-50000.log
+env-eval-50001.log     unity-eval-50001.log
+```
+
+General formula: **2 Python files per connection + the system file**, with the C# `unity-*.log`
+pairing each. (At `--n-envs N` that is `N` training connections + 1 eval connection.)
+
+**INFO vs DEBUG.** Default level is **INFO** (handshake / reset / episode milestones + the
+`run_config` / memory-estimate / `rollout_*` / `checkpoint_save` / `worker_death` system markers).
+Pass `--debug` (or set `POP_LOG_LEVEL=DEBUG`) — the **single switch** — to crank ALL logs to
+**DEBUG** (adds per-step send/recv/step).
+
+**JSONL schema + the cross-stack merge key.** Every Python line is one strict-JSON object with at
+least `ts_wall` (`time.time`), `ts_mono` (`time.monotonic`), `level`, `layer`, `role`, `port`,
+`event`, plus any detail fields (`bytes` / `elapsed_ms` / `episode` / `timesteps` / `fps` / …). The
+C# lines are `[tag] wall=<ISO-8601 UtcNow> k=v …`. **`ts_wall` (Python) and `wall=` (C#) are the
+same wall-clock**, so they are how you **merge across files and across the Python/C# stack** when
+chasing where a hang happened (e.g. line up a Python `step` against the C# `readpixels` / dead-zone
+lines for that port).
+
+**Eval isolation.** Each logger is set up with `propagate=False`, so eval records land ONLY in
+`env-eval-<port>.log` and **never leak into `training-system.log`** — when scanning the system log
+for the hang you are looking at training + system markers only, with no eval noise.
 
 ## 6. Validate coverage (no Unity required)
 

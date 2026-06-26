@@ -81,6 +81,8 @@ league / self-play path can compose them without re-deriving the transforms.
 from __future__ import annotations
 
 import contextlib
+import logging
+import time
 from collections.abc import Callable
 
 import gymnasium
@@ -89,6 +91,7 @@ from gymnasium import spaces
 
 from pop_trainer.core import state as S
 from pop_trainer.core.config import EnvConfig, RewardConfig
+from pop_trainer.core.logging_setup import LAYER_ENV
 from pop_trainer.core.protocol import (
     Connection,
     WallLayout,
@@ -107,6 +110,11 @@ ACTION_HIGH = 1.0
 # declares the expected shape (it must match what Unity renders). The default is a small
 # placeholder for tests / introspection — production passes the build's real frame shape.
 DEFAULT_FRAME_SHAPE = (36, 60, 3)
+
+
+def _ms_since(t0: float) -> float:
+    """Elapsed milliseconds since the monotonic timestamp ``t0`` (observability durations only)."""
+    return (time.monotonic() - t0) * 1000.0
 
 
 def _coerce_action(action) -> list[float]:
@@ -153,6 +161,14 @@ class TankEnv(gymnasium.Env):
             :data:`DEFAULT_FRAME_SHAPE`.
         survivor: survivor-mode terminal flip (threaded into the reward).
         seed: optional default seed (also overridable per ``reset``).
+        logger: OPTIONAL observability logger (default ``None`` = no logging, behavior-identical
+            to today, allocation-free on the hot path). When present the env logs its
+            reset/step/episode milestones at the env layer. The SAME logger should be threaded into
+            the :class:`~pop_trainer.core.protocol.Connection` (by the caller's
+            ``connection_factory``) so protocol + env records for one socket share the
+            ``env-<role>-<port>.log`` file.
+        role: the connection's role tag (``"train"`` / ``"eval"``) surfaced in the env's log
+            records; purely observational, defaults to ``"train"``.
     """
 
     metadata = {"render_modes": []}
@@ -167,6 +183,8 @@ class TankEnv(gymnasium.Env):
         frame_shape: tuple[int, int, int] = DEFAULT_FRAME_SHAPE,
         survivor: bool = False,
         seed: int | None = None,
+        logger: logging.Logger | None = None,
+        role: str = "train",
     ):
         super().__init__()
 
@@ -189,6 +207,10 @@ class TankEnv(gymnasium.Env):
         self.survivor = survivor
         self._default_seed = seed
 
+        # OPTIONAL observability. None = no logging (the default behavior-identical path).
+        self.logger = logger
+        self.role = role
+
         self.frame_shape = tuple(frame_shape)
         # Observation = the real rendered pixel frame; state is in info, not the obs space.
         self.observation_space = spaces.Box(low=0, high=255, shape=self.frame_shape, dtype=np.uint8)
@@ -201,12 +223,27 @@ class TankEnv(gymnasium.Env):
         self._raw_state: list[float] | None = None
         self.step_counter = 0
         self.last_winner = -1
+        # Monotonic episode counter (observability only; surfaced in the reset/episode log records).
+        self._episode = 0
         # The static wall layout of the current map, parsed from the optional one-time walls
         # message in the handshake. None until a walls message arrives (no arena configured).
         self.current_map: WallLayout | None = None
         # The actual length-5 actions sent on the wire on the most recent successful step.
         self.last_p1_action: list[float] | None = None
         self.last_p2_action: list[float] | None = None
+
+    # --- observability helper (no-op when self.logger is None) ---------------------------
+
+    def _log(self, level: int, event: str, **detail) -> None:
+        """Emit one env-layer observability record at ``level`` if a logger is attached; else no-op.
+
+        The ``self.logger is None`` early return keeps the default (no-logger) path allocation-free.
+        ``layer`` is tagged ``env`` so env records are distinguishable from the protocol records the
+        shared :class:`~pop_trainer.core.protocol.Connection` writes to the same file.
+        """
+        if self.logger is None:
+            return
+        self.logger.log(level, event, extra={"detail": {"layer": LAYER_ENV, **detail}})
 
     # --- gymnasium API -------------------------------------------------------------------
 
@@ -228,12 +265,27 @@ class TankEnv(gymnasium.Env):
 
         switch_target = options.get("switch_arena") if options else None
 
+        self._episode += 1
+        self._log(
+            logging.INFO,
+            "reset_begin",
+            episode=self._episode,
+            switch_arena=switch_target,
+        )
         try:
             obs, info = self._handshake_and_first_state(switch_target)
         except ConnectionError:
             # A dropped connection during reset: reconnect (if possible) and retry once.
+            self._log(logging.WARNING, "reset_lost_connection", episode=self._episode)
             self._reconnect()
             obs, info = self._handshake_and_first_state(switch_target)
+        map_layout = info.get("map")
+        self._log(
+            logging.INFO,
+            "reset_end",
+            episode=self._episode,
+            map=getattr(map_layout, "map_id", None),
+        )
         return obs, info
 
     def _handshake_and_first_state(self, switch_target=None):
@@ -262,8 +314,10 @@ class TankEnv(gymnasium.Env):
         non-walls object is the next handshake message. An absent walls message never consumes a
         state, so this is correct for every switch/no-switch x walls-present/absent combination.
         """
+        t0 = time.monotonic()
         self.conn.send({"restart": True})
         self.conn.receive()  # restart ack
+        self._log(logging.INFO, "handshake_restart_ack", elapsed_ms=_ms_since(t0))
 
         # !ingame window (after the restart ack, before the start send): optional map change.
         # switch_arena reads ONLY the {"arena_switched": true} ack. The switch branch's optional
@@ -271,19 +325,30 @@ class TankEnv(gymnasium.Env):
         # AFTER the start send, ahead of the start ack — a walls-absent switch wrote nothing there,
         # so nothing is mis-consumed.
         if switch_target is not None:
+            t_switch = time.monotonic()
             self.conn.switch_arena(switch_target)
+            self._log(
+                logging.INFO,
+                "handshake_switch_arena_ack",
+                elapsed_ms=_ms_since(t_switch),
+                switch_arena=switch_target,
+            )
 
+        t_start = time.monotonic()
         self.conn.send({"start": True})
 
         # Drain the switch branch's optional walls (if any) then the start ack it stops on.
         ack = self._drain_optional_walls()
         if "starting" not in ack:
             raise RuntimeError(f"unexpected start ack from game: {ack!r}")
+        self._log(logging.INFO, "handshake_start_ack", elapsed_ms=_ms_since(t_start))
 
         # Drain the start branch's optional walls (if any) then the first state it stops on; pair
         # the state with its trailing pixel frame.
+        t_state = time.monotonic()
         received = self._drain_optional_walls()
         frame = self.conn.receive_frame()
+        self._log(logging.INFO, "handshake_first_state", elapsed_ms=_ms_since(t_state))
 
         self._raw_state = list(received["state"])
         self._frame = np.asarray(frame, dtype=np.uint8)
@@ -356,6 +421,12 @@ class TankEnv(gymnasium.Env):
                 win_reward=self.reward_config.win_reward,
                 loss_reward=self.reward_config.loss_reward,
             )
+            self._log(
+                logging.INFO,
+                "step_lost_connection",
+                episode=self._episode,
+                step=self.step_counter,
+            )
             self._reconnect()
             return self._frame, reward, terminated, truncated, {"lost_connection": True}
 
@@ -364,6 +435,7 @@ class TankEnv(gymnasium.Env):
         self.step_counter += 1
         self.last_p1_action = a1
         self.last_p2_action = a2
+        self._log(logging.DEBUG, "step", episode=self._episode, step=self.step_counter)
 
         winner = int(received["winner"]) if "winner" in received else None
         done = bool("done" in received)
@@ -398,6 +470,18 @@ class TankEnv(gymnasium.Env):
                 info["outcome"] = "loss"
             else:
                 info["outcome"] = "draw"
+
+        if terminated or truncated:
+            self._log(
+                logging.INFO,
+                "episode_end",
+                episode=self._episode,
+                step=self.step_counter,
+                terminated=terminated,
+                truncated=truncated,
+                winner=winner,
+                outcome=info.get("outcome"),
+            )
 
         return self._frame, reward, terminated, truncated, info
 

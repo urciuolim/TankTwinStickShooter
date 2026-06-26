@@ -41,6 +41,8 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import logging
+import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -49,6 +51,15 @@ from typing import TYPE_CHECKING
 from pop_trainer.agents import AGENT_SELECTORS
 from pop_trainer.core import launch
 from pop_trainer.core.config import EnvConfig, RewardConfig
+from pop_trainer.core.logging_setup import (
+    LOG_LEVEL_ENV_VAR,
+    ROLE_EVAL,
+    ROLE_TRAIN,
+    level_from_env,
+    setup_env_logger,
+    setup_system_logger,
+    unity_log_path,
+)
 from pop_trainer.core.protocol import Connection
 from pop_trainer.env.tank_env import TankEnv
 from pop_trainer.rl.elo import elo_change
@@ -158,6 +169,11 @@ class TrainConfig:
         allow_oversized: skip the pre-flight rollout-buffer memory ABORT (the estimate is still
             printed). Use only when the box has RAM the conservative guard does not model.
         build_path: the build binary; ``None`` -> :func:`core.launch.default_build_path`.
+        log_dir: the directory the per-process observability logs (``training-system.log`` +
+            ``env-<role>-<port>.log`` + the paired Unity ``unity-<role>-<port>.log``) are written
+            to. ``None`` (default) -> ``run_dir / "logs"``. PURELY observational.
+        debug_logging: crank ALL observability logs to DEBUG (the single switch; default ``False``
+            = INFO). The CLI ``--debug`` flag / the ``POP_LOG_LEVEL`` env var set this.
     """
 
     total_timesteps: int
@@ -174,6 +190,8 @@ class TrainConfig:
     checkpoint_freq: int = 10_000
     resume: Path | None = None
     seed: int = 0
+    log_dir: Path | None = None
+    debug_logging: bool = False
     # PPO hyperparameters (pixel-PPO defaults).
     learning_rate: float = 3e-4
     n_steps: int = 2048
@@ -235,6 +253,16 @@ class TrainConfig:
         """
         return self.eval_port if self.eval_port is not None else self.game_port + self.n_envs
 
+    @property
+    def effective_log_dir(self) -> Path:
+        """The observability log directory: ``log_dir`` or, when ``None``, ``run_dir / "logs"``."""
+        return self.log_dir if self.log_dir is not None else self.run_dir / "logs"
+
+    @property
+    def log_level(self) -> int:
+        """The observability log level: ``DEBUG`` when ``debug_logging`` else ``INFO``."""
+        return logging.DEBUG if self.debug_logging else logging.INFO
+
     def to_dict(self) -> dict:
         """JSON-ready plain-dict view (Paths -> str, tuples -> list)."""
         return {
@@ -266,6 +294,8 @@ class TrainConfig:
             "eval_port": self.eval_port,
             "allow_oversized": self.allow_oversized,
             "build_path": None if self.build_path is None else str(self.build_path),
+            "log_dir": None if self.log_dir is None else str(self.log_dir),
+            "debug_logging": self.debug_logging,
         }
 
 
@@ -395,28 +425,37 @@ def _attach_launch_proc(env: TankEnv, proc: subprocess.Popen) -> None:
     env.close = close_and_reap  # type: ignore[method-assign]
 
 
-def _live_connection_factory_for_port(cfg: TrainConfig, port: int) -> Callable[[], Connection]:
+def _live_connection_factory_for_port(
+    cfg: TrainConfig, port: int, *, role: str = ROLE_TRAIN, logger: logging.Logger | None = None
+) -> Callable[[], Connection]:
     """Build the LIVE ``connection_factory`` for ``port``: launch the build, connect, wrap socket.
 
     Returns a zero-arg callable the env invokes on construction (and re-invokes on reconnect). Each
     call: launches the build via :func:`core.launch.build_launch_cmd` + ``subprocess.Popen`` on
-    ``port``, connects via :func:`core.launch.connect`, and wraps the socket in a
-    :class:`core.protocol.Connection`. The live ``Popen`` is stashed on the returned ``Connection``
-    (``conn._launch_proc``) so :func:`_build_base_env` can wire ``env.close`` to reap it.
+    ``port`` (with Unity's ``-logFile`` pointed at ``unity-<role>-<port>.log`` so each build writes
+    its OWN C# log), connects via :func:`core.launch.connect`, and wraps the socket in a
+    :class:`core.protocol.Connection` carrying the SHARED per-connection ``logger`` (so protocol +
+    env records for this socket land in one ``env-<role>-<port>.log``). The live ``Popen`` is
+    stashed on the returned ``Connection`` (``conn._launch_proc``) so :func:`_build_base_env` can
+    wire ``env.close`` to reap it.
 
     The build is launched WINDOWED (never batchmode) on ``cfg.game_config``. Parameterizing the
     ``port`` lets the TRAINING env (``cfg.game_port``) and the DEDICATED eval env
     (``cfg.effective_eval_port``) each launch their OWN build on their OWN socket. Re-derived from
     the shared ``core.launch`` primitives — ``rl`` does NOT import the ``data`` launch path.
+
+    Observability: ``role`` tags the Unity log filename; ``logger`` (when given) is threaded into
+    the ``Connection`` for wire-level evidence. Both default off — the no-logger path is identical.
     """
     exe = cfg.build_path if cfg.build_path is not None else launch.default_build_path(_REPO_ROOT)
+    u_log_path = unity_log_path(cfg.effective_log_dir, role, port)
 
     def factory() -> Connection:
-        cmd = launch.build_launch_cmd(exe, port, cfg.game_config)
+        cmd = launch.build_launch_cmd(exe, port, cfg.game_config, unity_log_path=u_log_path)
         proc = subprocess.Popen(cmd)  # noqa: S603 (arg-list, trusted local build path)
         try:
             sock = launch.connect(port)
-            conn = Connection(sock)
+            conn = Connection(sock, logger=logger)
         except BaseException:
             # The build is already running; if connect never completes, reap it so a failed launch
             # does not leak a process.
@@ -433,15 +472,23 @@ def _live_connection_factory_for_port(cfg: TrainConfig, port: int) -> Callable[[
 
 
 def _build_base_env(
-    cfg: TrainConfig, connection_factory: Callable[[], Connection], port: int
+    cfg: TrainConfig,
+    connection_factory: Callable[[], Connection],
+    port: int,
+    *,
+    role: str = ROLE_TRAIN,
+    logger: logging.Logger | None = None,
 ) -> TankEnv:
     """Build the bare pure-transport :class:`TankEnv` over the given ``connection_factory``.
 
     Wires the env config (``max_steps`` from the Phase-1 round cap, ``game_port`` = ``port`` so
     the built env records WHICH socket it speaks on), the default reward, the channels-last
-    ``frame_shape``, and the seed. If the factory stashed a live build ``Popen`` on its produced
-    ``Connection`` (the LIVE path), wrap ``env.close`` so closing the env reaps the build; an
-    injected STUB factory carries no proc, so the reap-wrap is skipped (no Unity).
+    ``frame_shape``, the seed, and the OPTIONAL observability ``logger`` / ``role`` (the env layer
+    logs its milestones on the SAME logger the connection_factory hands its ``Connection``). If the
+    factory stashed a live build ``Popen`` on its produced ``Connection`` (the LIVE path), wrap
+    ``env.close`` so closing the env reaps the build; an injected STUB factory carries no proc, so
+    the reap-wrap is skipped (no Unity). ``logger=None`` (the default / test path) is
+    behavior-identical to before.
     """
     env = TankEnv(
         connection_factory=connection_factory,
@@ -449,6 +496,8 @@ def _build_base_env(
         reward_config=RewardConfig(),
         frame_shape=cfg.frame_shape,
         seed=cfg.seed,
+        logger=logger,
+        role=role,
     )
     proc = getattr(env.conn, "_launch_proc", None)
     if proc is not None:
@@ -462,6 +511,7 @@ def _make_self_play_env(
     *,
     seed_offset: int = 0,
     connection_factory: Callable[[], Connection] | None = None,
+    role: str = ROLE_TRAIN,
 ) -> SelfPlayWrapper:
     """Build one full ``SelfPlayWrapper(TankEnv)`` for ``port`` — the per-env construction unit.
 
@@ -471,13 +521,21 @@ def _make_self_play_env(
     subproc's roster RNG differs). Constructing the PROVIDER here — not before — is what makes the
     closure that wraps this spawn-safe: nothing live is captured, the provider is built INSIDE the
     subprocess. Returns the wrapper.
+
+    Observability: on the LIVE path (no injected ``connection_factory``) this sets up the
+    per-process env logger for ``(role, port)`` HERE — which, for a ``SubprocVecEnv`` worker, runs
+    INSIDE the spawned subprocess, so the worker opens its OWN ``env-<role>-<port>.log`` handle —
+    and threads that SAME logger into both the live ``Connection`` and the env layer. An injected
+    STUB factory (the unit-test seam) gets NO logger (``None``), so the test path stays
+    behavior-identical and never touches the filesystem.
     """
-    factory = (
-        connection_factory
-        if connection_factory is not None
-        else _live_connection_factory_for_port(cfg, port)
-    )
-    base = _build_base_env(cfg, factory, port)
+    if connection_factory is not None:
+        factory = connection_factory
+        logger = None
+    else:
+        logger = setup_env_logger(cfg.effective_log_dir, role, port, level=cfg.log_level)
+        factory = _live_connection_factory_for_port(cfg, port, role=role, logger=logger)
+    base = _build_base_env(cfg, factory, port, role=role, logger=logger)
     provider = OpponentProvider.from_roster(
         cfg.opponents, cfg.opponent_strategy, seed=cfg.seed + seed_offset
     )
@@ -492,6 +550,7 @@ def training_ports(cfg: TrainConfig) -> list[int]:
 def _training_env_factories(
     cfg: TrainConfig,
     *,
+    role: str = ROLE_TRAIN,
     connection_factory_for_port: Callable[[int], Callable[[], Connection]] | None = None,
 ) -> list[Callable[[], SelfPlayWrapper]]:
     """The ``n_envs`` zero-arg env factories — one per training port (the SubprocVecEnv seam).
@@ -515,7 +574,9 @@ def _training_env_factories(
             conn_factory = (
                 None if connection_factory_for_port is None else connection_factory_for_port(port)
             )
-            return _make_self_play_env(cfg, port, seed_offset=i, connection_factory=conn_factory)
+            return _make_self_play_env(
+                cfg, port, seed_offset=i, connection_factory=conn_factory, role=role
+            )
 
         factories.append(factory)
     return factories
@@ -527,6 +588,7 @@ def build_vec_env(
     port: int | None = None,
     monitor: bool = False,
     single: bool = False,
+    role: str = ROLE_TRAIN,
     connection_factory: Callable[[], Connection] | None = None,
     connection_factory_for_port: Callable[[int], Callable[[], Connection]] | None = None,
 ) -> VecEnv:
@@ -561,9 +623,16 @@ def build_vec_env(
     :func:`_find_selfplay_wrapper`). ``port`` selects that single env's TCP port (default
     ``cfg.game_port``; the eval env passes ``cfg.effective_eval_port``).
 
+    ``role`` (``"train"`` / ``"eval"``) tags the per-process observability log filenames the LIVE
+    path opens (``env-<role>-<port>.log`` + the Unity ``unity-<role>-<port>.log``); the training env
+    is built with ``role="train"`` and the eval env with ``role="eval"`` so eval evidence routes to
+    its OWN file. It is purely observational and threads through to :func:`_make_self_play_env`.
+
     Test seams (no Unity): ``connection_factory`` injects a STUB for the SINGLE path; for the
     multi-env path ``connection_factory_for_port`` maps a port -> that port's STUB factory and the
     vec is built as a ``DummyVecEnv`` of the factories (subprocs are NOT spawned in unit tests).
+    When a STUB is injected NO logger is set up (the test path stays behavior-identical, no files
+    written).
     """
     from stable_baselines3.common.vec_env import (
         DummyVecEnv,
@@ -578,12 +647,14 @@ def build_vec_env(
         def make_wrapped(
             cf: Callable[[], Connection] | None = connection_factory,
         ) -> SelfPlayWrapper:
-            return _make_self_play_env(cfg, live_port, seed_offset=0, connection_factory=cf)
+            return _make_self_play_env(
+                cfg, live_port, seed_offset=0, connection_factory=cf, role=role
+            )
 
         vec: VecEnv = DummyVecEnv([make_wrapped])
     else:
         factories = _training_env_factories(
-            cfg, connection_factory_for_port=connection_factory_for_port
+            cfg, role=role, connection_factory_for_port=connection_factory_for_port
         )
         if connection_factory_for_port is not None:
             # TEST path: stub factories build with no Unity, so run them in-process (DummyVecEnv) —
@@ -779,6 +850,68 @@ def _make_sidecar_callback(
     return SidecarCallback(save_freq, cfg.run_dir / SIDECAR_NAME)
 
 
+def _make_observability_callback(sys_logger: logging.Logger, *, checkpoint_save_freq: int):
+    """An ADDITIVE SB3 callback logging rollout + checkpoint boundaries to the training-system log.
+
+    Logs ``rollout_start`` / ``rollout_end`` (iteration, ``num_timesteps``, and ``fps`` pulled from
+    SB3's own logger when available) at INFO on the ``_on_rollout_start`` / ``_on_rollout_end``
+    hooks, and ``checkpoint_save`` on the SAME per-call cadence the ``CheckpointCallback`` /
+    ``SidecarCallback`` ride (``n_calls % checkpoint_save_freq == 0``), so each ``model_*.zip``
+    write leaves a system-log marker. It NEVER returns ``False`` and NEVER mutates the model /
+    rollout — it is purely observational, so it does not change control flow. The SB3 import is
+    local so the pure helpers above stay import-light.
+    """
+    from stable_baselines3.common.callbacks import BaseCallback
+
+    class ObservabilityCallback(BaseCallback):
+        """Log rollout iteration + checkpoint boundaries — additive, no control flow change."""
+
+        def __init__(self, save_freq: int) -> None:
+            super().__init__(verbose=0)
+            self._iteration = 0
+            self._save_freq = save_freq
+
+        def _fps(self) -> float | None:
+            # SB3 records time/fps on its logger's name_to_value once a rollout completes; read it
+            # observationally (None before the first rollout / when unavailable).
+            values = getattr(self.logger, "name_to_value", None)
+            if isinstance(values, dict):
+                fps = values.get("time/fps")
+                if fps is not None:
+                    return float(fps)
+            return None
+
+        def _on_rollout_start(self) -> None:
+            self._iteration += 1
+            sys_logger.info(
+                "rollout_start",
+                extra={
+                    "detail": {"iteration": self._iteration, "num_timesteps": self.num_timesteps}
+                },
+            )
+
+        def _on_rollout_end(self) -> None:
+            sys_logger.info(
+                "rollout_end",
+                extra={
+                    "detail": {
+                        "iteration": self._iteration,
+                        "num_timesteps": self.num_timesteps,
+                        "fps": self._fps(),
+                    }
+                },
+            )
+
+        def _on_step(self) -> bool:
+            if self._save_freq > 0 and self.n_calls % self._save_freq == 0:
+                sys_logger.info(
+                    "checkpoint_save", extra={"detail": {"num_timesteps": self.num_timesteps}}
+                )
+            return True
+
+    return ObservabilityCallback(checkpoint_save_freq)
+
+
 # --- resume ----------------------------------------------------------------------------------
 
 
@@ -849,6 +982,31 @@ def train_local(cfg: TrainConfig) -> Path:
     set_random_seed(cfg.seed)
     cfg.run_dir.mkdir(parents=True, exist_ok=True)
 
+    # Set up the training-system logger (the main process) at the chosen level. INFO by default;
+    # DEBUG when the single switch is set. This is purely observational.
+    sys_logger = setup_system_logger(cfg.effective_log_dir, level=cfg.log_level)
+    sys_logger.info(
+        "run_config",
+        extra={
+            "detail": {
+                "n_envs": cfg.n_envs,
+                "training_ports": training_ports(cfg),
+                "eval_port": cfg.effective_eval_port,
+                "game_config": str(cfg.game_config),
+                "obs_pixels": True,
+                "n_steps": cfg.n_steps,
+                "total_timesteps": cfg.total_timesteps,
+                "frame_shape": list(cfg.frame_shape),
+                "frame_stack": cfg.frame_stack,
+                "opponents": list(cfg.opponents),
+                "opponent_strategy": cfg.opponent_strategy,
+                "seed": cfg.seed,
+                "log_dir": str(cfg.effective_log_dir),
+                "level": logging.getLevelName(cfg.log_level),
+            }
+        },
+    )
+
     # PRE-FLIGHT MEMORY GUARD (psutil only here, the run glue). The PPO RolloutBuffer + the live
     # Unity instances are the OOM surface at high n_envs x n_steps. Estimate, ALWAYS print, then
     # abort BEFORE launching any build if it blows the budget (unless --allow-oversized).
@@ -863,16 +1021,23 @@ def train_local(cfg: TrainConfig) -> Path:
             allow_oversized=cfg.allow_oversized,
         )
     except MemoryError as exc:
+        sys_logger.error("memory_abort", extra={"detail": {"message": str(exc)}})
         print(str(exc), file=sys.stderr)  # noqa: T201
         raise SystemExit(2) from exc
+    sys_logger.info(
+        "memory_estimate",
+        extra={"detail": {"line": estimate_line, "available_bytes": available}},
+    )
     print(estimate_line)  # noqa: T201
 
     # Training env: DummyVecEnv (n_envs=1) or SubprocVecEnv (n_envs>1) of builds on game_port + i,
     # VecMonitor-wrapped for rollout episode stats. Dedicated eval env: ALWAYS a single env on the
     # effective eval port (a separate build/socket — eval never touches the training env).
-    vec_env = build_vec_env(cfg, port=cfg.game_port, monitor=True)
+    vec_env = build_vec_env(cfg, port=cfg.game_port, monitor=True, role=ROLE_TRAIN)
     try:
-        eval_vec_env = build_vec_env(cfg, port=cfg.effective_eval_port, monitor=False, single=True)
+        eval_vec_env = build_vec_env(
+            cfg, port=cfg.effective_eval_port, monitor=False, single=True, role=ROLE_EVAL
+        )
         try:
             # n_envs=1: reach the in-process provider for position-exact round_robin resume.
             # n_envs>1: providers live per-subproc (unreachable here) -> None -> reseed-on-resume.
@@ -935,19 +1100,50 @@ def train_local(cfg: TrainConfig) -> Path:
                         name_prefix="model",
                     ),
                     _make_sidecar_callback(cfg, provider, elo, save_freq=ckpt_save_freq),
+                    _make_observability_callback(sys_logger, checkpoint_save_freq=ckpt_save_freq),
                 ]
             )
 
-            model.learn(
-                cfg.total_timesteps,
-                callback=callbacks,
-                reset_num_timesteps=reset_num_timesteps,
+            sys_logger.info(
+                "learn_begin",
+                extra={
+                    "detail": {
+                        "total_timesteps": cfg.total_timesteps,
+                        "reset_num_timesteps": reset_num_timesteps,
+                    }
+                },
             )
+            try:
+                model.learn(
+                    cfg.total_timesteps,
+                    callback=callbacks,
+                    reset_num_timesteps=reset_num_timesteps,
+                )
+            except (EOFError, BrokenPipeError, ConnectionError) as exc:
+                # The multi-env hang we are chasing surfaces as a SubprocVecEnv worker dying
+                # mid-run (a closed pipe / EOF from a spawned worker). LOG the death with the
+                # exception repr, then RE-RAISE unchanged — observability only, no swallow.
+                sys_logger.error(
+                    "worker_death",
+                    extra={
+                        "detail": {
+                            "exc_type": type(exc).__name__,
+                            "exc": repr(exc),
+                            "num_timesteps": getattr(model, "num_timesteps", None),
+                        }
+                    },
+                )
+                raise
+            sys_logger.info("learn_end", extra={"detail": {"num_timesteps": model.num_timesteps}})
 
             # Final per-opponent win-rate summary line (wires format_per_map_table -> the
             # Director's smoke gets one final per-opponent line). Eval re-wraps the DEDICATED eval
             # env's raw TankEnv in its own per-opponent SelfPlayWrapper (the evaluate_winrate
             # contract) — the training env / model state is untouched.
+            sys_logger.info(
+                "final_eval_begin",
+                extra={"detail": {"episodes": cfg.eval_episodes, "opponents": list(cfg.opponents)}},
+            )
             per_opponent = evaluate_winrate(
                 model,
                 eval_raw_env,
@@ -956,6 +1152,12 @@ def train_local(cfg: TrainConfig) -> Path:
                 seed=cfg.seed,
             )
             elo = _update_elo_from_eval(elo, per_opponent)
+            sys_logger.info(
+                "final_eval_end",
+                extra={
+                    "detail": {"win_rates": {str(k): float(v) for k, v in per_opponent.items()}}
+                },
+            )
             print(format_per_map_table(per_opponent, episodes=cfg.eval_episodes))  # noqa: T201
 
             # Persist the final sidecar (post-learn position + the eval-updated ELO).
@@ -1075,6 +1277,18 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         default=None,
         help="TCP port the eval build listens on (default: port + 1).",
     )
+    parser.add_argument(
+        "--log-dir",
+        type=Path,
+        default=None,
+        help="dir for the per-process observability logs (default: run_dir/logs).",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help=f"the SINGLE switch: crank ALL observability logs to DEBUG (default INFO). "
+        f"Equivalent to {LOG_LEVEL_ENV_VAR}=DEBUG.",
+    )
     args = parser.parse_args(argv)
     if args.opponents is not None:
         unknown = [sel for sel in args.opponents if sel not in AGENT_SELECTORS]
@@ -1085,10 +1299,21 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> Path:
-    """CLI entry: build a :class:`TrainConfig` from the args and run :func:`train_local`."""
+    """CLI entry: build a :class:`TrainConfig` from the args and run :func:`train_local`.
+
+    The SINGLE observability switch is ``--debug`` OR the ``POP_LOG_LEVEL`` env var resolving to
+    DEBUG (:func:`pop_trainer.core.logging_setup.level_from_env`); either cranks every layer's logs
+    to DEBUG. The default is INFO (negligible overhead). ``--log-dir`` overrides where the
+    per-process logs are written (default ``run_dir/logs``).
+    """
     args = _parse_args(argv)
     # --opponents omitted (None) -> let TrainConfig's DEFAULT_ROSTER default apply.
     opponents_kwarg = {} if args.opponents is None else {"opponents": args.opponents}
+    # The single DEBUG switch: --debug flag OR the POP_LOG_LEVEL env var (resolved purely).
+    debug_logging = (
+        level_from_env(debug=args.debug, env_value=os.environ.get(LOG_LEVEL_ENV_VAR))
+        == logging.DEBUG
+    )
     cfg = TrainConfig(
         total_timesteps=args.total_timesteps,
         game_config=args.config,
@@ -1107,6 +1332,8 @@ def main(argv: list[str] | None = None) -> Path:
         allow_oversized=args.allow_oversized,
         game_port=args.port,
         eval_port=args.eval_port,
+        log_dir=args.log_dir,
+        debug_logging=debug_logging,
         **opponents_kwarg,
     )
     return train_local(cfg)

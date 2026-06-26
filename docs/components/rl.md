@@ -326,6 +326,37 @@ collection cap applies; ≥ 10 corrupts), `obs_pixels: true` at `640×360`, both
 `player2_ai` `true`, `game_maxTime: 60`, `player_maxHealth: 3`, and a single `arena_path`
 (`Arenas/custom1.json` — no rotation, unlike the collection rotation set).
 
+#### Observability logging
+
+`train_local` wires [`core.logging_setup`](core.md) so a run leaves a per-process structured-JSONL
+trail (added to diagnose the multi-env training hang). **All of it is purely observational** — it
+does not change the TCP wire, the 52-float state, message ordering, or control flow.
+
+- **Per-process loggers.** The main process gets the system logger (`setup_system_logger` →
+  `training-system.log`, `train.py:987`); each live env connection gets its own
+  `setup_env_logger` → `env-<role>-<port>.log`, set up **inside** the env's construction (so a
+  `SubprocVecEnv` worker opens its OWN handle inside the spawned subprocess) and threaded into
+  BOTH the `Connection` and the env layer (`_make_self_play_env`, `train.py:536-538`). The Unity
+  build is launched with `-logFile` pointed at `unity-<role>-<port>.log` via `core.launch`'s
+  `unity_log_path` kwarg (`_live_connection_factory_for_port`, `train.py:451-454`), paired to the
+  Python file by the shared `(role, port)`. A unit-test STUB factory gets **no** logger (`None`),
+  so the test path stays behavior-identical and never touches the filesystem.
+- **The single DEBUG switch.** `--debug` OR the `POP_LOG_LEVEL` env var (resolved purely via
+  [`level_from_env`](../../src/pop_trainer/core/logging_setup.py), `train.py:1312-1316`) cranks
+  ALL logs from INFO (default) to DEBUG. INFO = handshake/reset/episode milestones; DEBUG =
+  per-step send/recv/step. The level flows through `TrainConfig.log_level` / `effective_log_dir`
+  (`train.py:256-264`); `--log-dir` overrides where the files land (default `run_dir/logs`).
+- **`ObservabilityCallback`.** An ADDITIVE SB3 callback ([`_make_observability_callback`](../../src/pop_trainer/rl/train.py),
+  `train.py:853-912`) logs `rollout_start` / `rollout_end` (iteration, `num_timesteps`, `fps`) and
+  `checkpoint_save` markers to the system log on the SAME cadence as the checkpoint/sidecar
+  callbacks. It NEVER returns `False` and NEVER mutates the model/rollout. `train_local` also logs
+  `run_config`, the memory estimate, `learn_begin`/`learn_end`, the final eval, and — for the hang
+  being chased — a `worker_death` record (exception repr + `num_timesteps`) on a
+  `SubprocVecEnv` worker dying mid-run, which it then **re-raises unchanged** (`train.py:1122-1136`).
+- The operator's guide to reading these files (the 5-file layout, the schema, the cross-stack
+  `ts_wall`/`wall=` merge key, eval isolation) is in the
+  [runbook → Observability logs](../runbook.md#observability-logs).
+
 **`train_local` composition** — the integrator wiring (TWO env stacks, both built once at startup):
 
 ```mermaid

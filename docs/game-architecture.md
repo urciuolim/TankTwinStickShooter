@@ -24,6 +24,38 @@ How the existing game actually runs, traced from code (game-sim-engineer + train
 
 Known latent bug for later: `human_matchmaking.get_human_stats` passes a path string to `json.load` (`human_matchmaking.py:43`), so the "existing human" branch is broken as written.
 
+## Observability logging (verbose-gated, ZERO wire impact)
+
+The C# side has structured observability logging — added to diagnose the reset/restart-handshake
+hang — that is gated **entirely** on the existing `verbose` config flag (`DriverController.verbose`,
+`DriverController.cs:51`). When `verbose` is false (the default) **none** of it runs, and it never
+touches the socket, the 52-float state, message ordering, or any control flow either way; the lines
+go to `Debug.Log`, not the wire.
+
+- **Pure helpers (unit-tested in EditMode).** [`DriverLog`](../Assets/Scripts/DriverLog.cs) formats
+  one stable, grep-able line — `[tag] wall=<ISO-8601 UtcNow 'o'> k=v …` — and
+  [`DeadZoneTracker`](../Assets/Scripts/DeadZoneTracker.cs) is a pure state machine that detects
+  ENTER/EXIT of the FixedUpdate **dead-zone** (`ingame && state == null`, the window that services
+  no socket I/O — the prime hang suspect) and reports its duration. Both read NO clock and touch NO
+  Unity/socket state (the duration is fed in by the caller), mirroring the existing
+  `WallMessage.Build` pure-helper pattern.
+- **Verbose-gated `Debug.Log` instrumentation** in
+  [`DriverController`](../Assets/Scripts/DriverController.cs) and
+  [`GameController`](../Assets/Scripts/GameController.cs) emits the handshake events
+  (`start_received` / `restart_received` / `ingame_flip` / `switch_arena_received` /
+  `arena_switched`), the dead-zone enter/exit + state null↔populated transitions
+  (`DriverController.cs:236-250`), and the per-step `ReadPixels` GPU-readback timing
+  (`readpixels`, `DriverController.cs:447-459`).
+- **Unscaled monotonic clock.** Durations come from `Stopwatch` / `DateTime.UtcNow`, **NEVER**
+  `Time.time` (which is frozen by `Time.timeScale = 0` inside `FixedUpdate`, so it would report
+  zero) — `DriverController.cs:64-66`.
+- **Paired to the Python logs by wall-clock.** The `wall=<UtcNow>` field correlates these C# lines
+  to the Python JSONL `ts_wall` field, so the two stacks merge across files. When `--config` points
+  at a build whose config sets `verbose: true`, route each build's C# log to its own
+  `unity-<role>-<port>.log` via `core.launch`'s `-logFile` / `unity_log_path` (the
+  [rl](components/rl.md#observability-logging) integrator does this). See the operator's guide:
+  [runbook → Observability logs](runbook.md#observability-logs).
+
 ## Config / arena source-of-truth map (consolidated 2026-06-18, cleanup A4)
 
 There is ONE canonical location for the shipped config + arenas; the rest are explicit fallbacks. The duplicate `PythonScripts/Assets/` tree (stale 2021 copy) was DELETED — its only consumer was a dead `os.path.exists("./Assets/config.json")` pre-flight in `preamble.py` that never read the file; that check is now removed.

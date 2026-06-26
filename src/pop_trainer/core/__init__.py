@@ -22,9 +22,22 @@ Modules:
 * :mod:`pop_trainer.core.launch` — stdlib-only live-build launch + socket-connect helpers
   (the windowed ``Popen`` arg-list + a bounded connect retry/backoff) shared by the demo and
   the collection runner.
+* :mod:`pop_trainer.core.logging_setup` — stdlib-``logging``-only per-process structured-JSONL
+  observability setup (per-process file routing + a strict-JSON line formatter) every layer
+  routes to.
 """
 
-from pop_trainer.core import agent, config, launch, maps, protocol, state
+from pop_trainer.core import agent, config, launch, logging_setup, maps, protocol, state
 from pop_trainer.core.agent import Agent, StatefulAgent
 
-__all__ = ["state", "protocol", "config", "maps", "agent", "launch", "Agent", "StatefulAgent"]
+__all__ = [
+    "state",
+    "protocol",
+    "config",
+    "maps",
+    "agent",
+    "launch",
+    "logging_setup",
+    "Agent",
+    "StatefulAgent",
+]

@@ -78,6 +78,7 @@ def default_build_path(repo_root: str | Path) -> Path:
         return x86_64
     return bare
 
+
 # Windowed-launch screen size (the build is launched as a watchable window, never fullscreen,
 # never batchmode). 1280x720 is 16:9 and comfortably visible.
 DEFAULT_SCREEN_WIDTH = 1280
@@ -97,6 +98,7 @@ def build_launch_cmd(
     *,
     screen_width: int = DEFAULT_SCREEN_WIDTH,
     screen_height: int = DEFAULT_SCREEN_HEIGHT,
+    unity_log_path: str | Path | None = None,
 ) -> list[str]:
     """The ``Popen`` ARG-LIST that launches the build WINDOWED (never fullscreen / batchmode).
 
@@ -105,8 +107,15 @@ def build_launch_cmd(
     channel the env reads). ``-screen-fullscreen 0`` + an explicit ``screen_width`` x
     ``screen_height`` keep the build a watchable window. ``-batchmode`` is deliberately ABSENT
     (it would hide the window). Pure: returns the arg-list, spawns nothing.
+
+    ``unity_log_path`` (OPTIONAL): when given, append Unity's standard ``-logFile <path>`` so this
+    instance writes its OWN C# log file instead of clobbering the shared default ``Player.log`` (the
+    Unity side of the per-process observability split — pair it with the Python
+    ``env-<role>-<port>.log`` by the shared port). When ``None`` (the default) NO ``-logFile`` is
+    added, so the arg-list is byte-identical to the no-log path and every existing call site / test
+    is preserved.
     """
-    return [
+    cmd = [
         str(exe),
         str(port),
         "--config",
@@ -118,6 +127,9 @@ def build_launch_cmd(
         "-screen-height",
         str(screen_height),
     ]
+    if unity_log_path is not None:
+        cmd += ["-logFile", str(unity_log_path)]
+    return cmd
 
 
 def connect(

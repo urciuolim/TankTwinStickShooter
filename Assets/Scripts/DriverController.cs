@@ -61,6 +61,16 @@ public class DriverController : MonoBehaviour
     // updated in the switch_arena branch to the new arena path. Empty string when no arena is set.
     private string currentMapId = "";
 
+    // OBSERVABILITY (verbose-gated; no behavior/wire impact). Process-wide MONOTONIC clock for all
+    // durations -- NEVER Time.time (frozen by Time.timeScale=0 inside FixedUpdate). Started once.
+    private static readonly System.Diagnostics.Stopwatch logClock = System.Diagnostics.Stopwatch.StartNew();
+    // Tracks ENTER/EXIT of the FixedUpdate dead-zone (ingame && state==null) so the 30s reset/
+    // restart-handshake gap is measured. Pure helper; observes existing condition values only.
+    private DeadZoneTracker deadZone;
+    // One-shot latch so the populated->null state transition is logged once (in the done branch),
+    // matching null->populated which is observed at the top of FixedUpdate.
+    private bool stateWasPopulated = false;
+
     private void Awake()
     {
         //JobsUtility.JobWorkerCount = 2;
@@ -218,6 +228,28 @@ public class DriverController : MonoBehaviour
             Time.timeScale = 0f;
             if (instance.running)
             {
+                // OBSERVE-ONLY (verbose-gated): read the SAME ingame/state values the if/else below
+                // uses, but do not alter the branch. Dead-zone = (ingame && state==null), the window
+                // that services no socket I/O -- the prime reset/restart-hang suspect. Also surface
+                // the state null<->populated transition (null->populated is visible right here; the
+                // populated->null nulling is logged in SendAndReceiveData's done branch).
+                if (verbose)
+                {
+                    bool deadZoneActive = ingame && state == null;
+                    DeadZoneTracker.Event dzEvent = deadZone.Observe(deadZoneActive, logClock.Elapsed.TotalMilliseconds);
+                    if (dzEvent == DeadZoneTracker.Event.Entered)
+                        Debug.Log(DriverLog.Format("deadzone_enter", System.DateTime.UtcNow, "port", connectionPort.ToString()));
+                    else if (dzEvent == DeadZoneTracker.Event.Exited)
+                        Debug.Log(DriverLog.Format("deadzone_exit", System.DateTime.UtcNow,
+                            new[] { "duration_ms", "port" },
+                            new[] { DriverLog.Ms(deadZone.LastDurationMs), connectionPort.ToString() }));
+
+                    bool statePopulated = state != null;
+                    if (statePopulated && !stateWasPopulated)
+                        Debug.Log(DriverLog.Format("state_populated", System.DateTime.UtcNow, "port", connectionPort.ToString()));
+                    stateWasPopulated = statePopulated;
+                }
+
                 if (ingame && state != null) //&& GameController.instance != null)
                 {
                     bool done = state["done"] != null ? true : false;
@@ -291,7 +323,10 @@ public class DriverController : MonoBehaviour
         { 
             if (message["start"] != null && message["start"].Value<bool>())
             {
-                Debug.Log("Start received");
+                if (verbose)
+                    Debug.Log(DriverLog.Format("start_received", System.DateTime.UtcNow, "port", connectionPort.ToString()));
+                else
+                    Debug.Log("Start received");
                 JObject confirmation = JObject.Parse("{starting:true}");
                 byte[] writeBuffer = Encoding.ASCII.GetBytes(confirmation.ToString());
                 nwStream.Write(writeBuffer, 0, writeBuffer.Length);
@@ -299,17 +334,29 @@ public class DriverController : MonoBehaviour
                 // OWN discrete write (see SendWallMessage / WallMessage.cs). Ordering is PINNED:
                 // confirmation first, walls second. Skipped gracefully if no arena is configured.
                 SendWallMessage();
+                if (verbose)
+                    Debug.Log(DriverLog.Format("ingame_flip", System.DateTime.UtcNow,
+                        new[] { "from", "to", "cause", "port" },
+                        new[] { "false", "true", "start", connectionPort.ToString() }));
                 ingame = true;
             } else if (message["end"] != null && message["end"].Value<bool>())
             {
-                Debug.Log("End received");
+                if (verbose)
+                    Debug.Log(DriverLog.Format("end_received", System.DateTime.UtcNow, "port", connectionPort.ToString()));
+                else
+                    Debug.Log("End received");
                 JObject confirmation = JObject.Parse("{ending:true}");
                 byte[] writeBuffer = Encoding.ASCII.GetBytes(confirmation.ToString());
                 nwStream.Write(writeBuffer, 0, writeBuffer.Length);
                 instance.running = false;
             } else if (message["restart"] != null && message["restart"].Value<bool>())
             {
-                Debug.Log("Restart received");
+                if (verbose)
+                    Debug.Log(DriverLog.Format("restart_received", System.DateTime.UtcNow,
+                        new[] { "phase", "port" },
+                        new[] { "pregame", connectionPort.ToString() }));
+                else
+                    Debug.Log("Restart received");
                 JObject confirmation = JObject.Parse("{restarting:true}");
                 byte[] writeBuffer = Encoding.ASCII.GetBytes(confirmation.ToString());
                 nwStream.Write(writeBuffer, 0, writeBuffer.Length);
@@ -321,7 +368,12 @@ public class DriverController : MonoBehaviour
                 // the scene here: during the pre-start handshake the active scene may be "Driver",
                 // and the start/restart handshake already triggers an Arena load momentarily.
                 string switchArenaPath = message["switch_arena"].Value<string>();
-                Debug.Log("Switch arena received: " + switchArenaPath);
+                if (verbose)
+                    Debug.Log(DriverLog.Format("switch_arena_received", System.DateTime.UtcNow,
+                        new[] { "path", "port" },
+                        new[] { switchArenaPath, connectionPort.ToString() }));
+                else
+                    Debug.Log("Switch arena received: " + switchArenaPath);
                 string resolvedArenaPath = ResolveArenaPath(resolvedConfigPath, switchArenaPath);
                 using (StreamReader arenaFile = File.OpenText(resolvedArenaPath))
                 using (JsonTextReader arenaReader = new JsonTextReader(arenaFile))
@@ -336,7 +388,12 @@ public class DriverController : MonoBehaviour
                 // One-time wall-layout message, AFTER the {arena_switched:true} confirmation, as
                 // its OWN discrete write. Ordering is PINNED: confirmation first, walls second.
                 SendWallMessage();
-                Debug.Log("Arena switched to: " + resolvedArenaPath);
+                if (verbose)
+                    Debug.Log(DriverLog.Format("arena_switched", System.DateTime.UtcNow,
+                        new[] { "resolved_path", "port" },
+                        new[] { resolvedArenaPath, connectionPort.ToString() }));
+                else
+                    Debug.Log("Arena switched to: " + resolvedArenaPath);
             }
         }
     }
@@ -382,19 +439,45 @@ public class DriverController : MonoBehaviour
         if (obsPixels && frameCapture != null)
         {
             int w, h;
+            // OBSERVE-ONLY: time the synchronous GPU readback (the prime GPU-stall suspect) with a
+            // MONOTONIC start/stop around CaptureRGB. This is the per-step / DEBUG-grade line (one
+            // per sent step) -- the SPAMMY one -- and is verbose-gated like the rest. The capture
+            // and the Write are unchanged; only a Stopwatch sample wraps them.
+            double captureMs = 0d;
+            long captureStart = verbose ? logClock.ElapsedTicks : 0L;
             byte[] rgb = frameCapture.CaptureRGB(out w, out h);
+            if (verbose)
+                captureMs = (logClock.ElapsedTicks - captureStart) * 1000d / System.Diagnostics.Stopwatch.Frequency;
             if (rgb != null)
             {
                 byte[] frameMessage = FrameCapture.BuildFrameMessage(rgb, w, h);
                 nwStream.Write(frameMessage, 0, frameMessage.Length);
             }
+            if (verbose)
+                Debug.Log(DriverLog.Format("readpixels", System.DateTime.UtcNow,
+                    new[] { "duration_ms", "rgb_null", "port" },
+                    new[] { DriverLog.Ms(captureMs), (rgb == null).ToString(), connectionPort.ToString() }));
         }
 
         if (done)
         {
-            Debug.Log("Game done");
+            if (verbose)
+            {
+                Debug.Log(DriverLog.Format("game_done", System.DateTime.UtcNow, "port", connectionPort.ToString()));
+                Debug.Log(DriverLog.Format("state_nulled", System.DateTime.UtcNow,
+                    new[] { "cause", "port" },
+                    new[] { "done", connectionPort.ToString() }));
+                Debug.Log(DriverLog.Format("ingame_flip", System.DateTime.UtcNow,
+                    new[] { "from", "to", "cause", "port" },
+                    new[] { "true", "false", "done", connectionPort.ToString() }));
+            }
+            else
+                Debug.Log("Game done");
             state = null;
             actions = null;
+            // Keep the dead-zone/state-populated latches consistent with the nulling we just did, so
+            // the next FixedUpdate observes a clean populated->null edge rather than a stale latch.
+            stateWasPopulated = false;
             ingame = false;
             return;
         }
@@ -415,11 +498,20 @@ public class DriverController : MonoBehaviour
         {
             if (message["restart"] != null && message["restart"].Value<bool>())
             {
-                Debug.Log("Restart received");
+                if (verbose)
+                    Debug.Log(DriverLog.Format("restart_received", System.DateTime.UtcNow,
+                        new[] { "phase", "port" },
+                        new[] { "midgame", connectionPort.ToString() }));
+                else
+                    Debug.Log("Restart received");
                 JObject confirmation = JObject.Parse("{restarting:true}");
                 writeBuffer = Encoding.ASCII.GetBytes(confirmation.ToString());
                 nwStream.Write(writeBuffer, 0, writeBuffer.Length);
                 GameController.instance.EndGame(-1);
+                if (verbose)
+                    Debug.Log(DriverLog.Format("ingame_flip", System.DateTime.UtcNow,
+                        new[] { "from", "to", "cause", "port" },
+                        new[] { "true", "false", "restart_midgame", connectionPort.ToString() }));
                 ingame = false;
             } else
             {

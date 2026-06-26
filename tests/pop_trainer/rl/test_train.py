@@ -695,8 +695,13 @@ def test_resume_restores_provider_and_elo_with_mocked_ppo_load(tmp_path, monkeyp
     monkeypatch.setattr(
         train_mod,
         "build_vec_env",
-        lambda c, *, port=None, monitor=False, single=False: build_vec_env(
-            c, port=port, monitor=monitor, single=single, connection_factory=_stub_factory
+        lambda c, *, port=None, monitor=False, single=False, role="train": build_vec_env(
+            c,
+            port=port,
+            monitor=monitor,
+            single=single,
+            role=role,
+            connection_factory=_stub_factory,
         ),
     )
 

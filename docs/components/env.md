@@ -22,6 +22,16 @@ nothing from `models` / `data` / `agents` / the Unity-side code.
   - **Injected transport** (`connection` or `connection_factory`), exactly like
     `core.protocol.Connection` — so the env is unit-testable against an in-process fake socket
     with no live Unity. `connection_factory` also enables reconnect after a dropped connection.
+  - **Optional observability** (`logger=` / `role=`). Both default off: `logger=None` is the
+    behavior-identical, allocation-free hot path (the `_log` helper early-returns when no logger
+    is attached — `tank_env.py:186-187,210-211,235-246`). When a `logging.Logger` is passed the
+    env emits env-layer `reset`/`step`/`episode` milestone records (tagged `layer="env"`); the
+    SAME logger is meant to be threaded into the `Connection` (by the caller's
+    `connection_factory`) so protocol + env records for one socket share the
+    `env-<role>-<port>.log` file. `role` (`"train"`/`"eval"`, default `"train"`) is the
+    purely-observational role tag surfaced in those records. This is wired by the
+    [rl](rl.md#observability-logging) integrator; it does **not** touch the wire, the 52-float
+    state, message ordering, or control flow.
 - [`shaped_step_reward` / `time_penalty_per_step`](../../src/pop_trainer/env/rewards.py) — the
   **pure** budget-based reward (no socket, no gym, no numpy): a per-step time penalty that
   accrues every step, plus the win/loss terminal *added* on the decided step. Survivor mode

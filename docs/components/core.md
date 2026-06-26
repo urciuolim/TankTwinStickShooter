@@ -41,6 +41,36 @@ from here instead of re-hardcoding them. All JSON is strict.
   bounded retry/backoff (the build needs a moment to boot its listener). Shared by both the
   [demo](demo.md) (one local watch) and the [data](data.md) collection runner (one build per
   worker).
+  - **Optional Unity log routing.** `build_launch_cmd` takes an optional keyword
+    `unity_log_path` (`launch.py:94-132`): when given it appends Unity's standard
+    `-logFile <path>` so that build writes its OWN C# log instead of clobbering the shared default
+    `Player.log` — the Unity side of the per-process observability split (pair it with
+    `logging_setup.unity_log_path` / the Python `env-<role>-<port>.log` by the shared port). When
+    `None` (the default) **no** `-logFile` is added, so the arg-list is **byte-identical** to the
+    no-log path and every existing call site / test is preserved.
+- [`core.logging_setup`](../../src/pop_trainer/core/logging_setup.py) — the **per-process
+  structured-JSONL observability seam** (the cross-stack diagnostic trail). **stdlib `logging`
+  only** (no new dependency), and it lives in `core` (the dependency-free root) so every layer
+  above — `train` / `env` / `protocol` — can route to it without a boundary violation
+  (`logging_setup.py:1-7`).
+  - **Per-process file routing.** A training run is many processes, and each writes to its OWN
+    file so concurrent writers never contend on one handle. The **pure** path builders (no I/O,
+    unit-tested for exact filenames): `system_log_path` → `training-system.log` (the main
+    process), `env_log_path` → `env-<role>-<port>.log` (one per env connection, `role` =
+    `train`/`eval`, `port` = the env's TCP port), and `unity_log_path` →
+    `unity-<role>-<port>.log` (passed to `core.launch`'s `-logFile` so each Unity build writes its
+    own C# log; pairs with `env_log_path` by the shared `(role, port)`) (`logging_setup.py:103-124`).
+  - **Strict-JSON line schema.** [`JsonlFormatter`](../../src/pop_trainer/core/logging_setup.py)
+    emits one strict-JSON object per record — keys `ts_wall` (`time.time`, the cross-file /
+    cross-stack merge key), `ts_mono` (`time.monotonic`), `level`, `layer`, `role`, `port`,
+    `event`, plus any per-call `detail` fields — with `role`/`port`/`layer` bound at setup so call
+    sites pass only `event` + an optional `detail` dict (`logging_setup.py:28-46,139-182`).
+  - **Eval isolation (load-bearing).** `setup_logger` / `setup_env_logger` /
+    `setup_system_logger` open the per-process file handle and set **`propagate=False`** so a
+    logger's records NEVER bubble up to the root/system handler — an eval env's records land ONLY
+    in `env-eval-<port>.log` and never leak into `training-system.log`. Setup is **idempotent**
+    (the handler it owns is tagged) so a re-entered factory never double-writes
+    (`logging_setup.py:20-26,188-264`).
 - [`core.agent`](../../src/pop_trainer/core/agent.py) — the **Agent Protocol** (`act(obs) →
   action`), type-only. [`Agent`](../../src/pop_trainer/core/agent.py) is `@runtime_checkable`
   (declares only `act`); [`StatefulAgent`](../../src/pop_trainer/core/agent.py) adds the OPTIONAL
@@ -106,8 +136,11 @@ Every other component depends on `core`:
 - [models](models.md) — shares `core`'s leaf position (but imports nothing from it today).
 - [env](env.md) — `state` (schema + transforms), `protocol` (`Connection` incl.
   `switch_arena`, `WallLayout`, `is_walls_message` / `parse_walls_message`), `config`,
-  `agent.Agent`.
+  `agent.Agent`, and `logging_setup.LAYER_ENV` (the optional observability logger's layer tag).
 - [agents](agents.md) — `agent.Agent` Protocol + the `state` schema.
+- [rl](rl.md) — `launch` (incl. the `build_launch_cmd` `unity_log_path` kwarg),
+  `protocol.Connection`, `config`, and `logging_setup` (the integrator wires the per-process
+  `system` / `env` loggers + the `--debug` / `POP_LOG_LEVEL` level switch via `level_from_env`).
 - [data](data.md) — `state` (`STATE_LEN` + `validate`), `config.EnvConfig`,
   `protocol.Connection`, `agent.Agent`, `launch` (the collection runner launches + connects one
   build per worker), and `maps.resolve_map_rotation` (the shared `--maps` rotation contract).

@@ -31,11 +31,23 @@ public class GameController : MonoBehaviour
 
     public TileBase[] tiles;
 
+    // OBSERVABILITY (verbose-gated; no behavior/wire impact). MONOTONIC stopwatch started when the
+    // Arena scene's GameController.Awake runs, used to measure scene-RELOAD duration: Awake ->
+    // first UpdateState after load. NEVER Time.time (frozen by Time.timeScale=0 in FixedUpdate).
+    private System.Diagnostics.Stopwatch awakeClock;
+    // One-shot latch so ONLY the first UpdateState after each Arena load logs the reload duration.
+    private bool firstStateLogged = false;
+
     private void Awake()
     {
         instance = this;
         gamePlaying = false;
         checkWinner = false;
+        if (DriverController.instance != null && DriverController.instance.verbose)
+        {
+            awakeClock = System.Diagnostics.Stopwatch.StartNew();
+            Debug.Log(DriverLog.Format("arena_awake", System.DateTime.UtcNow));
+        }
         JObject config = DriverController.instance.config;
         if (config["game_countdownStart"] != null)
             countdownStart = config["game_countdownStart"].Value<int>();
@@ -210,6 +222,17 @@ public class GameController : MonoBehaviour
 
         state.Add("state", new JArray(s));
         DriverController.instance.state = state;
+
+        // OBSERVE-ONLY (verbose-gated): the FIRST populated UpdateState after this Arena load.
+        // Elapsed since Awake = the scene-RELOAD duration. One-shot so only the first tick logs
+        // (not every FixedUpdate). The 52-float `s` layout above is untouched.
+        if (!firstStateLogged && DriverController.instance.verbose)
+        {
+            firstStateLogged = true;
+            double reloadMs = awakeClock != null ? awakeClock.Elapsed.TotalMilliseconds : 0d;
+            Debug.Log(DriverLog.Format("first_state_after_load", System.DateTime.UtcNow,
+                "reload_ms", DriverLog.Ms(reloadMs)));
+        }
     }
 
     private void UpdateGameTimer()
