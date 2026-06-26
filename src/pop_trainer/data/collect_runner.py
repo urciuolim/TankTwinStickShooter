@@ -52,10 +52,14 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import os
+import platform
+import socket
 import subprocess
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 import numpy as np
@@ -69,6 +73,7 @@ from pop_trainer.core.config import EnvConfig
 from pop_trainer.core.protocol import Connection
 from pop_trainer.data import collect, schema
 from pop_trainer.data.collect import CollectionSpec, EpisodePlan, collect_parallel
+from pop_trainer.data.manifest import MANIFEST_NAME, build_manifest
 from pop_trainer.env.tank_env import TankEnv
 
 __all__ = [
@@ -873,6 +878,61 @@ def main(argv: list[str] | None = None) -> int:
     summary = summarize_collection(worker_map_ids, sidecar_maps, total_shards=total_shards)
     for line in _format_summary(summary, args.out_dir, worker_shards):
         print(line)
+
+    # Provenance + machine manifest at the run root (live env reads; untested glue). Datasets are
+    # not byte-reproducible across machines, so this records what/which-build/where for the run.
+    def _git(args_list: list[str]) -> str | None:
+        try:
+            proc = subprocess.run(args_list, capture_output=True, text=True)
+        except FileNotFoundError:
+            return None
+        if proc.returncode != 0:
+            return None
+        return proc.stdout.strip()
+
+    commit = _git(["git", "rev-parse", "HEAD"])
+    status = _git(["git", "status", "--porcelain"])
+    git_dirty = None if status is None else bool(status)
+
+    st = args.exe.stat()
+    build = {
+        "path": str(args.exe),
+        "mtime_utc": datetime.fromtimestamp(st.st_mtime, tz=UTC).isoformat(),
+        "size_bytes": int(st.st_size),
+    }
+
+    manifest = build_manifest(
+        dataset=args.out_dir.name,
+        collection={
+            "seed": args.seed,
+            "command": list(sys.argv),
+            "workers": len(specs),
+            "episodes": args.episodes,
+            "max_steps": args.max_steps,
+            "maps": sidecar_maps,
+            "pairings": pairings,
+            "total_shards": summary.total_shards,
+            "total_samples": summary.total_samples,
+            "per_map_samples": {arena: samples for _map_id, arena, samples in summary.map_samples},
+        },
+        provenance={"git_commit": commit, "git_dirty": git_dirty, "build": build},
+        machine={
+            "hostname": socket.gethostname(),
+            "platform": platform.platform(),
+            "system": platform.system(),
+            "release": platform.release(),
+            "arch": platform.machine(),
+            "processor": platform.processor(),
+            "cpu_count": os.cpu_count(),
+            "ram_total_gb": round(psutil.virtual_memory().total / (1024**3), 2),
+            "python": platform.python_version(),
+        },
+        created_utc=datetime.now(UTC).isoformat(),
+    )
+    tmp = args.out_dir / (MANIFEST_NAME + ".tmp")
+    with open(tmp, "w") as fh:
+        json.dump(manifest, fh, indent=2)
+    tmp.replace(args.out_dir / MANIFEST_NAME)
     return 0
 
 

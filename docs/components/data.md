@@ -69,6 +69,11 @@ package is named `data` (not `datasets` — that name collides with the git-igno
   path drives the SAME bar via a `_DirectBarQueue` shim). It is a **pure observability side-channel** —
   workers report only an int count, so collecting with vs without it yields byte-identical shards
   (`collect.py:379-384,418-419`).
+- [`data.manifest`](../../src/pop_trainer/data/manifest.py) — the **pure dataset-manifest
+  assembler** (stdlib-only). [`build_manifest`](../../src/pop_trainer/data/manifest.py) shapes +
+  validates the run-root `manifest.json` from injected provenance/machine/collection values (no
+  I/O, no clock); the live gathering is `collect_runner.main`'s glue. See
+  [the run-root manifest](#the-run-root-manifestjson-dataset-fingerprint).
 - [`data.collect_runner`](../../src/pop_trainer/data/collect_runner.py) — the **live collection
   entry point** (`python -m pop_trainer.data.collect_runner`): the concrete factories + CLI riding
   on `collect`'s orchestration. It is **multi-worker** and runs either a single map or a
@@ -173,6 +178,47 @@ is read ONLY in [`collect_runner.main`](../../src/pop_trainer/data/collect_runne
 `psutil.virtual_memory().available`, calls `check_memory_budget`, and on `MemoryError` aborts with
 exit code `2` BEFORE launching any build (unless `--allow-oversized`).
 
+## The run-root `manifest.json` (dataset fingerprint)
+
+Each run writes a single **`manifest.json`** at the run root (next to the root `maps.json`) that
+**identifies** the dataset and makes cross-machine discrepancies explicable. Datasets are **NOT
+byte-reproducible** run-to-run (Unity physics + GPU rendering vary across machines), so the
+manifest is not a reproduce-this recipe — it records WHAT was collected, WHICH commit/build
+produced it, and on WHAT machine.
+
+The shape is the dict returned by [`build_manifest`](../../src/pop_trainer/data/manifest.py)
+(`manifest.py:92-128`). Top-level keys (constants `MANIFEST_NAME = "manifest.json"`,
+`MANIFEST_SCHEMA_VERSION = 1`, `manifest.py:24-25`):
+
+- `schema_version` (int) + `created_utc` (ISO-8601 UTC string) + `dataset` (the run name).
+- `collection` — the run params: `seed`, `command` (the `sys.argv` list), `workers`, `episodes`,
+  `max_steps`, `maps` (the arena list, aligned to `maps.json`), `pairings` (each a 2-element
+  `[player1, player2]` list), `total_shards`, `total_samples`, `per_map_samples` (an
+  `arena-path → count` map). The three counts + `per_map_samples` are reused from the same
+  [`CollectionSummary`](../../src/pop_trainer/data/collect_runner.py) the end-of-run printout uses.
+- `provenance` — `git_commit`, `git_dirty` (a bool, or `None` when git is absent / not a repo), and
+  `build` = `{path, mtime_utc, size_bytes}` (the build-binary fingerprint).
+- `machine` — `hostname`, `platform`, `system`, `release`, `arch`, `processor`, `cpu_count`,
+  `ram_total_gb`, `python`.
+
+**Pure builder / injected glue split** — the same shape as the rest of `data`:
+
+- [`build_manifest(*, dataset, collection, provenance, machine, created_utc)`](../../src/pop_trainer/data/manifest.py)
+  (`manifest.py:63-128`) is **pure + unit-tested**: it assembles AND validates the manifest dict
+  from values the caller **injects** — no I/O, no env reads, no clock read (`created_utc` is passed
+  in). It normalizes the JSON-unrepresentable pieces (pairing tuples → 2-element lists,
+  `per_map_samples` keys → strings, `manifest.py:89-90`) so the result round-trips through strict
+  JSON, and fails **loudly** (`ValueError`) if a required sub-key is missing / mistyped
+  (`_require_keys`, `manifest.py:54-87`). `manifest.py` is **stdlib-only**.
+- The **live gathering** of provenance + machine values is **untested CLI glue** in
+  [`collect_runner.main`](../../src/pop_trainer/data/collect_runner.py) (`collect_runner.py:882-935`):
+  `git_commit` via `git rev-parse HEAD` and `git_dirty` via `git status --porcelain` (both arg-list
+  `subprocess`, `None` if git is absent / errors); `build` from `args.exe.stat()`; `machine` from
+  `socket` / `platform` / `os` / `psutil`; `created_utc` from `datetime.now(UTC).isoformat()`. It is
+  written **atomically** — `json.dump` to `manifest.json.tmp`, then `Path.replace` onto
+  `manifest.json` (`collect_runner.py:932-935`) — the same tmp→replace discipline as the shards and
+  the sidecar.
+
 ## Pulls from (upstream)
 
 - [core](core.md) — `state` (`STATE_LEN`, `validate`), `config.EnvConfig`,
@@ -186,10 +232,13 @@ exit code `2` BEFORE launching any build (unless `--allow-oversized`).
 
 ## Pushes to (downstream)
 
-On-disk `.npz` shard artifacts + a dataset index — **not** via imports:
+On-disk `.npz` shard artifacts + a dataset index + the run-root `maps.json` / `manifest.json`
+fingerprint — **not** via imports:
 
 - (Future `pretraining` streams shards via the schema for the inverse-render / supervised-decode
   training.)
+- The [`manifest.json`](#the-run-root-manifestjson-dataset-fingerprint) is the dataset's identity
+  card for whoever later consumes / compares the corpus.
 
 ## Where it sits in the run
 

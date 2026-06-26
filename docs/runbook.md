@@ -261,6 +261,32 @@ arena path Unity actually loaded (echoed as `WallLayout.map_id`), decoded throug
 `arena-path → int` index built from this same list (the F5 tag-from-echo; see
 [data](components/data.md#the-rotation-scheduler--map-tagging)).
 
+### The `manifest.json` fingerprint (what identifies a dataset)
+
+Each run also writes a single **`manifest.json`** at the **run root** (next to the root
+`maps.json`, `collect_runner.py:882-935`). It records, under
+[`schema_version`](../src/pop_trainer/data/manifest.py)` = 1`:
+
+- **collection params** — `seed`, the full `command` (`sys.argv`), `workers`, `episodes`,
+  `max_steps`, the `maps` list, the `pairings`, and the `total_shards` / `total_samples` /
+  `per_map_samples` counts (reused from the same summary as the printout);
+- **provenance** — `git_commit` (`git rev-parse HEAD`), `git_dirty` (`git status --porcelain`,
+  `None` if git is absent), and a `build` fingerprint `{path, mtime_utc, size_bytes}` of the Unity
+  binary that produced the run;
+- **machine** — `hostname`, `platform`, `system`, `release`, `arch`, `processor`, `cpu_count`,
+  `ram_total_gb`, `python`.
+
+> **Not a reproduce-this recipe — it is the dataset's IDENTITY.** Datasets are **NOT
+> byte-reproducible run-to-run**: Unity physics + GPU rendering vary across machines, so two runs
+> of the same command on two boxes will differ. The manifest exists to **identify** a given dataset
+> and make those discrepancies **explicable** (which commit, which build, which machine) — it does
+> NOT let you regenerate a corpus byte-for-byte.
+
+The shaping is a **pure, unit-tested** assembler
+([`build_manifest`](../src/pop_trainer/data/manifest.py), `manifest.py:63-128`); the live gathering
+of the provenance/machine values is `main`'s untested CLI glue. The file is written **atomically**
+(tmp → `Path.replace`). See [data](components/data.md#the-run-root-manifestjson-dataset-fingerprint).
+
 ### The obs_pixels gotcha
 
 Collection **must** receive pixel frames (the env reads a length-prefixed frame after every state;
