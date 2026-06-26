@@ -17,7 +17,8 @@ core  ←  { models, env, agents, data }  ←  demo
 - [agents](components/agents.md) — imports `core` (+ numpy).
 - [data](components/data.md) — imports `core`, `env`, `agents`.
 - [demo](components/demo.md) — imports `core`, `env`, `agents`.
-- [rl](components/rl.md) — imports `models` (+ torch / gymnasium / stable-baselines3).
+- [rl](components/rl.md) — imports `core`, `env`, `models`, `agents` (+ torch / gymnasium / numpy /
+  stable-baselines3).
 
 No import cycles: `data` and `demo` sit at the top, `core` at the bottom, `models` off to the
 side. (`pretraining` / `eval` / `population` / `deployment` / `imitation` are not built yet and are
@@ -42,6 +43,7 @@ graph TD
 
     subgraph rl["rl (online RL; SB3)"]
         EncoderExtractor["EncoderExtractor<br/>(SB3 BaseFeaturesExtractor)"]
+        SelfPlay["SelfPlayWrapper (gym.Wrapper) /<br/>OpponentProvider / ScriptedOpponent"]
     end
 
     subgraph agents["agents (model-free policies)"]
@@ -85,8 +87,11 @@ graph TD
     %% models wiring
     Encoder -.->|leaf, no internal import| core
 
-    %% rl wiring (Phase-1 slice: only the policy<->encoder seam; imports only models)
+    %% rl wiring: the encoder seam wraps models; the self-play seam wraps env + reuses core/agents
     EncoderExtractor -.->|wraps build_encoder(nature,flatten) @360×640| Encoder
+    SelfPlay -.->|"wraps env; step(a1,a2)"| TankEnv
+    SelfPlay -.->|"from_roster → make_agent"| AgentImpls
+    SelfPlay -.->|split_state_for_opponent| State
 
     %% data wiring
     Runner --> Collect
@@ -121,7 +126,11 @@ graph TD
   `flip_frame_perspective`) and is owned **driver-side**: `data.collect` / `demo` flip player2's
   perspective to compute its action `a2`, then pass it to `env.step(a1, a2)`. Agents read `PLAYER_1`
   out of whatever (possibly flipped) view they're handed. `TankEnv` exposes `player2_frame()` /
-  `player2_state()` helpers but does not call them during `step`.
+  `player2_state()` helpers but does not call them during `step`. [`rl`](components/rl.md) now
+  packages this SAME driver path as a `gymnasium.Wrapper` — `SelfPlayWrapper` samples a scripted
+  opponent per episode (via `OpponentProvider` over the `agents` roster), caches player2's flipped
+  view from `info["state"]`, and drives `env.step(a1, a2)` so SB3 supplies only `a1`. Self-play stays
+  a WRAPPER over the trainer, never woven into the env or PPO core.
 - **The wall-message seam** flows `WallMessage` (Unity) → `protocol.parse_walls_message` →
   `WallLayout` → `TankEnv.current_map` → `info["map"]`, and from there into a map-aware agent via
   the OPTIONAL `set_map` hook — called **driver-side** on **both** players: `data.collect` /
@@ -146,8 +155,12 @@ graph TD
 - **`models` is detached** from the live loop today — it's the shared vision backbone, and the
   deployable ONNX artifact. The seam to consume it now exists: [`rl`](components/rl.md)'s
   `EncoderExtractor` wraps the `Encoder` and reads its `embed` flat embedding as the SB3 policy /
-  value feature extractor (the only internal dependency `rl` has in this slice). The future
-  `pretraining` (which reads `Encoder.features`) is still unbuilt.
+  value feature extractor. The future `pretraining` (which reads `Encoder.features`) is still unbuilt.
+- **`rl` now spans four internal deps**, not just `models`: the self-play seam adds `env` (the
+  `TankEnv` `SelfPlayWrapper` wraps), `agents` (`make_agent` for the opponent roster), and `core`
+  (`split_state_for_opponent` for the perspective flip). It still imports NOTHING from `data` /
+  `pretraining` — the opponent-driving primitives are reused directly, not the `data` module. The PPO
+  train loop, callbacks, and ELO remain deferred future work.
 
 ---
 [← back to index](README.md)
