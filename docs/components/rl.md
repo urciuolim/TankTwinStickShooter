@@ -148,99 +148,131 @@ the breakdown shows where the policy is strong/weak across the scripted family
     [`format_per_map_table`](../../src/pop_trainer/rl/evaluate.py) renders a one-line per-opponent
     breakdown (`<opp>: <rate> | ... | OVERALL: <overall> (N opponents x E episodes)`,
     `evaluate.py:164-183`) and **is now wired**: the [integrator](#the-train_local-integrator-seam)
-    imports it (`train.py:516`) and prints it as the end-of-run summary line (`train.py:595`). All
+    imports it (`train.py:576`) and prints it as the end-of-run summary line (`train.py:663`). All
     three helpers avoid torch/env (type-only imports, `evaluate.py:21-23,33-35`).
 - [`EvalWinRateCallback(BaseCallback)`](../../src/pop_trainer/rl/callbacks.py) — the SB3 callback
   that runs the eval periodically during training and logs it.
+  - **THE CRUX — eval against a DEDICATED eval env, NO buffer repair.** Eval runs against a SEPARATE
+    `TankEnv` on its OWN Unity build / socket, **passed in at construction** as `eval_env`
+    (`callbacks.py:59-60,64-78`) — it is NOT `self.model.get_env()` and NOT a re-wrap of the training
+    vec stack (`callbacks.py:10-14`). Because the training env / socket is never driven by eval, the
+    model's rollout state (`model._last_obs` / `model._last_episode_starts`) is left untouched and
+    there is **NO buffer "repair"** to undo — eval and training are **fully isolated by
+    construction** (`callbacks.py:13-14,48-50`). (The old env-reuse design wrote `_last_obs` /
+    `_last_episode_starts = all-True` in a `finally` after eval; that repair is **deleted** — only a
+    docstring mention of "no buffer repair" remains.)
   - **Rollout-boundary ONLY — never mid-rollout.** `_on_step` is a no-op returning `True`
-    (`callbacks.py:73-75`); the eval fires in `_on_rollout_end`, gated by `eval_freq` AND a timestep
-    delta against the last eval (`callbacks.py:77-83`). This is load-bearing: running `env.step`
-    inside a rollout would poison the PPO experience buffer (`callbacks.py:9-12`). `eval_freq <= 0`
-    disables eval (`callbacks.py:49,79-80`).
-  - **Evals against the RAW env.** It reaches `vec_env.envs[0].unwrapped` — the bare `TankEnv`
-    behind SB3's `DummyVecEnv` / `Monitor` — because `evaluate_winrate` re-wraps it in its own
-    per-opponent `SelfPlayWrapper`, so it must NOT be handed the vec wrapper
-    (`callbacks.py:85-89`). It logs `eval/win_rate/<selector>` per opponent plus an overall
-    `eval/win_rate` into the model's existing SB3 logger, then `dump`s — so the row lands in BOTH
-    `progress.csv` and TensorBoard `tfevents` at this timestep (`callbacks.py:110-115`).
-  - **THE CRUX — it repairs the rollout state afterward.** Eval drives `reset`/`step` on the SHARED
-    training env, leaving `model._last_obs` / `model._last_episode_starts` stale. So in a `finally`
-    (which ALWAYS runs, even if eval raises mid-batch) it does `obs = vec_env.reset()` then writes
-    `model._last_obs = obs` and `model._last_episode_starts = all-True` so the NEXT rollout starts
-    clean (`callbacks.py:116-125`).
+    (`callbacks.py:82-84`); the eval fires in `_on_rollout_end`, gated by `eval_freq` AND a timestep
+    delta against the last eval (`callbacks.py:86-92`). With the dedicated env this is now purely a
+    **cadence** choice (the training buffer can no longer be poisoned by eval), not a correctness one,
+    but the boundary cadence is kept so eval work is batched between rollouts (`callbacks.py:15-19`).
+    `eval_freq <= 0` disables eval (`callbacks.py:53,88-89`).
+  - **Evals via `evaluate_winrate` on the raw eval env.** It hands the raw `eval_env` (a bare
+    `TankEnv`, not a `SelfPlayWrapper` / vec stack) straight to `evaluate_winrate`, which re-wraps it
+    in its own per-opponent `SelfPlayWrapper` (`callbacks.py:104-110`). It logs
+    `eval/win_rate/<selector>` per opponent plus an overall `eval/win_rate` into the model's existing
+    SB3 logger, then `dump`s — so the row lands in BOTH `progress.csv` and TensorBoard `tfevents` at
+    this timestep (`callbacks.py:112-117`).
   - **Rotation-desync handling — by omission, not a toggle.** It suppresses map rotation during eval
     NOT via a (nonexistent) `env.set_rotation_enabled` toggle but simply by NEVER passing
-    `switch_arena` on any eval or repair reset: `TankEnv` rotates ONLY when the CALLER passes
-    `reset(options={"switch_arena": ...})`, `evaluate_winrate` issues plain `reset()`s, and the
-    repair is a plain `vec_env.reset()` — so the documented mid-eval arena-switch desync cannot occur
-    (`callbacks.py:91-101,119-123`).
+    `switch_arena` on any eval reset: `TankEnv` rotates ONLY when the CALLER passes
+    `reset(options={"switch_arena": ...})` and `evaluate_winrate` issues plain `reset()`s — so the
+    documented mid-eval arena-switch desync cannot occur (`callbacks.py:98-103`).
 - [`elo.py`](../../src/pop_trainer/rl/elo.py) — pure ELO rating math, `import math` ONLY (no
   sb3/gym/torch/numpy — unit-testable on its own, `elo.py:1-8`). `elo_prob(elo1, elo2)` is the
   logistic expected-win probability (base 10, `/400`) (`elo.py:11-13`); `elo_change(elo_a, elo_b,
   K, a_win_rate)` returns the per-side ROUNDED deltas, which (being rounded per side) need NOT sum to
   zero (`elo.py:16-28`). It is **NOT exported from `rl/__init__.py`** — reach it as
-  `from pop_trainer.rl.elo import elo_prob, elo_change`. It is for the **M2 ELO ladder over the
-  population** and is **not wired into the M1 train loop** yet (`elo.py:2-5`).
+  `from pop_trainer.rl.elo import elo_prob, elo_change`. **It is now wired into the integrator** as a
+  light sidecar update: `train_local` seeds every roster selector at `BASE_ELO` (`train.py:72,452-454`)
+  and nudges each opponent's rating from the realized per-opponent eval win-rate via
+  [`_update_elo_from_eval`](../../src/pop_trainer/rl/train.py) (which calls `elo_change`,
+  `train.py:468-489,662`), persisting the result in `state.json`. This is a deliberately light
+  Phase-1 wiring so the persisted ELO structure is non-trivial; the **full ELO ladder over a
+  frozen-self population is M2 work**, not yet built (`train.py:476-478`, `elo.py:2-5`).
 
 ### The `train_local` integrator seam
 
 [`train.py`](../../src/pop_trainer/rl/train.py) is the **INTEGRATOR** — it composes the three seams
 above into one runnable SB3 PPO self-play run and **re-implements nothing** (it WIRES the already-built
-parts, `train.py:1-14`). [`TrainConfig`](../../src/pop_trainer/rl/train.py) is the frozen, validated
-run spec (`train.py:77-187`); [`train_local(cfg)`](../../src/pop_trainer/rl/train.py) runs (or resumes)
-one local run and returns `cfg.run_dir` (`train.py:503-610`). The operator-facing CLI is documented in
+parts, `train.py:1-27`). [`TrainConfig`](../../src/pop_trainer/rl/train.py) is the frozen, validated
+run spec (`train.py:78-203`); [`train_local(cfg)`](../../src/pop_trainer/rl/train.py) runs (or resumes)
+one local run and returns `cfg.run_dir` (`train.py:556-683`). The operator-facing CLI is documented in
 the [runbook](../runbook.md#5-run-rl-training-cli).
 
+- **TWO env stacks, both built ONCE at startup.** `train_local` builds a TRAINING env on
+  `cfg.game_port` (`monitor=True`) and a DEDICATED eval env on `cfg.effective_eval_port`
+  (`monitor=False`) — a SECOND Unity build / socket — at the top of the run, NOT per-eval
+  (`train.py:583,585`). The two effective ports differ by construction: `effective_eval_port` is the
+  `eval_port` override or `game_port + 1`, and `__post_init__` REJECTS an `eval_port` equal to
+  `game_port` (`train.py:162-171`), so the two builds run side-by-side on separate sockets.
 - **The vec-env composition.** [`build_vec_env`](../../src/pop_trainer/rl/train.py) builds
-  `VecFrameStack(DummyVecEnv([SelfPlayWrapper(TankEnv)]))` (`train.py:289-331`): a bare pure-transport
-  `TankEnv` over the connection factory, wrapped in a `SelfPlayWrapper` driving player2 from an
-  `OpponentProvider` built from `cfg.opponents` / `cfg.opponent_strategy` (seeded with `cfg.seed`),
-  boxed in a `DummyVecEnv`, then `VecFrameStack` at `n_stack = cfg.frame_stack` (`1` = passthrough,
-  still wrapped so the stack is uniform — `train.py:302-303,330-331`).
-- **The policy.** PPO is built as `"CnnPolicy"` (`train.py:544-545`). Its `policy_kwargs` carries
+  `[VecMonitor(]VecFrameStack(DummyVecEnv([SelfPlayWrapper(TankEnv)]))[)]` (`train.py:318-380`): a bare
+  pure-transport `TankEnv` over the connection factory on the given `port`, wrapped in a
+  `SelfPlayWrapper` driving player2 from an `OpponentProvider` built from `cfg.opponents` /
+  `cfg.opponent_strategy` (seeded with `cfg.seed`), boxed in a `DummyVecEnv`, then `VecFrameStack` at
+  `n_stack = cfg.frame_stack` (`1` = passthrough, still wrapped so the stack is uniform —
+  `train.py:369-375`). When `monitor=True` it is wrapped OUTERMOST in `VecMonitor` so SB3 logs
+  `rollout/ep_rew_mean` / `rollout/ep_len_mean` — **only the TRAINING stack is monitored**; the eval
+  stack is built `monitor=False` (it uses `evaluate_winrate`'s own loop, not SB3 episode stats —
+  `train.py:337-339,376-379`).
+- **The policy.** PPO is built as `"CnnPolicy"` (`train.py:611-612`). Its `policy_kwargs` carries
   `features_extractor_class=EncoderExtractor` + `features_extractor_kwargs={checkpoint, freeze}` from
   `cfg.encoder_checkpoint` / `cfg.freeze_encoder` ([`_build_policy_kwargs`](../../src/pop_trainer/rl/train.py),
-  `train.py:334-346`) — so the `EncoderExtractor` (which owns the pretrained-encoder load + the freeze
+  `train.py:383-395`) — so the `EncoderExtractor` (which owns the pretrained-encoder load + the freeze
   path) is handed to the policy. The model is built **fresh** on a clean run, or **`PPO.load`-ed** on
-  resume (`train.py:528-558`).
+  resume (`train.py:593-625`).
 
 #### The live-launch seam / boundary (the crux)
 
 `TankEnv` does NOT launch Unity — it takes an injected `connection_factory`. The LIVE launch lives in
 [`data`](data.md), which `rl` must **NOT** import (boundary). So the live `connection_factory` is
 **re-derived HERE from the shared, dependency-free [`core.launch`](core.md) primitives** — never
-imported from `data` ([`_live_connection_factory`](../../src/pop_trainer/rl/train.py),
-`train.py:232-262`; imports at `train.py:39-42`). Each factory call: `build_launch_cmd` +
+imported from `data` ([`_live_connection_factory_for_port`](../../src/pop_trainer/rl/train.py),
+`train.py:257-288`; imports at `train.py:40-46`). The factory is **parameterized by `port`** so the
+TRAINING env (`cfg.game_port`) and the DEDICATED eval env (`cfg.effective_eval_port`) each launch
+their OWN build on their OWN socket (`train.py:266-269`). Each factory call: `build_launch_cmd` +
 `subprocess.Popen` (windowed, never batchmode) + `connect` + wrap the socket in a `core.protocol.Connection`
-(`train.py:248-252`). The live `Popen` is stashed on the produced `Connection` (`conn._launch_proc`,
-`train.py:259`), and [`_attach_launch_proc`](../../src/pop_trainer/rl/train.py) wraps `env.close` so
+(`train.py:273-286`). The live `Popen` is stashed on the produced `Connection` (`conn._launch_proc`,
+`train.py:285`), and [`_attach_launch_proc`](../../src/pop_trainer/rl/train.py) wraps `env.close` so
 closing the env **reaps the build** via [`_terminate`](../../src/pop_trainer/rl/train.py) (terminate →
-wait → kill, idempotent — `train.py:193-229`). A unit-test **STUB** factory carries no `_launch_proc`,
-so the reap-wrap is skipped and **no Unity launches** (`train.py:283-285`). The whole point of this
-seam: `rl` imports **nothing** from `data` / `pretraining` (`train.py:24-26`).
+wait → kill, idempotent — `train.py:209-224`). A unit-test **STUB** factory carries no `_launch_proc`,
+so the reap-wrap is skipped and **no Unity launches** (`train.py:312-314`). The whole point of this
+seam: `rl` imports **nothing** from `data` / `pretraining` (`train.py:25-27`).
+
+- **Reconnect-safe reap (current-proc, not captured-original).** A mid-run socket drop makes the env
+  RE-INVOKE the factory, producing a NEW `Connection` with a NEW `_launch_proc` for the relaunched
+  build. So `close_and_reap` reads `getattr(env.conn, "_launch_proc", proc)` **at CLOSE time** —
+  reaping the CURRENT connection's proc, falling back to the originally stashed `proc` only when the
+  current conn carries none (`train.py:243-254`). The already-dead original is a no-op reap, and the
+  relaunched build can never be orphaned.
+- **DUAL REAP — both builds reaped on any exit.** `train_local` uses a **nested `try/finally`**:
+  the eval env is closed in an inner `finally` (suppressed independently), and the training env in
+  the outer `finally` (`train.py:584-681`). A failure to close one still closes the other, so BOTH
+  live Unity builds are reaped even on exception / `KeyboardInterrupt` (`train.py:567-569,673-681`).
 
 #### Checkpoint / resume / sidecar
 
 - **Checkpoints.** SB3's `CheckpointCallback` writes `model_<steps>_steps.zip` on the
-  `cfg.checkpoint_freq` cadence (`train.py:568-572`).
+  `cfg.checkpoint_freq` cadence (`train.py:636-640`).
 - **The sidecar rides the SAME cadence.** [`_make_sidecar_callback`](../../src/pop_trainer/rl/train.py)
   builds a callback that writes `run_dir/state.json` alongside each checkpoint zip, gated on the same
-  `checkpoint_freq` (`train.py:439-472`). [`save_sidecar`](../../src/pop_trainer/rl/train.py) (PURE,
+  `checkpoint_freq` (`train.py:492-525`). [`save_sidecar`](../../src/pop_trainer/rl/train.py) (PURE,
   strict JSON) captures the provider position, the per-selector ELO dict, `cfg.to_dict()`, and
-  `num_timesteps` (`train.py:367-391`). The provider position is replayable **only for `round_robin`**
+  `num_timesteps` (`train.py:420-444`). The provider position is replayable **only for `round_robin`**
   (the `_index`); for `uniform` only `strategy` is recorded — non-replayable by design (the seeded RNG
-  continues fresh — `train.py:382-391`).
+  continues fresh — `train.py:435-444`).
 - **Resume.** `--resume <prior run_dir>` picks the **MAX-step** zip
   ([`_latest_checkpoint`](../../src/pop_trainer/rl/train.py), parses the trailing integer from each
-  `model_*.zip`, `train.py:478-497`), does `PPO.load(latest, env=vec_env)` (`train.py:534`), restores
+  `model_*.zip`, `train.py:531-550`), does `PPO.load(latest, env=vec_env)` (`train.py:601`), restores
   the provider position + ELO from the sidecar
-  ([`_restore_provider_position`](../../src/pop_trainer/rl/train.py), `train.py:404-413,536-539`), and
-  continues with `learn(reset_num_timesteps=False)` (`train.py:526,577-581`). Resuming a `run_dir` with
-  no parseable checkpoint raises `FileNotFoundError` (`train.py:531-533`).
+  ([`_restore_provider_position`](../../src/pop_trainer/rl/train.py), `train.py:457-465,602-606`), and
+  continues with `learn(reset_num_timesteps=False)` (`train.py:591,648`). Resuming a `run_dir` with
+  no parseable checkpoint raises `FileNotFoundError` (`train.py:597-600`).
 
 #### The `n_envs > 1` deferred seam
 
-`build_vec_env` **hard-raises `NotImplementedError`** for `n_envs != 1` (`train.py:314-319`). Phase-1
+`build_vec_env` **hard-raises `NotImplementedError`** for `n_envs != 1` (`train.py:355-360`). Phase-1
 is `n=1`; the multi-env fan-out (`SubprocVecEnv` + a distinct `game_port` per env, each launching its
 own build) is deferred. Note the sidecar and checkpoint cadences **coincide only at `n_envs == 1`** —
 the per-env-call counting both callbacks use lines up only with a single env.
@@ -248,25 +280,30 @@ the per-env-call counting both callbacks use lines up only with a single env.
 #### The training-topology config
 
 `cfg.game_config` defaults to [`train_config.json`](../../Assets/StreamingAssets/train_config.json)
-(`DEFAULT_TRAIN_CONFIG`, `train.py:60`) — the single-arena AI-vs-AI pixel config the build launches
+(`DEFAULT_TRAIN_CONFIG`, `train.py:61`) — the single-arena AI-vs-AI pixel config the build launches
 under. Load-bearing values (`train_config.json:1-22`): `timeScale: 5` (**MUST stay ≤ 5** — the
 collection cap applies; ≥ 10 corrupts), `obs_pixels: true` at `640×360`, both `player1_ai` /
 `player2_ai` `true`, `game_maxTime: 60`, `player_maxHealth: 3`, and a single `arena_path`
 (`Arenas/custom1.json` — no rotation, unlike the collection rotation set).
 
-**`train_local` composition** — the integrator wiring:
+**`train_local` composition** — the integrator wiring (TWO env stacks, both built once at startup):
 
 ```mermaid
 graph TD
-    cfg["TrainConfig"] -->|build_vec_env| vec["VecFrameStack(DummyVecEnv([SelfPlayWrapper(TankEnv)]))"]
-    cfg -.->|_live_connection_factory| launch["core.launch<br/>build_launch_cmd + Popen + connect"]
+    cfg["TrainConfig"] -->|"build_vec_env(port=game_port, monitor=True)"| vec["TRAINING stack<br/>VecMonitor(VecFrameStack(DummyVecEnv([SelfPlayWrapper(TankEnv)])))"]
+    cfg -->|"build_vec_env(port=effective_eval_port, monitor=False)"| evec["DEDICATED eval stack<br/>2nd Unity build / socket"]
+    cfg -.->|_live_connection_factory_for_port| launch["core.launch<br/>build_launch_cmd + Popen + connect"]
     launch -->|Connection (+_launch_proc)| vec
+    launch -->|Connection (+_launch_proc)| evec
     cfg -->|_build_policy_kwargs| pk["policy_kwargs<br/>EncoderExtractor + checkpoint/freeze"]
     pk --> ppo["PPO 'CnnPolicy'<br/>(fresh) or PPO.load (resume)"]
     vec --> ppo
-    ppo -->|model.learn| cbs["CallbackList:<br/>EvalWinRateCallback + CheckpointCallback + Sidecar"]
-    cbs -->|checkpoint cadence| ckpt["model_&lt;steps&gt;_steps.zip + state.json"]
-    ppo -->|final| summ["evaluate_winrate → format_per_map_table (printed)"]
+    evec -->|raw TankEnv| cbs
+    ppo -->|model.learn| cbs["CallbackList:<br/>EvalWinRateCallback (eval env) + CheckpointCallback + Sidecar"]
+    cbs -->|checkpoint cadence| ckpt["model_&lt;steps&gt;_steps.zip + state.json (+ELO)"]
+    ppo -->|final| summ["evaluate_winrate (eval env) → format_per_map_table (printed)"]
+    vec -.->|"outer finally: close + reap"| reap["DUAL REAP<br/>both builds reaped"]
+    evec -.->|"inner finally: close + reap"| reap
 ```
 
 ## Pulls from (upstream)
@@ -279,7 +316,7 @@ graph TD
   `state.py:178-185`); plus, for the integrator, `core.launch` (`build_launch_cmd` / `connect` /
   `default_build_path`), `core.protocol.Connection`, and `core.config` (`EnvConfig` / `RewardConfig`)
   — the live `connection_factory` `train_local` re-derives from the shared launch primitives
-  (`train.py:39-42,245-260`).
+  (`train.py:40-46,271-286`).
 - [env](env.md) — the symmetric pure-transport `TankEnv` that `SelfPlayWrapper` wraps and drives via
   `env.reset` / `env.step(a1, a2)` (`selfplay.py:177,207,227`); the eval seam ALSO reads its
   `info["outcome"]` win/loss/draw tag as the win signal (`tank_env.py:392-400`;
@@ -288,8 +325,8 @@ graph TD
   builds each roster opponent through it (`DEFAULT_ROSTER` = the five canonical selectors)
   (`selfplay.py:39,46-52,164`).
 - Plus torch / gymnasium / numpy / stable-baselines3 — the `BaseFeaturesExtractor` base class +
-  `gymnasium.Wrapper` (`extractor.py:24-27`; `selfplay.py:36-37`), the callback's `BaseCallback`
-  base + the model's SB3 logger / `numpy` for the repair (`callbacks.py:29-30,123-125`). The pure
+  `gymnasium.Wrapper` (`extractor.py:24-27`; `selfplay.py:36-37`), and the callback's `BaseCallback`
+  base + the model's SB3 logger (`callbacks.py:31,112-117`). The pure
   `evaluate.py` / `elo.py` helpers stay import-light: `evaluate.py` keeps sb3/gym type-only
   (`evaluate.py:33-35`) and `elo.py` imports `math` only (`elo.py:8`).
 
@@ -301,20 +338,22 @@ The eval seam consumes the self-play seam internally (`evaluate_winrate` re-wrap
 
 - `EncoderExtractor` plugs into the SB3 `CnnPolicy` via
   `policy_kwargs={"features_extractor_class": EncoderExtractor, ...}` — exactly what `_build_policy_kwargs`
-  emits (`train.py:334-346`) — so the policy / value heads read the standardized vision embedding.
+  emits (`train.py:383-395`) — so the policy / value heads read the standardized vision embedding.
 - `SelfPlayWrapper` wraps the env the trainer learns over, presenting it as a 1-action gym so SB3
   trains player1 against the sampled scripted opponent; `build_vec_env` composes it into the vec stack
-  (`train.py:325-331`).
+  (`train.py:369-375`).
 - `EvalWinRateCallback` is added to the `model.learn(callback=...)` list so the trainer logs greedy
-  per-opponent `eval/win_rate` at rollout boundaries (`train.py:560-575`); `format_per_map_table`
-  prints the final summary line (`train.py:595`).
+  per-opponent `eval/win_rate` at rollout boundaries — driven against the DEDICATED eval env
+  (`eval_raw_env`, the second build's raw `TankEnv`), never the training env
+  (`train.py:588,627-643`); `format_per_map_table` prints the final summary line (`train.py:663`).
 - **Downstream of the seams now:** the operator-facing CLI
   ([runbook §5](../runbook.md#5-run-rl-training-cli)) drives `train_local` over a live windowed Unity
-  build.
-- **Still deferred (M2 work, not the train loop):** the population / **frozen-self opponent** ladder
-  (the `elo` math is its primitive, not yet wired into the M1 loop — `elo.py:2-5`) and the `n_envs > 1`
+  build (two builds: training + dedicated eval).
+- **Still deferred (M2 work, not the train loop):** the full population / **frozen-self opponent**
+  ELO ladder (only a light from-eval ELO sidecar update is wired in M1 — `train.py:468-489`; the
+  ladder proper lands with frozen-self opponents in P2, `elo.py:2-5`) and the `n_envs > 1`
   multi-env fan-out (`SubprocVecEnv` + per-env ports; `build_vec_env` hard-raises today,
-  `train.py:314-319`). The integrator itself ships; the live Unity training smoke is the operator's run.
+  `train.py:355-360`). The integrator itself ships; the live Unity training smoke is the operator's run.
 
 ## Where it sits in the run
 
@@ -332,16 +371,18 @@ Three seams of the online-RL phase, all now composed by the **built**
   opponent-driving path the [data](data.md) collection runner uses, repackaged as a wrapper over the
   trainer.
 - **Eval + ELO seam** — where a trained policy is scored: `EvalWinRateCallback` fires at rollout
-  boundaries and calls `evaluate_winrate`, which RE-USES the self-play seam (one pinned opponent per
-  batch) to play greedy episodes and read the win/loss/draw straight from the env's `info["outcome"]`,
-  logging per-opponent + overall `eval/win_rate`. The `elo` math is the M2 ladder primitive, not yet
-  wired into the M1 loop.
+  boundaries and calls `evaluate_winrate` against a **DEDICATED eval env** (a second Unity build /
+  socket, so the training env is never touched and no buffer repair is needed), which RE-USES the
+  self-play seam (one pinned opponent per batch) to play greedy episodes and read the win/loss/draw
+  straight from the env's `info["outcome"]`, logging per-opponent + overall `eval/win_rate`. The
+  `elo` math gets a light from-eval sidecar update in M1; the full ELO ladder is M2 work.
 - **Integrator** — where the three seams become a runnable command:
-  [`train_local`](#the-train_local-integrator-seam) builds the vec-env stack + the `CnnPolicy` /
+  [`train_local`](#the-train_local-integrator-seam) builds TWO env stacks at startup (the
+  `VecMonitor`-wrapped training env + a dedicated eval env on a second socket) + the `CnnPolicy` /
   `EncoderExtractor` policy, attaches the eval + checkpoint + sidecar callbacks, runs `model.learn`,
   and prints a final per-opponent line — re-deriving the live Unity launch from [core](core.md)
-  `core.launch` (never [data](data.md)) and reaping the build in a `finally` (`train.py:503-610`). The
-  operator drives it from the [runbook](../runbook.md#5-run-rl-training-cli).
+  `core.launch` (never [data](data.md)) and reaping BOTH builds via a nested `try/finally`
+  (`train.py:556-683`). The operator drives it from the [runbook](../runbook.md#5-run-rl-training-cli).
 
 **Encoder seam** — pixel obs → standardized embedding:
 
@@ -351,14 +392,14 @@ graph LR
     ckpt["checkpoint<br/>(raw state_dict)"] -.->|load_state_dict| ext
     ext -->|wraps| enc["models.Encoder<br/>NatureCNN × Flatten"]
     enc -->|embed| feat["flat embedding<br/>(N, features_dim)"]
-    feat -.->|features_extractor_class| policy["SB3 CnnPolicy<br/>(future rl trainer)"]
+    feat -.->|features_extractor_class| policy["SB3 CnnPolicy<br/>(rl trainer — built: train_local)"]
 ```
 
 **Self-play seam** — `SelfPlayWrapper` drives player2 behind a 1-action gym face:
 
 ```mermaid
 graph LR
-    sb3["SB3 (future trainer)<br/>supplies a1 only"] -->|"step(a1)"| wrap["SelfPlayWrapper<br/>(gymnasium.Wrapper)"]
+    sb3["SB3 PPO trainer (built)<br/>supplies a1 only"] -->|"step(a1)"| wrap["SelfPlayWrapper<br/>(gymnasium.Wrapper)"]
     prov["OpponentProvider<br/>round_robin / uniform"] -.->|"sample() @reset"| wrap
     agents["agents.make_agent<br/>(DEFAULT_ROSTER selectors)"] -->|from_roster| prov
     wrap -->|"act(cached p2 view)"| opp["ScriptedOpponent → a2"]
@@ -372,14 +413,13 @@ graph LR
 
 ```mermaid
 graph LR
-    sb3["SB3 trainer<br/>(future)"] -->|"_on_rollout_end (gated by eval_freq)"| cb["EvalWinRateCallback<br/>(BaseCallback)"]
-    cb -->|"vec_env.envs[0].unwrapped"| raw["raw TankEnv"]
-    cb -->|"evaluate_winrate(model, raw_env)"| eval["evaluate_winrate<br/>(greedy, 1 pinned opp/batch)"]
+    sb3["SB3 PPO trainer (built)"] -->|"_on_rollout_end (gated by eval_freq)"| cb["EvalWinRateCallback<br/>(BaseCallback)"]
+    eraw["DEDICATED eval TankEnv<br/>(2nd build / socket, passed in)"] -->|"eval_env (training env untouched)"| cb
+    cb -->|"evaluate_winrate(model, eval_env)"| eval["evaluate_winrate<br/>(greedy, 1 pinned opp/batch)"]
     eval -.->|"wraps per selector"| sp["SelfPlayWrapper<br/>(self-play seam)"]
     eval -->|"info['outcome'] on terminated"| wr["win_rate / overall_win_rate"]
     wr -->|"record + dump"| log["SB3 logger<br/>(progress.csv + tfevents)"]
-    cb -.->|"finally: vec_env.reset() → _last_obs"| repair["rollout-state repair"]
-    elo["elo.py (pure math)<br/>M2 ladder — not wired yet"]
+    eval -.->|"final per-opponent"| elo["_update_elo_from_eval → state.json<br/>(light M1 wiring; full ladder = M2)"]
 ```
 
 ---

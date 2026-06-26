@@ -22,7 +22,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack
+from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack, VecMonitor
 
 from pop_trainer.core.protocol import Connection
 from pop_trainer.env.tank_env import TankEnv
@@ -31,7 +31,10 @@ from pop_trainer.rl.selfplay import DEFAULT_ROSTER, OpponentProvider, SelfPlayWr
 from pop_trainer.rl.train import (
     BASE_ELO,
     TrainConfig,
+    _attach_launch_proc,
+    _build_base_env,
     _build_policy_kwargs,
+    _find_selfplay_wrapper,
     _initial_elo,
     _latest_checkpoint,
     _restore_provider_position,
@@ -95,9 +98,23 @@ def test_trainconfig_defaults(tmp_path):
     assert cfg.freeze_encoder is False
     assert cfg.resume is None
     assert cfg.seed == 0
-    # the cadence defaults are small enough that a few-K-step smoke triggers a checkpoint + eval.
-    assert cfg.checkpoint_freq > 0
-    assert cfg.eval_freq >= 0
+    # the cadence defaults are a production-scale 10_000 (a smoke run overrides them downward).
+    assert cfg.checkpoint_freq == 10_000
+    assert cfg.eval_freq == 10_000
+    # eval_port defaults to None -> the effective eval port is game_port + 1 (a separate socket).
+    assert cfg.eval_port is None
+    assert cfg.effective_eval_port == cfg.game_port + 1
+
+
+def test_eval_port_explicit_override(tmp_path):
+    cfg = _cfg(tmp_path, game_port=50000, eval_port=50007)
+    assert cfg.eval_port == 50007
+    assert cfg.effective_eval_port == 50007  # explicit override wins over game_port + 1
+
+
+def test_eval_port_equal_to_game_port_rejected(tmp_path):
+    with pytest.raises(ValueError, match="eval_port must differ from game_port"):
+        _cfg(tmp_path, game_port=50000, eval_port=50000)
 
 
 @pytest.mark.parametrize(
@@ -137,12 +154,17 @@ def test_trainconfig_to_dict_roundtrips_paths_and_tuples(tmp_path):
     # tuples -> list
     assert d["opponents"] == list(DEFAULT_ROSTER)
     assert d["frame_shape"] == [4, 6, 3]
+    # eval_port serializes the RAW field value (None stays None).
+    assert d["eval_port"] is None
+    explicit = _cfg(tmp_path, eval_port=50123)
+    assert explicit.to_dict()["eval_port"] == 50123
     # None encoder_checkpoint / resume / build_path serialize as null
     none_cfg = _cfg(tmp_path)
     nd = none_cfg.to_dict()
     assert nd["encoder_checkpoint"] is None
     assert nd["resume"] is None
     assert nd["build_path"] is None
+    assert nd["eval_port"] is None
     # the dict is JSON-serializable (no Path / tuple leaks)
     import json
 
@@ -188,6 +210,118 @@ def test_build_vec_env_rejects_multi_env_seam(tmp_path):
     cfg = _cfg(tmp_path, n_envs=2)
     with pytest.raises(NotImplementedError):
         build_vec_env(cfg, connection_factory=_stub_factory)
+
+
+def test_build_vec_env_port_threads_into_envconfig(tmp_path):
+    # The training env builds on game_port; the eval env on the effective eval port. The built
+    # TankEnv records its socket via EnvConfig.game_port, so two distinct ports are assertable
+    # without launching Unity (the stub factory carries no proc).
+    cfg = _cfg(tmp_path, game_port=51000)
+    train_vec = build_vec_env(cfg, port=cfg.game_port, connection_factory=_stub_factory)
+    eval_vec = build_vec_env(cfg, port=cfg.effective_eval_port, connection_factory=_stub_factory)
+    try:
+        train_tank = _find_selfplay_wrapper(train_vec).env
+        eval_tank = _find_selfplay_wrapper(eval_vec).env
+        assert train_tank.env_config.game_port == 51000
+        assert eval_tank.env_config.game_port == 51001  # game_port + 1
+        assert train_tank.env_config.game_port != eval_tank.env_config.game_port
+    finally:
+        train_vec.close()
+        eval_vec.close()
+
+
+def test_build_vec_env_monitor_present_on_training_absent_on_eval(tmp_path):
+    cfg = _cfg(tmp_path)
+    train_vec = build_vec_env(
+        cfg, port=cfg.game_port, monitor=True, connection_factory=_stub_factory
+    )
+    eval_vec = build_vec_env(
+        cfg, port=cfg.effective_eval_port, monitor=False, connection_factory=_stub_factory
+    )
+    try:
+        # VecMonitor is OUTERMOST on the training stack (wrapping the VecFrameStack).
+        assert isinstance(train_vec, VecMonitor)
+        assert isinstance(train_vec.venv, VecFrameStack)
+        # The eval stack is NOT monitored (eval uses evaluate_winrate's own loop).
+        assert not isinstance(eval_vec, VecMonitor)
+        assert isinstance(eval_vec, VecFrameStack)
+    finally:
+        train_vec.close()
+        eval_vec.close()
+
+
+def test_find_selfplay_wrapper_walks_monitor_and_framestack(tmp_path):
+    # The walk must reach the SelfPlayWrapper through VecMonitor(VecFrameStack(DummyVecEnv([...]))).
+    cfg = _cfg(tmp_path, frame_stack=2)
+    vec = build_vec_env(cfg, port=cfg.game_port, monitor=True, connection_factory=_stub_factory)
+    try:
+        assert isinstance(vec, VecMonitor)
+        wrapper = _find_selfplay_wrapper(vec)
+        assert isinstance(wrapper, SelfPlayWrapper)
+        assert isinstance(wrapper.env, TankEnv)
+        assert isinstance(wrapper.opponents, OpponentProvider)
+    finally:
+        vec.close()
+
+
+# --- reconnect-safe close-and-reap -----------------------------------------------------------
+
+
+class _FakeProc:
+    """A subprocess.Popen stand-in: records terminate/kill; poll reports running until reaped."""
+
+    def __init__(self) -> None:
+        self.terminated = False
+        self.killed = False
+        self._dead = False
+
+    def poll(self):
+        return 0 if self._dead else None
+
+    def terminate(self):
+        self.terminated = True
+        self._dead = True
+
+    def wait(self, timeout=None):
+        return 0
+
+    def kill(self):
+        self.killed = True
+        self._dead = True
+
+
+def test_close_reaps_current_connection_proc_not_original(tmp_path):
+    # CHANGE 3: a mid-run reconnect swaps in a NEW Connection/_launch_proc; close must reap the
+    # CURRENT conn's proc, not the originally stashed one.
+    cfg = _cfg(tmp_path)
+    env = _build_base_env(cfg, _stub_factory, cfg.game_port)
+
+    original_proc = _FakeProc()
+    _attach_launch_proc(env, original_proc)  # wires close-and-reap, stashing the original
+
+    # Simulate a reconnect: the env now holds a fresh Connection whose _launch_proc is DIFFERENT.
+    current_proc = _FakeProc()
+    env.conn._launch_proc = current_proc  # type: ignore[attr-defined]
+
+    env.close()
+
+    assert current_proc.terminated  # the CURRENT connection's proc was reaped
+    assert not original_proc.terminated  # the stale original was NOT reaped
+
+
+def test_close_falls_back_to_original_proc_when_conn_has_none(tmp_path):
+    # When the current conn carries no _launch_proc, close falls back to the originally stashed one.
+    cfg = _cfg(tmp_path)
+    env = _build_base_env(cfg, _stub_factory, cfg.game_port)
+
+    original_proc = _FakeProc()
+    _attach_launch_proc(env, original_proc)
+    # The stub conn has no _launch_proc attribute -> getattr fallback to the original.
+    assert not hasattr(env.conn, "_launch_proc")
+
+    env.close()
+
+    assert original_proc.terminated
 
 
 def test_policy_kwargs_carry_extractor_and_checkpoint(tmp_path):
@@ -313,11 +447,15 @@ def test_resume_restores_provider_and_elo_with_mocked_ppo_load(tmp_path, monkeyp
         num_timesteps=2048,
     )
 
-    # The vec env build is replaced with a stub-backed real stack (no Unity).
+    # The vec env build is replaced with a stub-backed real stack (no Unity). train_local now
+    # builds TWO vec envs (training on game_port, eval on eval_port) and passes port + monitor
+    # kwargs; the stub factory serves BOTH ports (no Unity either way).
     monkeypatch.setattr(
         train_mod,
         "build_vec_env",
-        lambda c: build_vec_env(c, connection_factory=_stub_factory),
+        lambda c, *, port=None, monitor=False: build_vec_env(
+            c, port=port, monitor=monitor, connection_factory=_stub_factory
+        ),
     )
 
     captured: dict = {}

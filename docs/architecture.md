@@ -158,9 +158,13 @@ graph TD
   value feature extractor. The future `pretraining` (which reads `Encoder.features`) is still unbuilt.
 - **`rl` now spans four internal deps**, not just `models`: the self-play seam adds `env` (the
   `TankEnv` `SelfPlayWrapper` wraps), `agents` (`make_agent` for the opponent roster), and `core`
-  (`split_state_for_opponent` for the perspective flip). It still imports NOTHING from `data` /
-  `pretraining` — the opponent-driving primitives are reused directly, not the `data` module. The PPO
-  train loop, callbacks, and ELO remain deferred future work.
+  (`split_state_for_opponent` for the perspective flip, plus `core.launch` for the re-derived live
+  build launch). It still imports NOTHING from `data` / `pretraining` — the opponent-driving
+  primitives are reused directly, not the `data` module. The M1 PPO trainer is **built**:
+  `train_local` composes the vec-env stack + `CnnPolicy`/`EncoderExtractor` policy, the
+  `EvalWinRateCallback` (dedicated eval env on a second socket), checkpoint + resumable `state.json`
+  sidecar, and the light from-eval ELO wiring. Still future: the population / M2 frozen-self ELO
+  ladder, the `n_envs > 1` `SubprocVecEnv` fan-out, and the distributed/GCP cluster.
 
 ---
 [← back to index](README.md)

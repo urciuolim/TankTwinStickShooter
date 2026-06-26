@@ -8,7 +8,8 @@ Nothing here re-implements those seams — it WIRES them:
   features extractor (it owns the pretrained-encoder checkpoint load + the freeze path);
 * :class:`~pop_trainer.rl.selfplay.SelfPlayWrapper` +
   :class:`~pop_trainer.rl.selfplay.OpponentProvider` drive player2 behind the learner;
-* :class:`~pop_trainer.rl.callbacks.EvalWinRateCallback` logs periodic per-opponent win-rate;
+* :class:`~pop_trainer.rl.callbacks.EvalWinRateCallback` logs periodic per-opponent win-rate
+  against a DEDICATED eval env (a second build/socket) — the training env is never touched;
 * :func:`~pop_trainer.rl.evaluate.evaluate_winrate` +
   :func:`~pop_trainer.rl.evaluate.format_per_map_table` produce a final per-opponent summary line;
 * :mod:`~pop_trainer.rl.elo` holds the ELO math the sidecar persists.
@@ -81,9 +82,9 @@ class TrainConfig:
     Fields split into the run topology, the encoder wiring, the self-play roster, the
     eval/checkpoint cadence, the resume hook, and the PPO hyperparameters.
 
-    Cadence defaults (``eval_freq`` / ``eval_episodes`` / ``checkpoint_freq``) are deliberately
-    small so a few-thousand-step smoke triggers at least one checkpoint + one eval; a real run
-    overrides them upward.
+    Cadence defaults (``eval_freq`` / ``checkpoint_freq``) are ``10_000`` env-steps — a
+    production-scale cadence, NOT smoke-small. A short smoke run overrides them DOWNWARD so a
+    few-thousand-step run still triggers at least one checkpoint + one eval.
 
     Args:
         total_timesteps: total env-steps to train (must be ``> 0``).
@@ -104,7 +105,10 @@ class TrainConfig:
         learning_rate / n_steps / batch_size / n_epochs / gamma / gae_lambda / clip_range:
             PPO hyperparameters (pixel-PPO defaults).
         frame_shape: the ``(H, W, 3)`` pixel-frame shape (channels-last; SB3 transposes it).
-        game_port: the TCP port the build listens on (``args[1]`` of the launch arg-list).
+        game_port: the TCP port the TRAINING build listens on (``args[1]`` of the launch arg-list).
+        eval_port: the TCP port the DEDICATED eval build listens on. ``None`` (default) -> the
+            effective eval port is ``game_port + 1``. When set it must differ from ``game_port``
+            (the two builds run side-by-side on separate sockets).
         build_path: the build binary; ``None`` -> :func:`core.launch.default_build_path`.
     """
 
@@ -132,6 +136,7 @@ class TrainConfig:
     clip_range: float = 0.2
     frame_shape: tuple[int, int, int] = DEFAULT_FRAME_SHAPE
     game_port: int = 50000
+    eval_port: int | None = None
     build_path: Path | None = None
 
     def __post_init__(self) -> None:
@@ -154,6 +159,16 @@ class TrainConfig:
             raise ValueError(f"checkpoint_freq must be > 0, got {self.checkpoint_freq}")
         if len(self.frame_shape) != 3 or self.frame_shape[2] != 3:
             raise ValueError(f"frame_shape must be (H, W, 3), got {self.frame_shape!r}")
+        if self.eval_port is not None and self.eval_port == self.game_port:
+            raise ValueError(
+                f"eval_port must differ from game_port (both {self.game_port}); the eval build "
+                "runs side-by-side on a separate socket"
+            )
+
+    @property
+    def effective_eval_port(self) -> int:
+        """The port the dedicated eval build listens on: ``eval_port`` or ``game_port + 1``."""
+        return self.eval_port if self.eval_port is not None else self.game_port + 1
 
     def to_dict(self) -> dict:
         """JSON-ready plain-dict view (Paths -> str, tuples -> list)."""
@@ -183,6 +198,7 @@ class TrainConfig:
             "clip_range": self.clip_range,
             "frame_shape": list(self.frame_shape),
             "game_port": self.game_port,
+            "eval_port": self.eval_port,
             "build_path": None if self.build_path is None else str(self.build_path),
         }
 
@@ -217,38 +233,48 @@ def _attach_launch_proc(env: TankEnv, proc: subprocess.Popen) -> None:
     and THEN terminates the build. Idempotent (the second close is a no-op once reaped). The
     ``TankEnv`` class is untouched — this is per-instance caller-side wrapping. Mirrors the
     collection runner's pattern, re-derived here to keep ``rl`` off ``data``.
+
+    Reconnect-safe: a mid-run socket drop makes the env RE-INVOKE the factory, producing a NEW
+    ``Connection`` with a NEW ``_launch_proc`` for the relaunched build. So at close time we reap
+    the CURRENT connection's proc (``env.conn._launch_proc``), falling back to the originally
+    stashed ``proc`` only when the current conn carries none — the original (already-dead) build is
+    a no-op reap, and the relaunched build can never be orphaned.
     """
     env._launch_proc = proc
     original_close = env.close
 
     def close_and_reap() -> None:
+        # Read the CURRENT connection's launch proc before close tears the transport down; a
+        # reconnect mid-run swapped in a fresh Connection/proc, so reap THAT, not the original.
+        current = getattr(env.conn, "_launch_proc", proc)
         with contextlib.suppress(Exception):
             original_close()
-        _terminate(proc)
+        _terminate(current)
 
     env.close = close_and_reap  # type: ignore[method-assign]
 
 
-def _live_connection_factory(cfg: TrainConfig) -> Callable[[], Connection]:
-    """Build the LIVE ``connection_factory``: launch the Unity build, connect, wrap the socket.
+def _live_connection_factory_for_port(cfg: TrainConfig, port: int) -> Callable[[], Connection]:
+    """Build the LIVE ``connection_factory`` for ``port``: launch the build, connect, wrap socket.
 
     Returns a zero-arg callable the env invokes on construction (and re-invokes on reconnect). Each
-    call: launches the build via :func:`core.launch.build_launch_cmd` + ``subprocess.Popen``,
-    connects via :func:`core.launch.connect`, and wraps the socket in a
+    call: launches the build via :func:`core.launch.build_launch_cmd` + ``subprocess.Popen`` on
+    ``port``, connects via :func:`core.launch.connect`, and wraps the socket in a
     :class:`core.protocol.Connection`. The live ``Popen`` is stashed on the returned ``Connection``
     (``conn._launch_proc``) so :func:`_build_base_env` can wire ``env.close`` to reap it.
 
-    The build is launched WINDOWED (never batchmode) on ``cfg.game_config``; the port is
-    ``cfg.game_port``. Re-derived from the shared ``core.launch`` primitives — ``rl`` does NOT
-    import the ``data`` launch path.
+    The build is launched WINDOWED (never batchmode) on ``cfg.game_config``. Parameterizing the
+    ``port`` lets the TRAINING env (``cfg.game_port``) and the DEDICATED eval env
+    (``cfg.effective_eval_port``) each launch their OWN build on their OWN socket. Re-derived from
+    the shared ``core.launch`` primitives — ``rl`` does NOT import the ``data`` launch path.
     """
     exe = cfg.build_path if cfg.build_path is not None else launch.default_build_path(_REPO_ROOT)
 
     def factory() -> Connection:
-        cmd = launch.build_launch_cmd(exe, cfg.game_port, cfg.game_config)
+        cmd = launch.build_launch_cmd(exe, port, cfg.game_config)
         proc = subprocess.Popen(cmd)  # noqa: S603 (arg-list, trusted local build path)
         try:
-            sock = launch.connect(cfg.game_port)
+            sock = launch.connect(port)
             conn = Connection(sock)
         except BaseException:
             # The build is already running; if connect never completes, reap it so a failed launch
@@ -265,17 +291,20 @@ def _live_connection_factory(cfg: TrainConfig) -> Callable[[], Connection]:
 # --- env composition (the unit-test seam) ----------------------------------------------------
 
 
-def _build_base_env(cfg: TrainConfig, connection_factory: Callable[[], Connection]) -> TankEnv:
+def _build_base_env(
+    cfg: TrainConfig, connection_factory: Callable[[], Connection], port: int
+) -> TankEnv:
     """Build the bare pure-transport :class:`TankEnv` over the given ``connection_factory``.
 
-    Wires the env config (``max_steps`` from the Phase-1 round cap), the default reward, the
-    channels-last ``frame_shape``, and the seed. If the factory stashed a live build ``Popen`` on
-    its produced ``Connection`` (the LIVE path), wrap ``env.close`` so closing the env reaps the
-    build; an injected STUB factory carries no proc, so the reap-wrap is skipped (no Unity).
+    Wires the env config (``max_steps`` from the Phase-1 round cap, ``game_port`` = ``port`` so
+    the built env records WHICH socket it speaks on), the default reward, the channels-last
+    ``frame_shape``, and the seed. If the factory stashed a live build ``Popen`` on its produced
+    ``Connection`` (the LIVE path), wrap ``env.close`` so closing the env reaps the build; an
+    injected STUB factory carries no proc, so the reap-wrap is skipped (no Unity).
     """
     env = TankEnv(
         connection_factory=connection_factory,
-        env_config=EnvConfig(max_steps=DEFAULT_MAX_STEPS, game_port=cfg.game_port),
+        env_config=EnvConfig(max_steps=DEFAULT_MAX_STEPS, game_port=port),
         reward_config=RewardConfig(),
         frame_shape=cfg.frame_shape,
         seed=cfg.seed,
@@ -287,29 +316,41 @@ def _build_base_env(cfg: TrainConfig, connection_factory: Callable[[], Connectio
 
 
 def build_vec_env(
-    cfg: TrainConfig, *, connection_factory: Callable[[], Connection] | None = None
+    cfg: TrainConfig,
+    *,
+    port: int | None = None,
+    monitor: bool = False,
+    connection_factory: Callable[[], Connection] | None = None,
 ) -> VecEnv:
     """Compose the SB3 vec-env stack: ``VecFrameStack`` -> ``DummyVecEnv`` -> ``SelfPlayWrapper``.
 
     The composition (the seam the unit test asserts):
 
-    1. base :class:`TankEnv` over ``connection_factory`` (the LIVE launch when ``None``; the
-       injected STUB in tests);
+    1. base :class:`TankEnv` over ``connection_factory`` (the LIVE launch on ``port`` when ``None``;
+       the injected STUB in tests);
     2. wrapped in a :class:`~pop_trainer.rl.selfplay.SelfPlayWrapper` driving player2 from a
        :class:`~pop_trainer.rl.selfplay.OpponentProvider` built from ``cfg.opponents`` /
        ``cfg.opponent_strategy`` (seeded with ``cfg.seed``);
     3. boxed in a ``DummyVecEnv`` (Phase-1 ``n_envs == 1``);
     4. wrapped in ``VecFrameStack`` (``n_stack = cfg.frame_stack``; ``1`` = passthrough, still
-       wrapped so the stack is uniform).
+       wrapped so the stack is uniform);
+    5. when ``monitor`` is set, wrapped OUTERMOST in ``VecMonitor`` so SB3 logs
+       ``rollout/ep_rew_mean`` / ``rollout/ep_len_mean`` (the TRAINING env only; the eval env uses
+       ``evaluate_winrate``'s own loop, not SB3 episode stats, so it is built ``monitor=False``).
+
+    ``port`` selects the live build's TCP port (defaults to ``cfg.game_port`` — the training env;
+    the eval env passes ``cfg.effective_eval_port``). It also threads into ``EnvConfig.game_port``
+    so each built env records its own socket. When a STUB ``connection_factory`` is injected NO
+    Unity is launched on either port.
 
     ``n_envs > 1`` is a documented SEAM (``SubprocVecEnv`` + per-env distinct ports), NOT built in
     Phase-1 — it raises ``NotImplementedError``.
 
     The constructed ``OpponentProvider`` is reachable for assertions/resume through the vec stack:
-    ``vec_env`` (VecFrameStack) -> ``.venv`` (DummyVecEnv) -> ``.envs[0]`` (the SelfPlayWrapper) ->
-    ``.opponents``. :func:`_find_selfplay_wrapper` walks that path.
+    ``[VecMonitor ->] VecFrameStack -> DummyVecEnv -> envs[0]`` (the SelfPlayWrapper) ->
+    ``.opponents``. :func:`_find_selfplay_wrapper` walks that path (skipping any ``.venv`` layer).
     """
-    from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack
+    from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack, VecMonitor
 
     if cfg.n_envs != 1:
         # SEAM: n>1 needs SubprocVecEnv with a distinct game_port per env (each launches its own
@@ -318,17 +359,25 @@ def build_vec_env(
             f"n_envs > 1 is a deferred seam (SubprocVecEnv + per-env ports); got {cfg.n_envs}"
         )
 
+    live_port = port if port is not None else cfg.game_port
     factory = (
-        connection_factory if connection_factory is not None else _live_connection_factory(cfg)
+        connection_factory
+        if connection_factory is not None
+        else _live_connection_factory_for_port(cfg, live_port)
     )
 
     def make_wrapped() -> SelfPlayWrapper:
-        base = _build_base_env(cfg, factory)
+        base = _build_base_env(cfg, factory, live_port)
         provider = OpponentProvider.from_roster(cfg.opponents, cfg.opponent_strategy, seed=cfg.seed)
         return SelfPlayWrapper(base, provider)
 
     vec = DummyVecEnv([make_wrapped])
-    return VecFrameStack(vec, n_stack=cfg.frame_stack)
+    stacked: VecEnv = VecFrameStack(vec, n_stack=cfg.frame_stack)
+    if monitor:
+        # VecMonitor OUTERMOST so it sees episode boundaries on the stacked obs and logs SB3's
+        # rollout/ep_rew_mean + rollout/ep_len_mean. Only the training env is monitored.
+        stacked = VecMonitor(stacked)
+    return stacked
 
 
 def _build_policy_kwargs(cfg: TrainConfig) -> dict:
@@ -349,12 +398,16 @@ def _build_policy_kwargs(cfg: TrainConfig) -> dict:
 def _find_selfplay_wrapper(vec_env: VecEnv) -> SelfPlayWrapper:
     """Reach the :class:`SelfPlayWrapper` inside the vec stack (the provider-access path).
 
-    The stack is ``VecFrameStack(DummyVecEnv([SelfPlayWrapper(TankEnv)]))``; ``VecFrameStack``
-    exposes the inner vec env as ``.venv`` and ``DummyVecEnv`` exposes the gym envs as ``.envs``.
-    Walk down to ``.envs[0]`` — the ``SelfPlayWrapper`` whose ``.opponents`` is the
+    The training stack is ``VecMonitor(VecFrameStack(DummyVecEnv([SelfPlayWrapper(TankEnv)])))``;
+    the eval stack drops the ``VecMonitor`` layer. Each vec WRAPPER (``VecMonitor`` /
+    ``VecFrameStack``) exposes its inner vec env as ``.venv``, and ``DummyVecEnv`` exposes the gym
+    envs as ``.envs``. Walk ``.venv`` down to the ``DummyVecEnv`` (the layer that has ``.envs``),
+    then take ``.envs[0]`` — the ``SelfPlayWrapper`` whose ``.opponents`` is the
     :class:`OpponentProvider` the sidecar persists.
     """
-    inner = getattr(vec_env, "venv", vec_env)  # VecFrameStack -> DummyVecEnv
+    inner = vec_env
+    while not hasattr(inner, "envs") and hasattr(inner, "venv"):
+        inner = inner.venv  # VecMonitor -> VecFrameStack -> DummyVecEnv
     env0 = inner.envs[0]
     if not isinstance(env0, SelfPlayWrapper):
         raise TypeError(f"expected a SelfPlayWrapper at envs[0], got {type(env0).__name__}")
@@ -503,10 +556,17 @@ def _latest_checkpoint(run_dir: str | Path) -> Path | None:
 def train_local(cfg: TrainConfig) -> Path:
     """Run (or resume) one local PPO self-play training and return ``cfg.run_dir``.
 
-    Composes the vec-env stack, builds (or loads) the PPO model with the
-    :class:`EncoderExtractor` policy, attaches the eval + checkpoint + sidecar callbacks, runs
-    ``model.learn``, then prints a final per-opponent win-rate line. The vec env is ALWAYS closed
-    in a ``finally`` so the live Unity build is reaped even on exception / KeyboardInterrupt.
+    Composes TWO vec-env stacks at startup — the TRAINING env on ``cfg.game_port`` (wrapped in
+    ``VecMonitor`` so SB3 logs rollout episode stats) and a DEDICATED eval env on
+    ``cfg.effective_eval_port`` (a SECOND Unity build / socket) — builds (or loads) the PPO model
+    with the :class:`EncoderExtractor` policy, attaches the eval + checkpoint + sidecar callbacks,
+    runs ``model.learn``, then prints a final per-opponent win-rate line.
+
+    Eval (periodic + final) runs against the dedicated eval env's raw :class:`TankEnv`, so the
+    training env / model rollout state is NEVER touched by eval — no buffer "repair" is needed.
+    BOTH env stacks are ALWAYS closed in a ``finally`` (each close suppressed independently so a
+    failure to close one still closes the other) so both live Unity builds are reaped even on
+    exception / KeyboardInterrupt.
     """
     from stable_baselines3 import PPO
     from stable_baselines3.common.callbacks import CallbackList, CheckpointCallback
@@ -518,92 +578,105 @@ def train_local(cfg: TrainConfig) -> Path:
     set_random_seed(cfg.seed)
     cfg.run_dir.mkdir(parents=True, exist_ok=True)
 
-    vec_env = build_vec_env(cfg)
+    # Training env on game_port (VecMonitor-wrapped for rollout episode stats); dedicated eval env
+    # on the effective eval port (a separate build/socket — eval never touches the training env).
+    vec_env = build_vec_env(cfg, port=cfg.game_port, monitor=True)
     try:
-        provider = _find_selfplay_wrapper(vec_env).opponents
+        eval_vec_env = build_vec_env(cfg, port=cfg.effective_eval_port, monitor=False)
+        try:
+            provider = _find_selfplay_wrapper(vec_env).opponents
+            eval_raw_env = _find_selfplay_wrapper(eval_vec_env).env
 
-        elo = _initial_elo(cfg.opponents)
-        reset_num_timesteps = cfg.resume is None
+            elo = _initial_elo(cfg.opponents)
+            reset_num_timesteps = cfg.resume is None
 
-        if cfg.resume is not None:
-            # RESUME: load the latest checkpoint, restore the sidecar (provider position + ELO),
-            # and continue from the recorded num_timesteps.
-            latest = _latest_checkpoint(cfg.resume)
-            if latest is None:
-                raise FileNotFoundError(f"no model_*.zip checkpoint to resume from in {cfg.resume}")
-            model = PPO.load(latest, env=vec_env)
-            sidecar_path = Path(cfg.resume) / SIDECAR_NAME
-            if sidecar_path.exists():
-                sidecar = load_sidecar(sidecar_path)
-                _restore_provider_position(provider, sidecar)
-                elo = {**elo, **{k: float(v) for k, v in sidecar.get("elo", {}).items()}}
-        else:
-            # FRESH: build PPO with the CnnPolicy + EncoderExtractor (it owns the checkpoint load
-            # + freeze). SB3 builds the optimizer over all policy params; freeze works via the
-            # extractor's requires_grad path, not optimizer membership.
-            model = PPO(
-                "CnnPolicy",
-                vec_env,
-                policy_kwargs=_build_policy_kwargs(cfg),
-                seed=cfg.seed,
-                tensorboard_log=str(cfg.run_dir),
-                learning_rate=cfg.learning_rate,
-                n_steps=cfg.n_steps,
-                batch_size=cfg.batch_size,
-                n_epochs=cfg.n_epochs,
-                gamma=cfg.gamma,
-                gae_lambda=cfg.gae_lambda,
-                clip_range=cfg.clip_range,
-                verbose=1,
+            if cfg.resume is not None:
+                # RESUME: load the latest checkpoint, restore the sidecar (provider position + ELO),
+                # and continue from the recorded num_timesteps.
+                latest = _latest_checkpoint(cfg.resume)
+                if latest is None:
+                    raise FileNotFoundError(
+                        f"no model_*.zip checkpoint to resume from in {cfg.resume}"
+                    )
+                model = PPO.load(latest, env=vec_env)
+                sidecar_path = Path(cfg.resume) / SIDECAR_NAME
+                if sidecar_path.exists():
+                    sidecar = load_sidecar(sidecar_path)
+                    _restore_provider_position(provider, sidecar)
+                    elo = {**elo, **{k: float(v) for k, v in sidecar.get("elo", {}).items()}}
+            else:
+                # FRESH: build PPO with the CnnPolicy + EncoderExtractor (it owns the checkpoint
+                # load + freeze). SB3 builds the optimizer over all policy params; freeze works via
+                # the extractor's requires_grad path, not optimizer membership.
+                model = PPO(
+                    "CnnPolicy",
+                    vec_env,
+                    policy_kwargs=_build_policy_kwargs(cfg),
+                    seed=cfg.seed,
+                    tensorboard_log=str(cfg.run_dir),
+                    learning_rate=cfg.learning_rate,
+                    n_steps=cfg.n_steps,
+                    batch_size=cfg.batch_size,
+                    n_epochs=cfg.n_epochs,
+                    gamma=cfg.gamma,
+                    gae_lambda=cfg.gae_lambda,
+                    clip_range=cfg.clip_range,
+                    verbose=1,
+                )
+
+            callbacks = CallbackList(
+                [
+                    EvalWinRateCallback(
+                        cfg.eval_freq,
+                        cfg.eval_episodes,
+                        opponents=cfg.opponents,
+                        seed=cfg.seed,
+                        eval_env=eval_raw_env,
+                    ),
+                    CheckpointCallback(
+                        save_freq=cfg.checkpoint_freq,
+                        save_path=str(cfg.run_dir),
+                        name_prefix="model",
+                    ),
+                    _make_sidecar_callback(cfg, provider, elo),
+                ]
             )
 
-        callbacks = CallbackList(
-            [
-                EvalWinRateCallback(
-                    cfg.eval_freq,
-                    cfg.eval_episodes,
-                    opponents=cfg.opponents,
-                    seed=cfg.seed,
-                ),
-                CheckpointCallback(
-                    save_freq=cfg.checkpoint_freq,
-                    save_path=str(cfg.run_dir),
-                    name_prefix="model",
-                ),
-                _make_sidecar_callback(cfg, provider, elo),
-            ]
-        )
+            model.learn(
+                cfg.total_timesteps,
+                callback=callbacks,
+                reset_num_timesteps=reset_num_timesteps,
+            )
 
-        model.learn(
-            cfg.total_timesteps,
-            callback=callbacks,
-            reset_num_timesteps=reset_num_timesteps,
-        )
+            # Final per-opponent win-rate summary line (wires format_per_map_table -> the
+            # Director's smoke gets one final per-opponent line). Eval re-wraps the DEDICATED eval
+            # env's raw TankEnv in its own per-opponent SelfPlayWrapper (the evaluate_winrate
+            # contract) — the training env / model state is untouched.
+            per_opponent = evaluate_winrate(
+                model,
+                eval_raw_env,
+                opponents=cfg.opponents,
+                n_episodes=cfg.eval_episodes,
+                seed=cfg.seed,
+            )
+            elo = _update_elo_from_eval(elo, per_opponent)
+            print(format_per_map_table(per_opponent, episodes=cfg.eval_episodes))  # noqa: T201
 
-        # Final per-opponent win-rate summary line (wires format_per_map_table -> the Director's
-        # smoke gets one final per-opponent line). Eval re-wraps the raw TankEnv behind the vec
-        # stack in its own per-opponent SelfPlayWrapper (the evaluate_winrate contract).
-        raw_env = _find_selfplay_wrapper(vec_env).env
-        per_opponent = evaluate_winrate(
-            model,
-            raw_env,
-            opponents=cfg.opponents,
-            n_episodes=cfg.eval_episodes,
-            seed=cfg.seed,
-        )
-        elo = _update_elo_from_eval(elo, per_opponent)
-        print(format_per_map_table(per_opponent, episodes=cfg.eval_episodes))  # noqa: T201
-
-        # Persist the final sidecar (post-learn position + the eval-updated ELO).
-        save_sidecar(
-            cfg.run_dir / SIDECAR_NAME,
-            provider=provider,
-            elo=elo,
-            cfg=cfg,
-            num_timesteps=model.num_timesteps,
-        )
+            # Persist the final sidecar (post-learn position + the eval-updated ELO).
+            save_sidecar(
+                cfg.run_dir / SIDECAR_NAME,
+                provider=provider,
+                elo=elo,
+                cfg=cfg,
+                num_timesteps=model.num_timesteps,
+            )
+        finally:
+            # ALWAYS reap the eval Unity build; suppress so a failure here still lets the training
+            # env close below.
+            with contextlib.suppress(Exception):
+                eval_vec_env.close()
     finally:
-        # ALWAYS reap the live Unity build (the close-and-reap wrapper), even on exception /
+        # ALWAYS reap the training Unity build (the close-and-reap wrapper), even on exception /
         # KeyboardInterrupt.
         vec_env.close()
 

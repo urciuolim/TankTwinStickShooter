@@ -107,7 +107,9 @@ routes every inbound object by tag regardless of read order (`tank_env.py:239-30
 - [data](data.md) — collection drives `TankEnv` (the same observation pipeline RL trains on), and
   rotates the arena per episode via `reset(options={"switch_arena": ...})`.
 - [demo](demo.md) — constructs a `TankEnv` over a live socket and runs one episode.
-- (Future `rl` consumes `TankEnv` as its training env — not yet built.)
+- [rl](rl.md) — consumes `TankEnv` as both its training env and a dedicated eval env (each over its
+  own live socket): `SelfPlayWrapper` wraps it for PPO training, and `evaluate_winrate` re-wraps a
+  second `TankEnv` for periodic win-rate eval. (Built — the M1 `train_local` trainer.)
 
 ## Where it sits in the run
 
