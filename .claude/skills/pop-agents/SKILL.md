@@ -27,6 +27,24 @@ exposes it (`getattr`/`hasattr` — never required); the demo / collection do th
 
 **Contains:**
 - `RandomAgent` — uniform random actions (seeded). The map-agnostic baseline; KEPT.
+- `NoOpAgent` — obs-agnostic stationary agent: `act(obs) -> [0,0,0,0,0]` (the env's zero
+  action; no move/aim/fire). It is the curriculum FLOOR — an easy/stationary TRAINING opponent
+  for the RL learner. Implements `core.Agent` (`act` only; `obs` ignored); no `reset`/`set_map`
+  needed (stateless). Trivial, pure, torch-free.
+- **The canonical agent-selector registry (`agents/registry.py`).** The `make_agent(selector,
+  *, seed=None)` + `AGENT_SELECTORS` string→`core.Agent` map is OWNED HERE — `agents/` is the
+  natural home for "string → agent". It is the SINGLE source of truth; `data/collect_runner.py`
+  and `demo.py` MUST import it from `agents` (they previously each duplicated it — that mirror is
+  removed). The roster: `aggressive-coverage`, `wall-hugger`, `opponent-shadower`, `random`,
+  and `noop`. `make_agent` raises `ValueError` on an unknown selector (listing valid names).
+  - `demo.py`'s extra `"human"` selector is NOT in this registry — it needs a shared keyboard
+    listener a per-seed factory cannot express, so it stays a SPECIAL PATH in `demo.main`
+    (`HUMAN_SELECTOR` + `PLAYER_CHOICES = sorted(AGENT_SELECTORS) + [HUMAN_SELECTOR]`). The
+    registry move must preserve that demo behavior exactly.
+  - Boundary stays a clean leaf: `agents/registry.py` imports only `agents` siblings + `core`.
+    `data/` and `demo.py` import DOWN into `agents` (the allowed `core ← agents ← {data, demo}`
+    direction). This de-duplicates and lets `rl/` reuse the SAME selectors without `rl → data`
+    (a FORBIDDEN import).
 - `HumanAgent` (`agents/human_agent.py`) — a KEYBOARD-driven `core.Agent` for live human play
   (human-vs-human, two players on ONE keyboard). Contract:
   - Implements `core.Agent` (`act(obs) -> action`); **`act` IGNORES `obs`** — the action comes

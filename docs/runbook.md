@@ -278,7 +278,77 @@ missing.
 > (see the
 > [agents operational note](components/agents.md#operational-note--coverage-is-step-budget-dependent-on-the-real-engine)).
 
-## 5. Validate coverage (no Unity required)
+## 5. Run RL training (CLI)
+
+Train a PPO policy against the scripted self-play roster over the live Unity **pixel** env. The
+integrator is [`python -m pop_trainer.rl.train`](../src/pop_trainer/rl/train.py)
+([`main`](../src/pop_trainer/rl/train.py) → [`train_local`](../src/pop_trainer/rl/train.py)). It
+composes the RL seams (encoder extractor, self-play wrapper, eval callback) into one SB3 PPO run with
+checkpointing and a resumable sidecar — see the [rl component page](components/rl.md#the-train_local-integrator-seam).
+
+Like the demo (§3) and collection (§4), this **launches a live windowed Unity build** (needs the §2
+build present) and reads a pixel frame each step — `train_config.json` enables `obs_pixels` at
+640×360, required since the env always reads a pixel frame.
+
+The two required args plus a run dir:
+
+```bash
+uv run python -m pop_trainer.rl.train --total-timesteps 10000 --run-dir runs/train-smoke
+```
+
+See the full flag surface:
+
+```bash
+uv run python -m pop_trainer.rl.train --help
+```
+
+Flags (defaults shown), grounded in [`_parse_args`](../src/pop_trainer/rl/train.py)
+(`train.py:616-651`):
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--total-timesteps` | *(required)* | total env-steps to train (`train.py:628-630`). |
+| `--run-dir` | *(required)* | output dir for checkpoints / sidecar / TensorBoard (`train.py:631-633`). |
+| `--config` | `Assets/StreamingAssets/train_config.json` | game/training config JSON forwarded to the build launch (`DEFAULT_TRAIN_CONFIG`, `train.py:60,622-627`). |
+| `--resume` | *(absent)* | a prior `run_dir` to resume — load the latest `model_*.zip` + `state.json` (`train.py:634-639`). |
+| `--encoder-checkpoint` | `None` | optional pretrained-encoder `state_dict` for the features extractor (`train.py:640-645`). |
+| `--freeze-encoder` | *(off)* | freeze the encoder weights during RL (`train.py:646-648`). |
+| `--frame-stack` | `1` | `VecFrameStack` depth (`1` = passthrough, `train.py:649`). |
+| `--seed` | `0` | master seed — threaded into SB3, the env, and the opponent provider (`train.py:650`). |
+
+**Knobs NOT on the CLI** (they use `TrainConfig` dataclass defaults — override in code, not the
+command line): `opponents` (the 5-selector `DEFAULT_ROSTER`), `opponent_strategy` (`"round_robin"`),
+`eval_freq` (`10_000`), `eval_episodes` (`10`), `checkpoint_freq` (`10_000`), `game_port` (`50000`),
+and `build_path` (`None` → the OS-aware [`core.launch.default_build_path`](../src/pop_trainer/core/launch.py))
+— see `train.py:114-135`.
+
+### The training topology (`train_config.json`)
+
+The build launches under [`train_config.json`](../Assets/StreamingAssets/train_config.json): a
+**single-arena AI-vs-AI** pixel config — `obs_pixels: true` @ 640×360, both `player1_ai`/`player2_ai`
+`true`, `game_maxTime: 60`, `player_maxHealth: 3`, one `arena_path` (`Arenas/custom1.json`, no
+rotation) (`train_config.json:1-22`).
+
+> **`timeScale` MUST stay ≤ 5 (hard operational rule).** `train_config.json` ships `timeScale: 5`
+> (`train_config.json:5`). Collection at `timeScale ≤ 5` is bit-identical to 1×; **`timeScale ≥ 10`
+> corrupts** frames under load. NEVER raise it to 10 or above.
+
+### Resume
+
+`--resume <prior run_dir>` continues a previous run: it picks the **highest-step** `model_*.zip` in
+that dir (`_latest_checkpoint`, `train.py:478-497`), does `PPO.load(env=...)`, restores the opponent
+position + ELO from that dir's `state.json` sidecar (`train.py:528-539`), and continues with
+`reset_num_timesteps=False` (`train.py:577-581`). Resuming a dir with no parseable `model_*.zip`
+raises `FileNotFoundError` (`train.py:531-533`).
+
+> **CRITICAL — sub-10k smoke runs are NOT resumable.** The default `checkpoint_freq` is **10_000**
+> env-steps (`train.py:122`) and is **not exposed on the CLI**. So a smoke run with
+> `--total-timesteps` **below 10_000** writes **no intermediate `model_*.zip`** — only the final
+> `state.json` — and therefore **cannot be `--resume`d** (resume needs a checkpoint zip and will raise
+> `FileNotFoundError`). Use **`--total-timesteps >= 10000`** (the default checkpoint cadence) if you
+> want a resumable checkpoint; treat anything below that as a **smoke-only, non-resumable** run.
+
+## 6. Validate coverage (no Unity required)
 
 The [`measure_coverage`](../src/pop_trainer/agents/coverage_metrics.py) harness runs a
 deterministic kinematic rollout of an agent on a `WallLayout` and reports coverage-fraction +
