@@ -72,8 +72,15 @@ package is named `data` (not `datasets` — that name collides with the git-igno
 - [`data.manifest`](../../src/pop_trainer/data/manifest.py) — the **pure dataset-manifest
   assembler** (stdlib-only). [`build_manifest`](../../src/pop_trainer/data/manifest.py) shapes +
   validates the run-root `manifest.json` from injected provenance/machine/collection values (no
-  I/O, no clock); the live gathering is `collect_runner.main`'s glue. See
-  [the run-root manifest](#the-run-root-manifestjson-dataset-fingerprint).
+  I/O, no clock); the live gathering is `collect_runner.main`'s glue. It also carries a
+  `descriptions` list of human/agent annotations seeded by
+  [`add_description`](../../src/pop_trainer/data/manifest.py). See
+  [the run-root manifest](#the-run-root-manifestjson-dataset-fingerprint) and
+  [Descriptions](#descriptions-human--agent-annotations).
+- [`data.describe`](../../src/pop_trainer/data/describe.py) — the **annotate-a-manifest CLI**
+  (`python -m pop_trainer.data.describe <dataset-dir> --text … [--author …]` to add, or `--list`
+  to print): stdlib-only glue that appends one free-form description to a run's `manifest.json` and
+  rewrites it atomically. See [Descriptions](#descriptions-human--agent-annotations).
 - [`data.collect_runner`](../../src/pop_trainer/data/collect_runner.py) — the **live collection
   entry point** (`python -m pop_trainer.data.collect_runner`): the concrete factories + CLI riding
   on `collect`'s orchestration. It is **multi-worker** and runs either a single map or a
@@ -187,10 +194,14 @@ manifest is not a reproduce-this recipe — it records WHAT was collected, WHICH
 produced it, and on WHAT machine.
 
 The shape is the dict returned by [`build_manifest`](../../src/pop_trainer/data/manifest.py)
-(`manifest.py:92-128`). Top-level keys (constants `MANIFEST_NAME = "manifest.json"`,
-`MANIFEST_SCHEMA_VERSION = 1`, `manifest.py:24-25`):
+(`manifest.py:70-139`). Top-level keys (constants `MANIFEST_NAME = "manifest.json"`,
+`MANIFEST_SCHEMA_VERSION = 2`, `manifest.py:31-32`):
 
 - `schema_version` (int) + `created_utc` (ISO-8601 UTC string) + `dataset` (the run name).
+- `descriptions` — a list of free-form human/agent annotations (see
+  [Descriptions](#descriptions-human--agent-annotations)). Each entry is exactly
+  `{"author": str, "text": str, "added_utc": str}` (`added_utc` ISO-8601 UTC). Empty list when no
+  description was seeded.
 - `collection` — the run params: `seed`, `command` (the `sys.argv` list), `workers`, `episodes`,
   `max_steps`, `maps` (the arena list, aligned to `maps.json`), `pairings` (each a 2-element
   `[player1, player2]` list), `total_shards`, `total_samples`, `per_map_samples` (an
@@ -203,21 +214,57 @@ The shape is the dict returned by [`build_manifest`](../../src/pop_trainer/data/
 
 **Pure builder / injected glue split** — the same shape as the rest of `data`:
 
-- [`build_manifest(*, dataset, collection, provenance, machine, created_utc)`](../../src/pop_trainer/data/manifest.py)
-  (`manifest.py:63-128`) is **pure + unit-tested**: it assembles AND validates the manifest dict
+- [`build_manifest(*, dataset, collection, provenance, machine, created_utc, descriptions=None)`](../../src/pop_trainer/data/manifest.py)
+  (`manifest.py:70-139`) is **pure + unit-tested**: it assembles AND validates the manifest dict
   from values the caller **injects** — no I/O, no env reads, no clock read (`created_utc` is passed
   in). It normalizes the JSON-unrepresentable pieces (pairing tuples → 2-element lists,
-  `per_map_samples` keys → strings, `manifest.py:89-90`) so the result round-trips through strict
-  JSON, and fails **loudly** (`ValueError`) if a required sub-key is missing / mistyped
-  (`_require_keys`, `manifest.py:54-87`). `manifest.py` is **stdlib-only**.
+  `per_map_samples` keys → strings, `manifest.py:99-100`) and seeds `descriptions` (`None` → `[]`,
+  copied to a fresh list, `manifest.py:106`) so the result round-trips through strict JSON, and
+  fails **loudly** (`ValueError`) if a required sub-key is missing / mistyped (`_require_keys`,
+  `manifest.py:61-67`). `manifest.py` is **stdlib-only**.
 - The **live gathering** of provenance + machine values is **untested CLI glue** in
-  [`collect_runner.main`](../../src/pop_trainer/data/collect_runner.py) (`collect_runner.py:882-935`):
+  [`collect_runner.main`](../../src/pop_trainer/data/collect_runner.py) (`collect_runner.py:893-955`):
   `git_commit` via `git rev-parse HEAD` and `git_dirty` via `git status --porcelain` (both arg-list
   `subprocess`, `None` if git is absent / errors); `build` from `args.exe.stat()`; `machine` from
   `socket` / `platform` / `os` / `psutil`; `created_utc` from `datetime.now(UTC).isoformat()`. It is
   written **atomically** — `json.dump` to `manifest.json.tmp`, then `Path.replace` onto
-  `manifest.json` (`collect_runner.py:932-935`) — the same tmp→replace discipline as the shards and
+  `manifest.json` (`collect_runner.py:952-955`) — the same tmp→replace discipline as the shards and
   the sidecar.
+
+## Descriptions (human / agent annotations)
+
+The manifest carries a `descriptions` list of free-form annotations so a human or an agent can
+record WHAT a dataset is / why it was collected. Each entry is exactly
+`{"author": str, "text": str, "added_utc": str}` (`added_utc` ISO-8601 UTC). `author` is **content
+provenance** — who WROTE the note (`"human"`, `"claude"`, any string) — NOT git/PR attribution.
+
+`MANIFEST_SCHEMA_VERSION` bumped **1 → 2** (`manifest.py:32`); the only v1→v2 difference is this
+added `descriptions` list. A v1 manifest lacking the key is treated as having an **empty list**, so
+older datasets stay readable AND annotatable (backward-compatible).
+
+There are two ways to add a description:
+
+- **At collection time** — `collect_runner`'s `--description "TEXT" [--description-author NAME]`
+  flags seed exactly ONE entry into the manifest as it is written (`--description-author` defaults
+  to `"human"`). The seed entry's `added_utc` shares the manifest's `created_utc` (one clock read,
+  `collect_runner.py:915-921,950`). See the
+  [runbook](../runbook.md#descriptions-annotating-a-dataset).
+- **Post-hoc** — [`python -m pop_trainer.data.describe`](../../src/pop_trainer/data/describe.py)
+  loads a run's `manifest.json`, appends one annotation, and writes it back. See below.
+
+[`data.describe`](../../src/pop_trainer/data/describe.py) — the **annotate-a-manifest CLI**
+(stdlib-only glue):
+
+- `python -m pop_trainer.data.describe <dataset-dir> --text "TEXT" [--author NAME]` appends one
+  annotation (`--author` defaults to `"human"`) via the pure
+  [`add_description`](../../src/pop_trainer/data/manifest.py) (`manifest.py:142-153`, which never
+  mutates its input and treats a v1 manifest with no `descriptions` key as empty) and rewrites the
+  manifest **atomically** (sibling `*.tmp` → `Path.replace`, `describe.py:36-47`). `added_utc` is
+  the CLI's own `datetime.now(UTC)` clock read (`describe.py:117-122`).
+- `python -m pop_trainer.data.describe <dataset-dir> --list` prints the existing descriptions
+  instead of adding one.
+- Returns rc **0** on success, rc **2** on a missing `manifest.json` OR a missing `--text` (when
+  not `--list`) (`describe.py:103-115`).
 
 ## Pulls from (upstream)
 

@@ -23,9 +23,12 @@ Modules:
   pairing a ``player1`` + ``player2`` agent, plus spawn-based (never fork) parallel
   orchestration whose live socket path is isolated.
 * :mod:`pop_trainer.data.manifest` — pure assembly + validation of the run-root provenance +
-  machine manifest that makes a (non-byte-reproducible) dataset identifiable.
+  machine manifest (with free-form ``descriptions``) that makes a (non-byte-reproducible) dataset
+  identifiable.
+* :mod:`pop_trainer.data.describe` — stdlib-only CLI to add / list a manifest's free-form
+  descriptions (delegates to :func:`manifest.add_description`).
 """
 
-from pop_trainer.data import collect, manifest, readers, schema, shards
+from pop_trainer.data import collect, describe, manifest, readers, schema, shards
 
-__all__ = ["schema", "shards", "readers", "collect", "manifest"]
+__all__ = ["schema", "shards", "readers", "collect", "manifest", "describe"]
