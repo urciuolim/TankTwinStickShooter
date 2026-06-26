@@ -772,6 +772,17 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--description",
+        default=None,
+        metavar="TEXT",
+        help="seed one free-form description into the manifest at collection time (tagged below)",
+    )
+    parser.add_argument(
+        "--description-author",
+        default="human",
+        help="author for --description (free string; default 'human')",
+    )
+    parser.add_argument(
         "--allow-oversized",
         action="store_true",
         help=(
@@ -901,6 +912,14 @@ def main(argv: list[str] | None = None) -> int:
         "size_bytes": int(st.st_size),
     }
 
+    # One clock read for the run: the manifest's created_utc AND the seed description's added_utc.
+    created_utc = datetime.now(UTC).isoformat()
+    descriptions = (
+        [{"author": args.description_author, "text": args.description, "added_utc": created_utc}]
+        if args.description is not None
+        else []
+    )
+
     manifest = build_manifest(
         dataset=args.out_dir.name,
         collection={
@@ -927,7 +946,8 @@ def main(argv: list[str] | None = None) -> int:
             "ram_total_gb": round(psutil.virtual_memory().total / (1024**3), 2),
             "python": platform.python_version(),
         },
-        created_utc=datetime.now(UTC).isoformat(),
+        created_utc=created_utc,
+        descriptions=descriptions,
     )
     tmp = args.out_dir / (MANIFEST_NAME + ".tmp")
     with open(tmp, "w") as fh:

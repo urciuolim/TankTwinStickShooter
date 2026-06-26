@@ -181,6 +181,8 @@ Flags (defaults shown), grounded in
 | `--base-port` | `50000` | base TCP port; worker `w` connects on `base_port + w` |
 | `--seed` | `0` | base seed; worker `w` uses `base + w*10000` |
 | `--shard-size` | *(auto)* | in-RAM **BUFFER** bound (samples per worker before a flush), **NOT a file-size knob**. Omitted → auto: derived from the byte budget so the per-worker buffer stays bounded regardless of frame resolution (the OOM-safe default). See [Memory safety](#memory-safety-the-pre-flight-guard). |
+| `--description TEXT` | *(none)* | seed ONE free-form description into the manifest at collection time (see [Descriptions](#descriptions-annotating-a-dataset)). |
+| `--description-author` | `human` | author for `--description` (free string, e.g. `claude`). Content provenance — who wrote the note, not git/PR attribution. |
 | `--allow-oversized` | *(off)* | skip the pre-flight memory **abort** (the estimate is still printed). Use only when the box has RAM the guard's conservative estimate does not account for. |
 
 Selectors for `--pairing` (and `--map`'s default boot): `aggressive-coverage`, `wall-hugger`,
@@ -264,9 +266,12 @@ arena path Unity actually loaded (echoed as `WallLayout.map_id`), decoded throug
 ### The `manifest.json` fingerprint (what identifies a dataset)
 
 Each run also writes a single **`manifest.json`** at the **run root** (next to the root
-`maps.json`, `collect_runner.py:882-935`). It records, under
-[`schema_version`](../src/pop_trainer/data/manifest.py)` = 1`:
+`maps.json`, `collect_runner.py:893-955`). It records, under
+[`schema_version`](../src/pop_trainer/data/manifest.py)` = 2`:
 
+- **descriptions** — a list of free-form human/agent annotations (empty unless seeded with
+  `--description`; see [Descriptions](#descriptions-annotating-a-dataset)). Each entry is exactly
+  `{"author", "text", "added_utc"}`;
 - **collection params** — `seed`, the full `command` (`sys.argv`), `workers`, `episodes`,
   `max_steps`, the `maps` list, the `pairings`, and the `total_shards` / `total_samples` /
   `per_map_samples` counts (reused from the same summary as the printout);
@@ -283,9 +288,41 @@ Each run also writes a single **`manifest.json`** at the **run root** (next to t
 > NOT let you regenerate a corpus byte-for-byte.
 
 The shaping is a **pure, unit-tested** assembler
-([`build_manifest`](../src/pop_trainer/data/manifest.py), `manifest.py:63-128`); the live gathering
+([`build_manifest`](../src/pop_trainer/data/manifest.py), `manifest.py:70-139`); the live gathering
 of the provenance/machine values is `main`'s untested CLI glue. The file is written **atomically**
 (tmp → `Path.replace`). See [data](components/data.md#the-run-root-manifestjson-dataset-fingerprint).
+
+### Descriptions (annotating a dataset)
+
+The manifest carries a `descriptions` list of free-form human/agent annotations so you can record
+WHAT a dataset is. Each entry is exactly `{"author", "text", "added_utc"}` (`added_utc` ISO-8601
+UTC); `author` is **content provenance** (who wrote the note — `human`, `claude`, …), NOT git/PR
+attribution. `MANIFEST_SCHEMA_VERSION` is **2** for this field; a pre-existing v1 manifest with no
+`descriptions` key is tolerated (treated as empty), so older datasets stay annotatable.
+
+**At collection time** — seed one description as the manifest is written:
+
+```bash
+uv run python -m pop_trainer.data.collect_runner --out-dir runs/collect-demo \
+  --description "first center-block sweep" --description-author claude
+```
+
+`--description-author` defaults to `human`. The seed entry's `added_utc` shares the manifest's
+`created_utc` (one clock read).
+
+**Post-hoc** — append (or list) descriptions on an already-collected run with
+[`python -m pop_trainer.data.describe`](../src/pop_trainer/data/describe.py):
+
+```bash
+# append one annotation (rewrites manifest.json atomically; --author defaults to 'human')
+uv run python -m pop_trainer.data.describe runs/collect-demo --text "looks clean" --author claude
+
+# list the existing descriptions instead of adding one
+uv run python -m pop_trainer.data.describe runs/collect-demo --list
+```
+
+`describe` takes the run **directory** holding `manifest.json`. It returns **0** on success and
+**2** on a missing `manifest.json` or a missing `--text` (when not using `--list`).
 
 ### The obs_pixels gotcha
 

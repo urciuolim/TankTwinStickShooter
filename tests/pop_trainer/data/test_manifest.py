@@ -61,6 +61,7 @@ def _build(**kwargs):
         provenance=kwargs.get("provenance", _provenance()),
         machine=kwargs.get("machine", _machine()),
         created_utc=kwargs.get("created_utc", "2026-06-25T12:00:00+00:00"),
+        descriptions=kwargs.get("descriptions"),
     )
 
 
@@ -70,6 +71,7 @@ def test_happy_path_shape():
         "schema_version",
         "created_utc",
         "dataset",
+        "descriptions",
         "collection",
         "provenance",
         "machine",
@@ -150,3 +152,57 @@ def test_missing_machine_key_raises():
 def test_non_dict_sub_dict_raises():
     with pytest.raises(ValueError, match="machine must be a dict"):
         _build(machine=["not", "a", "dict"])
+
+
+def test_schema_version_is_2():
+    assert manifest.MANIFEST_SCHEMA_VERSION == 2
+
+
+def test_descriptions_default_is_empty_list():
+    result = _build()
+    assert result["descriptions"] == []
+
+
+def test_descriptions_passed_through_and_round_trips():
+    entries = [
+        {"author": "human", "text": "first run", "added_utc": "2026-06-25T12:00:00+00:00"},
+        {"author": "claude", "text": "notes", "added_utc": "2026-06-25T13:00:00+00:00"},
+    ]
+    result = manifest.build_manifest(
+        dataset="run_001",
+        collection=_collection(),
+        provenance=_provenance(),
+        machine=_machine(),
+        created_utc="2026-06-25T12:00:00+00:00",
+        descriptions=entries,
+    )
+    assert result["descriptions"] == entries
+    assert json.loads(json.dumps(result)) == result
+
+
+def test_add_description_appends_to_existing():
+    m = _build(descriptions=[{"author": "human", "text": "a", "added_utc": "t0"}])
+    out = manifest.add_description(m, author="claude", text="b", added_utc="t1")
+    assert out["descriptions"] == [
+        {"author": "human", "text": "a", "added_utc": "t0"},
+        {"author": "claude", "text": "b", "added_utc": "t1"},
+    ]
+
+
+def test_add_description_creates_list_on_v1_manifest():
+    v1 = {"schema_version": 1, "dataset": "old"}  # no descriptions key
+    out = manifest.add_description(v1, author="human", text="hi", added_utc="t0")
+    assert out["descriptions"] == [{"author": "human", "text": "hi", "added_utc": "t0"}]
+    assert "descriptions" not in v1  # input untouched
+
+
+def test_add_description_does_not_mutate_input():
+    original = [{"author": "human", "text": "a", "added_utc": "t0"}]
+    m = _build(descriptions=original)
+    inner_before = m["descriptions"]
+    out = manifest.add_description(m, author="claude", text="b", added_utc="t1")
+    # Neither the input manifest, its nested list, nor the original list is mutated.
+    assert len(m["descriptions"]) == 1
+    assert m["descriptions"] is inner_before
+    assert len(original) == 1
+    assert out["descriptions"] is not inner_before

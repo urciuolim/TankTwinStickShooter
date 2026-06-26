@@ -12,6 +12,13 @@ keys -> strings), and fails LOUDLY if a required field is missing or mistyped. T
 strict-JSON-serializable (``json.dumps`` round-trips it). The live gathering of provenance/machine
 values is the caller's untested CLI glue; this module only shapes + validates what it is given.
 
+The manifest carries a ``descriptions`` list of free-form human/agent annotations, each a
+``{"author": str, "text": str, "added_utc": str}`` entry. :func:`build_manifest` seeds the list
+(``None`` -> ``[]``); :func:`add_description` appends one annotation, returning an updated COPY
+(it never mutates its input, so a manifest loaded off disk is safe to annotate). A v1 manifest
+lacking the ``descriptions`` key is treated as having an empty list, so older datasets remain
+annotatable.
+
 stdlib only.
 """
 
@@ -19,10 +26,10 @@ from __future__ import annotations
 
 from typing import Any
 
-__all__ = ["MANIFEST_NAME", "MANIFEST_SCHEMA_VERSION", "build_manifest"]
+__all__ = ["MANIFEST_NAME", "MANIFEST_SCHEMA_VERSION", "build_manifest", "add_description"]
 
 MANIFEST_NAME = "manifest.json"
-MANIFEST_SCHEMA_VERSION = 1
+MANIFEST_SCHEMA_VERSION = 2
 
 _COLLECTION_KEYS = (
     "seed",
@@ -67,6 +74,7 @@ def build_manifest(
     provenance: dict,
     machine: dict,
     created_utc: str,
+    descriptions: list[dict] | None = None,
 ) -> dict:
     """Assemble + validate the dataset manifest from INJECTED values (pure: no I/O, no clock).
 
@@ -74,7 +82,9 @@ def build_manifest(
     clock. ``collection`` / ``provenance`` / ``machine`` are already-assembled sub-dicts whose
     required keys are validated here (a forgotten field fails loudly). ``pairings`` are normalized
     to 2-element lists and ``per_map_samples`` keys to strings so the result is strict-JSON-
-    serializable with a stable round-trip. Returns the top-level manifest dict.
+    serializable with a stable round-trip. ``descriptions`` is the (optional) list of caller-shaped
+    ``{"author", "text", "added_utc"}`` annotation entries — ``None`` -> ``[]`` — normalized to a
+    fresh list so the result stays strict-JSON-serializable. Returns the top-level manifest dict.
     """
     if not isinstance(dataset, str):
         raise ValueError(f"dataset must be a str; got {type(dataset).__name__}")
@@ -93,6 +103,7 @@ def build_manifest(
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "created_utc": created_utc,
         "dataset": dataset,
+        "descriptions": [] if descriptions is None else list(descriptions),
         "collection": {
             "seed": collection["seed"],
             "command": list(collection["command"]),
@@ -126,3 +137,17 @@ def build_manifest(
             "python": machine["python"],
         },
     }
+
+
+def add_description(manifest: dict, *, author: str, text: str, added_utc: str) -> dict:
+    """Append one annotation to ``manifest`` and return an updated COPY (pure: no I/O, no clock).
+
+    Builds a ``{"author": author, "text": text, "added_utc": added_utc}`` entry and appends it to a
+    FRESH copy of the manifest's ``descriptions`` list, leaving the input dict AND its nested list
+    untouched. A manifest without a ``descriptions`` key (a v1 manifest) is treated as having an
+    empty list, so older datasets remain annotatable. ``added_utc`` is the ISO-8601 UTC string the
+    caller read from the clock.
+    """
+    existing = manifest.get("descriptions") or []
+    entry = {"author": author, "text": text, "added_utc": added_utc}
+    return {**manifest, "descriptions": [*existing, entry]}
