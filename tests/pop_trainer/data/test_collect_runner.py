@@ -229,13 +229,19 @@ def test_build_specs_rotation_mode_switches_and_indexes():
 # --- selector surface --------------------------------------------------------------------
 
 
-def test_selector_surface_is_the_coverage_family_plus_random():
+def test_selector_surface_is_the_coverage_family_plus_random_and_noop():
+    # The registry now lives in pop_trainer.agents; collect_runner re-exports it. The roster is
+    # the coverage family, random, and the noop floor (a valid scripted opponent).
     assert set(R.AGENT_SELECTORS) == {
         "aggressive-coverage",
         "wall-hugger",
         "opponent-shadower",
         "random",
+        "noop",
     }
+    # The re-exported names are the SAME objects the registry owns (the de-dup is real).
+    assert R.AGENT_SELECTORS is agents.AGENT_SELECTORS
+    assert R.make_agent is agents.make_agent
 
 
 def test_every_selector_builds_a_valid_agent():
@@ -254,6 +260,7 @@ def test_make_agent_builds_the_right_types():
     assert isinstance(R.make_agent("wall-hugger"), agents.CoverageAgent)
     assert isinstance(R.make_agent("opponent-shadower"), agents.CoverageAgent)
     assert isinstance(R.make_agent("random"), agents.RandomAgent)
+    assert isinstance(R.make_agent("noop"), agents.NoOpAgent)
 
 
 # --- agent_pool_factory ------------------------------------------------------------------

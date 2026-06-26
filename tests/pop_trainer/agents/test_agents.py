@@ -330,6 +330,37 @@ def test_random_agent_different_seeds_differ():
     assert a != b
 
 
+# --- NoOpAgent (the stationary curriculum floor) ---------------------------------------------
+
+
+def test_noop_agent_satisfies_protocol():
+    # act-only is the runtime-checkable Agent surface; the stateless NoOpAgent passes.
+    assert isinstance(agents.NoOpAgent(), core.Agent)
+
+
+@pytest.mark.parametrize(
+    "obs",
+    [None, np.zeros(S.STATE_LEN, dtype=np.float32), [0.0] * S.STATE_LEN, [1.0, 2.0, 3.0]],
+    ids=["none", "ndarray", "state_list", "short_list"],
+)
+def test_noop_agent_returns_zero_action_for_any_obs(obs):
+    # Obs-agnostic: the zero action [0,0,0,0,0] regardless of the observation type / contents.
+    out = agents.NoOpAgent().act(obs)
+    assert out == [0.0, 0.0, 0.0, 0.0, 0.0]
+    assert len(out) == agents.ACTION_LEN
+
+
+def test_noop_agent_is_stateless_and_not_map_aware():
+    # The floor has no reset / set_map (stateless): act alone, never required to track a map.
+    agent = agents.NoOpAgent()
+    assert not hasattr(agent, "set_map")
+    assert not hasattr(agent, "reset")
+
+
+def test_noop_agent_is_exported():
+    assert "NoOpAgent" in agents.__all__
+
+
 # --- validate_action -------------------------------------------------------------------------
 
 

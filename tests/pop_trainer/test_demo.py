@@ -292,13 +292,19 @@ def test_default_selectors_are_visibly_different_policies():
     assert demo.DEFAULT_PLAYER1 != demo.DEFAULT_PLAYER2
 
 
-def test_selector_surface_is_the_new_family_plus_random():
+def test_selector_surface_is_the_new_family_plus_random_and_noop():
+    # The registry now lives in pop_trainer.agents; demo re-exports it. The roster is the coverage
+    # family, random, and the noop floor (a valid scripted opponent).
     assert set(demo.AGENT_SELECTORS) == {
         "aggressive-coverage",
         "wall-hugger",
         "opponent-shadower",
         "random",
+        "noop",
     }
+    # The re-exported names are the SAME objects the registry owns (the de-dup is real).
+    assert demo.AGENT_SELECTORS is agents.AGENT_SELECTORS
+    assert demo.make_agent is agents.make_agent
 
 
 def test_no_deleted_selectors_remain():

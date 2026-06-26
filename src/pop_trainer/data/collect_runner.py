@@ -54,14 +54,14 @@ import contextlib
 import json
 import subprocess
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import psutil
 
-from pop_trainer import agents
+from pop_trainer.agents import AGENT_SELECTORS, make_agent
 from pop_trainer.core import agent as core_agent
 from pop_trainer.core import launch
 from pop_trainer.core import maps as core_maps
@@ -146,16 +146,11 @@ MAX_WORKERS = 8
 _SEED_STRIDE = 10_000
 
 
-# --- agent selectors (the coverage/random presets; mirrors demo, built from agents directly) ---
-# Built straight from ``pop_trainer.agents`` — NOT imported from ``demo`` (demo is an env-app;
-# data reaching into it would be a cross-app boundary smell). The surface is intentionally the
-# same coverage family + random baseline the demo exposes.
-AGENT_SELECTORS: dict[str, Callable[[int | None], core_agent.Agent]] = {
-    "aggressive-coverage": lambda seed: agents.CoverageAgent.aggressive(seed=seed),
-    "wall-hugger": lambda seed: agents.CoverageAgent.wall_hugger(seed=seed),
-    "opponent-shadower": lambda seed: agents.CoverageAgent.opponent_shadower(seed=seed),
-    "random": lambda seed: agents.RandomAgent(seed=seed),
-}
+# --- agent selectors ---
+# The string -> agent registry (``AGENT_SELECTORS`` + ``make_agent``) is owned by
+# ``pop_trainer.agents`` (the single source of truth) and imported above; collection re-exports
+# the imported names in ``__all__`` so downstream callers are unaffected by the move. Only the
+# collection-POLICY defaults below (the players / pairing mix) live here.
 
 DEFAULT_PLAYER1 = "aggressive-coverage"
 DEFAULT_PLAYER2 = "opponent-shadower"
@@ -172,18 +167,6 @@ DEFAULT_PAIRINGS: list[tuple[str, str]] = [
     ("opponent-shadower", "random"),
     ("wall-hugger", "random"),
 ]
-
-
-def make_agent(selector: str, *, seed: int | None = None) -> core_agent.Agent:
-    """Build the agent named by ``selector`` (see :data:`AGENT_SELECTORS`).
-
-    Raises ``ValueError`` on an unknown selector, listing the valid names.
-    """
-    factory = AGENT_SELECTORS.get(selector)
-    if factory is None:
-        valid = ", ".join(sorted(AGENT_SELECTORS))
-        raise ValueError(f"unknown agent selector {selector!r}; choose one of: {valid}")
-    return factory(seed)
 
 
 # --- map rotation: config path -> (build config, switch_arena path) + the int index ----------

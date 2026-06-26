@@ -41,13 +41,13 @@ import argparse
 import contextlib
 import subprocess
 import sys
-from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
 from pop_trainer import agents
+from pop_trainer.agents import AGENT_SELECTORS, make_agent  # the canonical selector registry
 from pop_trainer.core import agent as core_agent
 from pop_trainer.core import state as S
 from pop_trainer.core.config import EnvConfig
@@ -81,38 +81,20 @@ DEFAULT_SEED = 0
 
 
 # --- agent selectors --------------------------------------------------------------------
-# Selector name -> a zero-arg-friendly factory taking an optional seed. The default pairing is
+# The string -> agent registry (``AGENT_SELECTORS`` + ``make_agent``) is owned by
+# ``pop_trainer.agents`` (the single source of truth) and imported above. The default pairing is
 # player1 = aggressive-coverage (sweeps the arena, aim-sweeps + fires) vs player2 =
 # opponent-shadower (the same coverage movement but the aim layer tracks player1 and fires):
-# two visibly different policies. ``random`` is the map-agnostic baseline.
-AGENT_SELECTORS: dict[str, Callable[[int | None], core_agent.Agent]] = {
-    "aggressive-coverage": lambda seed: agents.CoverageAgent.aggressive(seed=seed),
-    "wall-hugger": lambda seed: agents.CoverageAgent.wall_hugger(seed=seed),
-    "opponent-shadower": lambda seed: agents.CoverageAgent.opponent_shadower(seed=seed),
-    "random": lambda seed: agents.RandomAgent(seed=seed),
-}
-
+# two visibly different policies.
 DEFAULT_PLAYER1 = "aggressive-coverage"
 DEFAULT_PLAYER2 = "opponent-shadower"
 
-# The "human" selector is NOT a seed-factory (it needs a SHARED keyboard listener + state that a
-# per-agent seed factory cannot express), so it is a SPECIAL PATH in main, not an AGENT_SELECTORS
-# entry. It is offered alongside the seed-factory selectors as a --player1 / --player2 choice.
+# The "human" selector is NOT a registry seed-factory (it needs a SHARED keyboard listener + state
+# that a per-agent seed factory cannot express), so it is a SPECIAL PATH in main, NOT an
+# AGENT_SELECTORS entry. It is offered alongside the registry selectors as a --player1 / --player2
+# choice.
 HUMAN_SELECTOR = "human"
 PLAYER_CHOICES = sorted(AGENT_SELECTORS) + [HUMAN_SELECTOR]
-
-
-def make_agent(selector: str, *, seed: int | None = None) -> core_agent.Agent:
-    """Build the agent named by ``selector`` (see :data:`AGENT_SELECTORS`).
-
-    Raises ``ValueError`` on an unknown selector, listing the valid names. The ``"human"`` selector
-    is NOT handled here — it is a special shared-listener path in :func:`main`.
-    """
-    factory = AGENT_SELECTORS.get(selector)
-    if factory is None:
-        valid = ", ".join(sorted(AGENT_SELECTORS))
-        raise ValueError(f"unknown agent selector {selector!r}; choose one of: {valid}")
-    return factory(seed)
 
 
 def build_human_agents(
