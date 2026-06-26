@@ -17,6 +17,8 @@ Coverage:
 6. a NEW opponent is sampled at reset, NOT mid-episode (one ``sample()`` across N steps; a second
    reset samples again).
 7. ``_p2_obs`` RE-CACHES across steps, tracking each new flipped state.
+8. a lost-connection step (``info`` has no ``"state"`` key) does NOT crash, passes the env's
+   5-tuple through unchanged, and KEEPS the prior ``_p2_obs``.
 """
 
 from __future__ import annotations
@@ -293,6 +295,46 @@ def test_p2_obs_recaches_to_each_new_flipped_state():
         np.testing.assert_array_equal(
             opp.acted_on[i], split_state_for_opponent(np.asarray(states[i]))
         )
+
+
+# --- 8. lost-connection step (no "state" in info) does not crash -----------------------
+
+
+class LostConnectionEnv(StubEnv):
+    """A :class:`StubEnv` whose ``step`` mimics ``TankEnv``'s ConnectionError/reconnect path.
+
+    ``TankEnv.step`` returns ``info = {"lost_connection": True}`` with NO ``"state"`` key (and a
+    truncated, reward-0 step) when the transport drops. ``reset`` still primes ``info["state"]``
+    (the env reconnects), so only ``step`` diverges from the base stub.
+    """
+
+    def step(self, action, opponent_action=None):
+        self.step_calls.append((action, opponent_action))
+        return ("obs_drop", 0.0, False, True, {"lost_connection": True})
+
+
+def test_step_survives_lost_connection_and_keeps_prior_p2_obs():
+    env = LostConnectionEnv([_state(0.0), _state(100.0)])
+    opp = RecordingOpponent(map_aware=False, action=(0.1, 0.2, 0.3, 0.4, 0.5))
+    wrapper = SelfPlayWrapper(env, OpponentProvider([opp], strategy="round_robin"))
+    wrapper.reset()
+
+    p2_obs_before = wrapper._p2_obs
+    # 1. no KeyError despite info carrying no "state" key
+    obs, reward, terminated, truncated, info = wrapper.step([0.0] * 5)
+
+    # 2. the env's 5-tuple passes through unchanged
+    assert obs == "obs_drop"
+    assert reward == 0.0
+    assert terminated is False
+    assert truncated is True  # rewards.shaped_step_reward(lost_connection=True) -> truncated
+    assert info == {"lost_connection": True}
+
+    # 3. the cached p2 view is UNCHANGED across the lost-connection step (no re-cache)
+    assert wrapper._p2_obs is p2_obs_before
+    np.testing.assert_array_equal(
+        wrapper._p2_obs, split_state_for_opponent(np.asarray(env._states[0]))
+    )
 
 
 # --- wiring: spaces + protocol + factory ----------------------------------------------

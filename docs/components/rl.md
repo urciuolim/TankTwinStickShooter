@@ -108,8 +108,12 @@ package, `rl/__init__.py:33-38`). Self-play is a **WRAPPER over the trainer** (t
     the **PRE-step** view a simultaneous-move opponent sees (`selfplay.py:199-215`). At
     `step(action)` the opponent `act`s on that cached pre-step view, then `env.step(action, a2)`
     transports **BOTH** actions (a1 = caller, a2 = opponent), and the p2 view is **RE-cached** from
-    the new `info["state"]` (`selfplay.py:217-229`). A new opponent is sampled **ONLY at reset,
-    never mid-episode** (`selfplay.py:189-190`).
+    the new `info["state"]` (`selfplay.py:219-238`). That re-cache is **GUARDED on `"state" in
+    info`** (`selfplay.py:236-237`): on `TankEnv`'s lost-connection/reconnect step
+    (`info = {"lost_connection": True}`, no `state` — `tank_env.py:360`) the wrapper **KEEPS** the
+    prior cached p2 view and passes the env's 5-tuple through unchanged — a reward-0 truncation, so
+    the vec env auto-resets and `reset` re-primes the view. A new opponent is sampled **ONLY at
+    reset, never mid-episode** (`selfplay.py:189-190`).
   - **It mirrors the collection driver.** This is exactly `data.collect.run_episode`'s driver loop
     (`a2 = player2.act(split_state_for_opponent(np.asarray(vec)))` → `env.step(a1, a2)`,
     [`collect.py:395-397`](../../src/pop_trainer/data/collect.py)) — but packaged as a `Wrapper`
@@ -444,7 +448,7 @@ graph LR
     wrap -->|"split_state_for_opponent(info['state'])"| flip["flipped p2 view (cached)"]
     flip -.->|pre-step view| opp
     wrap -->|"env.step(a1, a2)"| env["symmetric TankEnv<br/>(pure transport)"]
-    env -.->|"info['state'] → re-cache"| flip
+    env -.->|"info['state'] → re-cache (skipped if lost_connection)"| flip
 ```
 
 **Eval + ELO seam** — `EvalWinRateCallback` scores the policy by win-rate at rollout boundaries:

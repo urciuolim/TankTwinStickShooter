@@ -210,7 +210,9 @@ class SelfPlayWrapper(gymnasium.Wrapper):
         self._opp.set_map(info.get("map"))
         self._opp.reset(seed)
         # Cache player2's PRE-step first-person view (the flip applied in the wrapper, like the
-        # driver). The opponent acts on this at the first step (simultaneous move).
+        # driver). The opponent acts on this at the first step (simultaneous move). reset ALWAYS
+        # carries info["state"] (the env's post-reset priming contract), so this read is
+        # unconditional — a missing key here is a real reset bug we want surfaced, not masked.
         self._p2_obs = split_state_for_opponent(np.asarray(info["state"]))
         return obs_p1, info
 
@@ -225,5 +227,12 @@ class SelfPlayWrapper(gymnasium.Wrapper):
         """
         a2 = self._opp.act(self._p2_obs)
         obs_p1, reward, terminated, truncated, info = self.env.step(action, a2)
-        self._p2_obs = split_state_for_opponent(np.asarray(info["state"]))
+        # RE-cache the flipped p2 view ONLY when state is present. TankEnv.step's
+        # ConnectionError/reconnect path returns info = {"lost_connection": True} with NO "state"
+        # key, so an unconditional re-cache would KeyError on a transient socket drop. Keeping the
+        # prior _p2_obs is safe: rewards.shaped_step_reward(lost_connection=True) -> (0.0, False,
+        # True), so the step is TRUNCATED and the vec env auto-resets (reset re-primes _p2_obs);
+        # in the non-done edge case, one stale opponent view is benign and the next step re-caches.
+        if "state" in info:
+            self._p2_obs = split_state_for_opponent(np.asarray(info["state"]))
         return obs_p1, reward, terminated, truncated, info
