@@ -14,8 +14,12 @@ trainer rather than woven into the PPO core. This Phase-1 slice ships:
   episode (round-robin / uniform); :class:`~pop_trainer.rl.selfplay.ScriptedOpponent` /
   :class:`~pop_trainer.rl.selfplay.Opponent` are the player2 wrapper + its protocol, resolving the
   canonical ``agents`` selectors via :func:`pop_trainer.agents.make_agent`.
+* the eval + ELO seam: :func:`~pop_trainer.rl.evaluate.evaluate_winrate` plays greedy episodes vs.
+  each opponent in a roster and returns a per-opponent win-rate; ``win_rate`` is the pure counting
+  helper; :class:`~pop_trainer.rl.callbacks.EvalWinRateCallback` logs that win-rate periodically at
+  rollout boundaries; :mod:`~pop_trainer.rl.elo` holds the pure ELO math.
 
-The PPO train loop, callbacks, ELO, and the live self-play smoke land in later RL tasks.
+The PPO train loop and the live self-play smoke land in later RL tasks.
 
 Boundary: ``rl`` imports ``core`` / ``env`` / ``models`` / ``agents``; it does NOT import ``data``
 or ``pretraining`` (the pretrained encoder is consumed as a loaded ``state_dict`` artifact — there
@@ -23,6 +27,8 @@ is no ``models.from_pretrained``; the opponent seam re-uses ``agents`` selectors
 ``core.state.split_state_for_opponent`` directly, never the ``data`` module). No cycles.
 """
 
+from pop_trainer.rl.callbacks import EvalWinRateCallback
+from pop_trainer.rl.evaluate import evaluate_winrate, win_rate
 from pop_trainer.rl.extractor import EncoderExtractor
 from pop_trainer.rl.selfplay import (
     Opponent,
@@ -33,8 +39,11 @@ from pop_trainer.rl.selfplay import (
 
 __all__ = [
     "EncoderExtractor",
+    "EvalWinRateCallback",
     "Opponent",
     "OpponentProvider",
     "ScriptedOpponent",
     "SelfPlayWrapper",
+    "evaluate_winrate",
+    "win_rate",
 ]
