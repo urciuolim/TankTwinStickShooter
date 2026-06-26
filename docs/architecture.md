@@ -17,10 +17,11 @@ core  ←  { models, env, agents, data }  ←  demo
 - [agents](components/agents.md) — imports `core` (+ numpy).
 - [data](components/data.md) — imports `core`, `env`, `agents`.
 - [demo](components/demo.md) — imports `core`, `env`, `agents`.
+- [rl](components/rl.md) — imports `models` (+ torch / gymnasium / stable-baselines3).
 
 No import cycles: `data` and `demo` sit at the top, `core` at the bottom, `models` off to the
-side. (`pretraining` / `rl` / `eval` / `population` / `deployment` / `imitation` are not built
-yet and are omitted.)
+side. (`pretraining` / `eval` / `population` / `deployment` / `imitation` are not built yet and are
+omitted.)
 
 ## Class-to-class interaction map
 
@@ -37,6 +38,10 @@ graph TD
 
     subgraph models["models (torch; no internal deps)"]
         Encoder["Encoder = Trunk × Pooling<br/>build_encoder / export_onnx"]
+    end
+
+    subgraph rl["rl (online RL; SB3)"]
+        EncoderExtractor["EncoderExtractor<br/>(SB3 BaseFeaturesExtractor)"]
     end
 
     subgraph agents["agents (model-free policies)"]
@@ -79,6 +84,9 @@ graph TD
 
     %% models wiring
     Encoder -.->|leaf, no internal import| core
+
+    %% rl wiring (Phase-1 slice: only the policy<->encoder seam; imports only models)
+    EncoderExtractor -.->|wraps build_encoder(nature,flatten) @360×640| Encoder
 
     %% data wiring
     Runner --> Collect
@@ -135,8 +143,11 @@ graph TD
   each sample's `map_id` from the arena Unity **echoed** (the F5 tag-from-echo), decoded through the
   `maps.json` sidecar / `map_index`. See
   [data](components/data.md#the-rotation-scheduler--map-tagging).
-- **`models` is detached** from the live loop today — it's the shared vision backbone the
-  future `pretraining` / `rl` will consume, and the deployable ONNX artifact.
+- **`models` is detached** from the live loop today — it's the shared vision backbone, and the
+  deployable ONNX artifact. The seam to consume it now exists: [`rl`](components/rl.md)'s
+  `EncoderExtractor` wraps the `Encoder` and reads its `embed` flat embedding as the SB3 policy /
+  value feature extractor (the only internal dependency `rl` has in this slice). The future
+  `pretraining` (which reads `Encoder.features`) is still unbuilt.
 
 ---
 [← back to index](README.md)
