@@ -31,19 +31,28 @@ from pop_trainer.rl.extractor import EncoderExtractor
 from pop_trainer.rl.selfplay import DEFAULT_ROSTER, OpponentProvider, SelfPlayWrapper
 from pop_trainer.rl.train import (
     BASE_ELO,
+    MEMORY_MARGIN,
+    UNITY_INSTANCE_BYTES,
     TrainConfig,
     _attach_launch_proc,
     _build_base_env,
     _build_policy_kwargs,
+    _checkpoint_save_freq,
     _find_selfplay_wrapper,
     _initial_elo,
     _latest_checkpoint,
+    _make_sidecar_callback,
     _parse_args,
     _restore_provider_position,
+    _training_env_factories,
     build_vec_env,
+    check_rl_memory_budget,
+    estimate_rl_memory_bytes,
+    frame_nbytes,
     load_sidecar,
     main,
     save_sidecar,
+    training_ports,
 )
 
 # --- stub connection seam (no socket / no Unity) ---------------------------------------------
@@ -73,6 +82,11 @@ class _StubConnection:
 def _stub_factory() -> Connection:
     """A zero-arg ``connection_factory`` returning a stub connection (no build, no socket)."""
     return _StubConnection()  # type: ignore[return-value]
+
+
+def _stub_factory_for_port(port: int):  # noqa: ARG001 (port unused; the stub is port-agnostic)
+    """The multi-env TEST seam: ``port -> a zero-arg stub factory`` (no Unity on any port)."""
+    return _stub_factory
 
 
 def _cfg(tmp_path: Path, **overrides) -> TrainConfig:
@@ -109,15 +123,36 @@ def test_trainconfig_defaults(tmp_path):
     assert cfg.effective_eval_port == cfg.game_port + 1
 
 
+def test_eval_port_default_is_after_training_range_at_multi_env(tmp_path):
+    # 7 training envs -> ports 50000..50006; eval defaults to game_port + n_envs = 50007 (the first
+    # port AFTER the training range, no collision).
+    cfg = _cfg(tmp_path, game_port=50000, n_envs=7)
+    assert cfg.eval_port is None
+    assert cfg.effective_eval_port == 50007
+    assert cfg.effective_eval_port not in set(training_ports(cfg))
+
+
 def test_eval_port_explicit_override(tmp_path):
     cfg = _cfg(tmp_path, game_port=50000, eval_port=50007)
     assert cfg.eval_port == 50007
-    assert cfg.effective_eval_port == 50007  # explicit override wins over game_port + 1
+    assert cfg.effective_eval_port == 50007  # explicit override wins over game_port + n_envs
 
 
 def test_eval_port_equal_to_game_port_rejected(tmp_path):
     with pytest.raises(ValueError, match="eval_port must differ from game_port"):
         _cfg(tmp_path, game_port=50000, eval_port=50000)
+
+
+def test_eval_port_inside_training_range_rejected(tmp_path):
+    # n_envs=7 -> training range [50000, 50006]; an explicit eval_port of 50003 collides.
+    with pytest.raises(ValueError, match="falls inside the training port range"):
+        _cfg(tmp_path, game_port=50000, n_envs=7, eval_port=50003)
+
+
+def test_eval_port_just_outside_training_range_accepted(tmp_path):
+    # 50007 is one past the range high (50006) -> accepted.
+    cfg = _cfg(tmp_path, game_port=50000, n_envs=7, eval_port=50007)
+    assert cfg.effective_eval_port == 50007
 
 
 @pytest.mark.parametrize(
@@ -161,6 +196,9 @@ def test_trainconfig_to_dict_roundtrips_paths_and_tuples(tmp_path):
     assert d["eval_port"] is None
     explicit = _cfg(tmp_path, eval_port=50123)
     assert explicit.to_dict()["eval_port"] == 50123
+    # allow_oversized round-trips (default False; explicit True).
+    assert d["allow_oversized"] is False
+    assert _cfg(tmp_path, allow_oversized=True).to_dict()["allow_oversized"] is True
     # None encoder_checkpoint / resume / build_path serialize as null
     none_cfg = _cfg(tmp_path)
     nd = none_cfg.to_dict()
@@ -209,10 +247,66 @@ def test_build_vec_env_frame_stack_depth(tmp_path):
         vec.close()
 
 
-def test_build_vec_env_rejects_multi_env_seam(tmp_path):
-    cfg = _cfg(tmp_path, n_envs=2)
-    with pytest.raises(NotImplementedError):
-        build_vec_env(cfg, connection_factory=_stub_factory)
+def test_training_ports_distinct_and_contiguous(tmp_path):
+    cfg = _cfg(tmp_path, game_port=50000, n_envs=7)
+    ports = training_ports(cfg)
+    assert ports == [50000, 50001, 50002, 50003, 50004, 50005, 50006]
+    assert len(set(ports)) == 7  # all distinct
+
+
+def test_training_env_factories_count_and_ports(tmp_path):
+    # The SubprocVecEnv seam: n_envs=7 -> 7 factory callables over 7 distinct ports 50000..50006,
+    # with eval (game_port + n_envs = 50007) BEYOND the range (no collision). Asserted on the pure
+    # port list + factory list so NO SubprocVecEnv / process is spawned.
+    cfg = _cfg(tmp_path, game_port=50000, n_envs=7)
+    factories = _training_env_factories(cfg, connection_factory_for_port=_stub_factory_for_port)
+    assert len(factories) == 7
+    ports = training_ports(cfg)
+    assert len(set(ports)) == 7
+    assert ports == list(range(50000, 50007))
+    # the eval port is outside the training port set (no collision).
+    assert cfg.effective_eval_port == 50007
+    assert cfg.effective_eval_port not in set(ports)
+
+
+def test_build_vec_env_multi_env_builds_distinct_ports(tmp_path):
+    # The multi-env path now BUILDS (no NotImplementedError). A stub-factory-for-port makes the vec
+    # a DummyVecEnv of the factories (no subprocs spawned) so each env's recorded port is checkable.
+    cfg = _cfg(tmp_path, game_port=52000, n_envs=3)
+    vec = build_vec_env(cfg, port=cfg.game_port, connection_factory_for_port=_stub_factory_for_port)
+    try:
+        assert isinstance(vec, VecFrameStack)
+        inner = vec.venv
+        assert isinstance(inner, DummyVecEnv)
+        assert inner.num_envs == 3
+        recorded = sorted(w.env.env_config.game_port for w in inner.envs)
+        assert recorded == [52000, 52001, 52002]
+        # each env carries its own seeded provider (per-subproc rotation).
+        for w in inner.envs:
+            assert isinstance(w, SelfPlayWrapper)
+            assert isinstance(w.opponents, OpponentProvider)
+    finally:
+        vec.close()
+
+
+def test_build_vec_env_eval_single_even_at_multi_env(tmp_path):
+    # The eval build is ALWAYS a single env (DummyVecEnv, num_envs == 1) even when cfg.n_envs > 1,
+    # because evaluate_winrate needs the raw single TankEnv. single=True forces the one-env path.
+    cfg = _cfg(tmp_path, game_port=53000, n_envs=4)
+    eval_vec = build_vec_env(
+        cfg, port=cfg.effective_eval_port, single=True, connection_factory=_stub_factory
+    )
+    try:
+        assert isinstance(eval_vec, VecFrameStack)
+        inner = eval_vec.venv
+        assert isinstance(inner, DummyVecEnv)
+        assert inner.num_envs == 1
+        wrapper = _find_selfplay_wrapper(eval_vec)
+        assert isinstance(wrapper.env, TankEnv)
+        # eval env sits on game_port + n_envs (53004), outside the training range.
+        assert wrapper.env.env_config.game_port == 53004
+    finally:
+        eval_vec.close()
 
 
 def test_build_vec_env_port_threads_into_envconfig(tmp_path):
@@ -336,6 +430,151 @@ def test_policy_kwargs_carry_extractor_and_checkpoint(tmp_path):
     assert pk["features_extractor_kwargs"]["freeze"] is True
 
 
+# --- 2b. rollout-buffer memory guard (pure; available_bytes INJECTED) ------------------------
+
+
+def test_frame_nbytes_is_element_product():
+    # uint8 = 1 byte/element, so the byte size is just the element product.
+    assert frame_nbytes((360, 640, 3)) == 360 * 640 * 3
+    assert frame_nbytes((4, 6, 3)) == 72
+
+
+def test_estimate_rl_memory_bytes_formula():
+    # n_steps x n_envs x frame_nbytes x frame_stack (uint8 rollout buffer).
+    est = estimate_rl_memory_bytes(n_steps=512, n_envs=7, frame_nbytes=691_200, frame_stack=1)
+    assert est == 512 * 7 * 691_200
+    # frame_stack multiplies the stored channel depth.
+    est4 = estimate_rl_memory_bytes(n_steps=512, n_envs=7, frame_nbytes=691_200, frame_stack=4)
+    assert est4 == 512 * 7 * 691_200 * 4
+
+
+def test_check_rl_memory_budget_passes_within_budget():
+    # A tiny buffer with plenty of RAM -> returns the estimate line, no raise.
+    line = check_rl_memory_budget(
+        n_steps=128,
+        n_envs=1,
+        frame_nbytes=72,
+        frame_stack=1,
+        available_bytes=64 * 1024**3,  # 64 GB available
+    )
+    assert "memory estimate" in line
+    assert "rollout buffer" in line
+
+
+def test_check_rl_memory_budget_aborts_when_over_budget():
+    # 7 envs x 2048 steps x 0.69 MB/frame ~ 9.2 GB buffer + ~8 GB Unity; on a small box this blows
+    # the 60% budget -> MemoryError with actionable guidance.
+    with pytest.raises(MemoryError, match="ABORT"):
+        check_rl_memory_budget(
+            n_steps=2048,
+            n_envs=7,
+            frame_nbytes=691_200,
+            frame_stack=1,
+            available_bytes=8 * 1024**3,  # only 8 GB available
+        )
+
+
+def test_check_rl_memory_budget_allow_oversized_overrides_abort():
+    # Same oversized config, but allow_oversized=True -> returns the line, NO raise.
+    line = check_rl_memory_budget(
+        n_steps=2048,
+        n_envs=7,
+        frame_nbytes=691_200,
+        frame_stack=1,
+        available_bytes=8 * 1024**3,
+        allow_oversized=True,
+    )
+    assert "memory estimate" in line
+
+
+def test_check_rl_memory_budget_includes_unity_allowance():
+    # The guard folds (n_envs + 1) Unity instances into the total. A buffer that fits alone but,
+    # with the Unity allowance, exceeds the budget must ABORT. Pick available so 0.6*available sits
+    # between the buffer alone and buffer + Unity.
+    n_envs = 3
+    buffer = estimate_rl_memory_bytes(
+        n_steps=10, n_envs=n_envs, frame_nbytes=691_200, frame_stack=1
+    )
+    unity = (n_envs + 1) * UNITY_INSTANCE_BYTES
+    # available chosen so threshold (0.6*available) is above buffer but below buffer+unity.
+    threshold_target = buffer + unity // 2
+    available = int(threshold_target / MEMORY_MARGIN)
+    assert int(available * MEMORY_MARGIN) >= buffer  # buffer alone would pass
+    with pytest.raises(MemoryError):
+        check_rl_memory_budget(
+            n_steps=10,
+            n_envs=n_envs,
+            frame_nbytes=691_200,
+            frame_stack=1,
+            available_bytes=available,
+        )
+
+
+# --- 2c. sidecar cadence rides num_timesteps in lockstep with CheckpointCallback -------------
+
+
+def test_checkpoint_save_freq_divides_by_n_envs():
+    # checkpoint_freq is env-steps; the per-call save_freq is max(freq // n_envs, 1) so a checkpoint
+    # lands every checkpoint_freq num_timesteps (num_timesteps = n_calls * n_envs).
+    assert _checkpoint_save_freq(_cfg_n_envs(1)) == 10_000
+    assert _checkpoint_save_freq(_cfg_n_envs(7, checkpoint_freq=7_000)) == 1_000
+    # never below 1 (a freq smaller than n_envs floors to 1 call).
+    assert _checkpoint_save_freq(_cfg_n_envs(7, checkpoint_freq=3)) == 1
+
+
+def _cfg_n_envs(n_envs, **overrides):
+    """A TrainConfig with n_envs set (game_port spread so eval avoids the training range)."""
+    base = {
+        "total_timesteps": 1_000,
+        "game_config": Path("cfg.json"),
+        "run_dir": Path("run"),
+        "frame_shape": (4, 6, 3),
+        "n_envs": n_envs,
+    }
+    base.update(overrides)
+    return TrainConfig(**base)
+
+
+def test_sidecar_cadence_matches_checkpoint_at_multi_env(tmp_path):
+    # At n_envs>1 the sidecar must fire on the SAME calls as SB3's CheckpointCallback. Both ride
+    # the SAME transformed save_freq (max(checkpoint_freq // n_envs, 1)) and gate on
+    # n_calls % save_freq, so state.json lands in lockstep with each model_<num_timesteps>.zip. We
+    # mirror SB3's call bookkeeping (n_calls increments per env.step(); num_timesteps =
+    # n_calls * n_envs) and assert the two gates fire on identical calls.
+    from stable_baselines3.common.callbacks import CheckpointCallback
+
+    n_envs = 7
+    cfg = _cfg(tmp_path, n_envs=n_envs, game_port=54000, checkpoint_freq=7_000)
+    save_freq = _checkpoint_save_freq(cfg)  # 7000 // 7 = 1000
+    assert save_freq == 1_000
+
+    provider = OpponentProvider.from_roster(cfg.opponents, cfg.opponent_strategy, seed=cfg.seed)
+    sidecar_cb = _make_sidecar_callback(
+        cfg, provider, _initial_elo(cfg.opponents), save_freq=save_freq
+    )
+    ckpt_cb = CheckpointCallback(save_freq=save_freq, save_path=str(tmp_path), name_prefix="model")
+
+    # Both gate on n_calls % save_freq == 0. Walk a range of calls; the fire-sets must be identical.
+    sidecar_fires = {c for c in range(1, 4_000) if c % sidecar_cb.save_freq == 0}
+    ckpt_fires = {c for c in range(1, 4_000) if c % ckpt_cb.save_freq == 0}
+    assert sidecar_fires == ckpt_fires
+    # and a fire lands exactly at num_timesteps = save_freq * n_envs = checkpoint_freq (lockstep).
+    first_fire_call = min(sidecar_fires)
+    assert first_fire_call * n_envs == 7_000
+
+
+def test_sidecar_save_with_none_provider_records_strategy_and_seed(tmp_path):
+    # At n_envs>1 there is no live provider (per-subproc); save_sidecar(provider=None) records the
+    # strategy + seed from cfg so the sidecar still fully describes the run.
+    cfg = _cfg(tmp_path, opponents=("noop", "random"), opponent_strategy="uniform", seed=11)
+    path = tmp_path / "state.json"
+    save_sidecar(path, provider=None, elo=_initial_elo(cfg.opponents), cfg=cfg, num_timesteps=512)
+    loaded = load_sidecar(path)
+    assert loaded["provider"]["strategy"] == "uniform"
+    assert loaded["provider"]["seed"] == 11
+    assert "index" not in loaded["provider"]
+
+
 # --- 3. sidecar save -> load round-trip ------------------------------------------------------
 
 
@@ -456,8 +695,8 @@ def test_resume_restores_provider_and_elo_with_mocked_ppo_load(tmp_path, monkeyp
     monkeypatch.setattr(
         train_mod,
         "build_vec_env",
-        lambda c, *, port=None, monitor=False: build_vec_env(
-            c, port=port, monitor=monitor, connection_factory=_stub_factory
+        lambda c, *, port=None, monitor=False, single=False: build_vec_env(
+            c, port=port, monitor=monitor, single=single, connection_factory=_stub_factory
         ),
     )
 
@@ -588,6 +827,11 @@ def test_main_threads_new_flags_into_config(tmp_path, monkeypatch):
             "3",
             "--checkpoint-freq",
             "250",
+            "--n-envs",
+            "7",
+            "--n-steps",
+            "512",
+            "--allow-oversized",
             "--port",
             "51234",
             "--eval-port",
@@ -601,6 +845,9 @@ def test_main_threads_new_flags_into_config(tmp_path, monkeypatch):
     assert cfg.eval_freq == 500
     assert cfg.eval_episodes == 3
     assert cfg.checkpoint_freq == 250
+    assert cfg.n_envs == 7
+    assert cfg.n_steps == 512
+    assert cfg.allow_oversized is True
     assert cfg.game_port == 51234
     assert cfg.eval_port == 51299
     assert cfg.effective_eval_port == 51299
@@ -616,6 +863,9 @@ def test_main_defaults_preserved_when_flags_omitted(tmp_path, monkeypatch):
     assert cfg.eval_freq == 10_000
     assert cfg.eval_episodes == 10
     assert cfg.checkpoint_freq == 10_000
+    assert cfg.n_envs == 1
+    assert cfg.n_steps == 2048  # the TrainConfig default
+    assert cfg.allow_oversized is False
     assert cfg.game_port == 50000
     assert cfg.eval_port is None
 

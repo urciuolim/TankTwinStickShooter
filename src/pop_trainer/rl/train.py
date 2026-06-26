@@ -22,9 +22,18 @@ the SHARED, dependency-free :mod:`pop_trainer.core.launch` primitives (``rl -> c
 ``Popen`` stashed so ``env.close()`` reaps the build (terminate -> wait -> kill). The unit tests
 inject a STUB ``connection_factory`` so NO Unity is launched.
 
+Multi-env (Phase 2): at ``n_envs > 1`` the training env is a ``SubprocVecEnv`` of ``n_envs`` Unity
+builds, each on its OWN port (``game_port + i``) in its OWN process (``start_method="spawn"`` —
+Windows-safe). The env factories are CLOSURES capturing only ``cfg`` + the int ``i`` and building
+everything live INSIDE the subprocess (cloudpickle ships them), mirroring collection's per-worker
+fan-out. A pre-flight memory guard sizes the PPO RolloutBuffer + the live Unity instances against
+available RAM and aborts before launch if over budget.
+
 Boundary: imports ``core`` (incl. ``core.launch`` / ``core.protocol`` / ``core.config``), ``env``,
-sb3 / gymnasium / stdlib. Imports NOTHING from ``data`` or ``pretraining`` (the live launch is
-re-derived from ``core.launch``, never imported from ``data``). No cycles.
+``models`` / ``agents`` (transitively, via the extractor / self-play seams), ``psutil``, sb3 /
+gymnasium / stdlib. Imports NOTHING from ``data`` or ``pretraining`` (the live launch is re-derived
+from ``core.launch``, never imported from ``data``; the memory guard is the rl-side equivalent of
+collection's, not an import of it). No cycles.
 """
 
 from __future__ import annotations
@@ -47,11 +56,22 @@ from pop_trainer.rl.extractor import EncoderExtractor
 from pop_trainer.rl.selfplay import _STRATEGIES, DEFAULT_ROSTER, OpponentProvider, SelfPlayWrapper
 
 if TYPE_CHECKING:  # type-only: keep the pure helpers / config import-light at module load
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
 
     from stable_baselines3.common.vec_env import VecEnv
 
-__all__ = ["TrainConfig", "train_local", "build_vec_env", "save_sidecar", "load_sidecar", "main"]
+__all__ = [
+    "TrainConfig",
+    "train_local",
+    "build_vec_env",
+    "save_sidecar",
+    "load_sidecar",
+    "main",
+    "frame_nbytes",
+    "estimate_rl_memory_bytes",
+    "check_rl_memory_budget",
+    "training_ports",
+]
 
 # This file is src/pop_trainer/rl/train.py: parents[3] is the repo root
 # (core sibling -> rl -> pop_trainer -> src -> repo).
@@ -75,6 +95,23 @@ BASE_ELO = 1000.0
 # The sidecar file written alongside each model_<steps>.zip checkpoint.
 SIDECAR_NAME = "state.json"
 
+# --- multi-env rollout-buffer memory guard ---------------------------------------------------
+# At n_envs > 1 the SB3 PPO RolloutBuffer is the OOM surface: it allocates
+# (n_steps, n_envs, *obs_shape) of the obs dtype. The pixel obs is uint8 (tank_env: dtype=uint8),
+# so the buffer stores uint8 — 1 byte/element — but n_steps x n_envs x frame is still large
+# (e.g. 2048 x 7 x 691200 B ~ 9.2 GB). VecFrameStack(n_stack=k) multiplies the stored channel
+# depth by k, so the per-element obs cost scales with frame_stack. We pre-flight this against the
+# box's available RAM exactly as collection pre-flights its per-worker shard buffer.
+
+# Coarse per-Unity-instance RAM allowance the rollout-buffer estimate does NOT model. Each training
+# build + the eval build is its own live Unity process (~1 GB). Folded into the total so the guard
+# reasons about builds + buffer, not just the buffer.
+UNITY_INSTANCE_BYTES = 1024**3  # ~1 GB per live Unity instance (coarse).
+
+# The estimate excludes the OS + torch/CUDA + the policy net, so the guard only lets the modelled
+# total consume a conservative fraction of available RAM (mirrors collection's MARGIN).
+MEMORY_MARGIN = 0.6
+
 
 @dataclass(frozen=True)
 class TrainConfig:
@@ -92,7 +129,11 @@ class TrainConfig:
         game_config: the game/training config JSON forwarded to the build launch as ``--config``
             (single-map, ``obs_pixels=True``, ``timeScale<=5``).
         run_dir: the output directory for checkpoints / sidecar / tensorboard logs.
-        n_envs: number of parallel envs (Phase-1 is ``1``; ``>1`` is a documented SEAM, not built).
+        n_envs: number of parallel TRAINING envs. ``1`` -> ``DummyVecEnv`` (single in-process env,
+            position-exact ``round_robin`` resume). ``>1`` -> ``SubprocVecEnv`` of ``n_envs`` Unity
+            builds, each on its OWN port (``game_port + i``). At ``>1`` the opponent rotation is
+            PER-SUBPROC (each subproc has its own seeded provider) and resume RESEEDS it
+            (approximate phase, like ``uniform``) — see :func:`build_vec_env`.
         frame_stack: VecFrameStack depth (``1`` = passthrough).
         encoder_checkpoint: optional pretrained-encoder ``state_dict`` path for the extractor.
         freeze_encoder: freeze the encoder weights during RL.
@@ -106,10 +147,16 @@ class TrainConfig:
         learning_rate / n_steps / batch_size / n_epochs / gamma / gae_lambda / clip_range:
             PPO hyperparameters (pixel-PPO defaults).
         frame_shape: the ``(H, W, 3)`` pixel-frame shape (channels-last; SB3 transposes it).
-        game_port: the TCP port the TRAINING build listens on (``args[1]`` of the launch arg-list).
+        game_port: the BASE TCP port. Training env ``i`` listens on ``game_port + i`` for
+            ``i in 0..n_envs-1`` (``args[1]`` of each build's launch arg-list).
         eval_port: the TCP port the DEDICATED eval build listens on. ``None`` (default) -> the
-            effective eval port is ``game_port + 1``. When set it must differ from ``game_port``
-            (the two builds run side-by-side on separate sockets).
+            effective eval port is ``game_port + n_envs`` (the first port AFTER the training range,
+            so at ``n_envs == 1`` it is ``game_port + 1`` as before). When set it must differ from
+            ``game_port`` AND must NOT fall inside the training range
+            ``[game_port, game_port + n_envs - 1]`` (the eval build cannot collide with any training
+            build); both run side-by-side on separate sockets.
+        allow_oversized: skip the pre-flight rollout-buffer memory ABORT (the estimate is still
+            printed). Use only when the box has RAM the conservative guard does not model.
         build_path: the build binary; ``None`` -> :func:`core.launch.default_build_path`.
     """
 
@@ -138,6 +185,7 @@ class TrainConfig:
     frame_shape: tuple[int, int, int] = DEFAULT_FRAME_SHAPE
     game_port: int = 50000
     eval_port: int | None = None
+    allow_oversized: bool = False
     build_path: Path | None = None
 
     def __post_init__(self) -> None:
@@ -165,11 +213,27 @@ class TrainConfig:
                 f"eval_port must differ from game_port (both {self.game_port}); the eval build "
                 "runs side-by-side on a separate socket"
             )
+        # The eval build must not collide with any of the n_envs training builds. The training
+        # range is [game_port, game_port + n_envs - 1]; an explicit eval_port inside it would
+        # double-bind a socket. (n_envs == 1 -> the range is {game_port}, already rejected above.)
+        if self.eval_port is not None:
+            train_hi = self.game_port + self.n_envs - 1
+            if self.game_port <= self.eval_port <= train_hi:
+                raise ValueError(
+                    f"eval_port {self.eval_port} falls inside the training port range "
+                    f"[{self.game_port}, {train_hi}] (n_envs={self.n_envs}); the eval build cannot "
+                    "collide with a training build — choose a port outside that range"
+                )
 
     @property
     def effective_eval_port(self) -> int:
-        """The port the dedicated eval build listens on: ``eval_port`` or ``game_port + 1``."""
-        return self.eval_port if self.eval_port is not None else self.game_port + 1
+        """The dedicated eval build's port: ``eval_port`` or ``game_port + n_envs``.
+
+        The default sits the eval build on the FIRST port after the training range
+        ``[game_port, game_port + n_envs - 1]`` (so 7 train envs = ``50000..50006`` -> eval
+        ``50007``). At ``n_envs == 1`` this is ``game_port + 1`` exactly as before.
+        """
+        return self.eval_port if self.eval_port is not None else self.game_port + self.n_envs
 
     def to_dict(self) -> dict:
         """JSON-ready plain-dict view (Paths -> str, tuples -> list)."""
@@ -200,8 +264,84 @@ class TrainConfig:
             "frame_shape": list(self.frame_shape),
             "game_port": self.game_port,
             "eval_port": self.eval_port,
+            "allow_oversized": self.allow_oversized,
             "build_path": None if self.build_path is None else str(self.build_path),
         }
+
+
+# --- pure rollout-buffer memory guard (no psutil here; available_bytes is INJECTED) ----------
+
+
+def frame_nbytes(frame_shape: Sequence[int]) -> int:
+    """The uncompressed byte size of ONE uint8 frame of ``frame_shape`` (the element product).
+
+    uint8 is 1 byte/element, so a frame costs exactly ``prod(frame_shape)`` bytes. This is the
+    per-(step, env) obs cost the rollout-buffer estimate multiplies up.
+    """
+    n = 1
+    for dim in frame_shape:
+        n *= int(dim)
+    return n
+
+
+def estimate_rl_memory_bytes(
+    *, n_steps: int, n_envs: int, frame_nbytes: int, frame_stack: int
+) -> int:
+    """Estimate the SB3 PPO RolloutBuffer's peak obs bytes (PURE; no allocation).
+
+    The buffer is ``(n_steps, n_envs, *obs_shape)`` of the uint8 obs dtype, and
+    ``VecFrameStack(n_stack=frame_stack)`` multiplies the stored channel depth by ``frame_stack``.
+    So the obs bytes are ``n_steps * n_envs * frame_nbytes * frame_stack``. (The buffer's rewards /
+    returns / values / log-probs are O(n_steps * n_envs) floats — negligible beside the frames — so
+    they are not modelled.) This is the quantity the pre-flight guard compares against RAM.
+    """
+    return int(n_steps) * int(n_envs) * int(frame_nbytes) * int(frame_stack)
+
+
+def check_rl_memory_budget(
+    *,
+    n_steps: int,
+    n_envs: int,
+    frame_nbytes: int,
+    frame_stack: int,
+    available_bytes: int,
+    allow_oversized: bool = False,
+) -> str:
+    """Pre-flight RL memory guard. Returns the estimate line; may raise ``MemoryError``.
+
+    Adds the rollout-buffer obs estimate (:func:`estimate_rl_memory_bytes`) to a coarse Unity
+    allowance of :data:`UNITY_INSTANCE_BYTES` per live instance — ``n_envs`` training builds plus
+    the ONE dedicated eval build (``n_envs + 1`` instances) — and compares the TOTAL to a
+    conservative fraction (:data:`MEMORY_MARGIN`) of ``available_bytes`` (INJECTED by the caller —
+    this pure function never touches psutil). When the total exceeds the threshold and
+    ``allow_oversized`` is ``False`` it raises ``MemoryError`` with an ACTIONABLE message (lower
+    ``--n-steps`` or ``--n-envs``, or pass ``--allow-oversized``). Within budget — or overridden —
+    it returns the estimate line so the caller can ALWAYS print it at startup.
+    """
+    buffer_bytes = estimate_rl_memory_bytes(
+        n_steps=n_steps, n_envs=n_envs, frame_nbytes=frame_nbytes, frame_stack=frame_stack
+    )
+    unity_instances = n_envs + 1  # training builds + the dedicated eval build.
+    unity_bytes = unity_instances * UNITY_INSTANCE_BYTES
+    total = buffer_bytes + unity_bytes
+    threshold = int(available_bytes * MEMORY_MARGIN)
+    gib = 1024**3
+    line = (
+        f"memory estimate: rollout buffer ~{buffer_bytes / gib:.2f} GB "
+        f"(n_steps={n_steps} x n_envs={n_envs} x {frame_nbytes / 1024**2:.2f} MB/frame "
+        f"x {frame_stack} frame_stack) + {unity_instances} Unity instance(s) "
+        f"~{unity_bytes / gib:.2f} GB = total ~{total / gib:.2f} GB; "
+        f"available {available_bytes / gib:.2f} GB, "
+        f"budget {MEMORY_MARGIN:.0%} = {threshold / gib:.2f} GB"
+    )
+    if total > threshold and not allow_oversized:
+        raise MemoryError(
+            f"{line}. ABORT: estimated total ~{total / gib:.2f} GB exceeds the "
+            f"{MEMORY_MARGIN:.0%} budget ({threshold / gib:.2f} GB of "
+            f"{available_bytes / gib:.2f} GB available). lower --n-steps or --n-envs "
+            "(or pass --allow-oversized to override)."
+        )
+    return line
 
 
 # --- live launch seam (re-derived from core.launch; NEVER imported from data) ----------------
@@ -316,63 +456,145 @@ def _build_base_env(
     return env
 
 
+def _make_self_play_env(
+    cfg: TrainConfig,
+    port: int,
+    *,
+    seed_offset: int = 0,
+    connection_factory: Callable[[], Connection] | None = None,
+) -> SelfPlayWrapper:
+    """Build one full ``SelfPlayWrapper(TankEnv)`` for ``port`` — the per-env construction unit.
+
+    Builds the live ``connection_factory`` for ``port`` (re-derived from ``core.launch``) unless an
+    explicit STUB ``connection_factory`` is injected (tests / the n_envs=1 seam), the base
+    :class:`TankEnv`, and the :class:`OpponentProvider` (seeded ``cfg.seed + seed_offset`` so each
+    subproc's roster RNG differs). Constructing the PROVIDER here — not before — is what makes the
+    closure that wraps this spawn-safe: nothing live is captured, the provider is built INSIDE the
+    subprocess. Returns the wrapper.
+    """
+    factory = (
+        connection_factory
+        if connection_factory is not None
+        else _live_connection_factory_for_port(cfg, port)
+    )
+    base = _build_base_env(cfg, factory, port)
+    provider = OpponentProvider.from_roster(
+        cfg.opponents, cfg.opponent_strategy, seed=cfg.seed + seed_offset
+    )
+    return SelfPlayWrapper(base, provider)
+
+
+def training_ports(cfg: TrainConfig) -> list[int]:
+    """The ``n_envs`` distinct training ports ``[game_port + i for i in range(n_envs)]`` (PURE)."""
+    return [cfg.game_port + i for i in range(cfg.n_envs)]
+
+
+def _training_env_factories(
+    cfg: TrainConfig,
+    *,
+    connection_factory_for_port: Callable[[int], Callable[[], Connection]] | None = None,
+) -> list[Callable[[], SelfPlayWrapper]]:
+    """The ``n_envs`` zero-arg env factories — one per training port (the SubprocVecEnv seam).
+
+    Each factory ``i`` is a CLOSURE that builds env ``i`` on port ``game_port + i`` with provider
+    seed ``cfg.seed + i``. The closure captures ONLY ``cfg`` (a frozen, picklable dataclass) and the
+    int ``i`` — it constructs the provider / base env / live connection INSIDE its body, so nothing
+    live crosses the spawn boundary (SB3 ships the ``env_fns`` via cloudpickle, which serializes the
+    closure by its captured vars). This is why a closure is spawn-safe HERE where collection needed
+    module-level functions: cloudpickle handles closures that capture only plain data.
+
+    ``connection_factory_for_port`` is a TEST seam: given a port it returns that port's STUB
+    ``connection_factory`` (no Unity). ``None`` (the live path) -> each factory derives its own
+    live connection from ``core.launch``. Returns the factory list (length ``n_envs``); the
+    matching ports are :func:`training_ports`.
+    """
+    factories: list[Callable[[], SelfPlayWrapper]] = []
+    for i, port in enumerate(training_ports(cfg)):
+
+        def factory(i: int = i, port: int = port) -> SelfPlayWrapper:
+            conn_factory = (
+                None if connection_factory_for_port is None else connection_factory_for_port(port)
+            )
+            return _make_self_play_env(cfg, port, seed_offset=i, connection_factory=conn_factory)
+
+        factories.append(factory)
+    return factories
+
+
 def build_vec_env(
     cfg: TrainConfig,
     *,
     port: int | None = None,
     monitor: bool = False,
+    single: bool = False,
     connection_factory: Callable[[], Connection] | None = None,
+    connection_factory_for_port: Callable[[int], Callable[[], Connection]] | None = None,
 ) -> VecEnv:
-    """Compose the SB3 vec-env stack: ``VecFrameStack`` -> ``DummyVecEnv`` -> ``SelfPlayWrapper``.
+    """Compose the SB3 vec-env stack: ``[VecMonitor ->] VecFrameStack -> {Dummy,Subproc}VecEnv``.
 
-    The composition (the seam the unit test asserts):
+    The per-env unit (:func:`_make_self_play_env`) is a base :class:`TankEnv` over its port's
+    ``connection_factory`` wrapped in a :class:`~pop_trainer.rl.selfplay.SelfPlayWrapper` driving
+    player2 from an :class:`~pop_trainer.rl.selfplay.OpponentProvider` (``cfg.opponents`` /
+    ``cfg.opponent_strategy``). The vec stack around it:
 
-    1. base :class:`TankEnv` over ``connection_factory`` (the LIVE launch on ``port`` when ``None``;
-       the injected STUB in tests);
-    2. wrapped in a :class:`~pop_trainer.rl.selfplay.SelfPlayWrapper` driving player2 from a
-       :class:`~pop_trainer.rl.selfplay.OpponentProvider` built from ``cfg.opponents`` /
-       ``cfg.opponent_strategy`` (seeded with ``cfg.seed``);
-    3. boxed in a ``DummyVecEnv`` (Phase-1 ``n_envs == 1``);
-    4. wrapped in ``VecFrameStack`` (``n_stack = cfg.frame_stack``; ``1`` = passthrough, still
-       wrapped so the stack is uniform);
-    5. when ``monitor`` is set, wrapped OUTERMOST in ``VecMonitor`` so SB3 logs
-       ``rollout/ep_rew_mean`` / ``rollout/ep_len_mean`` (the TRAINING env only; the eval env uses
-       ``evaluate_winrate``'s own loop, not SB3 episode stats, so it is built ``monitor=False``).
+    * **n_envs == 1 (or ``single=True``)** -> a ``DummyVecEnv`` of ONE env on ``port`` (default
+      ``cfg.game_port``), provider seeded ``cfg.seed``. The provider is reachable for assertions /
+      position-exact ``round_robin`` resume via :func:`_find_selfplay_wrapper` (``.envs`` is exposed
+      in-process).
+    * **n_envs > 1** -> a ``SubprocVecEnv`` of ``n_envs`` envs, one per training port
+      (``game_port + i``, see :func:`training_ports`), each launching its OWN Unity build in its OWN
+      process with provider seeded ``cfg.seed + i``. ``start_method="spawn"`` is REQUIRED (Windows;
+      no fork/forkserver). The env factories are CLOSURES that capture only ``cfg`` (a frozen,
+      picklable dataclass) + the int ``i`` and build everything live INSIDE the subprocess — SB3
+      ships them via cloudpickle, so nothing live crosses the boundary. The provider lives PER-
+      SUBPROC and is NOT reachable via :func:`_find_selfplay_wrapper` (``SubprocVecEnv`` exposes no
+      ``.envs``); the caller treats opponent rotation as per-subproc + reseed-on-resume (see
+      :func:`train_local`).
 
-    ``port`` selects the live build's TCP port (defaults to ``cfg.game_port`` — the training env;
-    the eval env passes ``cfg.effective_eval_port``). It also threads into ``EnvConfig.game_port``
-    so each built env records its own socket. When a STUB ``connection_factory`` is injected NO
-    Unity is launched on either port.
+    Then ``VecFrameStack`` (``n_stack = cfg.frame_stack``; ``1`` = passthrough, still wrapped for a
+    uniform stack), and OUTERMOST ``VecMonitor`` when ``monitor`` is set (the TRAINING env only — it
+    logs ``rollout/ep_rew_mean`` / ``rollout/ep_len_mean``; the eval env uses ``evaluate_winrate``'s
+    own loop, so it is built ``monitor=False``).
 
-    ``n_envs > 1`` is a documented SEAM (``SubprocVecEnv`` + per-env distinct ports), NOT built in
-    Phase-1 — it raises ``NotImplementedError``.
+    ``single=True`` forces the ONE-env ``DummyVecEnv`` path regardless of ``cfg.n_envs`` — the eval
+    env is ALWAYS a single in-process env (``evaluate_winrate`` needs the raw single ``TankEnv`` via
+    :func:`_find_selfplay_wrapper`). ``port`` selects that single env's TCP port (default
+    ``cfg.game_port``; the eval env passes ``cfg.effective_eval_port``).
 
-    The constructed ``OpponentProvider`` is reachable for assertions/resume through the vec stack:
-    ``[VecMonitor ->] VecFrameStack -> DummyVecEnv -> envs[0]`` (the SelfPlayWrapper) ->
-    ``.opponents``. :func:`_find_selfplay_wrapper` walks that path (skipping any ``.venv`` layer).
+    Test seams (no Unity): ``connection_factory`` injects a STUB for the SINGLE path; for the
+    multi-env path ``connection_factory_for_port`` maps a port -> that port's STUB factory and the
+    vec is built as a ``DummyVecEnv`` of the factories (subprocs are NOT spawned in unit tests).
     """
-    from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack, VecMonitor
-
-    if cfg.n_envs != 1:
-        # SEAM: n>1 needs SubprocVecEnv with a distinct game_port per env (each launches its own
-        # build). Phase-1 is n=1; the multi-env fan-out is deferred.
-        raise NotImplementedError(
-            f"n_envs > 1 is a deferred seam (SubprocVecEnv + per-env ports); got {cfg.n_envs}"
-        )
-
-    live_port = port if port is not None else cfg.game_port
-    factory = (
-        connection_factory
-        if connection_factory is not None
-        else _live_connection_factory_for_port(cfg, live_port)
+    from stable_baselines3.common.vec_env import (
+        DummyVecEnv,
+        SubprocVecEnv,
+        VecFrameStack,
+        VecMonitor,
     )
 
-    def make_wrapped() -> SelfPlayWrapper:
-        base = _build_base_env(cfg, factory, live_port)
-        provider = OpponentProvider.from_roster(cfg.opponents, cfg.opponent_strategy, seed=cfg.seed)
-        return SelfPlayWrapper(base, provider)
+    if single or cfg.n_envs == 1:
+        live_port = port if port is not None else cfg.game_port
 
-    vec = DummyVecEnv([make_wrapped])
+        def make_wrapped(
+            cf: Callable[[], Connection] | None = connection_factory,
+        ) -> SelfPlayWrapper:
+            return _make_self_play_env(cfg, live_port, seed_offset=0, connection_factory=cf)
+
+        vec: VecEnv = DummyVecEnv([make_wrapped])
+    else:
+        factories = _training_env_factories(
+            cfg, connection_factory_for_port=connection_factory_for_port
+        )
+        if connection_factory_for_port is not None:
+            # TEST path: stub factories build with no Unity, so run them in-process (DummyVecEnv) —
+            # spawning real subprocs in a unit test would re-import + launch builds. The list /
+            # ports are what the seam asserts.
+            vec = DummyVecEnv(factories)
+        else:
+            # LIVE path: one Unity build per env in its OWN process. spawn is REQUIRED (Windows; no
+            # fork/forkserver per CLAUDE.md).
+            vec = SubprocVecEnv(factories, start_method="spawn")
+
     stacked: VecEnv = VecFrameStack(vec, n_stack=cfg.frame_stack)
     if monitor:
         # VecMonitor OUTERMOST so it sees episode boundaries on the stacked obs and logs SB3's
@@ -421,7 +643,7 @@ def _find_selfplay_wrapper(vec_env: VecEnv) -> SelfPlayWrapper:
 def save_sidecar(
     path: str | Path,
     *,
-    provider: OpponentProvider,
+    provider: OpponentProvider | None,
     elo: dict[str, float],
     cfg: TrainConfig,
     num_timesteps: int,
@@ -432,10 +654,18 @@ def save_sidecar(
     current ``num_timesteps``. The provider position is replayable ONLY for ``round_robin`` (the
     ``_index``); for ``uniform`` there is no replayable position, so only ``strategy`` is recorded
     (resume continues the seeded RNG fresh — documented as the non-replayable strategy).
+
+    ``provider is None`` is the n_envs>1 case: the providers live PER-SUBPROC (unreachable in this
+    process), so only the strategy + seed (from ``cfg``) are recorded — resume RESEEDS the per-
+    subproc rotation (approximate phase, like ``uniform``). The config carries ``opponent_strategy``
+    and ``seed`` either way, so the sidecar still fully describes the run.
     """
-    provider_state: dict = {"strategy": provider.strategy}
-    if provider.strategy == "round_robin":
-        provider_state["index"] = int(provider._index)
+    if provider is None:
+        provider_state: dict = {"strategy": cfg.opponent_strategy, "seed": cfg.seed}
+    else:
+        provider_state = {"strategy": provider.strategy}
+        if provider.strategy == "round_robin":
+            provider_state["index"] = int(provider._index)
     payload = {
         "num_timesteps": int(num_timesteps),
         "provider": provider_state,
@@ -455,12 +685,16 @@ def _initial_elo(opponents: tuple[str, ...]) -> dict[str, float]:
     return {sel: BASE_ELO for sel in opponents}
 
 
-def _restore_provider_position(provider: OpponentProvider, sidecar: dict) -> None:
+def _restore_provider_position(provider: OpponentProvider | None, sidecar: dict) -> None:
     """Restore the opponent-provider position from a loaded sidecar (round_robin only).
 
     For ``round_robin`` the ``_index`` is restored so the rotation continues where it left off; for
     ``uniform`` there is nothing replayable to restore (the seeded RNG simply continues fresh).
+    ``provider is None`` (n_envs>1) is a no-op: the per-subproc providers are unreachable here and
+    resume RESEEDS them (approximate phase).
     """
+    if provider is None:
+        return
     provider_state = sidecar.get("provider", {})
     if provider.strategy == "round_robin" and "index" in provider_state:
         provider._index = int(provider_state["index"])
@@ -490,18 +724,37 @@ def _update_elo_from_eval(
     return updated
 
 
-def _make_sidecar_callback(cfg: TrainConfig, provider: OpponentProvider, elo: dict[str, float]):
-    """Build the SB3 callback that writes ``state.json`` on the checkpoint cadence.
+def _checkpoint_save_freq(cfg: TrainConfig) -> int:
+    """The per-env-CALL save_freq so a checkpoint lands every ``checkpoint_freq`` NUM_TIMESTEPS.
+
+    SB3's ``CheckpointCallback._on_step`` gates on ``self.n_calls % self.save_freq == 0`` and does
+    NOT divide ``save_freq`` by ``n_envs`` internally (it only *documents* that the caller should
+    pass ``max(save_freq // n_envs, 1)``; verified in the installed source). Since
+    ``num_timesteps == n_calls * n_envs``, gating on the RAW ``checkpoint_freq`` would fire every
+    ``checkpoint_freq * n_envs`` timesteps at ``n_envs > 1`` — NOT the env-step cadence the cfg
+    field promises. So we apply the documented ``max(checkpoint_freq // n_envs, 1)`` transform HERE
+    and feed the SAME value to BOTH the ``CheckpointCallback`` and the ``SidecarCallback`` so they
+    fire in lockstep at any ``n_envs`` and each ``state.json`` lands beside its ``model_*.zip``.
+    """
+    return max(cfg.checkpoint_freq // cfg.n_envs, 1)
+
+
+def _make_sidecar_callback(
+    cfg: TrainConfig, provider: OpponentProvider | None, elo: dict[str, float], *, save_freq: int
+):
+    """Build the SB3 callback that writes ``state.json`` in lockstep with each checkpoint.
 
     The callback is created lazily (SB3 imported here, not at module top) so the pure sidecar
-    helpers above stay import-light. It rides the SAME ``checkpoint_freq`` as
-    ``CheckpointCallback``, writing ``run_dir/state.json`` alongside each ``model_<steps>.zip``,
-    capturing the provider position + ELO + cfg + ``num_timesteps``.
+    helpers above stay import-light. It rides the SAME transformed ``save_freq`` as the
+    ``CheckpointCallback`` (see :func:`_checkpoint_save_freq`) so ``run_dir/state.json`` lands
+    alongside each ``model_<steps>.zip`` at ANY ``n_envs``, capturing the provider position + ELO +
+    cfg + ``num_timesteps``. ``provider`` is ``None`` for ``n_envs > 1`` (the per-subproc providers
+    are unreachable; the sidecar records strategy + seed from ``cfg`` instead).
     """
     from stable_baselines3.common.callbacks import BaseCallback
 
     class SidecarCallback(BaseCallback):
-        """Persist the resumable sidecar on the checkpoint cadence (mirrors CheckpointCallback)."""
+        """Persist the resumable sidecar in lockstep with CheckpointCallback (same save_freq)."""
 
         def __init__(self, save_freq: int, sidecar_path: Path) -> None:
             super().__init__(verbose=0)
@@ -511,8 +764,8 @@ def _make_sidecar_callback(cfg: TrainConfig, provider: OpponentProvider, elo: di
             self._elo = elo
 
         def _on_step(self) -> bool:
-            # Gate on the SAME cadence CheckpointCallback uses (per-env-call counting); write the
-            # sidecar alongside the just-written model_<steps>.zip.
+            # Gate on the SAME (n_envs-transformed) cadence CheckpointCallback uses, so the sidecar
+            # lands alongside the just-written model_<steps>.zip at any n_envs.
             if self.n_calls % self.save_freq == 0:
                 save_sidecar(
                     self.sidecar_path,
@@ -523,7 +776,7 @@ def _make_sidecar_callback(cfg: TrainConfig, provider: OpponentProvider, elo: di
                 )
             return True
 
-    return SidecarCallback(cfg.checkpoint_freq, cfg.run_dir / SIDECAR_NAME)
+    return SidecarCallback(save_freq, cfg.run_dir / SIDECAR_NAME)
 
 
 # --- resume ----------------------------------------------------------------------------------
@@ -557,18 +810,35 @@ def _latest_checkpoint(run_dir: str | Path) -> Path | None:
 def train_local(cfg: TrainConfig) -> Path:
     """Run (or resume) one local PPO self-play training and return ``cfg.run_dir``.
 
-    Composes TWO vec-env stacks at startup — the TRAINING env on ``cfg.game_port`` (wrapped in
-    ``VecMonitor`` so SB3 logs rollout episode stats) and a DEDICATED eval env on
-    ``cfg.effective_eval_port`` (a SECOND Unity build / socket) — builds (or loads) the PPO model
-    with the :class:`EncoderExtractor` policy, attaches the eval + checkpoint + sidecar callbacks,
-    runs ``model.learn``, then prints a final per-opponent win-rate line.
+    Composes the TRAINING vec-env stack at startup — a ``DummyVecEnv`` of ONE env at
+    ``cfg.n_envs == 1`` or a ``SubprocVecEnv`` of ``cfg.n_envs`` builds (ports ``game_port + i``),
+    ``VecMonitor``-wrapped so SB3 logs rollout episode stats — plus a DEDICATED, ALWAYS-SINGLE eval
+    env on ``cfg.effective_eval_port`` (a separate Unity build / socket, ``single=True`` regardless
+    of ``cfg.n_envs`` because ``evaluate_winrate`` needs the raw single ``TankEnv``). It builds (or
+    loads) the PPO model with the :class:`EncoderExtractor` policy, attaches the eval + checkpoint +
+    sidecar callbacks, runs ``model.learn``, then prints a final per-opponent win-rate line.
+
+    A PRE-FLIGHT memory guard runs at startup: it reads ``psutil.virtual_memory().available``,
+    estimates the rollout-buffer + Unity-instance bytes (:func:`check_rl_memory_budget`), ALWAYS
+    prints the estimate, and ABORTS (raises ``MemoryError``) before any build launches if the
+    estimate blows the budget — unless ``cfg.allow_oversized``.
+
+    OPPONENT PROVIDER. At ``n_envs == 1`` the provider is reached in-process via
+    :func:`_find_selfplay_wrapper` and resume restores its position EXACTLY (position-exact
+    ``round_robin``). At ``n_envs > 1`` the providers live PER-SUBPROC (one per training build,
+    seeded ``cfg.seed + i``) and are NOT reachable here; the sidecar records strategy + seed only
+    and resume RESEEDS the rotation (approximate phase, like ``uniform``) — ``round_robin`` at
+    ``n_envs > 1`` therefore degrades to per-subproc rotation with reseed-on-resume.
 
     Eval (periodic + final) runs against the dedicated eval env's raw :class:`TankEnv`, so the
     training env / model rollout state is NEVER touched by eval — no buffer "repair" is needed.
     BOTH env stacks are ALWAYS closed in a ``finally`` (each close suppressed independently so a
-    failure to close one still closes the other) so both live Unity builds are reaped even on
+    failure to close one still closes the other) so all live Unity builds are reaped even on
     exception / KeyboardInterrupt.
     """
+    import sys
+
+    import psutil
     from stable_baselines3 import PPO
     from stable_baselines3.common.callbacks import CallbackList, CheckpointCallback
     from stable_baselines3.common.utils import set_random_seed
@@ -579,13 +849,34 @@ def train_local(cfg: TrainConfig) -> Path:
     set_random_seed(cfg.seed)
     cfg.run_dir.mkdir(parents=True, exist_ok=True)
 
-    # Training env on game_port (VecMonitor-wrapped for rollout episode stats); dedicated eval env
-    # on the effective eval port (a separate build/socket — eval never touches the training env).
+    # PRE-FLIGHT MEMORY GUARD (psutil only here, the run glue). The PPO RolloutBuffer + the live
+    # Unity instances are the OOM surface at high n_envs x n_steps. Estimate, ALWAYS print, then
+    # abort BEFORE launching any build if it blows the budget (unless --allow-oversized).
+    available = psutil.virtual_memory().available
+    try:
+        estimate_line = check_rl_memory_budget(
+            n_steps=cfg.n_steps,
+            n_envs=cfg.n_envs,
+            frame_nbytes=frame_nbytes(cfg.frame_shape),
+            frame_stack=cfg.frame_stack,
+            available_bytes=available,
+            allow_oversized=cfg.allow_oversized,
+        )
+    except MemoryError as exc:
+        print(str(exc), file=sys.stderr)  # noqa: T201
+        raise SystemExit(2) from exc
+    print(estimate_line)  # noqa: T201
+
+    # Training env: DummyVecEnv (n_envs=1) or SubprocVecEnv (n_envs>1) of builds on game_port + i,
+    # VecMonitor-wrapped for rollout episode stats. Dedicated eval env: ALWAYS a single env on the
+    # effective eval port (a separate build/socket — eval never touches the training env).
     vec_env = build_vec_env(cfg, port=cfg.game_port, monitor=True)
     try:
-        eval_vec_env = build_vec_env(cfg, port=cfg.effective_eval_port, monitor=False)
+        eval_vec_env = build_vec_env(cfg, port=cfg.effective_eval_port, monitor=False, single=True)
         try:
-            provider = _find_selfplay_wrapper(vec_env).opponents
+            # n_envs=1: reach the in-process provider for position-exact round_robin resume.
+            # n_envs>1: providers live per-subproc (unreachable here) -> None -> reseed-on-resume.
+            provider = _find_selfplay_wrapper(vec_env).opponents if cfg.n_envs == 1 else None
             eval_raw_env = _find_selfplay_wrapper(eval_vec_env).env
 
             elo = _initial_elo(cfg.opponents)
@@ -625,6 +916,10 @@ def train_local(cfg: TrainConfig) -> Path:
                     verbose=1,
                 )
 
+            # Both CheckpointCallback and the sidecar ride the SAME n_envs-transformed save_freq so
+            # a checkpoint + its state.json land every checkpoint_freq NUM_TIMESTEPS in lockstep at
+            # any n_envs (see _checkpoint_save_freq).
+            ckpt_save_freq = _checkpoint_save_freq(cfg)
             callbacks = CallbackList(
                 [
                     EvalWinRateCallback(
@@ -635,11 +930,11 @@ def train_local(cfg: TrainConfig) -> Path:
                         eval_env=eval_raw_env,
                     ),
                     CheckpointCallback(
-                        save_freq=cfg.checkpoint_freq,
+                        save_freq=ckpt_save_freq,
                         save_path=str(cfg.run_dir),
                         name_prefix="model",
                     ),
-                    _make_sidecar_callback(cfg, provider, elo),
+                    _make_sidecar_callback(cfg, provider, elo, save_freq=ckpt_save_freq),
                 ]
             )
 
@@ -731,6 +1026,24 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--freeze-encoder", action="store_true", help="freeze the encoder weights during RL."
     )
     parser.add_argument("--frame-stack", type=int, default=1, help="VecFrameStack depth (1=off).")
+    parser.add_argument(
+        "--n-envs",
+        type=int,
+        default=1,
+        help="parallel training envs (1=DummyVecEnv; >1=SubprocVecEnv, one Unity build per env on "
+        "game_port + i).",
+    )
+    parser.add_argument(
+        "--n-steps",
+        type=int,
+        default=TrainConfig.n_steps,
+        help="PPO rollout length (the memory lever at n_envs>1; lower it for more envs).",
+    )
+    parser.add_argument(
+        "--allow-oversized",
+        action="store_true",
+        help="skip the pre-flight rollout-buffer memory abort (the estimate is still printed).",
+    )
     parser.add_argument("--seed", type=int, default=0, help="master seed.")
     parser.add_argument(
         "--opponents",
@@ -780,6 +1093,7 @@ def main(argv: list[str] | None = None) -> Path:
         total_timesteps=args.total_timesteps,
         game_config=args.config,
         run_dir=args.run_dir,
+        n_envs=args.n_envs,
         frame_stack=args.frame_stack,
         encoder_checkpoint=args.encoder_checkpoint,
         freeze_encoder=args.freeze_encoder,
@@ -789,6 +1103,8 @@ def main(argv: list[str] | None = None) -> Path:
         eval_freq=args.eval_freq,
         eval_episodes=args.eval_episodes,
         checkpoint_freq=args.checkpoint_freq,
+        n_steps=args.n_steps,
+        allow_oversized=args.allow_oversized,
         game_port=args.port,
         eval_port=args.eval_port,
         **opponents_kwarg,

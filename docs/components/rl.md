@@ -11,10 +11,12 @@ seam** ([`evaluate.py`](../../src/pop_trainer/rl/evaluate.py) `evaluate_winrate`
 [`train.py`](../../src/pop_trainer/rl/train.py) (`TrainConfig` + `train_local`) composes those
 seams into one runnable SB3 PPO self-play run — vec-env stack, the `CnnPolicy` + `EncoderExtractor`
 policy, periodic eval, checkpointing, and a resumable `state.json` sidecar (`train.py:1-27`,
-`rl/__init__.py:22-26`). What remains for **later `rl` tasks** is the M2 work: the population /
-frozen-self opponent ladder (the `elo` math is the M2 primitive, not yet wired into the M1 loop)
-and the `n_envs > 1` multi-env fan-out (a documented seam `train_local` hard-raises on — see below).
-The live Unity training smoke is the **operator's run** (the integrator itself ships); see the
+`rl/__init__.py:22-26`). The `n_envs > 1` multi-env
+fan-out (`SubprocVecEnv` of one Unity build per training port) is now **implemented + unit-tested** —
+see [Multi-env (`n_envs > 1`)](#multi-env-n_envs--1). What remains for **later `rl` tasks** is the M2
+work: the population / frozen-self opponent ladder (the `elo` math is the M2 primitive, not yet wired
+into the M1 loop). The live Unity training smoke (incl. the multi-env 8-instance launch) is the
+**operator's run** (the integrator itself ships); see the
 [runbook](../runbook.md#5-run-rl-training-cli).
 
 **Boundary:** `rl` imports [`core`](core.md) (`core.state.split_state_for_opponent` — the
@@ -201,21 +203,25 @@ one local run and returns `cfg.run_dir` (`train.py:556-683`). The operator-facin
 the [runbook](../runbook.md#5-run-rl-training-cli).
 
 - **TWO env stacks, both built ONCE at startup.** `train_local` builds a TRAINING env on
-  `cfg.game_port` (`monitor=True`) and a DEDICATED eval env on `cfg.effective_eval_port`
-  (`monitor=False`) — a SECOND Unity build / socket — at the top of the run, NOT per-eval
-  (`train.py:583,585`). The two effective ports differ by construction: `effective_eval_port` is the
-  `eval_port` override or `game_port + 1`, and `__post_init__` REJECTS an `eval_port` equal to
-  `game_port` (`train.py:162-171`), so the two builds run side-by-side on separate sockets.
+  `cfg.game_port` (`monitor=True`) and a DEDICATED, ALWAYS-SINGLE eval env on
+  `cfg.effective_eval_port` (`monitor=False`, `single=True`) — a SECOND Unity build / socket — at the
+  top of the run, NOT per-eval (`train.py:873,875`). The two effective ports differ by construction:
+  `effective_eval_port` is the `eval_port` override or **`game_port + n_envs`** — the first port AFTER
+  the training range `[game_port, game_port + n_envs - 1]` (at `n_envs == 1` that is `game_port + 1`).
+  `__post_init__` REJECTS an `eval_port` equal to `game_port` OR one inside the training range
+  (`train.py:211-236`), so the eval build never collides with a training build.
 - **The vec-env composition.** [`build_vec_env`](../../src/pop_trainer/rl/train.py) builds
-  `[VecMonitor(]VecFrameStack(DummyVecEnv([SelfPlayWrapper(TankEnv)]))[)]` (`train.py:318-380`): a bare
-  pure-transport `TankEnv` over the connection factory on the given `port`, wrapped in a
-  `SelfPlayWrapper` driving player2 from an `OpponentProvider` built from `cfg.opponents` /
-  `cfg.opponent_strategy` (seeded with `cfg.seed`), boxed in a `DummyVecEnv`, then `VecFrameStack` at
-  `n_stack = cfg.frame_stack` (`1` = passthrough, still wrapped so the stack is uniform —
-  `train.py:369-375`). When `monitor=True` it is wrapped OUTERMOST in `VecMonitor` so SB3 logs
-  `rollout/ep_rew_mean` / `rollout/ep_len_mean` — **only the TRAINING stack is monitored**; the eval
-  stack is built `monitor=False` (it uses `evaluate_winrate`'s own loop, not SB3 episode stats —
-  `train.py:337-339,376-379`).
+  `[VecMonitor(]VecFrameStack({Dummy,Subproc}VecEnv([SelfPlayWrapper(TankEnv)]))[)]`
+  (`train.py:524-603`): each per-env unit is a bare pure-transport `TankEnv` over its port's connection
+  factory, wrapped in a `SelfPlayWrapper` driving player2 from an `OpponentProvider` built from
+  `cfg.opponents` / `cfg.opponent_strategy`. At **`n_envs == 1`** it is a `DummyVecEnv` of ONE env on
+  `port` (provider seeded `cfg.seed`); at **`n_envs > 1`** it is a `SubprocVecEnv` of `n_envs` envs,
+  one per training port `game_port + i` (provider seeded `cfg.seed + i`, `start_method="spawn"`) — see
+  [Multi-env (`n_envs > 1`)](#multi-env-n_envs--1). Then `VecFrameStack` at `n_stack = cfg.frame_stack`
+  (`1` = passthrough, still wrapped so the stack is uniform — `train.py:598`), and when `monitor=True`
+  it is wrapped OUTERMOST in `VecMonitor` so SB3 logs `rollout/ep_rew_mean` / `rollout/ep_len_mean` —
+  **only the TRAINING stack is monitored**; the eval stack is built `monitor=False` (it uses
+  `evaluate_winrate`'s own loop, not SB3 episode stats — `train.py:599-602`).
 - **The policy.** PPO is built as `"CnnPolicy"` (`train.py:611-612`). Its `policy_kwargs` carries
   `features_extractor_class=EncoderExtractor` + `features_extractor_kwargs={checkpoint, freeze}` from
   `cfg.encoder_checkpoint` / `cfg.freeze_encoder` ([`_build_policy_kwargs`](../../src/pop_trainer/rl/train.py),
@@ -270,12 +276,42 @@ seam: `rl` imports **nothing** from `data` / `pretraining` (`train.py:25-27`).
   continues with `learn(reset_num_timesteps=False)` (`train.py:591,648`). Resuming a `run_dir` with
   no parseable checkpoint raises `FileNotFoundError` (`train.py:597-600`).
 
-#### The `n_envs > 1` deferred seam
+#### Multi-env (`n_envs > 1`)
 
-`build_vec_env` **hard-raises `NotImplementedError`** for `n_envs != 1` (`train.py:355-360`). Phase-1
-is `n=1`; the multi-env fan-out (`SubprocVecEnv` + a distinct `game_port` per env, each launching its
-own build) is deferred. Note the sidecar and checkpoint cadences **coincide only at `n_envs == 1`** —
-the per-env-call counting both callbacks use lines up only with a single env.
+The multi-env fan-out is now **IMPLEMENTED** (code path + unit tests ship; the LIVE 8-instance launch
+is the operator's smoke, still pending). At `cfg.n_envs == 1` `build_vec_env` builds a `DummyVecEnv`
+of one in-process env; at `cfg.n_envs > 1` it builds a **`SubprocVecEnv`** of `n_envs` Unity builds
+with **`start_method="spawn"`** (REQUIRED — no fork/forkserver per CLAUDE.md; Windows-safe),
+one build **per training port** `game_port + i` (`training_ports`, `train.py:487-489`), each in its
+OWN process (`build_vec_env`, `train.py:575-597`).
+
+- **Spawn-safe env factories.** Each env factory `i` is a CLOSURE capturing only `cfg` (a frozen,
+  picklable dataclass) + the int `i`; it constructs the provider / base env / live connection INSIDE
+  the subprocess, so nothing live crosses the spawn boundary (SB3 ships the `env_fns` via cloudpickle —
+  `_training_env_factories`, `train.py:492-521`; `_make_self_play_env`, `train.py:459-484`).
+- **Per-subproc opponent provider.** Each subproc builds its OWN `OpponentProvider` seeded
+  `cfg.seed + i` (`train.py:481-483`), so each training build rotates its roster independently. The
+  providers are **NOT reachable** from the main process (`SubprocVecEnv` exposes no `.envs`), so
+  `_find_selfplay_wrapper` is used only at `n_envs == 1` (`train.py:879`).
+- **Resume at `n_envs > 1` RESEEDS the rotation.** Because the per-subproc providers are unreachable,
+  `train_local` passes `provider=None` at `n_envs > 1`; the sidecar records only `strategy` + `seed`
+  and resume RESEEDS the rotation — **approximate phase, like `uniform`** (`save_sidecar` /
+  `_restore_provider_position`, `train.py:663-664,696-697`; the `provider is None` branch,
+  `train.py:879`). `round_robin` at `n_envs > 1` therefore degrades to per-subproc rotation with
+  reseed-on-resume. **`n_envs == 1` keeps position-exact `round_robin` resume** (the in-process
+  provider's `_index` is restored, `train.py:699-700`).
+- **Eval is ALWAYS single.** The dedicated eval env is a single in-process env on
+  `cfg.effective_eval_port` regardless of `cfg.n_envs` (`single=True` — `evaluate_winrate` needs the
+  raw single `TankEnv` via `_find_selfplay_wrapper`, `train.py:875,621-637`).
+- **Cadence holds at any `n_envs`.** The checkpoint + sidecar callbacks ride the SAME
+  `max(checkpoint_freq // n_envs, 1)` per-call `save_freq` (`_checkpoint_save_freq`, `train.py:727-739`),
+  so a `model_*.zip` + its `state.json` still land every `checkpoint_freq` NUM_TIMESTEPS in lockstep
+  at any `n_envs`.
+- **Pre-flight memory guard.** At high `n_envs` the PPO `RolloutBuffer` is the OOM surface; a startup
+  guard sizes it (≈ `n_steps × n_envs × frame_bytes × frame_stack`) plus ~1 GB per live Unity instance
+  (`n_envs + 1` instances) and ABORTS before launch if the total exceeds 60 % of available RAM unless
+  `--allow-oversized` (`check_rl_memory_budget`, `train.py:301-344`). Operator details + the 7+1
+  example: [runbook §5 → Multi-env training](../runbook.md#multi-env-training-n-envs--1).
 
 #### The training-topology config
 
@@ -349,11 +385,13 @@ The eval seam consumes the self-play seam internally (`evaluate_winrate` re-wrap
 - **Downstream of the seams now:** the operator-facing CLI
   ([runbook §5](../runbook.md#5-run-rl-training-cli)) drives `train_local` over a live windowed Unity
   build (two builds: training + dedicated eval).
+- **Now built:** the `n_envs > 1` multi-env fan-out (`SubprocVecEnv` + per-env ports `game_port + i`,
+  `start_method="spawn"`) is implemented + unit-tested (`build_vec_env`, `train.py:575-597`) — see
+  [Multi-env (`n_envs > 1`)](#multi-env-n_envs--1); the LIVE 8-instance launch is the operator's smoke.
 - **Still deferred (M2 work, not the train loop):** the full population / **frozen-self opponent**
-  ELO ladder (only a light from-eval ELO sidecar update is wired in M1 — `train.py:468-489`; the
-  ladder proper lands with frozen-self opponents in P2, `elo.py:2-5`) and the `n_envs > 1`
-  multi-env fan-out (`SubprocVecEnv` + per-env ports; `build_vec_env` hard-raises today,
-  `train.py:355-360`). The integrator itself ships; the live Unity training smoke is the operator's run.
+  ELO ladder (only a light from-eval ELO sidecar update is wired in M1 — `train.py:703-724`; the
+  ladder proper lands with frozen-self opponents in P2, `elo.py:2-5`). The integrator itself ships;
+  the live Unity training smoke is the operator's run.
 
 ## Where it sits in the run
 

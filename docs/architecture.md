@@ -163,8 +163,10 @@ graph TD
   primitives are reused directly, not the `data` module. The M1 PPO trainer is **built**:
   `train_local` composes the vec-env stack + `CnnPolicy`/`EncoderExtractor` policy, the
   `EvalWinRateCallback` (dedicated eval env on a second socket), checkpoint + resumable `state.json`
-  sidecar, and the light from-eval ELO wiring. Still future: the population / M2 frozen-self ELO
-  ladder, the `n_envs > 1` `SubprocVecEnv` fan-out, and the distributed/GCP cluster.
+  sidecar, and the light from-eval ELO wiring — plus the `n_envs > 1` `SubprocVecEnv` fan-out (one
+  Unity build per training port `game_port + i`, `start_method="spawn"`), now implemented + unit-tested
+  (live multi-instance launch pending). Still future: the population / M2 frozen-self ELO ladder and
+  the distributed/GCP cluster.
 
 ---
 [← back to index](README.md)
