@@ -290,10 +290,32 @@ Like the demo (§3) and collection (§4), this **launches a live windowed Unity 
 build present) and reads a pixel frame each step — `train_config.json` enables `obs_pixels` at
 640×360, required since the env always reads a pixel frame.
 
-The two required args plus a run dir:
+The two required args plus a run dir. This example **omits `--opponents`**, so it trains against the
+full 5-selector `DEFAULT_ROSTER` (`noop`, `random`, `aggressive-coverage`, `wall-hugger`,
+`opponent-shadower`):
 
 ```bash
 uv run python -m pop_trainer.rl.train --total-timesteps 10000 --run-dir runs/train-smoke
+```
+
+Train against a **single opponent** (NoOp-only roster) by passing `--opponents`:
+
+```bash
+uv run python -m pop_trainer.rl.train --total-timesteps 10000 --run-dir runs/train-noop --opponents noop
+```
+
+`--opponents` takes a comma-separated list, so `--opponents noop,random` trains against two. An
+unknown selector (e.g. `--opponents foo`) exits 2 with the valid list, **before** Unity launches.
+
+Run **two trainings side-by-side** on separate sockets with `--port` / `--eval-port` (each training
+build uses its `--port`, and its eval build uses `--eval-port`, defaulting to `--port` + 1 when
+omitted — so leave a ≥2-port gap between runs):
+
+```bash
+# run A: training on 50000, eval on 50001 (the default port + 1)
+uv run python -m pop_trainer.rl.train --total-timesteps 10000 --run-dir runs/train-a --port 50000
+# run B: training on 50002, eval on 50003
+uv run python -m pop_trainer.rl.train --total-timesteps 10000 --run-dir runs/train-b --port 50002 --eval-port 50003
 ```
 
 See the full flag surface:
@@ -303,24 +325,31 @@ uv run python -m pop_trainer.rl.train --help
 ```
 
 Flags (defaults shown), grounded in [`_parse_args`](../src/pop_trainer/rl/train.py)
-(`train.py:616-651`):
+(`train.py:700-771`):
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `--total-timesteps` | *(required)* | total env-steps to train (`train.py:628-630`). |
-| `--run-dir` | *(required)* | output dir for checkpoints / sidecar / TensorBoard (`train.py:631-633`). |
-| `--config` | `Assets/StreamingAssets/train_config.json` | game/training config JSON forwarded to the build launch (`DEFAULT_TRAIN_CONFIG`, `train.py:60,622-627`). |
-| `--resume` | *(absent)* | a prior `run_dir` to resume — load the latest `model_*.zip` + `state.json` (`train.py:634-639`). |
-| `--encoder-checkpoint` | `None` | optional pretrained-encoder `state_dict` for the features extractor (`train.py:640-645`). |
-| `--freeze-encoder` | *(off)* | freeze the encoder weights during RL (`train.py:646-648`). |
-| `--frame-stack` | `1` | `VecFrameStack` depth (`1` = passthrough, `train.py:649`). |
-| `--seed` | `0` | master seed — threaded into SB3, the env, and the opponent provider (`train.py:650`). |
+| `--total-timesteps` | *(required)* | total env-steps to train (`train.py:712-714`). |
+| `--run-dir` | *(required)* | output dir for checkpoints / sidecar / TensorBoard (`train.py:715-717`). |
+| `--config` | `Assets/StreamingAssets/train_config.json` | game/training config JSON forwarded to the build launch (`DEFAULT_TRAIN_CONFIG`, `train.py:60-62,706-711`). |
+| `--resume` | *(absent)* | a prior `run_dir` to resume — load the latest `model_*.zip` + `state.json` (`train.py:718-723`). |
+| `--encoder-checkpoint` | `None` | optional pretrained-encoder `state_dict` for the features extractor (`train.py:724-729`). |
+| `--freeze-encoder` | *(off)* | freeze the encoder weights during RL (`train.py:730-732`). |
+| `--frame-stack` | `1` | `VecFrameStack` depth (`1` = passthrough, `train.py:733`). |
+| `--seed` | `0` | master seed — threaded into SB3, the env, and the opponent provider (`train.py:734`). |
+| `--opponents` | *(absent → full `DEFAULT_ROSTER`)* | comma-separated self-play roster selectors (e.g. `noop,random`), parsed to an ordered tuple and **validated** against [`AGENT_SELECTORS`](../src/pop_trainer/agents/registry.py) (`aggressive-coverage`, `noop`, `opponent-shadower`, `random`, `wall-hugger`); an unknown selector exits 2 with the valid list **before any Unity launch**. **Omitting** the flag trains against the full 5-selector [`DEFAULT_ROSTER`](../src/pop_trainer/rl/selfplay.py) (the omit path passes no kwarg, so the dataclass default owns it) (`train.py:736-740,766-770`; omit plumbing `train.py:777-778`). |
+| `--opponent-strategy` | `round_robin` | opponent rotation: `round_robin` (resumable) or `uniform` (seed-only resume) — the two `choices` (`train.py:741-746`). |
+| `--eval-freq` | `10000` | env-steps between win-rate evals (`0` = off) (`train.py:747-749`). |
+| `--eval-episodes` | `10` | greedy episodes per opponent per eval (`train.py:750-752`). |
+| `--checkpoint-freq` | `10000` | env-steps between checkpoints (the sidecar rides this cadence) (`train.py:753-755`). |
+| `--port` | `50000` | TCP port the **training** build listens on → `game_port` (`train.py:756-758`). |
+| `--eval-port` | *(absent → `--port` + 1)* | TCP port the **dedicated eval** build listens on → `eval_port`. When omitted the effective eval port is `port + 1` (the `effective_eval_port` property, `train.py:169-172`). When set it **must differ from `--port`**; an equal value is rejected by `TrainConfig.__post_init__` with a `ValueError` (NOT duplicated in argparse) (`train.py:759-764`; rejection `train.py:163-167`). |
 
 **Knobs NOT on the CLI** (they use `TrainConfig` dataclass defaults — override in code, not the
-command line): `opponents` (the 5-selector `DEFAULT_ROSTER`), `opponent_strategy` (`"round_robin"`),
-`eval_freq` (`10_000`), `eval_episodes` (`10`), `checkpoint_freq` (`10_000`), `game_port` (`50000`),
-and `build_path` (`None` → the OS-aware [`core.launch.default_build_path`](../src/pop_trainer/core/launch.py))
-— see `train.py:114-135`.
+command line): `n_envs` (`1`), `frame_shape` (the 640×360×3 frame), the PPO hyperparameters
+(`learning_rate`, `n_steps`, `batch_size`, `n_epochs`, `gamma`, `gae_lambda`, `clip_range`), and
+`build_path` (`None` → the OS-aware [`core.launch.default_build_path`](../src/pop_trainer/core/launch.py))
+— see `train.py:116-141`.
 
 ### The training topology (`train_config.json`)
 
@@ -336,17 +365,19 @@ rotation) (`train_config.json:1-22`).
 ### Resume
 
 `--resume <prior run_dir>` continues a previous run: it picks the **highest-step** `model_*.zip` in
-that dir (`_latest_checkpoint`, `train.py:478-497`), does `PPO.load(env=...)`, restores the opponent
-position + ELO from that dir's `state.json` sidecar (`train.py:528-539`), and continues with
-`reset_num_timesteps=False` (`train.py:577-581`). Resuming a dir with no parseable `model_*.zip`
-raises `FileNotFoundError` (`train.py:531-533`).
+that dir (`_latest_checkpoint`, `train.py:532-551`), does `PPO.load(env=...)`, restores the opponent
+position + ELO from that dir's `state.json` sidecar (`train.py:594-607`), and continues with
+`reset_num_timesteps=False` (`train.py:592,649`). Resuming a dir with no parseable `model_*.zip`
+raises `FileNotFoundError` (`train.py:598-601`).
 
-> **CRITICAL — sub-10k smoke runs are NOT resumable.** The default `checkpoint_freq` is **10_000**
-> env-steps (`train.py:122`) and is **not exposed on the CLI**. So a smoke run with
-> `--total-timesteps` **below 10_000** writes **no intermediate `model_*.zip`** — only the final
-> `state.json` — and therefore **cannot be `--resume`d** (resume needs a checkpoint zip and will raise
-> `FileNotFoundError`). Use **`--total-timesteps >= 10000`** (the default checkpoint cadence) if you
-> want a resumable checkpoint; treat anything below that as a **smoke-only, non-resumable** run.
+> **CRITICAL — sub-cadence smoke runs are NOT resumable.** The checkpoint cadence (`--checkpoint-freq`,
+> default **10_000** env-steps; `train.py:127`) controls when a `model_*.zip` is written. A run whose
+> `--total-timesteps` is **below the checkpoint cadence** writes **no intermediate `model_*.zip`** —
+> only the final `state.json` — and therefore **cannot be `--resume`d** (resume needs a checkpoint zip
+> and will raise `FileNotFoundError`). For a resumable checkpoint, keep `--total-timesteps >=` the
+> `--checkpoint-freq` you pass (with the default that means `--total-timesteps >= 10000`); treat
+> anything below the cadence as a **smoke-only, non-resumable** run. You can lower `--checkpoint-freq`
+> to force an earlier checkpoint on a short run.
 
 ## 6. Validate coverage (no Unity required)
 

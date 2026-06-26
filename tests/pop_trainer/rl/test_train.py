@@ -24,6 +24,7 @@ from pathlib import Path
 import pytest
 from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack, VecMonitor
 
+from pop_trainer.agents import AGENT_SELECTORS
 from pop_trainer.core.protocol import Connection
 from pop_trainer.env.tank_env import TankEnv
 from pop_trainer.rl.extractor import EncoderExtractor
@@ -37,9 +38,11 @@ from pop_trainer.rl.train import (
     _find_selfplay_wrapper,
     _initial_elo,
     _latest_checkpoint,
+    _parse_args,
     _restore_provider_position,
     build_vec_env,
     load_sidecar,
+    main,
     save_sidecar,
 )
 
@@ -514,3 +517,123 @@ def test_resume_restores_provider_and_elo_with_mocked_ppo_load(tmp_path, monkeyp
     assert set(final_elo) == set(cfg.opponents)
     # the restored ratings (not the BASE_ELO default) seeded the final ELO.
     assert final_elo["noop"] != BASE_ELO or final_elo["random"] != BASE_ELO
+
+
+# --- 5. CLI: _parse_args + main namespace -> TrainConfig mapping ------------------------------
+
+
+def _capture_cfg(monkeypatch) -> dict:
+    """Patch ``train_local`` to capture the TrainConfig it receives (no training runs).
+
+    Returns a dict that gets ``["cfg"]`` set to the captured config when ``main`` reaches
+    ``train_local``. The lambda returns ``cfg.run_dir`` so ``main`` still yields a Path.
+    """
+    import pop_trainer.rl.train as train_mod
+
+    captured: dict = {}
+
+    def _fake_train_local(cfg):
+        captured["cfg"] = cfg
+        return cfg.run_dir
+
+    monkeypatch.setattr(train_mod, "train_local", _fake_train_local)
+    return captured
+
+
+def test_parse_args_opponents_single():
+    args = _parse_args(["--total-timesteps", "1000", "--run-dir", "out", "--opponents", "noop"])
+    assert args.opponents == ("noop",)
+
+
+def test_parse_args_opponents_multiple_in_order():
+    args = _parse_args(
+        [
+            "--total-timesteps",
+            "1000",
+            "--run-dir",
+            "out",
+            "--opponents",
+            "noop,random,aggressive-coverage",
+        ]
+    )
+    assert args.opponents == ("noop", "random", "aggressive-coverage")
+
+
+def test_parse_args_opponents_unknown_exits_listing_valid(capsys):
+    with pytest.raises(SystemExit) as exc:
+        _parse_args(["--total-timesteps", "1000", "--run-dir", "out", "--opponents", "noop,bogus"])
+    assert exc.value.code == 2  # argparse parser.error exits 2
+    err = capsys.readouterr().err
+    assert "bogus" in err  # names the bad selector
+    # lists the valid selectors (every real one appears in the message)
+    for sel in AGENT_SELECTORS:
+        assert sel in err
+
+
+def test_main_threads_new_flags_into_config(tmp_path, monkeypatch):
+    captured = _capture_cfg(monkeypatch)
+    out = main(
+        [
+            "--total-timesteps",
+            "1000",
+            "--run-dir",
+            str(tmp_path),
+            "--opponents",
+            "noop,random",
+            "--opponent-strategy",
+            "uniform",
+            "--eval-freq",
+            "500",
+            "--eval-episodes",
+            "3",
+            "--checkpoint-freq",
+            "250",
+            "--port",
+            "51234",
+            "--eval-port",
+            "51299",
+        ]
+    )
+    cfg = captured["cfg"]
+    assert out == cfg.run_dir
+    assert cfg.opponents == ("noop", "random")
+    assert cfg.opponent_strategy == "uniform"
+    assert cfg.eval_freq == 500
+    assert cfg.eval_episodes == 3
+    assert cfg.checkpoint_freq == 250
+    assert cfg.game_port == 51234
+    assert cfg.eval_port == 51299
+    assert cfg.effective_eval_port == 51299
+
+
+def test_main_defaults_preserved_when_flags_omitted(tmp_path, monkeypatch):
+    captured = _capture_cfg(monkeypatch)
+    main(["--total-timesteps", "1000", "--run-dir", str(tmp_path)])
+    cfg = captured["cfg"]
+    # --opponents omitted -> the dataclass DEFAULT_ROSTER default owns it.
+    assert cfg.opponents == DEFAULT_ROSTER
+    assert cfg.opponent_strategy == "round_robin"
+    assert cfg.eval_freq == 10_000
+    assert cfg.eval_episodes == 10
+    assert cfg.checkpoint_freq == 10_000
+    assert cfg.game_port == 50000
+    assert cfg.eval_port is None
+
+
+def test_main_equal_ports_rejected_through_cli(tmp_path, monkeypatch):
+    # The equal-port rejection lives in TrainConfig.__post_init__; threading --port/--eval-port
+    # through must still surface it (raises before train_local is reached).
+    _capture_cfg(monkeypatch)
+    with pytest.raises(ValueError, match="eval_port must differ from game_port"):
+        main(
+            [
+                "--total-timesteps",
+                "1000",
+                "--run-dir",
+                str(tmp_path),
+                "--port",
+                "50000",
+                "--eval-port",
+                "50000",
+            ]
+        )

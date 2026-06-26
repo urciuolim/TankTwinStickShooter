@@ -37,6 +37,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from pop_trainer.agents import AGENT_SELECTORS
 from pop_trainer.core import launch
 from pop_trainer.core.config import EnvConfig, RewardConfig
 from pop_trainer.core.protocol import Connection
@@ -686,6 +687,16 @@ def train_local(cfg: TrainConfig) -> Path:
 # --- CLI -------------------------------------------------------------------------------------
 
 
+def _parse_opponents(spec: str) -> tuple[str, ...]:
+    """Split a comma-separated ``--opponents`` selector list into an ordered, stripped tuple.
+
+    Pure: ``"noop"`` -> ``("noop",)``; ``"a, b ,c"`` -> ``("a", "b", "c")``. Validation against
+    :data:`AGENT_SELECTORS` is the caller's job (so a parse error can route through
+    ``parser.error`` for a clean exit-code-2 message).
+    """
+    return tuple(s.strip() for s in spec.split(","))
+
+
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     """Parse the train CLI (PURE: no side effects, returns the namespace)."""
     parser = argparse.ArgumentParser(
@@ -721,12 +732,50 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     )
     parser.add_argument("--frame-stack", type=int, default=1, help="VecFrameStack depth (1=off).")
     parser.add_argument("--seed", type=int, default=0, help="master seed.")
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--opponents",
+        type=_parse_opponents,
+        default=None,
+        help="comma-separated self-play roster selectors (default: the full roster).",
+    )
+    parser.add_argument(
+        "--opponent-strategy",
+        choices=("round_robin", "uniform"),
+        default="round_robin",
+        help="opponent rotation: round_robin (resumable) or uniform (seed-only resume).",
+    )
+    parser.add_argument(
+        "--eval-freq", type=int, default=10_000, help="env-steps between win-rate evals (0=off)."
+    )
+    parser.add_argument(
+        "--eval-episodes", type=int, default=10, help="greedy episodes per opponent per eval."
+    )
+    parser.add_argument(
+        "--checkpoint-freq", type=int, default=10_000, help="env-steps between checkpoints."
+    )
+    parser.add_argument(
+        "--port", type=int, default=50000, help="TCP port the training build listens on."
+    )
+    parser.add_argument(
+        "--eval-port",
+        type=int,
+        default=None,
+        help="TCP port the eval build listens on (default: port + 1).",
+    )
+    args = parser.parse_args(argv)
+    if args.opponents is not None:
+        unknown = [sel for sel in args.opponents if sel not in AGENT_SELECTORS]
+        if unknown:
+            valid = ", ".join(sorted(AGENT_SELECTORS))
+            parser.error(f"unknown opponent selector(s) {unknown}; choose from: {valid}")
+    return args
 
 
 def main(argv: list[str] | None = None) -> Path:
     """CLI entry: build a :class:`TrainConfig` from the args and run :func:`train_local`."""
     args = _parse_args(argv)
+    # --opponents omitted (None) -> let TrainConfig's DEFAULT_ROSTER default apply.
+    opponents_kwarg = {} if args.opponents is None else {"opponents": args.opponents}
     cfg = TrainConfig(
         total_timesteps=args.total_timesteps,
         game_config=args.config,
@@ -736,6 +785,13 @@ def main(argv: list[str] | None = None) -> Path:
         freeze_encoder=args.freeze_encoder,
         resume=args.resume,
         seed=args.seed,
+        opponent_strategy=args.opponent_strategy,
+        eval_freq=args.eval_freq,
+        eval_episodes=args.eval_episodes,
+        checkpoint_freq=args.checkpoint_freq,
+        game_port=args.port,
+        eval_port=args.eval_port,
+        **opponents_kwarg,
     )
     return train_local(cfg)
 
