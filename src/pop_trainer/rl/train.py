@@ -1310,6 +1310,12 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="PPO rollout length (the memory lever at n_envs>1; lower it for more envs).",
     )
     parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=TrainConfig.batch_size,
+        help="PPO batch size",
+    )
+    parser.add_argument(
         "--allow-oversized",
         action="store_true",
         help="skip the pre-flight rollout-buffer memory abort (the estimate is still printed).",
@@ -1397,6 +1403,7 @@ def main(argv: list[str] | None = None) -> Path:
         eval_episodes=args.eval_episodes,
         checkpoint_freq=args.checkpoint_freq,
         n_steps=args.n_steps,
+        batch_size=args.batch_size,
         allow_oversized=args.allow_oversized,
         game_port=args.port,
         eval_port=args.eval_port,
