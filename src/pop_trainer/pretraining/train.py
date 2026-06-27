@@ -32,6 +32,7 @@ from pop_trainer.pretraining.dataset import build_splits
 from pop_trainer.pretraining.decoder import StateDecoder
 from pop_trainer.pretraining.device import resolve_device
 from pop_trainer.pretraining.progress import ProgressReporter
+from pop_trainer.pretraining.sampler import ShardGroupedBatchSampler
 from pop_trainer.pretraining.targets import NormStats, presence_pos_weight
 
 __all__ = ["TrainConfig", "seed_everything", "train_one_epoch", "evaluate", "run", "main"]
@@ -195,8 +196,11 @@ def run(cfg: TrainConfig) -> dict:
     probe_opt = torch.optim.Adam(model.probe_parameters(), lr=cfg.lr)
     pos_weight = _fit_pos_weight(splits.train)
 
-    train_loader = _make_loader(
-        splits.train, cfg.batch_size, shuffle=True, num_workers=cfg.num_workers
+    train_sampler = ShardGroupedBatchSampler(
+        splits.train.sample_shards(), batch_size=cfg.batch_size, seed=cfg.seed
+    )
+    train_loader = DataLoader(
+        splits.train, batch_sampler=train_sampler, num_workers=cfg.num_workers
     )
     val_loader = _make_loader(
         splits.val, cfg.batch_size, shuffle=False, num_workers=cfg.num_workers
@@ -209,6 +213,7 @@ def run(cfg: TrainConfig) -> dict:
     total_steps = len(train_loader)
     loss_trajectory: list[dict[str, float]] = []
     for epoch in range(cfg.epochs):
+        train_sampler.set_epoch(epoch)
         reporter.epoch_start(epoch + 1, total_steps)
         epoch_losses = train_one_epoch(
             model,

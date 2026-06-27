@@ -50,6 +50,10 @@ training), per `__init__.py:19`.
 - [`pretraining.dataset`](../../src/pop_trainer/pretraining/dataset.py) — the
   [`DecodeDataset`](../../src/pop_trainer/pretraining/dataset.py), a shard-streaming torch
   `Dataset` over a decode-v1 dir. See [the dataset loader](#the-dataset-loader--map-aware-split).
+- [`pretraining.sampler`](../../src/pop_trainer/pretraining/sampler.py) — the
+  [`ShardGroupedBatchSampler`](../../src/pop_trainer/pretraining/sampler.py), a numpy-only
+  per-epoch batch sampler that keeps the TRAIN loader's shuffle cache-friendly. See
+  [the dataset loader](#the-dataset-loader--map-aware-split).
 - [`pretraining.device`](../../src/pop_trainer/pretraining/device.py) —
   [`resolve_device`](../../src/pop_trainer/pretraining/device.py): `--device auto` picks
   cuda > mps > cpu, so the same command runs on a 4090 unchanged with **no hardcoded device**
@@ -95,10 +99,40 @@ group key = `map_id`, so no map leaks across train/val/test, `dataset.py:192` �
   deterministic **area** interpolation (`dataset.py:45-61`). Frames are `uint8 (H,W,3)` →
   float32 `[0,1]` NCHW.
 - [`build_splits`](../../src/pop_trainer/pretraining/dataset.py) wires the index + split +
-  **TRAIN-only** `NormStats` consistently across the three views (`dataset.py:165-199`); `limit`
-  caps the total indexed samples (a deterministic evenly-strided subset) for smoke runs.
-  A last-read-shard cache means consecutive same-shard rows reuse one `.npz` read; frames are
-  never bulk-loaded into RAM (`dataset.py:78-91`).
+  **TRAIN-only** `NormStats` consistently across the three views (`dataset.py:174-208`); `limit`
+  caps the total indexed samples for smoke runs. The subset is **shard-local**: `_subset_index`
+  spreads the budget evenly across shards and keeps a **contiguous per-shard prefix** of rows
+  (not a global stride), so a smoke still touches each shard once per pass and preserves map
+  coverage (`dataset.py:211-240`).
+- A **single-entry shard cache** (`_ShardCache`, `dataset.py:78-91`) means consecutive same-shard
+  rows reuse one decompressed `.npz`; frames are never bulk-loaded into RAM. This cache is the
+  reason the TRAIN loader needs the shard-grouped sampler below.
+
+### Shard-grouped TRAIN sampler (cache-friendly shuffle)
+
+The TRAIN loader does **not** use plain `shuffle=True`. It drives the `DataLoader` through a
+[`ShardGroupedBatchSampler`](../../src/pop_trainer/pretraining/sampler.py) via `batch_sampler=`
+(`train.py:199-204`), `set_epoch(epoch)` called before each epoch (`train.py:216`).
+
+- **What it does** — each epoch it shuffles the **order of shards** and the **rows within each
+  shard** with an RNG seeded `(seed, epoch)`, then walks the rows shard-by-shard, cutting batches
+  of `batch_size`. **A batch never spans a shard boundary** (`sampler.py:73-82`). One epoch is a
+  full **permutation** of the train split's local indices — every sample exactly once, no
+  drops/dups (`drop_last` defaults False), just shard-grouped instead of globally shuffled.
+  `set_epoch` makes successive epochs differ; a fresh sampler at epoch 0 is deterministic
+  (`sampler.py:63-65`). It also exposes `__len__` (batch count) and `__iter__`, and is numpy-only.
+- **Where the grouping comes from** — the sampler is built over the int64 shard-id-per-local-index
+  array returned by [`DecodeDataset.sample_shards()`](../../src/pop_trainer/pretraining/dataset.py)
+  (`dataset.py:122-129`), so it groups on the dataset's own shard layout without reaching into the
+  view's private split positions.
+- **Why** — with the old global `shuffle=True`, consecutive `__getitem__` calls landed in
+  different shards, so **every row re-decompressed a whole `.npz`** against the single-entry cache
+  (a smoke ran ~17 min with the GPU idle). Shard-grouping makes consecutive samples hit the same
+  shard, so each shard decompresses **once per epoch** (cache hits for the rest) while keeping the
+  SGD benefit of shuffling.
+- **Val/test are unchanged** — they stay sequential (`shuffle=False`, `train.py:205-210`): already
+  shard-local, deterministic, and their metrics are order-independent, so they never needed the
+  sampler.
 
 ## The CLIs
 

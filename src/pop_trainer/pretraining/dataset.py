@@ -119,6 +119,15 @@ class DecodeDataset(Dataset):
         """The TRAIN-fit normalization stats this view applies (shared across splits)."""
         return self._stats
 
+    def sample_shards(self) -> np.ndarray:
+        """``(len(self),)`` int64 shard id per LOCAL index ``i`` (for shard-grouped sampling).
+
+        Lets a sampler group local indices by their backing shard so consecutive ``__getitem__``
+        calls hit the same ``.npz`` and the single-entry cache decompresses each shard once per
+        pass — without reaching into this view's private split positions.
+        """
+        return self._index.sample_shard[self._samples].astype(np.int64)
+
     def __len__(self) -> int:
         return int(self._samples.shape[0])
 
@@ -200,9 +209,26 @@ def build_splits(
 
 
 def _subset_index(index: readers.DatasetIndex, limit: int) -> readers.DatasetIndex:
-    """Deterministic evenly-strided subset of ``limit`` samples (keeps map coverage)."""
-    keep = np.linspace(0, len(index) - 1, num=limit, dtype=np.int64)
-    keep = np.unique(keep)
+    """Deterministic shard-local subset of ``<= limit`` samples (keeps map coverage, no thrash).
+
+    Distributes the budget evenly across the shards present in the index and keeps a CONTIGUOUS
+    per-shard PREFIX of rows from each (the index is built in shard order, so a shard's samples
+    are a contiguous block). Reading the subset still touches each shard once per pass instead of
+    striding across every shard per row. Every shard contributes at least one row whenever the
+    budget allows, preserving the map coverage the split needs.
+    """
+    shard_ids = index.sample_shard
+    present = np.unique(shard_ids)
+    quotas = readers.even_group_targets(present.shape[0], limit)
+    keep_parts: list[np.ndarray] = []
+    for shard, quota in zip(present, quotas, strict=True):
+        rows = np.nonzero(shard_ids == shard)[0]  # contiguous, ascending (shard-ordered index)
+        keep_parts.append(rows[:quota])
+    keep = (
+        np.sort(np.concatenate(keep_parts)).astype(np.int64)
+        if keep_parts
+        else np.empty(0, dtype=np.int64)
+    )
     return readers.DatasetIndex(
         shard_files=index.shard_files,
         map_ids=index.map_ids[keep],
