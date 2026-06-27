@@ -18,6 +18,7 @@ import argparse
 import json
 import math
 import random
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,7 +36,15 @@ from pop_trainer.pretraining.progress import ProgressReporter
 from pop_trainer.pretraining.sampler import ShardGroupedBatchSampler
 from pop_trainer.pretraining.targets import NormStats, presence_pos_weight
 
-__all__ = ["TrainConfig", "seed_everything", "train_one_epoch", "evaluate", "run", "main"]
+__all__ = [
+    "TrainConfig",
+    "seed_everything",
+    "should_eval_epoch",
+    "train_one_epoch",
+    "evaluate",
+    "run",
+    "main",
+]
 
 _NATIVE_HEIGHT = 360
 _NATIVE_WIDTH = 640
@@ -58,6 +67,25 @@ class TrainConfig:
     subset: int | None = None
     num_workers: int = 0
     progress: bool = True
+    eval_every: int = 1
+
+
+def should_eval_epoch(epoch: int, *, eval_every: int, total_epochs: int) -> bool:
+    """PURE: should periodic val eval run at the end of ``epoch`` (0-based)?
+
+    Returns True when ``eval_every > 0`` AND (``epoch`` is a multiple of ``eval_every``
+    OR ``epoch`` is the final epoch ``total_epochs - 1``).
+
+    When ``eval_every <= 0`` returns False for ALL epochs, including the final one — the
+    periodic val curve is fully disabled and the existing end-of-run eval (called after the
+    loop) is the sole evaluation. This makes the behavior of ``--eval-every 0`` identical to
+    the pre-change code: no extra compute, ``val_trajectory`` stays empty.
+
+    No I/O, no tensors.
+    """
+    if eval_every <= 0:
+        return False
+    return (epoch % eval_every == 0) or (epoch == total_epochs - 1)
 
 
 def seed_everything(seed: int) -> None:
@@ -212,6 +240,7 @@ def run(cfg: TrainConfig) -> dict:
     reporter = ProgressReporter(total_epochs=cfg.epochs, enabled=cfg.progress)
     total_steps = len(train_loader)
     loss_trajectory: list[dict[str, float]] = []
+    val_trajectory: list[dict] = []
     for epoch in range(cfg.epochs):
         train_sampler.set_epoch(epoch)
         reporter.epoch_start(epoch + 1, total_steps)
@@ -226,6 +255,29 @@ def run(cfg: TrainConfig) -> dict:
         )
         reporter.epoch_close()
         loss_trajectory.append(epoch_losses)
+
+        # Periodic val eval: train_one_epoch calls model.train() at its start, so evaluating
+        # here (which calls model.eval() + no_grad) is safe — the next epoch re-enters train
+        # mode unconditionally.
+        if should_eval_epoch(epoch, eval_every=cfg.eval_every, total_epochs=cfg.epochs):
+            ep_val = evaluate(model, val_loader, device, splits.stats)
+            val_trajectory.append({"epoch": epoch, **_sanitize(ep_val)})
+            # Print the val line to stderr regardless of --progress: it is low-frequency
+            # (once per eval_every epochs) and is the primary convergence signal for the run.
+            sp = ep_val.get("spatial", {})
+            pos_err = sp.get("player_position", float("nan"))
+            aim_err = sp.get("player_aim", float("nan"))
+            pres_f1 = sp.get("bullet_presence", {})
+            if isinstance(pres_f1, dict):
+                pres_f1 = pres_f1.get("f1", float("nan"))
+            print(
+                f"[val] epoch {epoch}"
+                f"  pos={_finite(pos_err):.4f}"
+                f"  aim={_finite(aim_err):.2f}°"
+                f"  presence_f1={_finite(pres_f1):.4f}",
+                file=sys.stderr,
+                flush=True,
+            )
 
     val_metrics = evaluate(model, val_loader, device, splits.stats)
     test_metrics = evaluate(model, test_loader, device, splits.stats)
@@ -251,6 +303,7 @@ def run(cfg: TrainConfig) -> dict:
         "n_val": len(splits.val),
         "n_test": len(splits.test),
         "loss_trajectory": [{k: _finite(v) for k, v in e.items()} for e in loss_trajectory],
+        "val_trajectory": _sanitize(val_trajectory),
         "val_metrics": _sanitize(val_metrics),
         "test_metrics": _sanitize(test_metrics),
         "norm_stats": splits.stats.to_json(),
@@ -271,6 +324,7 @@ def _config_json(cfg: TrainConfig) -> dict:
         "lr": cfg.lr,
         "seed": cfg.seed,
         "subset": cfg.subset,
+        "eval_every": cfg.eval_every,
     }
 
 
@@ -317,6 +371,15 @@ def main(argv: list[str] | None = None) -> int:
         default=True,
         help="show a live tqdm bar (TTY) or throttled progress lines (captured); on by default.",
     )
+    parser.add_argument(
+        "--eval-every",
+        type=int,
+        default=1,
+        help=(
+            "run val eval every K epochs and record a val_trajectory curve. "
+            "Default 1 (every epoch). 0 disables periodic eval (end-of-run eval unchanged)."
+        ),
+    )
     args = parser.parse_args(argv)
 
     cfg = TrainConfig(
@@ -333,6 +396,7 @@ def main(argv: list[str] | None = None) -> int:
         subset=args.subset,
         num_workers=args.num_workers,
         progress=args.progress,
+        eval_every=args.eval_every,
     )
     record = run(cfg)
 
