@@ -39,18 +39,18 @@ Nothing internal. Just `torch` (a leaf alongside [core](core.md) in the dependen
 
 ## Pushes to (downstream)
 
-Nothing internal **yet** — the consumers are not built:
-
-- (Future `pretraining` reads `Encoder.features` for the supervised-decode heads.)
-- (Future `rl` reads `Encoder.embed` as the policy/value feature extractor.)
+- [pretraining](pretraining.md) — the single-frame decoder reads `Encoder.features` for its
+  encoder-training spatial heads and `Encoder.embed` (detached) for the pooling probe, via
+  `build_encoder` / `EncoderConfig`. It is the first real consumer, and it trains this encoder.
+- (Future `rl` reads `Encoder.embed` as the policy/value feature extractor — not built yet.)
 - Unity-Sentis runs the exported ONNX graph at deploy.
 
 ## Where it sits in the run
 
-Off to the side of the live loop today: the encoder is the standardized vision backbone that
-the (not-yet-built) pretraining and RL phases will share, and the deployable ONNX artifact. It
-consumes the pixel frames that [env](env.md) produces and [data](data.md) records, but only once
-those consumers exist.
+Off to the side of the live loop: the encoder is the standardized vision backbone that
+[pretraining](pretraining.md) trains (and the future RL phase will share), plus the deployable
+ONNX artifact. It consumes the pixel frames that [env](env.md) produces and [data](data.md)
+records, by way of the pretraining harness streaming that corpus.
 
 ---
 [← back to index](../README.md)

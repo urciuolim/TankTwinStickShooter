@@ -282,8 +282,9 @@ There are two ways to add a description:
 On-disk `.npz` shard artifacts + a dataset index + the run-root `maps.json` / `manifest.json`
 fingerprint — **not** via imports:
 
-- (Future `pretraining` streams shards via the schema for the inverse-render / supervised-decode
-  training.)
+- [pretraining](pretraining.md) streams these shards (via `readers.DatasetIndex` + the map-aware
+  `split`, the `schema` array names, and `shards`) to train the single-frame decoder — the first
+  real consumer of the decode-v1 corpus.
 - The [`manifest.json`](#the-run-root-manifestjson-dataset-fingerprint) is the dataset's identity
   card for whoever later consumes / compares the corpus.
 

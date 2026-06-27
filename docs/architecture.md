@@ -8,7 +8,7 @@ The cross-component class-to-class interaction map for the built + GO'd slice of
 `models` imports nothing internal (a leaf alongside `core`). The full direction:
 
 ```
-core  ←  { models, env, agents, data }  ←  demo
+core  ←  { models, env, agents, data }  ←  { demo, pretraining }
 ```
 
 - [core](components/core.md) — stdlib + numpy only; imports nothing internal.
@@ -17,10 +17,12 @@ core  ←  { models, env, agents, data }  ←  demo
 - [agents](components/agents.md) — imports `core` (+ numpy).
 - [data](components/data.md) — imports `core`, `env`, `agents`.
 - [demo](components/demo.md) — imports `core`, `env`, `agents`.
+- [pretraining](components/pretraining.md) — imports `core`, `models`, `data` (+ torch, numpy);
+  nothing from `env` / `rl`.
 
-No import cycles: `data` and `demo` sit at the top, `core` at the bottom, `models` off to the
-side. (`pretraining` / `rl` / `eval` / `population` / `deployment` / `imitation` are not built
-yet and are omitted.)
+No import cycles: `data` / `demo` / `pretraining` sit at the top, `core` at the bottom, `models`
+off to the side. (`rl` / `eval` / `population` / `deployment` / `imitation` are not built yet and
+are omitted.)
 
 ## Class-to-class interaction map
 
@@ -53,6 +55,13 @@ graph TD
         Collect["collect.py<br/>run_episode / collect_to_shards /<br/>resolve_map_tag / collect_parallel"]
         Shards["shards.py / schema.py"]
         Readers["readers.py<br/>split_groups / build_index"]
+    end
+
+    subgraph pretraining["pretraining (single-frame decoder harness)"]
+        Decoder["decoder.py<br/>StateDecoder = Encoder +<br/>spatial heads + detached probe"]
+        Targets["targets.py / losses.py / metrics.py<br/>(per-group target / loss / metric)"]
+        DecodeDS["dataset.py<br/>DecodeDataset / build_splits"]
+        TrainCLI["train.py / profile.py (CLI)"]
     end
 
     Demo["demo.py<br/>run_demo_episode / main"]
@@ -99,6 +108,15 @@ graph TD
     Demo --> Protocol
     Demo --> Launch
 
+    %% pretraining wiring (offline; decoupled from env by the dataset)
+    TrainCLI --> Decoder
+    TrainCLI --> DecodeDS
+    Decoder -->|"features (GAP) +<br/>embed.detach"| Encoder
+    Decoder --> Targets
+    DecodeDS -->|"reuses DatasetIndex.split<br/>(map-aware)"| Readers
+    DecodeDS --> Targets
+    Targets --> State
+
     classDef root fill:#d4edda,stroke:#28a745;
     class core root;
 ```
@@ -135,8 +153,17 @@ graph TD
   each sample's `map_id` from the arena Unity **echoed** (the F5 tag-from-echo), decoded through the
   `maps.json` sidecar / `map_index`. See
   [data](components/data.md#the-rotation-scheduler--map-tagging).
-- **`models` is detached** from the live loop today — it's the shared vision backbone the
-  future `pretraining` / `rl` will consume, and the deployable ONNX artifact.
+- **`models` is detached** from the live loop — it's the shared vision backbone
+  [`pretraining`](components/pretraining.md) trains (and the future `rl` will consume), and the
+  deployable ONNX artifact.
+- **`pretraining` is the offline arm.** `StateDecoder` wraps a `build_encoder` [`Encoder`](components/models.md)
+  and decodes the 52-float state from one frame: the **spatial heads** read `Encoder.features`
+  (GAP'd, grad flows to the encoder — the artifact trains here) while the **detached embed-probe**
+  reads `Encoder.embed.detach()` (encoder-frozen, measuring how much state survives pooling).
+  `DecodeDataset` streams [`data`](components/data.md)'s decode-v1 shards and **reuses**
+  `DatasetIndex.split` (map-aware, no reimplementation); targets are carved via the
+  [`core.state`](components/core.md) named accessors. It imports nothing from `env` / `rl` — the
+  dataset decouples it from the live engine. See [pretraining](components/pretraining.md).
 
 ---
 [← back to index](README.md)

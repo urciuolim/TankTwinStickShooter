@@ -13,9 +13,9 @@ end to end via the [runbook](runbook.md).
 ## What's here today
 
 The built + GO'd slice of the target architecture. The dependency direction is
-**`core ← {models, env, data, agents} ← demo`** — `core` is the dependency-free root and every
-component points inward toward it. (`pretraining` / `rl` / `eval` / `population` / `deployment`
-/ `imitation` are namespace placeholders, not yet built — not documented here.)
+**`core ← {models, env, data, agents} ← {data, demo, pretraining}`** — `core` is the
+dependency-free root and every component points inward toward it. (`rl` / `eval` / `population` /
+`deployment` / `imitation` are namespace placeholders, not yet built — not documented here.)
 
 ## Component map at a glance
 
@@ -27,6 +27,7 @@ graph TD
     agents["agents<br/>map-aware coverage policies"]
     data["data<br/>dataset pipeline"]
     demo["demo<br/>runnable entry point"]
+    pretraining["pretraining<br/>single-frame decoder harness"]
     unity["Unity sim<br/>(TCP-JSON + pixel frames)"]
 
     env --> core
@@ -38,6 +39,9 @@ graph TD
     demo --> core
     demo --> env
     demo --> agents
+    pretraining --> core
+    pretraining --> models
+    pretraining --> data
     env <-->|socket| unity
 
     classDef root fill:#d4edda,stroke:#28a745;
@@ -57,6 +61,7 @@ internal — it only shares `core`'s place as a leaf the future `pretraining` / 
 | [agents](components/agents.md) | The model-free decision-makers: the map-aware `CoverageAgent` family (+ presets) + the `RandomAgent` baseline + the coverage-measurement harness. |
 | [data](components/data.md) | The dataset pipeline: a multi-worker collection CLI (`collect_runner`) → `(frame, state, action)` samples → shards → map-aware splits. |
 | [demo](components/demo.md) | `python -m pop_trainer.demo` — launch the live build and watch two agents play. |
+| [pretraining](components/pretraining.md) | The single-frame decoder harness: a supervised inverse-renderer that decodes the 52-float state from one pixel frame (`StateDecoder` = encoder + spatial heads + detached embed-probe), training the reusable encoder artifact. |
 
 - [Architecture](architecture.md) — the cross-component class-to-class interaction map.
 - [Runbook](runbook.md) — clone → `uv sync` → build the Unity game → run the demo / collection.
