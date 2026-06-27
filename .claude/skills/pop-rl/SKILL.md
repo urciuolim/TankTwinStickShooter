@@ -45,4 +45,4 @@ description: Contract + boundaries for the rl/ component of src/pop_trainer. Loa
 `state_dict` itself; there is NO `models.from_pretrained`). The opponent roster reaches the scripted
 agents through the canonical `agents` registry, NOT through `data`. No cycles.
 
-**Inspiration (do NOT copy):** `reference/tank_twin_m1/{train,evaluate,callbacks,elo}.py`; the 2021 `PythonScripts/` PPO scripts.
+**Inspiration (do NOT copy):** the 2021 PPO trainer + the M1 `tank_twin` reference trainer (train / evaluate / callbacks / elo). Both are retired — read them in git history if you need the intent. Build the algorithm fresh.

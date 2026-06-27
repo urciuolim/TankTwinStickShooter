@@ -18,7 +18,7 @@ from pop_trainer.agents.coverage_metrics import (
 )
 from pop_trainer.core.protocol import WallDims, WallLayout
 
-ARENA_DIR = Path(__file__).resolve().parents[3] / "exp-configs" / "maps" / "Arenas"
+ARENA_DIR = Path(__file__).resolve().parents[3] / "Assets" / "StreamingAssets" / "Arenas"
 
 
 def _layout_from_arena(name: str) -> WallLayout:

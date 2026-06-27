@@ -17,7 +17,7 @@ from pop_trainer.agents.coverage_metrics import measure_coverage
 from pop_trainer.core import state as S
 from pop_trainer.core.protocol import WallDims, WallLayout
 
-ARENA_DIR = Path(__file__).resolve().parents[3] / "exp-configs" / "maps" / "Arenas"
+ARENA_DIR = Path(__file__).resolve().parents[3] / "Assets" / "StreamingAssets" / "Arenas"
 HARD_MAPS = ("center_block", "central_cross", "chokepoint", "scattered")
 
 
@@ -268,8 +268,11 @@ def test_family_beats_random_on_hard_maps(map_name):
 
 
 def test_family_beats_random_on_all_arenas():
-    # A broader sweep across every shipped arena (not just the hard ones) — the family wins
-    # everywhere by mean coverage.
+    # A broader sweep across every shipped arena (not just the hard ones) — the family is never
+    # beaten by Random, and wins strictly wherever the arena has coverage HEADROOM. On a
+    # degenerate arena whose reachable floor is tiny enough that BOTH agents saturate to full
+    # coverage (e.g. the nowin_test game fixture), the result is a genuine tie, not a family
+    # weakness — so strict superiority is required only when Random has not already saturated.
     for arena in ARENA_DIR.glob("*.json"):
         layout = _layout_from_arena(arena.stem)
         fam = np.mean(
@@ -284,7 +287,12 @@ def test_family_beats_random_on_all_arenas():
                 for s in range(3)
             ]
         )
-        assert fam > rnd, f"{arena.stem}: family {fam:.3f} <= random {rnd:.3f}"
+        if rnd >= 1.0:
+            # Random already covers everything reachable — the family cannot beat a perfect
+            # score; assert it at least matches (never worse).
+            assert fam >= rnd, f"{arena.stem}: family {fam:.3f} < random {rnd:.3f} (saturated)"
+        else:
+            assert fam > rnd, f"{arena.stem}: family {fam:.3f} <= random {rnd:.3f}"
 
 
 # --- RandomAgent (kept) ----------------------------------------------------------------------

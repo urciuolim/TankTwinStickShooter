@@ -127,5 +127,5 @@ open-loop sweeps and the tactical rules are SUBSUMED by the one family + its aim
 the `opponent-shadower` preset. `RandomAgent` is the only pre-redesign agent kept.
 
 **Inspiration (do NOT copy):** `.scratch/coverage_sim.py` (the `OccupancyBiased` spike, K=4,
-eps=0.02, prefer-near — the production target) + `.scratch/tune.py` (the preset sweep); 2021
-`PythonScripts/` opponent policies. The behaviour we trust is the ALGORITHM, not the spike code.
+eps=0.02, prefer-near — the production target) + `.scratch/tune.py` (the preset sweep); the 2021
+opponent policies (retired to git history). The behaviour we trust is the ALGORITHM, not the spike code.

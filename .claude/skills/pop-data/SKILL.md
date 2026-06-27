@@ -23,4 +23,4 @@ Tests cover the progress plumbing WITHOUT live workers: the per-episode counting
 
 **Boundaries:** imports `core`, `env` (the gym wrapper), and `agents` (the policies it drives collection with — the rule policies live in `agents/`, not here). Imports nothing from `models / pretraining / rl`. Dependency direction: `core ← {env, agents} ← data`. Communicates downstream ONLY via dataset artifacts on disk. The package is named `data/` — **NOT `datasets/`** (collides with the git-ignored data dir).
 
-**Inspiration (do NOT copy):** the 2021 `PythonScripts/` data-collection scripts.
+**Inspiration (do NOT copy):** the 2021 data-collection scripts (retired to git history).

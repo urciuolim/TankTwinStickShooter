@@ -10,16 +10,6 @@
 /[Bb]uilds/
 /[Ll]ogs/
 /[Mm]emoryCaptures/
-/PythonScripts/*test*/
-/PythonScripts/gamelog*
-/PythonScripts/*env*
-/PythonScripts/__pycache__/
-/PythonScripts/*.npz
-/PythonScripts/old_image_based/*
-/PythonScripts/agent_db/*
-/PythonScripts/*agent_db*/*
-/PythonScripts/*.png
-!/PythonScripts/*.py
 *.rar
 
 # Asset meta data should only be ignored when the corresponding asset is also ignored
@@ -91,6 +81,7 @@ __pycache__/
 *.py[cod]
 # generated artifacts (cleanup)
 .coverage
+.coverage_py
 *.log
 /gamelog*.txt
 /scripts/*.out

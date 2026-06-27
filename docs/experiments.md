@@ -1,7 +1,7 @@
 # Arena (map) JSON format
 
 The reference for the arena-config JSON the Unity build loads — the `"Floor"` / `"Walls"`
-geometry every map under `exp-configs/maps/Arenas/` and `Assets/StreamingAssets/Arenas/` uses.
+geometry every map under `Assets/StreamingAssets/Arenas/` uses.
 This is the same `Walls` shape that Unity's [`WallMessage.Build`](../Assets/Scripts/WallMessage.cs)
 emits and that `pop_trainer`'s [`core.protocol.parse_walls_message`](../src/pop_trainer/core/protocol.py)
 parses into a `WallLayout` (see the [core seam writeup](components/core.md#the-wall-message--protocol-seam-walllayout--infomap)).
@@ -93,6 +93,6 @@ Copy it verbatim into `Arenas/tiny.json`:
 at rows `-1, 0`.)
 
 ---
-The curated map + reward sets live under `exp-configs/` (see `exp-configs/README.md`).
+The curated map configs live under `exp-configs/` (see `exp-configs/README.md`).
 
 [← back to index](README.md)
