@@ -16,15 +16,11 @@ from pop_trainer.pretraining.progress import (
 
 def test_should_emit_first_call_always():
     # No prior emit -> emit (the first line of the epoch always lands).
-    assert should_emit(
-        now=0.0, last_emit_time=None, throttle_seconds=5.0, step=1, total_steps=10
-    )
+    assert should_emit(now=0.0, last_emit_time=None, throttle_seconds=5.0, step=1, total_steps=10)
 
 
 def test_should_emit_after_throttle_elapsed():
-    assert should_emit(
-        now=10.0, last_emit_time=4.0, throttle_seconds=5.0, step=3, total_steps=10
-    )
+    assert should_emit(now=10.0, last_emit_time=4.0, throttle_seconds=5.0, step=3, total_steps=10)
 
 
 def test_should_not_emit_mid_throttle():
@@ -36,9 +32,7 @@ def test_should_not_emit_mid_throttle():
 
 def test_should_emit_on_final_step_despite_throttle():
     # Final step lands even though we are mid-throttle, so the last line is never lost.
-    assert should_emit(
-        now=4.5, last_emit_time=4.0, throttle_seconds=5.0, step=10, total_steps=10
-    )
+    assert should_emit(now=4.5, last_emit_time=4.0, throttle_seconds=5.0, step=10, total_steps=10)
 
 
 def test_format_duration():
