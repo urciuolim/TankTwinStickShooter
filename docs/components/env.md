@@ -21,7 +21,15 @@ nothing from `models` / `data` / `agents` / the Unity-side code.
   - `ACTION_DIM = 5`: the action is `[move_x, move_y, aim_x, aim_y, fire]` in `[-1, 1]`.
   - **Injected transport** (`connection` or `connection_factory`), exactly like
     `core.protocol.Connection` — so the env is unit-testable against an in-process fake socket
-    with no live Unity. `connection_factory` also enables reconnect after a dropped connection.
+    with no live Unity. `connection_factory` also enables **lazy launch**, **reconnect** after a
+    dropped connection, and **re-launch** after `release()` — see
+    [Instance lifecycle](#instance-lifecycle-lazy-launch--release--kill-old-first-reconnect).
+  - **Injected reap hook** (`reap=`), exactly like the transport: a `Callable[[object], None]`
+    that hard-kills a `Popen`-like build process. The env stays `core`-only — it never imports a
+    subprocess reap; the caller injects it ([rl](rl.md) injects `reap=_terminate`), and the env
+    reads the live process off `getattr(self.conn, "_launch_proc", None)` and calls
+    `reap(proc)` from `release()` / the kill-old-first reconnect (`tank_env.py:182-188,626-648`).
+    `reap=None` (the pure-test default) skips the proc-kill and only closes the transport.
   - **Optional observability** (`logger=` / `role=`). Both default off: `logger=None` is the
     behavior-identical, allocation-free hot path (the `_log` helper early-returns when no logger
     is attached — `tank_env.py:186-187,210-211,235-246`). When a `logging.Logger` is passed the
@@ -58,6 +66,39 @@ swap) and `player2_state()` (`split_state_for_opponent` on the latest raw state,
 > **Seam unchanged.** The wire shape is **byte-identical** to the frozen RL seam — only the
 > *source* of `a2` moved from env-internal to the caller. Integer keys `1` / `2`, length-5 `[-1, 1]`
 > actions, unchanged player1 path.
+
+## Instance lifecycle (lazy launch / `release` / kill-old-first reconnect)
+
+The env owns the **live Unity instance's lifecycle** — start it lazily, hard-kill it, and survive a
+dropped socket — but it does it through the **injected** `connection_factory` + `reap` hook, so the
+env itself stays `core`-only and launches nothing on its own.
+
+- **Lazy launch.** Constructed with a `connection_factory`, the env launches **NO** Unity at
+  construction: `self.conn is None`, `is_running` is `False`. The factory is invoked LAZILY on the
+  first `reset` (and guarded again in `step`) via `_ensure_connected` (`tank_env.py:75-81,288-292,613-624`).
+  So a caller can construct **many** envs cheaply and pay the Unity-launch cost only when an env is
+  actually driven. (A bare `connection` is "running" from construction, the old behaviour.)
+- **`release()` — hard-kill + reclaim.** `release()` hard-kills the live Unity child via the injected
+  reap hook (the proc read off `getattr(self.conn, "_launch_proc", None)`), closes the transport, and
+  sets `self.conn = None` (`tank_env.py:569-588,626-648`). Unlike `close()` it does **NOT** do the
+  graceful end handshake — the point is to reclaim a possibly-**stalled** instance that would not
+  answer it. It is **idempotent**, **never touches the `-logFile`**, and the env **OBJECT stays
+  alive**: the next `reset` lazily re-launches via the factory. (This is the primitive
+  [rl](rl.md#the-no-coexist-eval-cycle)'s eval cycle uses to tear instances down.)
+- **Kill-old-first reconnect.** On a dropped connection (`step`/`reset` catch `ConnectionError`)
+  `_reconnect` kills/reaps the **OLD** instance to free its port **BEFORE** launching the new one
+  (`tank_env.py:650-671`). The **order is load-bearing**: a dropped socket may leave the old Unity
+  alive-but-stalled, still bound to its port, so relaunching before reaping would collide on bind.
+  This is what makes the intermittent multi-env training stall **survivable** — the run recovers
+  instead of wedging. (A bare-`connection` env with no factory is left "not running" and the next
+  wire op re-raises.) It does **NOT** fix the underlying C# reset-region root cause of the stall — it
+  recovers from it.
+
+> **Logfile safety.** `release` / `_reconnect` only kill the process and close the socket — they
+> NEVER write, truncate, or re-point any Unity `-logFile` (that arg lives entirely in the caller's
+> launch command). The prior instance's C# log is left intact for post-mortem
+> (`tank_env.py:97-99`). The [rl](rl.md#per-attempt-logfiles) factory points each launch at a
+> DISTINCT `unity-<role>-<port>-<attempt>.log`, so a respawn never truncates a prior log either.
 
 ## Map tracking (`info["map"]`)
 
@@ -103,7 +144,8 @@ routes every inbound object by tag regardless of read order (`tank_env.py:239-30
 - `terminated` — the game decided the round (a winner, or a bare `done`).
 - `truncated` — `max_steps` reached on an undecided step, **OR** a lost connection. A dropped
   connection (`core.protocol` raises `ConnectionError`) becomes a `truncated` step with reward
-  `0.0` and `info["lost_connection"] = True`, then the env reconnects via the factory.
+  `0.0` and `info["lost_connection"] = True`, then the env **kill-old-first** reconnects via the
+  factory (see [Instance lifecycle](#instance-lifecycle-lazy-launch--release--kill-old-first-reconnect)).
 
 ## Pulls from (upstream)
 
@@ -117,9 +159,12 @@ routes every inbound object by tag regardless of read order (`tank_env.py:239-30
 - [data](data.md) — collection drives `TankEnv` (the same observation pipeline RL trains on), and
   rotates the arena per episode via `reset(options={"switch_arena": ...})`.
 - [demo](demo.md) — constructs a `TankEnv` over a live socket and runs one episode.
-- [rl](rl.md) — consumes `TankEnv` as both its training env and a dedicated eval env (each over its
-  own live socket): `SelfPlayWrapper` wraps it for PPO training, and `evaluate_winrate` re-wraps a
-  second `TankEnv` for periodic win-rate eval. (Built — the M1 `train_local` trainer.)
+- [rl](rl.md) — consumes `TankEnv` as both its training set and a **same-width** (`M_eval ==
+  N_train`) eval set, each over its own live socket and on a **disjoint port block**:
+  `SelfPlayWrapper` wraps each for PPO training, and `evaluate_winrate` re-wraps the eval envs for
+  periodic **parallel** win-rate eval. The eval cycle uses `release()` to time-multiplex the two
+  sets so they **never coexist**, and `connection_factory`'s **lazy launch** is what makes that
+  cheap. (Built — the M1 `train_local` trainer.)
 
 ## Where it sits in the run
 

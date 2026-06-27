@@ -659,3 +659,219 @@ def test_reset_reconnects_and_retries_once_on_dropped_handshake():
     env = TankEnv(connection_factory=factory)
     _, info = env.reset(seed=0)
     assert info["state"] == raw_ok
+
+
+# --- lazy lifecycle / release / reap hook / kill-old-first reconnect ---------------------
+
+
+class _FakeProc:
+    """A subprocess.Popen stand-in: records terminate/kill; poll reports running until reaped.
+
+    Copied locally (not imported from the rl test) so the env test owns no rl dependency.
+    """
+
+    def __init__(self) -> None:
+        self.terminated = False
+        self.killed = False
+        self._dead = False
+
+    def poll(self):
+        return 0 if self._dead else None
+
+    def terminate(self):
+        self.terminated = True
+        self._dead = True
+
+    def wait(self, timeout=None):
+        return 0
+
+    def kill(self):
+        self.killed = True
+        self._dead = True
+
+
+def test_factory_not_called_at_construction_and_env_not_running():
+    # LAZY: a connection_factory is NOT invoked in __init__; the env is "not running" until reset.
+    calls = []
+
+    def factory():
+        calls.append(1)
+        return P.Connection(ScriptedTransport(_reset_blobs(_flat_state())))
+
+    env = TankEnv(connection_factory=factory)
+    assert calls == []  # never called at construction
+    assert env.is_running is False
+    assert env.conn is None
+
+
+def test_first_reset_lazily_launches_via_factory():
+    # The factory IS called exactly once on the first reset, and is_running flips True.
+    raw = [float(i) for i in range(S.STATE_LEN)]
+    calls = []
+
+    def factory():
+        calls.append(1)
+        return P.Connection(ScriptedTransport(_reset_blobs(raw)))
+
+    env = TankEnv(connection_factory=factory)
+    assert env.is_running is False
+    _, info = env.reset(seed=0)
+    assert calls == [1]  # launched exactly once on the first reset
+    assert env.is_running is True
+    assert info["state"] == raw
+
+
+def test_bare_connection_is_running_from_construction():
+    # The bare-connection seam is UNCHANGED: running from construction, factory path untouched.
+    env, _ = _make_env([])
+    assert env.is_running is True
+    assert env.conn is not None
+
+
+def test_release_reaps_proc_closes_transport_and_stops_running():
+    # RELEASE on a running env: reaps the stashed proc, closes the transport, is_running -> False.
+    raw = _flat_state()
+    transport = ScriptedTransport(_reset_blobs(raw))
+    proc = _FakeProc()
+
+    def factory(_transport=transport, _proc=proc):
+        conn = P.Connection(_transport)
+        conn._launch_proc = _proc
+        return conn
+
+    reaped = []
+    env = TankEnv(connection_factory=factory, reap=lambda p: reaped.append(p))
+    env.reset(seed=0)
+    assert env.is_running is True
+
+    env.release()
+    assert reaped == [proc]  # the stashed proc was reaped via the hook
+    assert transport.closed is True  # the transport was closed
+    assert env.is_running is False
+    assert env.conn is None
+
+
+def test_release_is_idempotent():
+    # A second release is a no-op: the reap hook is NOT called again.
+    raw = _flat_state()
+    proc = _FakeProc()
+
+    def factory():
+        conn = P.Connection(ScriptedTransport(_reset_blobs(raw)))
+        conn._launch_proc = proc
+        return conn
+
+    reaped = []
+    env = TankEnv(connection_factory=factory, reap=lambda p: reaped.append(p))
+    env.reset(seed=0)
+    env.release()
+    assert len(reaped) == 1
+    env.release()  # already not running -> no-op
+    assert len(reaped) == 1
+    assert env.is_running is False
+
+
+def test_reset_after_release_relaunches_via_factory():
+    # The env OBJECT stays usable: a reset after release re-launches via the factory.
+    raw_first = _flat_state(0.0)
+    raw_again = _flat_state(2.0)
+    scripts = iter([_reset_blobs(raw_first), _reset_blobs(raw_again)])
+    calls = []
+
+    def factory():
+        calls.append(1)
+        conn = P.Connection(ScriptedTransport(next(scripts)))
+        conn._launch_proc = _FakeProc()
+        return conn
+
+    env = TankEnv(connection_factory=factory, reap=lambda p: p.terminate())
+    _, info1 = env.reset(seed=0)
+    assert info1["state"] == raw_first
+    env.release()
+    assert env.is_running is False
+    _, info2 = env.reset(seed=0)  # re-launches via the factory
+    assert calls == [1, 1]  # factory invoked again on the post-release reset
+    assert env.is_running is True
+    assert info2["state"] == raw_again
+
+
+def test_release_with_reap_none_closes_transport_without_proc_kill():
+    # reap=None: release closes the transport, does not crash, and attempts no proc-kill.
+    raw = _flat_state()
+    transport = ScriptedTransport(_reset_blobs(raw))
+    proc = _FakeProc()
+
+    def factory(_transport=transport, _proc=proc):
+        conn = P.Connection(_transport)
+        conn._launch_proc = _proc  # a proc is stashed, but reap=None must ignore it
+        return conn
+
+    env = TankEnv(connection_factory=factory)  # reap defaults to None
+    env.reset(seed=0)
+    env.release()
+    assert transport.closed is True
+    assert proc.terminated is False  # no proc-kill attempted with reap=None
+    assert env.is_running is False
+
+
+def test_reconnect_kills_old_proc_before_launching_new():
+    # KILL-OLD-FIRST: the old (possibly stalled) instance is reaped BEFORE the new build launches.
+    raw = _flat_state()
+    order = []
+
+    old_proc = _FakeProc()
+
+    def factory():
+        order.append("launch")
+        conn = P.Connection(ScriptedTransport(_reset_blobs(raw)))
+        conn._launch_proc = _FakeProc()
+        return conn
+
+    def reap(_proc):
+        order.append("reap")
+
+    env = TankEnv(connection_factory=factory, reap=reap)
+    env.reset(seed=0)  # launch #1
+    assert order == ["launch"]
+    # Stash a known OLD proc on the current conn, then force a reconnect.
+    env.conn._launch_proc = old_proc
+    order.clear()
+    env._reconnect()
+    # The old proc was reaped FIRST, THEN the new build was launched.
+    assert order == ["reap", "launch"]
+    assert env.is_running is True
+
+
+def test_reconnect_with_no_factory_is_noop():
+    # A bare connection (no factory) cannot reconnect: documented no-op, conn left in place.
+    raw = _flat_state()
+    env, _ = _make_env(_reset_blobs(raw))
+    env.reset(seed=0)
+    before = env.conn
+    env._reconnect()  # no factory -> no-op
+    assert env.conn is before
+    assert env.is_running is True
+
+
+def test_step_lost_connection_reconnect_reaps_old_then_relaunches():
+    # The lost-connection step path uses kill-old-first reconnect: with reap + factory the old
+    # proc is reaped and a fresh conn is created; the next reset reads the new connection's state.
+    raw0 = _flat_state(0.0)
+    raw_again = _flat_state(5.0)
+    scripts = iter([_reset_blobs(raw0), _reset_blobs(raw_again, fill=(4, 5, 6))])
+    reaped = []
+
+    def factory():
+        conn = P.Connection(ScriptedTransport(next(scripts)))
+        conn._launch_proc = _FakeProc()
+        return conn
+
+    env = TankEnv(connection_factory=factory, reap=lambda p: reaped.append(p))
+    env.reset(seed=0)
+    old_proc = env.conn._launch_proc
+    _, _, _, truncated, info = env.step(np.zeros(ACTION_DIM, dtype=np.float32))
+    assert truncated is True
+    assert info["lost_connection"] is True
+    assert reaped == [old_proc]  # the old build was reaped on reconnect
+    _, info2 = env.reset(seed=0)
+    assert info2["state"] == raw_again

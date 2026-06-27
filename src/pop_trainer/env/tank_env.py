@@ -72,6 +72,32 @@ drive a fake socket with canned ``state`` + frame bytes — NO live Unity build 
 required. The real production path (a TCP socket to a launched Unity build) is out of scope
 for this component and is supplied by the caller via ``connection_factory``.
 
+Lazy training-instance lifecycle: with a bare ``connection`` the env is "running" from
+construction (``self.conn`` is that connection). With a ``connection_factory`` the env
+constructs WITHOUT launching anything -- ``self.conn`` is ``None`` ("not running") and the
+factory is invoked LAZILY on the first ``reset`` (guarded again in ``step``) via
+:meth:`_ensure_connected`. :attr:`is_running` (``self.conn is not None``) is queryable at any
+time. This lets a caller construct many envs cheaply and pay the Unity-launch cost only when a
+training instance is actually driven.
+
+Release / re-launch: :meth:`release` HARD-KILLS the live Unity child (via the injected reap
+hook, see below) and frees the connection WITHOUT the graceful end handshake -- the point is to
+reclaim a stalled instance that would not answer the handshake. The env OBJECT stays alive and
+fully usable: the next ``reset`` re-launches lazily via the factory. ``release`` is idempotent.
+
+Reap hook (the boundary-safe shared kill primitive): the env never imports a subprocess reap.
+The caller injects ``reap`` -- a ``Callable[[object], None]`` that kills a ``Popen``-like
+handle -- and the env reads the live process handle off
+``getattr(self.conn, "_launch_proc", None)`` (the attribute the caller's ``connection_factory``
+stashes on each produced ``Connection``). :meth:`release` and the kill-old-first
+:meth:`_reconnect` are the ONLY two callers of the hook. With ``reap=None`` (the pure-test
+default) there is no real process behind the stub, so both paths skip the proc-kill and only
+close the transport.
+
+Logfile safety: the env NEVER writes, truncates, or re-points any Unity ``-logFile`` (that arg
+lives entirely in the caller's launch command). ``release`` / ``_reconnect`` only kill the
+process and close the socket -- the prior instance's C# log is left intact for post-mortem.
+
 Survivor / self-play perspective: player2's first-person view is available via
 :meth:`player2_frame` (R/B channel swap, :func:`core.state.flip_frame_perspective`) and
 :meth:`player2_state` (52-float half swap, :func:`core.state.split_state_for_opponent`) so the
@@ -139,18 +165,27 @@ class TankEnv(gymnasium.Env):
     Construct with an injected connection so the env is testable with no Unity:
 
     * ``connection`` — a ready :class:`pop_trainer.core.protocol.Connection` (over a real
-      socket OR an in-process fake transport). Used as-is; on a lost connection there is no
-      reconnect (the next step would re-raise) unless a ``connection_factory`` is also given.
-    * ``connection_factory`` — a zero-arg callable returning a fresh ``Connection``. Called
-      on construction (if no ``connection`` was passed) and AGAIN to reconnect after a
-      dropped connection (the reconnect-on-``ConnectionError`` path).
+      socket OR an in-process fake transport). Used as-is, "running" from construction; on a
+      lost connection there is no reconnect (the next step would re-raise) unless a
+      ``connection_factory`` is also given.
+    * ``connection_factory`` — a zero-arg callable returning a fresh ``Connection``. NOT called
+      on construction (the env starts "not running", ``self.conn is None``); invoked LAZILY on
+      the first ``reset`` / ``step`` to launch+connect, and AGAIN to reconnect after a dropped
+      connection (the kill-old-first reconnect path) and after :meth:`release`.
 
     Exactly one of ``connection`` / ``connection_factory`` must be provided.
 
     Args:
         connection: a ready ``Connection`` (the simplest test seam).
-        connection_factory: a zero-arg callable returning a ``Connection`` (enables
-            reconnect after a dropped connection).
+        connection_factory: a zero-arg callable returning a ``Connection`` (enables lazy launch
+            + reconnect after a dropped connection + re-launch after :meth:`release`).
+        reap: OPTIONAL ``Callable[[object], None]`` that kills a ``Popen``-like build process.
+            Injected by the caller so the env can hard-kill the live Unity child WITHOUT
+            importing a subprocess reap (boundary: ``env`` imports ``core`` only). The env reads
+            the handle off ``getattr(self.conn, "_launch_proc", None)`` and calls ``reap(proc)``
+            in :meth:`release` and the kill-old-first :meth:`_reconnect`. ``None`` (the default /
+            pure-test path) skips the proc-kill (no real process behind a stub) and only closes
+            the transport.
         env_config: an :class:`pop_trainer.core.config.EnvConfig` (only ``max_steps`` is used
             by the env loop; the socket-address fields belong to the caller's factory).
             Defaults to ``EnvConfig()``.
@@ -178,6 +213,7 @@ class TankEnv(gymnasium.Env):
         *,
         connection: Connection | None = None,
         connection_factory: Callable[[], Connection] | None = None,
+        reap: Callable[[object], None] | None = None,
         env_config: EnvConfig | None = None,
         reward_config: RewardConfig | None = None,
         frame_shape: tuple[int, int, int] = DEFAULT_FRAME_SHAPE,
@@ -197,9 +233,11 @@ class TankEnv(gymnasium.Env):
             raise ValueError(f"frame_shape must be (H, W, 3), got {frame_shape!r}")
 
         self._connection_factory = connection_factory
-        self.conn: Connection | None = (
-            connection if connection is not None else connection_factory()
-        )
+        self._reap = reap
+        # Lazy lifecycle: a bare `connection` is "running" from construction; a factory is NOT
+        # invoked here (conn stays None / "not running") and is called lazily on the first
+        # reset/step via _ensure_connected. So constructing with a factory launches no Unity.
+        self.conn: Connection | None = connection
 
         self.env_config = env_config if env_config is not None else EnvConfig()
         self.reward_config = reward_config if reward_config is not None else RewardConfig()
@@ -245,19 +283,30 @@ class TankEnv(gymnasium.Env):
             return
         self.logger.log(level, event, extra={"detail": {"layer": LAYER_ENV, **detail}})
 
+    # --- lifecycle state -----------------------------------------------------------------
+
+    @property
+    def is_running(self) -> bool:
+        """``True`` when a live ``Connection`` is held, ``False`` after construction-with-factory
+        (before the first ``reset``) or after :meth:`release` / :meth:`close`."""
+        return self.conn is not None
+
     # --- gymnasium API -------------------------------------------------------------------
 
     def reset(self, *, seed=None, options=None):
         """Run the restart/start/first-state handshake; return ``(obs, info)``.
 
-        Seeds ``self.np_random`` via ``super().reset``. Performs the handshake
-        (``{"restart": True}`` -> ack, ``{"start": True}`` -> ``"starting"`` ack), then reads
-        the first ``state`` + pixel frame. The observation is the frame; the 52-float state is
-        in ``info["state"]``.
+        Seeds ``self.np_random`` via ``super().reset``. LAZILY launches+connects the training
+        instance (:meth:`_ensure_connected`) if the env is "not running" — the first ``reset``
+        after construction-with-factory (or after :meth:`release`) is what actually starts Unity.
+        Then performs the handshake (``{"restart": True}`` -> ack, ``{"start": True}`` ->
+        ``"starting"`` ack) and reads the first ``state`` + pixel frame. The observation is the
+        frame; the 52-float state is in ``info["state"]``.
 
         On a dropped connection during the handshake, reconnects via the
-        ``connection_factory`` (if one was given) and retries ONCE; a second failure raises
-        ``ConnectionError`` (reset cannot return a valid first observation without the game).
+        ``connection_factory`` (kill-old-first, if one was given) and retries ONCE; a second
+        failure raises ``ConnectionError`` (reset cannot return a valid first observation
+        without the game).
         """
         if seed is None:
             seed = self._default_seed
@@ -265,6 +314,7 @@ class TankEnv(gymnasium.Env):
 
         switch_target = options.get("switch_arena") if options else None
 
+        self._ensure_connected()
         self._episode += 1
         self._log(
             logging.INFO,
@@ -397,7 +447,11 @@ class TankEnv(gymnasium.Env):
         with no winner); ``last_p1_action`` / ``last_p2_action`` keep their last good values and
         the action keys are omitted from that step's ``info``. The env reconnects (if a
         ``connection_factory`` was given) so the next ``reset`` can start a fresh episode.
+
+        Guards lazy lifecycle: if the env is "not running" (stepped before any ``reset``, or
+        after :meth:`release`) :meth:`_ensure_connected` launches+connects via the factory first.
         """
+        self._ensure_connected()
         a1 = np.asarray(action, dtype=np.float32).tolist()
 
         # a2's source is the caller: the opponent action (a no-op zero action when omitted),
@@ -512,6 +566,27 @@ class TankEnv(gymnasium.Env):
                     close()
             self.conn = None
 
+    def release(self):
+        """Hard-kill the live Unity child and free the connection; the env OBJECT stays alive.
+
+        Reaps the live build process via the injected reap hook (the proc handle is read off
+        ``getattr(self.conn, "_launch_proc", None)``; skipped when ``reap`` is ``None`` or no
+        proc is stashed — the pure-test path has no real process), then closes the transport
+        (best-effort, errors suppressed) and sets ``self.conn = None`` so :attr:`is_running` is
+        ``False``.
+
+        UNLIKE :meth:`close`, ``release`` does NOT do the graceful end handshake: a stalled
+        instance being hard-killed will not answer it — reclaiming such an instance is the whole
+        point. It never touches the prior instance's ``-logFile`` (the env does not own it).
+
+        IDEMPOTENT: a no-op when already "not running" (the reap hook is not called again). The
+        env remains fully usable — a subsequent ``reset`` lazily re-launches via the factory.
+        """
+        if self.conn is None:
+            return
+        self._log(logging.INFO, "release", episode=self._episode)
+        self._free_connection(reap_proc=True)
+
     # --- self-play perspective helpers ---------------------------------------------------
 
     def player2_frame(self):
@@ -535,12 +610,62 @@ class TankEnv(gymnasium.Env):
 
     # --- internal ------------------------------------------------------------------------
 
-    def _reconnect(self):
-        """Replace ``self.conn`` with a fresh connection from the factory, if one was given.
+    def _ensure_connected(self):
+        """Lazily launch+connect via the factory when the env is "not running".
 
-        The reconnect-on-``ConnectionError`` path. A no-op when the env was constructed with a
-        bare ``connection`` (no factory) — the next wire op would then re-raise, which is the
-        documented behaviour for that construction mode.
+        Invoked at the top of ``reset`` and as a guard in ``step``. A no-op when already running
+        (``self.conn is not None``) OR when there is no factory (a bare ``connection`` that has
+        not been released — its first ``reset`` proceeds straight to the handshake). When the env
+        is "not running" AND a factory was given, this calls the factory to produce a fresh
+        ``Connection`` (the LIVE path launches+connects Unity here, lazily) and assigns
+        ``self.conn`` so :attr:`is_running` becomes ``True``.
         """
-        if self._connection_factory is not None:
+        if self.conn is None and self._connection_factory is not None:
             self.conn = self._connection_factory()
+
+    def _free_connection(self, *, reap_proc: bool):
+        """Kill the live build (optional) and release the current connection; set ``conn = None``.
+
+        The ONE shared kill primitive behind :meth:`release` and :meth:`_reconnect`. When
+        ``reap_proc`` is set and a reap hook was injected, it reaps the build process read off
+        ``getattr(self.conn, "_launch_proc", None)`` (skipped when ``reap`` is ``None`` or no
+        proc is stashed). Then it closes the transport best-effort (errors suppressed) and nulls
+        ``self.conn``. Does NOT send the end handshake (the process may be a stalled instance, or
+        already dead) and NEVER touches the instance's log file.
+        """
+        conn = self.conn
+        if conn is None:
+            return
+        if reap_proc and self._reap is not None:
+            proc = getattr(conn, "_launch_proc", None)
+            if proc is not None:
+                self._reap(proc)
+        transport = getattr(conn, "transport", None)
+        close = getattr(transport, "close", None)
+        if callable(close):
+            with contextlib.suppress(OSError):
+                close()
+        self.conn = None
+
+    def _reconnect(self):
+        """Kill the OLD instance FIRST, then re-launch a fresh connection from the factory.
+
+        The reconnect-on-``ConnectionError`` path. The ORDER is load-bearing: a dropped socket
+        may leave the OLD Unity instance alive-but-stalled, still bound to its port; relaunching
+        the new build before reaping the old one would collide on bind. So this:
+
+        1. closes the old transport (best-effort) and REAPS the old build process via the reap
+           hook FIRST (freeing the port; via :meth:`_free_connection` — skipped when ``reap`` is
+           ``None`` / no proc, the pure-test path), then
+        2. invokes the factory to launch+connect the NEW build, assigning ``self.conn``.
+
+        A no-op when the env was constructed with a bare ``connection`` (no factory) — the env is
+        left "not running" and the next wire op re-raises, which is the documented behaviour for
+        that construction mode. Never touches the old instance's ``-logFile``.
+        """
+        if self._connection_factory is None:
+            return
+        # 1. Kill the old (possibly stalled) instance to free its port BEFORE relaunching.
+        self._free_connection(reap_proc=True)
+        # 2. Launch+connect the new build.
+        self.conn = self._connection_factory()

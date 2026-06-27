@@ -82,6 +82,7 @@ __all__ = [
     "estimate_rl_memory_bytes",
     "check_rl_memory_budget",
     "training_ports",
+    "eval_ports",
 ]
 
 # This file is src/pop_trainer/rl/train.py: parents[3] is the repo root
@@ -114,9 +115,11 @@ SIDECAR_NAME = "state.json"
 # depth by k, so the per-element obs cost scales with frame_stack. We pre-flight this against the
 # box's available RAM exactly as collection pre-flights its per-worker shard buffer.
 
-# Coarse per-Unity-instance RAM allowance the rollout-buffer estimate does NOT model. Each training
-# build + the eval build is its own live Unity process (~1 GB). Folded into the total so the guard
-# reasons about builds + buffer, not just the buffer.
+# Coarse per-Unity-instance RAM allowance the rollout-buffer estimate does NOT model. Each live
+# Unity build is its own process (~1 GB). The eval and training instance SETS never coexist (eval
+# tears down training first, see EvalWinRateCallback), so peak concurrent instances is
+# max(n_envs, n_envs) = n_envs, NOT n_envs + 1. Folded into the total so the guard reasons about
+# builds + buffer, not just the buffer.
 UNITY_INSTANCE_BYTES = 1024**3  # ~1 GB per live Unity instance (coarse).
 
 # The estimate excludes the OS + torch/CUDA + the policy net, so the guard only lets the modelled
@@ -159,13 +162,19 @@ class TrainConfig:
             PPO hyperparameters (pixel-PPO defaults).
         frame_shape: the ``(H, W, 3)`` pixel-frame shape (channels-last; SB3 transposes it).
         game_port: the BASE TCP port. Training env ``i`` listens on ``game_port + i`` for
-            ``i in 0..n_envs-1`` (``args[1]`` of each build's launch arg-list).
-        eval_port: the TCP port the DEDICATED eval build listens on. ``None`` (default) -> the
-            effective eval port is ``game_port + n_envs`` (the first port AFTER the training range,
-            so at ``n_envs == 1`` it is ``game_port + 1`` as before). When set it must differ from
-            ``game_port`` AND must NOT fall inside the training range
-            ``[game_port, game_port + n_envs - 1]`` (the eval build cannot collide with any training
-            build); both run side-by-side on separate sockets.
+            ``i in 0..n_envs-1`` (``args[1]`` of each build's launch arg-list). The training BLOCK
+            is ``[game_port, game_port + n_envs - 1]``.
+        eval_port: the BASE TCP port for the eval block. There are ``n_envs`` eval builds
+            (``M_eval == N_train``), each listening on ``eval_port_base + i`` for
+            ``i in 0..n_envs-1``, so the eval BLOCK is
+            ``[eval_port_base, eval_port_base + n_envs - 1]``. ``None`` (default) ->
+            ``eval_port_base = game_port + n_envs`` (the eval block sits entirely AFTER the training
+            block: ``[game_port + n_envs, game_port + 2*n_envs - 1]``, so at ``n_envs == 1`` it is
+            ``game_port + 1`` as before). When set it must differ from ``game_port`` AND the WHOLE
+            eval block must NOT overlap the training block (no eval build can collide with any
+            training build). The eval and training builds NEVER run concurrently (the eval callback
+            tears training down before spawning eval), but the disjoint port blocks keep a
+            relaunched-but-not-yet-reaped instance from clashing on bind.
         allow_oversized: skip the pre-flight rollout-buffer memory ABORT (the estimate is still
             printed). Use only when the box has RAM the conservative guard does not model.
         build_path: the build binary; ``None`` -> :func:`core.launch.default_build_path`.
@@ -228,28 +237,32 @@ class TrainConfig:
             raise ValueError(f"frame_shape must be (H, W, 3), got {self.frame_shape!r}")
         if self.eval_port is not None and self.eval_port == self.game_port:
             raise ValueError(
-                f"eval_port must differ from game_port (both {self.game_port}); the eval build "
-                "runs side-by-side on a separate socket"
+                f"eval_port must differ from game_port (both {self.game_port}); the eval block "
+                "binds its own sockets"
             )
-        # The eval build must not collide with any of the n_envs training builds. The training
-        # range is [game_port, game_port + n_envs - 1]; an explicit eval_port inside it would
-        # double-bind a socket. (n_envs == 1 -> the range is {game_port}, already rejected above.)
+        # The eval BLOCK [eval_port, eval_port + n_envs - 1] must not overlap the training block
+        # [game_port, game_port + n_envs - 1] — no eval build may collide with a training build.
+        # Two half-open ranges [a, a+n) and [b, b+n) overlap iff a < b+n and b < a+n.
         if self.eval_port is not None:
-            train_hi = self.game_port + self.n_envs - 1
-            if self.game_port <= self.eval_port <= train_hi:
+            train_lo, train_hi = self.game_port, self.game_port + self.n_envs - 1
+            eval_lo, eval_hi = self.eval_port, self.eval_port + self.n_envs - 1
+            if eval_lo <= train_hi and train_lo <= eval_hi:
                 raise ValueError(
-                    f"eval_port {self.eval_port} falls inside the training port range "
-                    f"[{self.game_port}, {train_hi}] (n_envs={self.n_envs}); the eval build cannot "
-                    "collide with a training build — choose a port outside that range"
+                    f"the eval port block [{eval_lo}, {eval_hi}] overlaps the training port block "
+                    f"[{train_lo}, {train_hi}] (n_envs={self.n_envs}); no eval build can collide "
+                    "with a training build — choose an eval_port whose block is disjoint (e.g. "
+                    f">= {train_hi + 1})"
                 )
 
     @property
     def effective_eval_port(self) -> int:
-        """The dedicated eval build's port: ``eval_port`` or ``game_port + n_envs``.
+        """The BASE eval port (the eval block's low end): ``eval_port`` or ``game_port + n_envs``.
 
-        The default sits the eval build on the FIRST port after the training range
-        ``[game_port, game_port + n_envs - 1]`` (so 7 train envs = ``50000..50006`` -> eval
-        ``50007``). At ``n_envs == 1`` this is ``game_port + 1`` exactly as before.
+        The default places the eval block ENTIRELY after the training block
+        ``[game_port, game_port + n_envs - 1]`` — eval is ``[game_port + n_envs, game_port +
+        2*n_envs - 1]`` (so 7 train envs = ``50000..50006`` -> eval ``50007..50013``). At
+        ``n_envs == 1`` this is ``game_port + 1`` exactly as before. The full eval port list is
+        :func:`eval_ports`.
         """
         return self.eval_port if self.eval_port is not None else self.game_port + self.n_envs
 
@@ -340,18 +353,23 @@ def check_rl_memory_budget(
     """Pre-flight RL memory guard. Returns the estimate line; may raise ``MemoryError``.
 
     Adds the rollout-buffer obs estimate (:func:`estimate_rl_memory_bytes`) to a coarse Unity
-    allowance of :data:`UNITY_INSTANCE_BYTES` per live instance — ``n_envs`` training builds plus
-    the ONE dedicated eval build (``n_envs + 1`` instances) — and compares the TOTAL to a
-    conservative fraction (:data:`MEMORY_MARGIN`) of ``available_bytes`` (INJECTED by the caller —
-    this pure function never touches psutil). When the total exceeds the threshold and
-    ``allow_oversized`` is ``False`` it raises ``MemoryError`` with an ACTIONABLE message (lower
-    ``--n-steps`` or ``--n-envs``, or pass ``--allow-oversized``). Within budget — or overridden —
-    it returns the estimate line so the caller can ALWAYS print it at startup.
+    allowance of :data:`UNITY_INSTANCE_BYTES` per live instance. Peak concurrent instances is
+    ``max(N_train, M_eval) = max(n_envs, n_envs) = n_envs``: the ``M_eval == n_envs`` eval builds
+    NEVER coexist with the ``n_envs`` training builds (the eval callback tears all training builds
+    down before spawning eval, and tears eval down before respawning training — see
+    :class:`~pop_trainer.rl.callbacks.EvalWinRateCallback`). So the guard charges ``n_envs`` Unity
+    instances, not ``n_envs + 1``. The TOTAL is compared to a conservative fraction
+    (:data:`MEMORY_MARGIN`) of ``available_bytes`` (INJECTED by the caller — this pure function
+    never touches psutil). When the total exceeds the threshold and ``allow_oversized`` is ``False``
+    it raises ``MemoryError`` with an ACTIONABLE message (lower ``--n-steps`` or ``--n-envs``, or
+    pass ``--allow-oversized``). Within budget — or overridden — it returns the estimate line so the
+    caller can ALWAYS print it at startup.
     """
     buffer_bytes = estimate_rl_memory_bytes(
         n_steps=n_steps, n_envs=n_envs, frame_nbytes=frame_nbytes, frame_stack=frame_stack
     )
-    unity_instances = n_envs + 1  # training builds + the dedicated eval build.
+    # Peak concurrent Unity instances = max(N_train, M_eval) = n_envs (the sets never coexist).
+    unity_instances = n_envs
     unity_bytes = unity_instances * UNITY_INSTANCE_BYTES
     total = buffer_bytes + unity_bytes
     threshold = int(available_bytes * MEMORY_MARGIN)
@@ -395,34 +413,18 @@ def _terminate(proc: subprocess.Popen) -> None:
             proc.wait(timeout=10)
 
 
-def _attach_launch_proc(env: TankEnv, proc: subprocess.Popen) -> None:
-    """Stash ``proc`` on ``env`` and wrap ``env.close`` so closing the env reaps the build.
+def _attempt_unity_log_path(base_log_dir, role: str, port: int, attempt: int):
+    """The per-LAUNCH Unity ``-logFile`` path: ``unity-<role>-<port>-<attempt>.log`` (PURE).
 
-    ``TankEnv.close`` releases only the transport (the socket) — it does NOT know about the build
-    subprocess. So we record the proc on ``env._launch_proc`` (inspectable) and replace
-    ``env.close`` with a wrapper that runs the original close (end-handshake + transport release)
-    and THEN terminates the build. Idempotent (the second close is a no-op once reaped). The
-    ``TankEnv`` class is untouched — this is per-instance caller-side wrapping. Mirrors the
-    collection runner's pattern, re-derived here to keep ``rl`` off ``data``.
-
-    Reconnect-safe: a mid-run socket drop makes the env RE-INVOKE the factory, producing a NEW
-    ``Connection`` with a NEW ``_launch_proc`` for the relaunched build. So at close time we reap
-    the CURRENT connection's proc (``env.conn._launch_proc``), falling back to the originally
-    stashed ``proc`` only when the current conn carries none — the original (already-dead) build is
-    a no-op reap, and the relaunched build can never be orphaned.
+    Unity's ``-logFile`` TRUNCATES its target on every launch, so a relaunch (lazy respawn /
+    reconnect) reusing ONE path would wipe the prior (possibly hung) instance's C# log. Suffixing a
+    monotonically incrementing ``attempt`` counter gives each launch within a factory a DISTINCT
+    file (``...-0.log`` for the first launch, ``...-1.log`` for the first relaunch, ...), so a prior
+    instance's log survives for post-mortem. Built off the shared :func:`unity_log_path` stem so the
+    ``(role, port)`` pairing with the Python ``env-<role>-<port>.log`` is preserved.
     """
-    env._launch_proc = proc
-    original_close = env.close
-
-    def close_and_reap() -> None:
-        # Read the CURRENT connection's launch proc before close tears the transport down; a
-        # reconnect mid-run swapped in a fresh Connection/proc, so reap THAT, not the original.
-        current = getattr(env.conn, "_launch_proc", proc)
-        with contextlib.suppress(Exception):
-            original_close()
-        _terminate(current)
-
-    env.close = close_and_reap  # type: ignore[method-assign]
+    stem = unity_log_path(base_log_dir, role, port)  # .../unity-<role>-<port>.log
+    return stem.with_name(f"{stem.stem}-{attempt}{stem.suffix}")
 
 
 def _live_connection_factory_for_port(
@@ -430,27 +432,35 @@ def _live_connection_factory_for_port(
 ) -> Callable[[], Connection]:
     """Build the LIVE ``connection_factory`` for ``port``: launch the build, connect, wrap socket.
 
-    Returns a zero-arg callable the env invokes on construction (and re-invokes on reconnect). Each
-    call: launches the build via :func:`core.launch.build_launch_cmd` + ``subprocess.Popen`` on
-    ``port`` (with Unity's ``-logFile`` pointed at ``unity-<role>-<port>.log`` so each build writes
-    its OWN C# log), connects via :func:`core.launch.connect`, and wraps the socket in a
-    :class:`core.protocol.Connection` carrying the SHARED per-connection ``logger`` (so protocol +
-    env records for this socket land in one ``env-<role>-<port>.log``). The live ``Popen`` is
-    stashed on the returned ``Connection`` (``conn._launch_proc``) so :func:`_build_base_env` can
-    wire ``env.close`` to reap it.
+    Returns a zero-arg callable the env invokes on the first ``reset``/``step`` (LAZY launch) and
+    re-invokes on every reconnect / post-``release`` respawn. Each call: launches the build via
+    :func:`core.launch.build_launch_cmd` + ``subprocess.Popen`` on ``port``, connects via
+    :func:`core.launch.connect`, and wraps the socket in a :class:`core.protocol.Connection`
+    carrying the SHARED per-connection ``logger`` (so protocol + env records for this socket land
+    in one ``env-<role>-<port>.log``). The live ``Popen`` is stashed on the returned ``Connection``
+    (``conn._launch_proc``) so the env's injected reap hook (``reap=_terminate``) can hard-kill it
+    on :meth:`TankEnv.release` / the kill-old-first reconnect.
+
+    Per-launch logfile (no truncation across respawns): a launch counter is captured in the closure
+    and incremented every invocation, so each launch points Unity's ``-logFile`` at a DISTINCT
+    ``unity-<role>-<port>-<attempt>.log`` (:func:`_attempt_unity_log_path`). A respawn therefore
+    NEVER truncates the prior instance's C# log.
 
     The build is launched WINDOWED (never batchmode) on ``cfg.game_config``. Parameterizing the
-    ``port`` lets the TRAINING env (``cfg.game_port``) and the DEDICATED eval env
-    (``cfg.effective_eval_port``) each launch their OWN build on their OWN socket. Re-derived from
+    ``port`` lets each TRAINING / EVAL env launch its OWN build on its OWN socket. Re-derived from
     the shared ``core.launch`` primitives — ``rl`` does NOT import the ``data`` launch path.
 
     Observability: ``role`` tags the Unity log filename; ``logger`` (when given) is threaded into
     the ``Connection`` for wire-level evidence. Both default off — the no-logger path is identical.
     """
     exe = cfg.build_path if cfg.build_path is not None else launch.default_build_path(_REPO_ROOT)
-    u_log_path = unity_log_path(cfg.effective_log_dir, role, port)
+    # Mutable launch counter captured by the closure: each (lazy launch / reconnect / respawn) gets
+    # a distinct -logFile so no prior instance's log is truncated.
+    attempt = {"n": 0}
 
     def factory() -> Connection:
+        u_log_path = _attempt_unity_log_path(cfg.effective_log_dir, role, port, attempt["n"])
+        attempt["n"] += 1
         cmd = launch.build_launch_cmd(exe, port, cfg.game_config, unity_log_path=u_log_path)
         proc = subprocess.Popen(cmd)  # noqa: S603 (arg-list, trusted local build path)
         try:
@@ -461,7 +471,7 @@ def _live_connection_factory_for_port(
             # does not leak a process.
             _terminate(proc)
             raise
-        # Stash the proc on the connection so the env-build step can reap it on close.
+        # Stash the proc on the connection so the env's reap hook can hard-kill it on release.
         conn._launch_proc = proc  # type: ignore[attr-defined]
         return conn
 
@@ -484,14 +494,21 @@ def _build_base_env(
     Wires the env config (``max_steps`` from the Phase-1 round cap, ``game_port`` = ``port`` so
     the built env records WHICH socket it speaks on), the default reward, the channels-last
     ``frame_shape``, the seed, and the OPTIONAL observability ``logger`` / ``role`` (the env layer
-    logs its milestones on the SAME logger the connection_factory hands its ``Connection``). If the
-    factory stashed a live build ``Popen`` on its produced ``Connection`` (the LIVE path), wrap
-    ``env.close`` so closing the env reaps the build; an injected STUB factory carries no proc, so
-    the reap-wrap is skipped (no Unity). ``logger=None`` (the default / test path) is
-    behavior-identical to before.
+    logs its milestones on the SAME logger the connection_factory hands its ``Connection``).
+
+    LAZY: the factory is NOT invoked here — ``env.conn`` is ``None`` until the first
+    ``reset``/``step``. The build the factory eventually launches (the LIVE path) is reaped by the
+    env ITSELF via the injected ``reap=_terminate`` hook: :meth:`TankEnv.release` and the
+    kill-old-first reconnect read the live ``Popen`` off
+    ``getattr(self.conn, "_launch_proc", None)`` and call ``reap(proc)``. ``rl`` owns the reap
+    primitive (:func:`_terminate`) and injects it so ``env`` need not import a subprocess reap
+    (boundary: ``env`` imports ``core`` only). An injected
+    STUB factory carries no proc, so the reap is a no-op (no Unity). ``logger=None`` (the default /
+    test path) is behavior-identical to before.
     """
-    env = TankEnv(
+    return TankEnv(
         connection_factory=connection_factory,
+        reap=_terminate,
         env_config=EnvConfig(max_steps=DEFAULT_MAX_STEPS, game_port=port),
         reward_config=RewardConfig(),
         frame_shape=cfg.frame_shape,
@@ -499,10 +516,6 @@ def _build_base_env(
         logger=logger,
         role=role,
     )
-    proc = getattr(env.conn, "_launch_proc", None)
-    if proc is not None:
-        _attach_launch_proc(env, proc)
-    return env
 
 
 def _make_self_play_env(
@@ -547,28 +560,41 @@ def training_ports(cfg: TrainConfig) -> list[int]:
     return [cfg.game_port + i for i in range(cfg.n_envs)]
 
 
-def _training_env_factories(
+def eval_ports(cfg: TrainConfig) -> list[int]:
+    """The ``n_envs`` eval ports ``[effective_eval_port + i for i in range(n_envs)]`` (PURE).
+
+    ``M_eval == N_train == n_envs`` eval builds, one per port in the eval block. The block is
+    disjoint from :func:`training_ports` (validated in :meth:`TrainConfig.__post_init__`), so an
+    eval build never collides with a training build even across a relaunch.
+    """
+    return [cfg.effective_eval_port + i for i in range(cfg.n_envs)]
+
+
+def _env_factories_for_ports(
     cfg: TrainConfig,
+    ports: list[int],
     *,
     role: str = ROLE_TRAIN,
     connection_factory_for_port: Callable[[int], Callable[[], Connection]] | None = None,
 ) -> list[Callable[[], SelfPlayWrapper]]:
-    """The ``n_envs`` zero-arg env factories — one per training port (the SubprocVecEnv seam).
+    """``len(ports)`` zero-arg env factories — one per port (the SubprocVecEnv seam).
 
-    Each factory ``i`` is a CLOSURE that builds env ``i`` on port ``game_port + i`` with provider
-    seed ``cfg.seed + i``. The closure captures ONLY ``cfg`` (a frozen, picklable dataclass) and the
-    int ``i`` — it constructs the provider / base env / live connection INSIDE its body, so nothing
-    live crosses the spawn boundary (SB3 ships the ``env_fns`` via cloudpickle, which serializes the
-    closure by its captured vars). This is why a closure is spawn-safe HERE where collection needed
-    module-level functions: cloudpickle handles closures that capture only plain data.
+    Each factory ``i`` is a CLOSURE that builds env ``i`` on ``ports[i]`` with provider seed
+    ``cfg.seed + i``. The closure captures ONLY ``cfg`` (a frozen, picklable dataclass) and the ints
+    ``i`` / ``port`` — it constructs the provider / base env / live connection INSIDE its body, so
+    nothing live crosses the spawn boundary (SB3 ships the ``env_fns`` via cloudpickle, which
+    serializes the closure by its captured vars). This is why a closure is spawn-safe HERE where
+    collection needed module-level functions: cloudpickle handles closures that capture only plain
+    data.
 
+    ``ports`` is the explicit port block: :func:`training_ports` for the training vec, or
+    :func:`eval_ports` for the eval vec (the eval block is disjoint from training).
     ``connection_factory_for_port`` is a TEST seam: given a port it returns that port's STUB
-    ``connection_factory`` (no Unity). ``None`` (the live path) -> each factory derives its own
-    live connection from ``core.launch``. Returns the factory list (length ``n_envs``); the
-    matching ports are :func:`training_ports`.
+    ``connection_factory`` (no Unity). ``None`` (the live path) -> each factory derives its own live
+    connection from ``core.launch``. Returns the factory list (length ``len(ports)``).
     """
     factories: list[Callable[[], SelfPlayWrapper]] = []
-    for i, port in enumerate(training_ports(cfg)):
+    for i, port in enumerate(ports):
 
         def factory(i: int = i, port: int = port) -> SelfPlayWrapper:
             conn_factory = (
@@ -582,10 +608,30 @@ def _training_env_factories(
     return factories
 
 
+def _training_env_factories(
+    cfg: TrainConfig,
+    *,
+    role: str = ROLE_TRAIN,
+    connection_factory_for_port: Callable[[int], Callable[[], Connection]] | None = None,
+) -> list[Callable[[], SelfPlayWrapper]]:
+    """The ``n_envs`` training env factories (one per :func:`training_ports` port).
+
+    Thin wrapper over :func:`_env_factories_for_ports` pinned to the TRAINING port block — kept as a
+    named seam the unit tests assert on.
+    """
+    return _env_factories_for_ports(
+        cfg,
+        training_ports(cfg),
+        role=role,
+        connection_factory_for_port=connection_factory_for_port,
+    )
+
+
 def build_vec_env(
     cfg: TrainConfig,
     *,
     port: int | None = None,
+    ports: list[int] | None = None,
     monitor: bool = False,
     single: bool = False,
     role: str = ROLE_TRAIN,
@@ -603,25 +649,27 @@ def build_vec_env(
       ``cfg.game_port``), provider seeded ``cfg.seed``. The provider is reachable for assertions /
       position-exact ``round_robin`` resume via :func:`_find_selfplay_wrapper` (``.envs`` is exposed
       in-process).
-    * **n_envs > 1** -> a ``SubprocVecEnv`` of ``n_envs`` envs, one per training port
-      (``game_port + i``, see :func:`training_ports`), each launching its OWN Unity build in its OWN
-      process with provider seeded ``cfg.seed + i``. ``start_method="spawn"`` is REQUIRED (Windows;
-      no fork/forkserver). The env factories are CLOSURES that capture only ``cfg`` (a frozen,
-      picklable dataclass) + the int ``i`` and build everything live INSIDE the subprocess — SB3
-      ships them via cloudpickle, so nothing live crosses the boundary. The provider lives PER-
-      SUBPROC and is NOT reachable via :func:`_find_selfplay_wrapper` (``SubprocVecEnv`` exposes no
-      ``.envs``); the caller treats opponent rotation as per-subproc + reseed-on-resume (see
-      :func:`train_local`).
+    * **n_envs > 1** -> a ``SubprocVecEnv`` of ``n_envs`` envs, one per port in ``ports`` (default
+      :func:`training_ports`; the eval vec passes :func:`eval_ports`, a disjoint block), each
+      launching its OWN Unity build in its OWN process with provider seeded ``cfg.seed + i``.
+      ``start_method="spawn"`` is REQUIRED (Windows; no fork/forkserver). The env factories are
+      CLOSURES that capture only ``cfg`` (a frozen, picklable dataclass) + the ints ``i`` / ``port``
+      and build everything live INSIDE the subprocess — SB3 ships them via cloudpickle, so nothing
+      live crosses the boundary. The provider lives PER-SUBPROC and is NOT reachable via
+      :func:`_find_selfplay_wrapper` (``SubprocVecEnv`` exposes no ``.envs``); the caller treats
+      opponent rotation as per-subproc + reseed-on-resume (see :func:`train_local`).
 
     Then ``VecFrameStack`` (``n_stack = cfg.frame_stack``; ``1`` = passthrough, still wrapped for a
     uniform stack), and OUTERMOST ``VecMonitor`` when ``monitor`` is set (the TRAINING env only — it
-    logs ``rollout/ep_rew_mean`` / ``rollout/ep_len_mean``; the eval env uses ``evaluate_winrate``'s
+    logs ``rollout/ep_rew_mean`` / ``rollout/ep_len_mean``; the eval vec uses ``evaluate_winrate``'s
     own loop, so it is built ``monitor=False``).
 
-    ``single=True`` forces the ONE-env ``DummyVecEnv`` path regardless of ``cfg.n_envs`` — the eval
-    env is ALWAYS a single in-process env (``evaluate_winrate`` needs the raw single ``TankEnv`` via
-    :func:`_find_selfplay_wrapper`). ``port`` selects that single env's TCP port (default
-    ``cfg.game_port``; the eval env passes ``cfg.effective_eval_port``).
+    The TRAINING and EVAL vec envs are built the SAME way and at the SAME width (``M_eval ==
+    N_train == cfg.n_envs``): training passes ``ports=training_ports`` (default) + ``role="train"``,
+    eval passes ``ports=eval_ports`` + ``role="eval"``. ``single=True`` forces the ONE-env
+    ``DummyVecEnv`` path regardless of ``cfg.n_envs`` (used by tests / a forced single env);
+    ``port`` selects that single env's TCP port. ``ports`` overrides the multi-env port block (the
+    eval vec uses it to bind the disjoint eval block instead of the training block).
 
     ``role`` (``"train"`` / ``"eval"``) tags the per-process observability log filenames the LIVE
     path opens (``env-<role>-<port>.log`` + the Unity ``unity-<role>-<port>.log``); the training env
@@ -653,8 +701,9 @@ def build_vec_env(
 
         vec: VecEnv = DummyVecEnv([make_wrapped])
     else:
-        factories = _training_env_factories(
-            cfg, role=role, connection_factory_for_port=connection_factory_for_port
+        block = ports if ports is not None else training_ports(cfg)
+        factories = _env_factories_for_ports(
+            cfg, block, role=role, connection_factory_for_port=connection_factory_for_port
         )
         if connection_factory_for_port is not None:
             # TEST path: stub factories build with no Unity, so run them in-process (DummyVecEnv) —
@@ -1031,18 +1080,21 @@ def train_local(cfg: TrainConfig) -> Path:
     print(estimate_line)  # noqa: T201
 
     # Training env: DummyVecEnv (n_envs=1) or SubprocVecEnv (n_envs>1) of builds on game_port + i,
-    # VecMonitor-wrapped for rollout episode stats. Dedicated eval env: ALWAYS a single env on the
-    # effective eval port (a separate build/socket — eval never touches the training env).
+    # VecMonitor-wrapped for rollout episode stats. Eval env: a vec of M_eval == n_envs builds on
+    # the DISJOINT eval port block (eval_ports) — same width as training. The two SETS never
+    # coexist: the eval callback tears the training instances down before lazy-launching the eval
+    # instances and tears the eval instances down before respawning training (see
+    # EvalWinRateCallback). With LAZY TankEnv construction, building these vec envs launches NO
+    # Unity — the instances start only on the first reset/step (training: learn; eval: first cycle).
     vec_env = build_vec_env(cfg, port=cfg.game_port, monitor=True, role=ROLE_TRAIN)
     try:
         eval_vec_env = build_vec_env(
-            cfg, port=cfg.effective_eval_port, monitor=False, single=True, role=ROLE_EVAL
+            cfg, port=cfg.effective_eval_port, ports=eval_ports(cfg), monitor=False, role=ROLE_EVAL
         )
         try:
             # n_envs=1: reach the in-process provider for position-exact round_robin resume.
             # n_envs>1: providers live per-subproc (unreachable here) -> None -> reseed-on-resume.
             provider = _find_selfplay_wrapper(vec_env).opponents if cfg.n_envs == 1 else None
-            eval_raw_env = _find_selfplay_wrapper(eval_vec_env).env
 
             elo = _initial_elo(cfg.opponents)
             reset_num_timesteps = cfg.resume is None
@@ -1092,7 +1144,11 @@ def train_local(cfg: TrainConfig) -> Path:
                         cfg.eval_episodes,
                         opponents=cfg.opponents,
                         seed=cfg.seed,
-                        eval_env=eval_raw_env,
+                        # The eval vec (M == n_envs) and the TRAINING vec handle SB3 reads
+                        # _last_obs from (model.env, post-VecTransposeImage). The callback
+                        # time-multiplexes the two SETS so no eval/training instance coexists.
+                        eval_env=eval_vec_env,
+                        training_vec=model.env,
                     ),
                     CheckpointCallback(
                         save_freq=ckpt_save_freq,
@@ -1136,17 +1192,19 @@ def train_local(cfg: TrainConfig) -> Path:
                 raise
             sys_logger.info("learn_end", extra={"detail": {"num_timesteps": model.num_timesteps}})
 
-            # Final per-opponent win-rate summary line (wires format_per_map_table -> the
-            # Director's smoke gets one final per-opponent line). Eval re-wraps the DEDICATED eval
-            # env's raw TankEnv in its own per-opponent SelfPlayWrapper (the evaluate_winrate
-            # contract) — the training env / model state is untouched.
+            # Final per-opponent win-rate summary line (wires format_per_map_table -> the Director's
+            # smoke gets one final per-opponent line). OBEY THE INVARIANT: tear the TRAINING
+            # instances down FIRST (free their RAM/ports) so the M eval instances never coexist with
+            # them; then run the PARALLEL eval over the eval vec. This is end-of-run, so no respawn
+            # is needed afterward — everything is closed in the finally blocks below.
             sys_logger.info(
                 "final_eval_begin",
                 extra={"detail": {"episodes": cfg.eval_episodes, "opponents": list(cfg.opponents)}},
             )
+            vec_env.env_method("release")
             per_opponent = evaluate_winrate(
                 model,
-                eval_raw_env,
+                eval_vec_env,
                 opponents=cfg.opponents,
                 n_episodes=cfg.eval_episodes,
                 seed=cfg.seed,
@@ -1169,13 +1227,19 @@ def train_local(cfg: TrainConfig) -> Path:
                 num_timesteps=model.num_timesteps,
             )
         finally:
-            # ALWAYS reap the eval Unity build; suppress so a failure here still lets the training
-            # env close below.
+            # ALWAYS reap any live eval Unity instances. release() HARD-KILLS each live build via
+            # the env's injected reap hook (close() alone only does the graceful end-handshake +
+            # transport release, NOT the process kill); then close() tears down transports/workers.
+            # Suppressed so a failure here still lets the training env tear down below.
+            with contextlib.suppress(Exception):
+                eval_vec_env.env_method("release")
             with contextlib.suppress(Exception):
                 eval_vec_env.close()
     finally:
-        # ALWAYS reap the training Unity build (the close-and-reap wrapper), even on exception /
-        # KeyboardInterrupt.
+        # ALWAYS reap any live training Unity instances (hard-kill via the reap hook), then close,
+        # even on exception / KeyboardInterrupt.
+        with contextlib.suppress(Exception):
+            vec_env.env_method("release")
         vec_env.close()
 
     return cfg.run_dir

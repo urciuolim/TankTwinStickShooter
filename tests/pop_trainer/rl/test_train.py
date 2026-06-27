@@ -34,20 +34,24 @@ from pop_trainer.rl.train import (
     MEMORY_MARGIN,
     UNITY_INSTANCE_BYTES,
     TrainConfig,
-    _attach_launch_proc,
+    _attempt_unity_log_path,
     _build_base_env,
     _build_policy_kwargs,
     _checkpoint_save_freq,
     _find_selfplay_wrapper,
     _initial_elo,
     _latest_checkpoint,
+    _live_connection_factory_for_port,
+    _make_self_play_env,
     _make_sidecar_callback,
     _parse_args,
     _restore_provider_position,
+    _terminate,
     _training_env_factories,
     build_vec_env,
     check_rl_memory_budget,
     estimate_rl_memory_bytes,
+    eval_ports,
     frame_nbytes,
     load_sidecar,
     main,
@@ -144,15 +148,31 @@ def test_eval_port_equal_to_game_port_rejected(tmp_path):
 
 
 def test_eval_port_inside_training_range_rejected(tmp_path):
-    # n_envs=7 -> training range [50000, 50006]; an explicit eval_port of 50003 collides.
-    with pytest.raises(ValueError, match="falls inside the training port range"):
+    # n_envs=7 -> training block [50000, 50006]; an eval block based at 50003 overlaps it.
+    with pytest.raises(ValueError, match="overlaps the training port block"):
         _cfg(tmp_path, game_port=50000, n_envs=7, eval_port=50003)
 
 
+def test_eval_block_overlapping_training_block_from_below_rejected(tmp_path):
+    # eval block [49998, 50004] (n_envs=7) overlaps training [50000, 50006] from below.
+    with pytest.raises(ValueError, match="overlaps the training port block"):
+        _cfg(tmp_path, game_port=50000, n_envs=7, eval_port=49998)
+
+
 def test_eval_port_just_outside_training_range_accepted(tmp_path):
-    # 50007 is one past the range high (50006) -> accepted.
+    # 50007 is one past training high (50006) -> the eval block [50007, 50013] is disjoint.
     cfg = _cfg(tmp_path, game_port=50000, n_envs=7, eval_port=50007)
     assert cfg.effective_eval_port == 50007
+    assert eval_ports(cfg) == list(range(50007, 50014))
+    assert set(eval_ports(cfg)).isdisjoint(set(training_ports(cfg)))
+
+
+def test_eval_ports_default_block_disjoint_from_training(tmp_path):
+    # Default eval base = game_port + n_envs; the eval block sits entirely after training.
+    cfg = _cfg(tmp_path, game_port=50000, n_envs=4)
+    assert training_ports(cfg) == [50000, 50001, 50002, 50003]
+    assert eval_ports(cfg) == [50004, 50005, 50006, 50007]
+    assert set(eval_ports(cfg)).isdisjoint(set(training_ports(cfg)))
 
 
 @pytest.mark.parametrize(
@@ -361,7 +381,7 @@ def test_find_selfplay_wrapper_walks_monitor_and_framestack(tmp_path):
         vec.close()
 
 
-# --- reconnect-safe close-and-reap -----------------------------------------------------------
+# --- reap hook + lazy lifecycle (the env OWNS the reap; rl injects reap=_terminate) ----------
 
 
 class _FakeProc:
@@ -387,38 +407,151 @@ class _FakeProc:
         self._dead = True
 
 
-def test_close_reaps_current_connection_proc_not_original(tmp_path):
-    # CHANGE 3: a mid-run reconnect swaps in a NEW Connection/_launch_proc; close must reap the
-    # CURRENT conn's proc, not the originally stashed one.
+class _ProcStubConnection(_StubConnection):
+    """A stub ``Connection`` carrying a live build ``Popen`` on ``_launch_proc`` (the LIVE-path
+    shape the env's reap hook reads). Each instance owns a fresh :class:`_FakeProc`."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._launch_proc = _FakeProc()
+
+
+def _proc_factory_calls() -> tuple:
+    """A connection_factory that yields a fresh ``_ProcStubConnection`` per call + a record list.
+
+    Returns ``(factory, conns)`` where ``conns`` accumulates every produced connection so a test can
+    inspect the proc that each (lazy launch / reconnect) created.
+    """
+    conns: list[_ProcStubConnection] = []
+
+    def factory() -> Connection:
+        conn = _ProcStubConnection()
+        conns.append(conn)
+        return conn
+
+    return factory, conns
+
+
+def test_build_base_env_injects_terminate_reap_hook(tmp_path):
+    # The env OWNS the reap: _build_base_env wires reap=_terminate so release()/reconnect can
+    # hard-kill the live Unity child via the env's own machinery (no close-monkeypatch).
     cfg = _cfg(tmp_path)
     env = _build_base_env(cfg, _stub_factory, cfg.game_port)
-
-    original_proc = _FakeProc()
-    _attach_launch_proc(env, original_proc)  # wires close-and-reap, stashing the original
-
-    # Simulate a reconnect: the env now holds a fresh Connection whose _launch_proc is DIFFERENT.
-    current_proc = _FakeProc()
-    env.conn._launch_proc = current_proc  # type: ignore[attr-defined]
-
-    env.close()
-
-    assert current_proc.terminated  # the CURRENT connection's proc was reaped
-    assert not original_proc.terminated  # the stale original was NOT reaped
+    assert env._reap is _terminate
 
 
-def test_close_falls_back_to_original_proc_when_conn_has_none(tmp_path):
-    # When the current conn carries no _launch_proc, close falls back to the originally stashed one.
+def test_make_self_play_env_injects_terminate_reap_hook(tmp_path):
+    # The self-play env unit (over an injected stub factory) also carries reap=_terminate.
+    cfg = _cfg(tmp_path)
+    wrapper = _make_self_play_env(cfg, cfg.game_port, connection_factory=_stub_factory)
+    assert wrapper.env._reap is _terminate
+
+
+def test_lazy_construction_does_not_connect(tmp_path):
+    # With a factory, _build_base_env launches nothing: conn is None / not running until reset.
+    cfg = _cfg(tmp_path)
+    factory, conns = _proc_factory_calls()
+    env = _build_base_env(cfg, factory, cfg.game_port)
+    assert env.conn is None
+    assert env.is_running is False
+    assert conns == []  # the factory was never invoked at construction
+
+
+def test_release_reaps_the_current_live_build(tmp_path):
+    # The MUST-FIX intent (adapted to lazy + reap-hook): the live build is reaped on teardown via
+    # release(), which hard-kills the CURRENT connection's proc through the injected reap hook.
+    cfg = _cfg(tmp_path)
+    factory, conns = _proc_factory_calls()
+    env = _build_base_env(cfg, factory, cfg.game_port)
+
+    env._ensure_connected()  # lazily materialize the live connection (carrying _launch_proc)
+    assert env.is_running is True
+    current_proc = env.conn._launch_proc
+
+    env.release()
+
+    assert current_proc.terminated  # the live build was hard-killed via reap=_terminate
+    assert env.conn is None and env.is_running is False  # env object stays alive, conn freed
+
+
+def test_reconnect_swapped_proc_is_the_one_reaped(tmp_path):
+    # The MUST-FIX reconnect intent: a reconnect swaps in a NEW connection/proc; a later release()
+    # reaps THAT (current) proc, and the kill-old-first reconnect already reaped the original.
+    cfg = _cfg(tmp_path)
+    factory, conns = _proc_factory_calls()
+    env = _build_base_env(cfg, factory, cfg.game_port)
+
+    env._ensure_connected()  # first (original) live connection
+    original_proc = env.conn._launch_proc
+
+    env._reconnect()  # kill-old-first: reaps original, then relaunches a fresh connection
+    assert original_proc.terminated  # the kill-old-first reconnect reaped the original build
+    current_proc = env.conn._launch_proc
+    assert current_proc is not original_proc
+
+    env.release()  # reaps the CURRENT (reconnect-swapped) proc
+    assert current_proc.terminated
+
+
+def test_release_is_idempotent_and_noop_without_proc(tmp_path):
+    # release() on a not-running env is a no-op; a stub conn without _launch_proc reaps nothing.
     cfg = _cfg(tmp_path)
     env = _build_base_env(cfg, _stub_factory, cfg.game_port)
-
-    original_proc = _FakeProc()
-    _attach_launch_proc(env, original_proc)
-    # The stub conn has no _launch_proc attribute -> getattr fallback to the original.
+    env.release()  # not running -> no-op (no raise)
+    env._ensure_connected()  # stub conn (NO _launch_proc)
     assert not hasattr(env.conn, "_launch_proc")
+    env.release()  # nothing to reap; just frees the transport
+    assert env.conn is None
+    env.release()  # idempotent second call
 
-    env.close()
 
-    assert original_proc.terminated
+# --- logfile-per-attempt (no truncation across relaunches) -----------------------------------
+
+
+def test_attempt_unity_log_path_is_distinct_per_attempt(tmp_path):
+    # Each launch attempt gets a distinct unity-<role>-<port>-<attempt>.log so a relaunch never
+    # truncates the prior instance's C# log.
+    p0 = _attempt_unity_log_path(tmp_path, "train", 50000, 0)
+    p1 = _attempt_unity_log_path(tmp_path, "train", 50000, 1)
+    assert p0.name == "unity-train-50000-0.log"
+    assert p1.name == "unity-train-50000-1.log"
+    assert p0 != p1
+
+
+def test_live_factory_relaunch_uses_distinct_logfiles(tmp_path, monkeypatch):
+    # The live connection_factory increments an attempt counter per invocation, so each
+    # (lazy launch / reconnect / respawn) points Unity's -logFile at a DISTINCT path -> a relaunch
+    # never truncates the prior instance's log. We capture the unity_log_path build_launch_cmd sees
+    # across successive factory calls and assert they differ. No Unity is launched (Popen/connect
+    # are stubbed).
+    import pop_trainer.rl.train as train_mod
+
+    cfg = _cfg(tmp_path, log_dir=tmp_path / "logs")
+    log_paths: list = []
+
+    def _fake_build_cmd(exe, port, config, *, unity_log_path=None, **kw):
+        log_paths.append(unity_log_path)
+        return ["stub", str(port)]
+
+    class _FakePopen:
+        def __init__(self, cmd):
+            self.cmd = cmd
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(train_mod.launch, "build_launch_cmd", _fake_build_cmd)
+    monkeypatch.setattr(train_mod.subprocess, "Popen", lambda cmd: _FakePopen(cmd))
+    monkeypatch.setattr(train_mod.launch, "connect", lambda port: object())
+    monkeypatch.setattr(train_mod, "Connection", lambda sock, logger=None: _StubConnection())
+
+    factory = _live_connection_factory_for_port(cfg, 50000, role="train")
+    factory()  # first launch
+    factory()  # relaunch (reconnect / respawn)
+    factory()  # another relaunch
+
+    assert len(log_paths) == 3
+    assert len(set(str(p) for p in log_paths)) == 3  # all DISTINCT -> no truncation
 
 
 def test_policy_kwargs_carry_extractor_and_checkpoint(tmp_path):
@@ -488,14 +621,14 @@ def test_check_rl_memory_budget_allow_oversized_overrides_abort():
 
 
 def test_check_rl_memory_budget_includes_unity_allowance():
-    # The guard folds (n_envs + 1) Unity instances into the total. A buffer that fits alone but,
-    # with the Unity allowance, exceeds the budget must ABORT. Pick available so 0.6*available sits
-    # between the buffer alone and buffer + Unity.
+    # The guard folds n_envs Unity instances into the total (NOT n_envs + 1 — the eval and training
+    # SETS never coexist, so peak = max(N_train, M_eval) = n_envs). A buffer that fits alone but,
+    # with the Unity allowance, exceeds the budget must ABORT.
     n_envs = 3
     buffer = estimate_rl_memory_bytes(
         n_steps=10, n_envs=n_envs, frame_nbytes=691_200, frame_stack=1
     )
-    unity = (n_envs + 1) * UNITY_INSTANCE_BYTES
+    unity = n_envs * UNITY_INSTANCE_BYTES
     # available chosen so threshold (0.6*available) is above buffer but below buffer+unity.
     threshold_target = buffer + unity // 2
     available = int(threshold_target / MEMORY_MARGIN)
@@ -508,6 +641,26 @@ def test_check_rl_memory_budget_includes_unity_allowance():
             frame_stack=1,
             available_bytes=available,
         )
+
+
+def test_check_rl_memory_budget_peak_is_n_envs_not_n_envs_plus_one():
+    # The peak-instances formula change: a config sized to fit under n_envs Unity instances but NOT
+    # under the OLD n_envs + 1 must now be ACCEPTED (the eval set never coexists with training).
+    n_envs = 4
+    buffer = estimate_rl_memory_bytes(n_steps=8, n_envs=n_envs, frame_nbytes=691_200, frame_stack=1)
+    new_total = buffer + n_envs * UNITY_INSTANCE_BYTES  # current (max(N, M)) accounting
+    old_total = buffer + (n_envs + 1) * UNITY_INSTANCE_BYTES  # the rejected-under accounting
+    # Pick available so 0.6*available sits BETWEEN new_total and old_total: fits now, blew before.
+    threshold_target = (new_total + old_total) // 2
+    available = int(threshold_target / MEMORY_MARGIN)
+    assert new_total <= int(available * MEMORY_MARGIN) < old_total
+    # Now accepted (no raise) — the over-rejection under n_envs + 1 is gone.
+    line = check_rl_memory_budget(
+        n_steps=8, n_envs=n_envs, frame_nbytes=691_200, frame_stack=1, available_bytes=available
+    )
+    assert "memory estimate" in line
+    # The printed estimate names n_envs (not n_envs + 1) Unity instances.
+    assert f"{n_envs} Unity instance" in line
 
 
 # --- 2c. sidecar cadence rides num_timesteps in lockstep with CheckpointCallback -------------
@@ -692,24 +845,28 @@ def test_resume_restores_provider_and_elo_with_mocked_ppo_load(tmp_path, monkeyp
     # The vec env build is replaced with a stub-backed real stack (no Unity). train_local now
     # builds TWO vec envs (training on game_port, eval on eval_port) and passes port + monitor
     # kwargs; the stub factory serves BOTH ports (no Unity either way).
-    monkeypatch.setattr(
-        train_mod,
-        "build_vec_env",
-        lambda c, *, port=None, monitor=False, single=False, role="train": build_vec_env(
+    def _stub_build_vec_env(c, *, port=None, ports=None, monitor=False, single=False, role="train"):
+        # Serve BOTH the single path (connection_factory) and the multi-env eval block path
+        # (connection_factory_for_port) with stubs so NO Unity launches on either branch.
+        return build_vec_env(
             c,
             port=port,
+            ports=ports,
             monitor=monitor,
             single=single,
             role=role,
             connection_factory=_stub_factory,
-        ),
-    )
+            connection_factory_for_port=_stub_factory_for_port,
+        )
+
+    monkeypatch.setattr(train_mod, "build_vec_env", _stub_build_vec_env)
 
     captured: dict = {}
 
     class _FakeModel:
         def __init__(self) -> None:
             self.num_timesteps = 2048
+            self.env = None  # set to the training vec by _fake_load (callback reads model.env)
 
         def learn(self, total_timesteps, callback=None, reset_num_timesteps=True):
             captured["reset_num_timesteps"] = reset_num_timesteps
@@ -727,6 +884,7 @@ def test_resume_restores_provider_and_elo_with_mocked_ppo_load(tmp_path, monkeyp
     def _fake_load(path, env=None):
         captured["loaded_path"] = Path(path)
         fake_model._vec = env
+        fake_model.env = env  # the callback is constructed with training_vec=model.env
         return fake_model
 
     # Patch PPO.load + the final-eval helper (we are not running a real eval here).
