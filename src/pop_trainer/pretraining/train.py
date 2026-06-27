@@ -18,6 +18,7 @@ import argparse
 import json
 import math
 import random
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -30,6 +31,7 @@ from pop_trainer.pretraining import losses, metrics
 from pop_trainer.pretraining.dataset import build_splits
 from pop_trainer.pretraining.decoder import StateDecoder
 from pop_trainer.pretraining.device import resolve_device
+from pop_trainer.pretraining.progress import ProgressReporter
 from pop_trainer.pretraining.targets import NormStats, presence_pos_weight
 
 __all__ = ["TrainConfig", "seed_everything", "train_one_epoch", "evaluate", "run", "main"]
@@ -54,6 +56,7 @@ class TrainConfig:
     device: str = "auto"
     subset: int | None = None
     num_workers: int = 0
+    progress: bool = True
 
 
 def seed_everything(seed: int) -> None:
@@ -81,12 +84,20 @@ def train_one_epoch(
     device: torch.device,
     *,
     pos_weight: float | None,
+    on_batch: Callable[[int, float, float], None] | None = None,
 ) -> dict[str, float]:
     """One training pass: a spatial-loss step (trains encoder) + a probe-loss step per batch.
 
     Returns the mean total spatial loss and mean total probe loss over the epoch (for the loss
     trajectory). The probe reads ``embed.detach()``, so its optimizer step cannot move the
     encoder; the two steps are kept on disjoint parameter groups.
+
+    ``on_batch`` is an OPTIONAL pure observability side-channel: when given, it is called after each
+    batch with ``(step, running_spatial_loss, running_probe_loss)`` (``step`` is 1-based; the
+    running losses are the epoch means so far, plain floats) so a reporter can show progress.
+    ``None`` (the default) is a no-op and leaves this loop byte-identical — the callback receives
+    only ints / floats and returns nothing, so it cannot touch tensors-with-grad, the optimizers, or
+    the RNG.
     """
     model.train()
     spatial_sum = 0.0
@@ -113,6 +124,8 @@ def train_one_epoch(
         spatial_sum += float(spatial_total.detach())
         probe_sum += float(probe_total.detach())
         n_batches += 1
+        if on_batch is not None:
+            on_batch(n_batches, spatial_sum / n_batches, probe_sum / n_batches)
 
     denom = max(1, n_batches)
     return {"spatial_loss": spatial_sum / denom, "probe_loss": probe_sum / denom}
@@ -192,11 +205,21 @@ def run(cfg: TrainConfig) -> dict:
         splits.test, cfg.batch_size, shuffle=False, num_workers=cfg.num_workers
     )
 
+    reporter = ProgressReporter(total_epochs=cfg.epochs, enabled=cfg.progress)
+    total_steps = len(train_loader)
     loss_trajectory: list[dict[str, float]] = []
-    for _epoch in range(cfg.epochs):
+    for epoch in range(cfg.epochs):
+        reporter.epoch_start(epoch + 1, total_steps)
         epoch_losses = train_one_epoch(
-            model, train_loader, spatial_opt, probe_opt, device, pos_weight=pos_weight
+            model,
+            train_loader,
+            spatial_opt,
+            probe_opt,
+            device,
+            pos_weight=pos_weight,
+            on_batch=reporter.on_batch,
         )
+        reporter.epoch_close()
         loss_trajectory.append(epoch_losses)
 
     val_metrics = evaluate(model, val_loader, device, splits.stats)
@@ -282,6 +305,13 @@ def main(argv: list[str] | None = None) -> int:
         help="cap the TOTAL indexed samples (smoke runs).",
     )
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument(
+        "--progress",
+        dest="progress",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="show a live tqdm bar (TTY) or throttled progress lines (captured); on by default.",
+    )
     args = parser.parse_args(argv)
 
     cfg = TrainConfig(
@@ -297,6 +327,7 @@ def main(argv: list[str] | None = None) -> int:
         device=args.device,
         subset=args.subset,
         num_workers=args.num_workers,
+        progress=args.progress,
     )
     record = run(cfg)
 
