@@ -66,6 +66,7 @@ crashlytics-build.properties
 # Unity (additional)
 mono_crash.*
 /unity/[Rr]ecordings/
+/unity/.vsconfig
 *.app
 *.slnx
 

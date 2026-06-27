@@ -153,7 +153,8 @@ runtime `switch_arena` seam). Single-map:
 uv run python -m pop_trainer.data.collect_runner --out-dir runs/collect-demo
 ```
 
-Rotate over the shipped 10 maps, default pairing mix:
+Rotate over the curated 10-map rotation (`core.maps.CURATED_ROTATION`), default pairing mix —
+pass `--maps` with **no value**:
 
 ```bash
 uv run python -m pop_trainer.data.collect_runner --out-dir runs/collect-rot --maps
@@ -170,7 +171,7 @@ Flags (defaults shown), grounded in
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `--maps` / `--map-rotation` | *(absent)* | rotation set. **No value** → the shipped 10 `exp-configs/maps/*.json`; **a directory** → its `*.json` (sorted); **a list of paths** → that order. **Absent** → no rotation (single `--map`). |
+| `--maps` / `--map-rotation` | *(absent)* | rotation set. **No value** → the curated 10-map rotation (defined in `core.maps`); **a directory** → its `*.json` configs' arena targets (sorted); **a list of arena targets** → that order. **Absent** → no rotation (single `--map`). |
 | `--pairing P1:P2` | `DEFAULT_PAIRINGS` mix | a `(player1:player2)` selector pairing; **repeatable**. Omitted → the default coverage-family mix (coverage vs each other + vs random). |
 | `--map` | `custom1` | single-map (no-rotation) config; the **boot** + only arena when `--maps` is absent. |
 | `--episodes` | `1` | episodes **per worker** |
@@ -207,7 +208,7 @@ peak buffer ~= frame_bytes × shard_size × workers × spike   (spike = SPIKE_FA
 count-based default of `10000` (a ~6.9 GB/worker buffer that OOMed a multi-worker box,
 `collect.py:93`).
 
-`main` runs a **pre-flight guard** before launching any build (`collect_runner.py:718-739`): it
+`main` runs a **pre-flight guard** before launching any build (`collect_runner.py:786-815`): it
 reads `psutil.virtual_memory().available`, computes the estimate, and **always prints the estimate
 line at startup**. When the estimate exceeds `MARGIN` (`0.6` → 60%) of available RAM it **aborts
 with exit code `2` BEFORE any build launches** (`check_memory_budget`, `collect.py:136-170`) —
@@ -232,7 +233,7 @@ observability side-channel — it does not affect a single shard byte.
 ### End-of-run summary
 
 After collection finishes (the bar closes), `main` prints a **concise summary** — counts only, no
-filename dumps (`collect_runner.py:856-869`). Three parts:
+filename dumps (`collect_runner.py:819-838`). Three parts:
 
 1. an **aggregate** line —
    `done: <N> shards, <N,NNN> samples, <K> workers -> <out-dir>`;
@@ -241,10 +242,10 @@ filename dumps (`collect_runner.py:856-869`). Three parts:
    `map <id>  <arena>  <count>` per arena, **including arenas that got zero samples**.
 
 The sample + per-map counts come from a **pure** counter
-([`summarize_collection`](../src/pop_trainer/data/collect_runner.py), `collect_runner.py:613-648`)
+([`summarize_collection`](../src/pop_trainer/data/collect_runner.py), `collect_runner.py:576-611`)
 over each worker's per-sample `map_ids` (read back by globbing each worker dir's `shard_*.npz` in
 sorted order and lazily reading ONLY each shard's `map_ids` member — the big `frames` array is never
-decompressed, `collect_runner.py:651-666`); the worker result dict supplies only the shard counts.
+decompressed, `collect_runner.py:614-629`); the worker result dict supplies only the shard counts.
 
 ### The `maps.json` sidecar (reversible map ids)
 
@@ -267,9 +268,9 @@ Collection **must** receive pixel frames (the env reads a length-prefixed frame 
 a build without `obs_pixels` would leave the env blocking on bytes that never arrive). So the build
 **boots** on the obs_pixels-enabled `--map` config (`custom1` → `unity/Assets/StreamingAssets/demo_config.json`,
 the **same** config the demo launches with — 640×360 pixels on, arena `Arenas/custom1.json`) and
-rotates the arena via `switch_arena` at runtime. The shipped `exp-configs/maps` rotation configs
-supply **switch targets only** (their `arena_path`) and do **not** enable `obs_pixels`, so they are
-never used as the boot config. Either way the captured `(frame, state)` rows are byte-for-byte the
+rotates the arena via `switch_arena` at runtime. The curated rotation supplies **arena switch
+targets directly** (the `Arenas/<name>.json` strings) and is never used as the boot config. Either
+way the captured `(frame, state)` rows are byte-for-byte the
 demo's / RL's observation pipeline. `main` exits `2` if the build exe or the resolved boot config is
 missing.
 

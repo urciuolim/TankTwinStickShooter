@@ -1,4 +1,4 @@
-"""Generate the symmetric experiment maps under exp-configs/maps/.
+"""Generate the symmetric experiment arena geometry under unity/Assets/StreamingAssets/Arenas/.
 
 Every map is POINT-SYMMETRIC under (x, y) -> (-1 - x, -1 - y) (a 180 deg rotation
 about the wall-grid centre (-0.5, -0.5)). That is the same symmetry the shipped
@@ -12,9 +12,10 @@ every map. Interior obstacles stay in the central columns, away from the tank
 spawns near the left/right edges (world x ~= +/-7), and never wall off a column.
 
 Run from anywhere:  uv run python exp-configs/_generate_maps.py
-It (re)writes the arena geometry to unity/Assets/StreamingAssets/Arenas/*.json and the
-config wrappers to exp-configs/maps/*.json, copies the 2021 custom1 arena
-verbatim, and asserts symmetry on all 10.
+It (re)writes the arena geometry to unity/Assets/StreamingAssets/Arenas/*.json,
+copies the 2021 custom1 arena verbatim, and asserts symmetry + floor connectivity
+on all 10. The curated TRAINING ROTATION (which of these arenas the rotation plays,
+in order) lives in src/pop_trainer/core/maps.py (CURATED_ROTATION) -- not here.
 """
 
 import json
@@ -22,7 +23,6 @@ import shutil
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
-MAPS = REPO / "exp-configs" / "maps"
 ARENAS = REPO / "unity" / "Assets" / "StreamingAssets" / "Arenas"
 CUSTOM1_SRC = REPO / "unity" / "Assets" / "StreamingAssets" / "Arenas" / "custom1.json"
 
@@ -30,26 +30,6 @@ WALL_DIMS = {"minX": -10, "maxX": 9, "minY": -6, "maxY": 5}
 FLOOR_DIMS = {"minX": -8, "maxX": 7, "minY": -4, "maxY": 3}
 SOLID_COLS = (-10, -9, 8, 9)  # full-height border columns
 BORDER_ROWS = (-6, -5, 4, 5)  # top/bottom border rows on every other column
-
-CONFIG_TEMPLATE = {
-    "connectionIP": "127.0.0.1",
-    "connectionPort": 50000,
-    "game_maxTime": 60,
-    "timeScale": 5,
-    "verbose": False,
-    "arena_path": None,
-    "player1_ai": True,
-    "player1_keyboard": False,
-    "player2_ai": True,
-    "player2_keyboard": False,
-    "ai_async": False,
-    "ai_actionFreq": 10,
-    "ai_fixedDeltaTime": 0.02,
-    "player_maxHealth": 1,
-    "player_randomStart": False,
-    "player_x_spawn_lim": 0.5,
-    "player_y_spawn_lim": 1.0,
-}
 
 
 def mirror(cell):
@@ -122,12 +102,6 @@ def write_json(path, obj):
     path.write_text(json.dumps(obj, indent=2) + "\n", encoding="utf-8")
 
 
-def write_config(name):
-    cfg = dict(CONFIG_TEMPLATE)
-    cfg["arena_path"] = f"Arenas/{name}.json"
-    write_json(MAPS / f"{name}.json", cfg)
-
-
 def free_space_connected(wall_cells):
     """Flood-fill the floor interior; every non-wall floor cell must be reachable."""
     floor = floor_cells()
@@ -160,7 +134,6 @@ def main():
     }
     assert_symmetric(c1_walls)
     assert free_space_connected(c1_walls), "custom1_2021 floor not connected"
-    write_config("custom1_2021")
     names.append("custom1_2021")
 
     # Maps #2-10: generated, symmetric by construction.
@@ -170,10 +143,9 @@ def main():
         assert free_space_connected(walls), f"{name} floor not connected"
         arena = {"Floor": floor_block, "Walls": cells_to_block(walls, WALL_DIMS, 1)}
         write_json(ARENAS / f"{name}.json", arena)
-        write_config(name)
         names.append(name)
 
-    print(f"wrote {len(names)} maps (symmetric + connected): {', '.join(names)}")
+    print(f"wrote {len(names)} arenas (symmetric + connected): {', '.join(names)}")
 
 
 if __name__ == "__main__":

@@ -17,7 +17,6 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from pop_trainer.core import maps as core_maps
 from pop_trainer.core.state import STATE_LEN
 from pop_trainer.data import collect_runner as R
 from pop_trainer.data import schema, shards
@@ -30,10 +29,10 @@ pytestmark = [
     ),
 ]
 
-# Two shipped map configs (exp-configs/maps) for the rotation, so at least one switch_arena
-# happens and both arenas must echo-tag.
-_MAP_A = core_maps.DEFAULT_MAPS_DIR / "center_block.json"
-_MAP_B = core_maps.DEFAULT_MAPS_DIR / "empty.json"
+# Two curated-rotation arena targets, so at least one switch_arena happens and both arenas must
+# echo-tag.
+_MAP_A = "Arenas/center_block.json"
+_MAP_B = "Arenas/empty.json"
 
 
 def test_live_small_collection_two_workers_two_maps(tmp_path, capsys):
@@ -45,8 +44,8 @@ def test_live_small_collection_two_workers_two_maps(tmp_path, capsys):
     exit_code = R.main(
         [
             "--maps",
-            str(_MAP_A),
-            str(_MAP_B),
+            _MAP_A,
+            _MAP_B,
             "--pairing",
             "aggressive-coverage:opponent-shadower",
             "--episodes",
@@ -105,10 +104,9 @@ def test_live_small_collection_two_workers_two_maps(tmp_path, capsys):
     # map_ids across shards covers both ints.
     sidecar = R.read_maps_sidecar(out_dir / R.MAPS_SIDECAR_NAME)
     assert len(sidecar) == 2
-    arena_a = R.arena_path_for_config(_MAP_A)
-    arena_b = R.arena_path_for_config(_MAP_B)
-    assert set(sidecar) == {arena_a, arena_b}
-    assert {sidecar.index(arena_a), sidecar.index(arena_b)} <= all_map_ids
+    # The map values ARE the arena targets now (passed verbatim into the rotation).
+    assert set(sidecar) == {_MAP_A, _MAP_B}
+    assert {sidecar.index(_MAP_A), sidecar.index(_MAP_B)} <= all_map_ids
 
     # Both players' actions are present (player2's row is not uniformly zero).
     assert saw_player2_action

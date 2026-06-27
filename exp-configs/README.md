@@ -1,19 +1,18 @@
-# exp-configs — ready-made maps for experiments
+# exp-configs — symmetric arena geometry for experiments
 
-Point the trainer at one map config to run an experiment.
-See `docs/experiments.md` for the full format reference; this dir is the curated
-set to grab from.
+This dir generates the curated set of symmetric **arena geometry** files. See
+`docs/experiments.md` for the full arena-format reference.
 
 ```
 exp-configs/
-  maps/
-    <name>.json          # game config (references its arena)
-  _generate_maps.py      # regenerates the maps (symmetry guaranteed by construction)
+  _generate_maps.py      # (re)generates the arena geometry (symmetry guaranteed by construction)
 ```
 
-Each `maps/<name>.json` is the game-config wrapper (it carries an `arena_path`). The arena
-**geometry** (walls/floor) is written by `_generate_maps.py` to `unity/Assets/StreamingAssets/Arenas/`,
-the single source of truth for that geometry.
+`_generate_maps.py` writes the arena **geometry** (walls/floor) to
+`unity/Assets/StreamingAssets/Arenas/`, the single source of truth for that geometry. The curated
+10-map **training rotation** — which of those arenas the trainer rotates over, and in what order —
+lives in `src/pop_trainer/core/maps.py` (the `CURATED_ROTATION` constant). There are no game-config
+wrappers in this dir.
 
 ## Maps (10)
 
@@ -39,7 +38,9 @@ Symmetry, obs-shape, and floor-connectivity are pinned by `tests/test_exp_config
 Regenerate / add more: edit the seed lists in `_generate_maps.py` and run
 `uv run python exp-configs/_generate_maps.py` — it auto-mirrors every wall you place,
 so new maps stay symmetric by construction. (Keep the Walls dims fixed to keep the
-(36, 60, 3) obs and cross-map model compatibility.)
+(36, 60, 3) obs and cross-map model compatibility.) If you add a new arena to the
+training rotation, also add its `Arenas/<name>.json` target to `CURATED_ROTATION` in
+`src/pop_trainer/core/maps.py`.
 
 ## Rewards
 
@@ -49,5 +50,5 @@ The reward shaping lives in code, not here — see `src/pop_trainer/env/rewards.
 ## Run an experiment
 
 The previous `tank_twin.train` experiment commands were retired at M1 (the `tank_twin` package
-was removed; see git history). A `pop_trainer` training entrypoint that consumes these map
-configs supersedes them and is not yet wired.
+was removed; see git history). A `pop_trainer` training entrypoint that consumes the curated
+rotation supersedes them and is not yet wired.

@@ -83,7 +83,7 @@ package is named `data` (not `datasets` — that name collides with the git-igno
   [`agent_pool_factory`](../../src/pop_trainer/data/collect_runner.py) is the module-level (spawn-safe)
   factory that builds the worker's `{selector → agent}` pool once up front — covering every selector
   its plan pairs — so each selector's RNG stream is continuous across the episodes it plays
-  (`collect_runner.py:403-413`); both factories are wired onto every spec and **required** by
+  (`collect_runner.py:384-394`); both factories are wired onto every spec and **required** by
   `run_worker` (it raises `ValueError` if either is `None`).
   [`build_specs`](../../src/pop_trainer/data/collect_runner.py) is the pure
   CLI-args→`list[CollectionSpec]` builder (one per worker, `--workers` clamped to `[1, MAX_WORKERS=8]`,
@@ -97,25 +97,25 @@ package is named `data` (not `datasets` — that name collides with the git-igno
   table — counts only, no filename dumps). See the
   [runbook](../runbook.md#4-collect-a-dataset-cli) for the flags + the printout.
 - [`summarize_collection(worker_map_ids, maps, *, total_shards)`](../../src/pop_trainer/data/collect_runner.py)
-  / [`CollectionSummary`](../../src/pop_trainer/data/collect_runner.py)
-  (`collect_runner.py:596-648`) — the **pure** (no disk I/O) end-of-run counter: it rolls up
+  (`collect_runner.py:576-611`) / [`CollectionSummary`](../../src/pop_trainer/data/collect_runner.py)
+  (`collect_runner.py:559-573`) — the **pure** (no disk I/O) end-of-run counter: it rolls up
   per-worker + per-map sample counts from each worker's per-sample `map_ids`, returning a frozen
   `CollectionSummary` (`total_shards` / `total_samples` / `worker_samples` / `map_samples`, with ONE
   `map_samples` row per arena in the `maps` sidecar — arenas with zero samples shown as `0`). `main`
   feeds it the per-worker `map_ids` read back by `_read_worker_map_ids`, which globs each worker dir's
   `shard_*.npz` in sorted filename order and lazily reads ONLY each shard's tiny `map_ids` member (the
-  big `frames` array is never inflated — NOT via `build_index`, `collect_runner.py:651-666`), and
-  renders it with a format-only helper (`collect_runner.py:669-685`).
+  big `frames` array is never inflated — NOT via `build_index`, `collect_runner.py:614-629`), and
+  renders it with a format-only helper (`collect_runner.py:632-652`).
 
 ## The rotation scheduler + map tagging
 
 A run is a deterministic **round-robin over the (map × pairing) grid**. The rotation set comes from
-`--maps` (resolved by [`core.maps.resolve_map_rotation`](core.md), mapped to each config's
-`arena_path`); the pairing set is `--pairing` (default `DEFAULT_PAIRINGS`, the coverage family vs
-each other + vs random).
+`--maps` (resolved by [`core.maps.resolve_map_rotation`](core.md) directly into arena targets);
+the pairing set is `--pairing` (default `DEFAULT_PAIRINGS`, the coverage family vs each other + vs
+random).
 
 - [`round_robin_plan(rotation, pairings, *, episodes, worker_id, n_workers, map_index)`](../../src/pop_trainer/data/collect_runner.py)
-  (`collect_runner.py:246-292`) — the **pure** per-worker scheduler (unit-tested, no live build).
+  (`collect_runner.py:227-273`) — the **pure** per-worker scheduler (unit-tested, no live build).
   The grid is `rotation × pairings` enumerated **map-major**: cell `g` decodes to
   `(map = rotation[g // P], pairing = pairings[g % P])` for `P = len(pairings)`, giving
   `G = M * P` cells. Worker `w` episode `i` picks cell **`(worker_id + i*n_workers) % G`**. Across
@@ -169,7 +169,7 @@ Constants (`collect.py:97-107`): `SHARD_BYTES_BUDGET ≈ 384 MB` (per-worker buf
 estimate consume 60% of available RAM, leaving headroom for the unmodeled ~1 GB/worker Unity
 instances + the OS). These functions take `available_bytes` as an **injected argument** — `psutil`
 is read ONLY in [`collect_runner.main`](../../src/pop_trainer/data/collect_runner.py)
-(`collect_runner.py:718-739`, the CLI glue), which resolves the effective `shard_size`, reads
+(`collect_runner.py:786-815`, the CLI glue), which resolves the effective `shard_size`, reads
 `psutil.virtual_memory().available`, calls `check_memory_budget`, and on `MemoryError` aborts with
 exit code `2` BEFORE launching any build (unless `--allow-oversized`).
 
