@@ -39,11 +39,11 @@ release and THEN terminates the build process (terminate -> wait(10) -> kill on 
 
 PIXELS. Collection MUST receive pixel frames (the env reads a length-prefixed frame after every
 state; a build without ``obs_pixels`` would leave the env blocking on bytes that never arrive). The
-no-rotation default ``--map`` resolves to ``Assets/StreamingAssets/demo_config.json`` — the SAME
-obs_pixels-enabled config the demo launches with (640x360, arena ``Arenas/custom1.json`` resolved
-against the config dir) — so the captured ``(frame, state)`` rows are byte-for-byte the demo's /
-RL's observation pipeline, with no drift. For a rotation run the boot config is the FIRST rotation
-map config (it must likewise enable ``obs_pixels``). The env is built with the matching
+no-rotation default ``--map`` resolves to ``unity/Assets/StreamingAssets/demo_config.json`` — the
+SAME obs_pixels-enabled config the demo launches with (640x360, arena ``Arenas/custom1.json``
+resolved against the config dir) — so the captured ``(frame, state)`` rows are byte-for-byte the
+demo's / RL's observation pipeline, with no drift. For a rotation run the boot config is the FIRST
+rotation map config (it must likewise enable ``obs_pixels``). The env is built with the matching
 ``frame_shape`` either way.
 """
 
@@ -102,7 +102,7 @@ __all__ = [
 # The repo root is three parents up from this file (src/pop_trainer/data/collect_runner.py).
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 # OS-aware default to the launchable build binary (.exe / .app inner / bare); --exe overrides it.
-DEFAULT_EXE = launch.default_build_path(_REPO_ROOT)
+DEFAULT_EXE = launch.default_build_path(_REPO_ROOT / "unity")
 
 # Rendered pixel-frame dimensions (W x H) — MUST match the launched config's obs_pixels_*.
 FRAME_WIDTH = 640
@@ -123,7 +123,7 @@ def frame_nbytes(frame_shape: Sequence[int]) -> int:
 # Map name -> the obs_pixels-enabled build config it launches with (the single-map / no-rotation
 # default). Reusing the demo config keeps collection's frames byte-identical to the demo's / RL's
 # pipeline (640x360 pixels on, arena Arenas/custom1.json resolved against the config dir).
-_STREAMING_ASSETS = _REPO_ROOT / "Assets" / "StreamingAssets"
+_STREAMING_ASSETS = _REPO_ROOT / "unity" / "Assets" / "StreamingAssets"
 MAP_CONFIGS: dict[str, Path] = {
     "custom1": _STREAMING_ASSETS / "demo_config.json",
 }

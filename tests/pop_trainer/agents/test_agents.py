@@ -17,7 +17,7 @@ from pop_trainer.agents.coverage_metrics import measure_coverage
 from pop_trainer.core import state as S
 from pop_trainer.core.protocol import WallDims, WallLayout
 
-ARENA_DIR = Path(__file__).resolve().parents[3] / "Assets" / "StreamingAssets" / "Arenas"
+ARENA_DIR = Path(__file__).resolve().parents[3] / "unity" / "Assets" / "StreamingAssets" / "Arenas"
 HARD_MAPS = ("center_block", "central_cross", "chokepoint", "scattered")
 
 

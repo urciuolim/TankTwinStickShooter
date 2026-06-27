@@ -1,8 +1,8 @@
 # Arena (map) JSON format
 
 The reference for the arena-config JSON the Unity build loads — the `"Floor"` / `"Walls"`
-geometry every map under `Assets/StreamingAssets/Arenas/` uses.
-This is the same `Walls` shape that Unity's [`WallMessage.Build`](../Assets/Scripts/WallMessage.cs)
+geometry every map under `unity/Assets/StreamingAssets/Arenas/` uses.
+This is the same `Walls` shape that Unity's [`WallMessage.Build`](../unity/Assets/Scripts/WallMessage.cs)
 emits and that `pop_trainer`'s [`core.protocol.parse_walls_message`](../src/pop_trainer/core/protocol.py)
 parses into a `WallLayout` (see the [core seam writeup](components/core.md#the-wall-message--protocol-seam-walllayout--infomap)).
 
@@ -21,7 +21,7 @@ An arena is one JSON object with a `"Floor"` block and a `"Walls"` block. Each b
   y-rows that have a tile in that column.
 
 **The `Walls` block defines the map's wall geometry — NOT the observation.** Unity renders
-these walls and emits them once per map via [`WallMessage.Build`](../Assets/Scripts/WallMessage.cs);
+these walls and emits them once per map via [`WallMessage.Build`](../unity/Assets/Scripts/WallMessage.cs);
 `pop_trainer` parses that into a `WallLayout` and surfaces it as `info["map"]` map-state (see the
 [core seam writeup](components/core.md#the-wall-message--protocol-seam-walllayout--infomap)).
 The observation is the **real rendered pixel frame `(360, 640, 3)`** from Unity

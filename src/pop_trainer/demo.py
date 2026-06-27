@@ -16,10 +16,10 @@ nothing from ``tank_twin``. The episode-driving logic is the pure :func:`run_dem
 connect live in :func:`main`, which the tests do NOT exercise.
 
 PIXELS MUST BE ON. ``TankEnv.reset``/``step`` always read a length-prefixed pixel frame after
-each state JSON, but the shipped ``Assets/StreamingAssets/config.json`` has no ``obs_pixels``
+each state JSON, but the shipped ``unity/Assets/StreamingAssets/config.json`` has no ``obs_pixels``
 key, so the build defaults ``obsPixels=false`` and sends NO frame — the env would block waiting
 for bytes that never arrive. The demo therefore launches the build with
-``Assets/StreamingAssets/demo_config.json``, which sets ``"obs_pixels": true`` plus
+``unity/Assets/StreamingAssets/demo_config.json``, which sets ``"obs_pixels": true`` plus
 ``obs_pixels_width``/``obs_pixels_height`` (640x360, the DriverController defaults and 16:9),
 and constructs the env with ``frame_shape=(360, 640, 3)`` to MATCH. That config lives inside
 StreamingAssets next to the ``Arenas/`` directory so its relative ``arena_path``
@@ -60,14 +60,14 @@ from pop_trainer.env.tank_env import TankEnv
 # The repo root is three parents up from this file (src/pop_trainer/demo.py -> repo).
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 # OS-aware default to the launchable build binary (.exe / .app inner / bare); --exe overrides it.
-DEFAULT_EXE = default_build_path(_REPO_ROOT)
+DEFAULT_EXE = default_build_path(_REPO_ROOT / "unity")
 # The demo config enables obs_pixels and lives in StreamingAssets so its relative arena_path
 # resolves against the config directory (DriverController.ResolveArenaPath).
-DEFAULT_CONFIG = _REPO_ROOT / "Assets" / "StreamingAssets" / "demo_config.json"
+DEFAULT_CONFIG = _REPO_ROOT / "unity" / "Assets" / "StreamingAssets" / "demo_config.json"
 # Real-time human play needs a slower, more forgiving cadence than the watch-the-bots demo:
 # timeScale 1, a responsive ai_actionFreq, and more health for a duel. Used as the default config
 # when EITHER player is "human" (unless --config is explicitly overridden).
-HUMAN_CONFIG = _REPO_ROOT / "Assets" / "StreamingAssets" / "human_config.json"
+HUMAN_CONFIG = _REPO_ROOT / "unity" / "Assets" / "StreamingAssets" / "human_config.json"
 DEFAULT_PORT = 50000
 
 # Rendered pixel-frame dimensions (W x H) — MUST match demo_config.json's obs_pixels_*.

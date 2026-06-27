@@ -35,7 +35,7 @@ The collector rotates arenas *and* policy pairings between episodes — one long
 
 ```bash
 uv sync                                          # Python 3.12 env (managed by uv)
-# build the Unity game -> build/TankTwinStickShooter.exe  (see docs/runbook.md)
+# build the Unity game -> unity/build/TankTwinStickShooter.exe  (see docs/runbook.md)
 uv run python -m pop_trainer.demo                # watch two policies play one episode
 uv run python -m pop_trainer.data.collect_runner --out-dir runs/demo --maps   # collect a rotating dataset
 ```

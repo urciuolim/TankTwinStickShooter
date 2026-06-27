@@ -13,7 +13,7 @@ Research-derived standards for bringing this repo "up to snuff within reason" �
 - **Load-bearing prerequisite:** the gym→gymnasium migration (5-tuple `step`, `reset(seed=,options=)`, `terminated`/`truncated`) must land before `check_env` passes — stage tests: pure-logic first, env-contract after the port.
 - **Overkill to avoid:** MLflow/Hydra, `--strict` mypy, ruff `D`/`ANN` rules, coverage gates >70%, release automation, testing that PPO converges.
 
-## Unity / C# (`Assets/Scripts/`)
+## Unity / C# (`unity/Assets/Scripts/`)
 
 - **Assemblies:** add THREE asmdefs only — runtime `TankTwinStickShooter` (references Newtonsoft), `…EditModeTests`, `…PlayModeTests`. Skip the 6-module split (overkill for 4 scripts). The runtime asmdef turns the stray-`UnityEditor`-import bug class into a compile error.
 - **Testing:** Unity Test Framework 1.7 (bundled; 2.x is experimental — don't). EditMode for pure logic (arena parse, config parse, the `float[52]` state encoder, protocol dispatch); a thin PlayMode smoke layer (~4 tests: scene boot, timer-end, player-death-end, bullet collision/despawn). Skip visual/UI and live-socket tests.

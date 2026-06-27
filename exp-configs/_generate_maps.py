@@ -12,7 +12,7 @@ every map. Interior obstacles stay in the central columns, away from the tank
 spawns near the left/right edges (world x ~= +/-7), and never wall off a column.
 
 Run from anywhere:  uv run python exp-configs/_generate_maps.py
-It (re)writes the arena geometry to Assets/StreamingAssets/Arenas/*.json and the
+It (re)writes the arena geometry to unity/Assets/StreamingAssets/Arenas/*.json and the
 config wrappers to exp-configs/maps/*.json, copies the 2021 custom1 arena
 verbatim, and asserts symmetry on all 10.
 """
@@ -23,8 +23,8 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 MAPS = REPO / "exp-configs" / "maps"
-ARENAS = REPO / "Assets" / "StreamingAssets" / "Arenas"
-CUSTOM1_SRC = REPO / "Assets" / "StreamingAssets" / "Arenas" / "custom1.json"
+ARENAS = REPO / "unity" / "Assets" / "StreamingAssets" / "Arenas"
+CUSTOM1_SRC = REPO / "unity" / "Assets" / "StreamingAssets" / "Arenas" / "custom1.json"
 
 WALL_DIMS = {"minX": -10, "maxX": 9, "minY": -6, "maxY": 5}
 FLOOR_DIMS = {"minX": -8, "maxX": 7, "minY": -4, "maxY": 3}

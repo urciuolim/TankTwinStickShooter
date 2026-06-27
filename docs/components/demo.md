@@ -45,9 +45,9 @@ All in [`demo.py`](../../src/pop_trainer/demo.py):
 ## Pixels must be on
 
 `TankEnv.reset` / `step` always read a length-prefixed pixel frame after each state JSON, but the
-shipped `Assets/StreamingAssets/config.json` has no `obs_pixels` key (the build defaults it off
+shipped `unity/Assets/StreamingAssets/config.json` has no `obs_pixels` key (the build defaults it off
 and sends no frame). So the demo launches the build with
-[`Assets/StreamingAssets/demo_config.json`](../../Assets/StreamingAssets/demo_config.json), which
+[`unity/Assets/StreamingAssets/demo_config.json`](../../unity/Assets/StreamingAssets/demo_config.json), which
 sets `"obs_pixels": true` at 640×360, and constructs the env with `frame_shape=(360, 640, 3)` to
 match. That config lives inside `StreamingAssets` so its relative `arena_path`
 (`Arenas/custom1.json`) resolves against the config directory.
@@ -61,7 +61,7 @@ stops it in `finally` (`demo.py:300-348`). Two humans thus share one physical ke
 + one bot is also valid (the bot player is built normally).
 
 When a player is human the default config switches from `demo_config.json` to
-[`human_config.json`](../../Assets/StreamingAssets/human_config.json) — real-time `timeScale: 1`
+[`human_config.json`](../../unity/Assets/StreamingAssets/human_config.json) — real-time `timeScale: 1`
 (vs the bots demo's `2`), `ai_actionFreq: 3`, `player_maxHealth: 4` — UNLESS `--config` is given
 (`demo.py:302-308`). `pynput` is the optional `human` extra, imported lazily by the listener: a
 missing extra fails in `main` at listener construction (BEFORE the build launches) with an

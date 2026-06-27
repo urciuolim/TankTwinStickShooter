@@ -88,7 +88,7 @@ Unity is the source of truth for the static map geometry. The end-to-end path:
 
 1. On a map load (start handshake), `DriverController` writes `{"starting": true}` first, then a
    **separate** strict-JSON `{"type": "walls", ...}` message built by
-   [`WallMessage.Build`](../../Assets/Scripts/WallMessage.cs) — skipped entirely when no arena is
+   [`WallMessage.Build`](../../unity/Assets/Scripts/WallMessage.cs) — skipped entirely when no arena is
    configured.
 2. `core.protocol.is_walls_message` discriminates it by its `"type"` tag and
    `parse_walls_message` strict-parses it into a frozen `WallLayout` (column-x string keys →

@@ -363,7 +363,7 @@ each in its OWN process (`build_vec_env`, `train.py:692-723`).
 
 #### The training-topology config
 
-`cfg.game_config` defaults to [`train_config.json`](../../Assets/StreamingAssets/train_config.json)
+`cfg.game_config` defaults to [`train_config.json`](../../unity/Assets/StreamingAssets/train_config.json)
 (`DEFAULT_TRAIN_CONFIG`, `train.py:94`) — the single-arena AI-vs-AI pixel config the build launches
 under. Load-bearing values (`train_config.json:1-22`): `timeScale: 5` (**MUST stay ≤ 5** — the
 collection cap applies; ≥ 10 corrupts), `obs_pixels: true` at `640×360`, both `player1_ai` /

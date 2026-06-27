@@ -37,33 +37,33 @@ uv run pytest -m e2e
 ## 2. Build the Unity game
 
 The trainer/demo needs a standalone build of the simulator for the host OS. The headless build
-entry points live in [`BuildScript`](../Assets/Editor/BuildScript.cs): one method per platform,
+entry points live in [`BuildScript`](../unity/Assets/Editor/BuildScript.cs): one method per platform,
 each invoked via the Unity 6.5 editor in batchmode. Both build the enabled scenes, exit non-zero
 on failure (so the batchmode caller can detect it), and ship `StreamingAssets` (`config.json` +
 `Arenas/*.json` + the demo / human configs) into the player automatically.
 
 ### Windows
 
-[`BuildScript.BuildWindows`](../Assets/Editor/BuildScript.cs) → `build/TankTwinStickShooter.exe`
+[`BuildScript.BuildWindows`](../unity/Assets/Editor/BuildScript.cs) → `unity/build/TankTwinStickShooter.exe`
 (git-ignored):
 
 ```bash
 "C:\Program Files\Unity\Hub\Editor\6000.5.0f1\Editor\Unity.exe" \
   -batchmode -quit -accept-apiupdate -logFile - \
-  -projectPath "C:\src\TankTwinStickShooter" \
+  -projectPath "C:\src\TankTwinStickShooter\unity" \
   -executeMethod BuildScript.BuildWindows
 ```
 
 ### macOS
 
-[`BuildScript.BuildOSX`](../Assets/Editor/BuildScript.cs) targets `StandaloneOSX` and writes the
-`build/TankTwinStickShooter.app` bundle (git-ignored). The Unity 6.5 editor binary on macOS is
+[`BuildScript.BuildOSX`](../unity/Assets/Editor/BuildScript.cs) targets `StandaloneOSX` and writes the
+`unity/build/TankTwinStickShooter.app` bundle (git-ignored). The Unity 6.5 editor binary on macOS is
 inside the editor `.app`:
 
 ```bash
 /Applications/Unity/Hub/Editor/6000.5.0f1/Unity.app/Contents/MacOS/Unity \
   -batchmode -quit -accept-apiupdate -logFile - \
-  -projectPath "/Users/<you>/path/to/TankTwinStickShooter" \
+  -projectPath "/Users/<you>/path/to/TankTwinStickShooter/unity" \
   -executeMethod BuildScript.BuildOSX
 ```
 
@@ -83,7 +83,7 @@ With the build in place, watch two visibly-different policies play one episode:
 uv run python -m pop_trainer.demo
 ```
 
-This launches the build **windowed** with `Assets/StreamingAssets/demo_config.json` (which enables
+This launches the build **windowed** with `unity/Assets/StreamingAssets/demo_config.json` (which enables
 `obs_pixels` at 640×360 — required, since the env always reads a pixel frame each step), connects
 over TCP, runs one episode of `player1 = aggressive-coverage` vs `player2 = opponent-shadower`,
 prints a trace, and tears down.
@@ -91,9 +91,9 @@ prints a trace, and tears down.
 **No `--exe` needed on any OS.** The default executable is resolved for the current platform by
 [`core.launch.default_build_path`](../src/pop_trainer/core/launch.py)
 ([`demo.DEFAULT_EXE`](../src/pop_trainer/demo.py)): on **Windows** it is
-`build/TankTwinStickShooter.exe`; on **macOS** it is the binary *inside* the
-`build/TankTwinStickShooter.app` bundle (`Contents/MacOS/`, discovered by globbing the bundle —
-you don't type the inner name); on **Linux** the bare `build/TankTwinStickShooter` binary. So
+`unity/build/TankTwinStickShooter.exe`; on **macOS** it is the binary *inside* the
+`unity/build/TankTwinStickShooter.app` bundle (`Contents/MacOS/`, discovered by globbing the bundle —
+you don't type the inner name); on **Linux** the bare `unity/build/TankTwinStickShooter` binary. So
 `python -m pop_trainer.demo` works as-is once the platform build from §2 is present — pass `--exe`
 only to point at a build elsewhere.
 
@@ -104,7 +104,7 @@ uv run python -m pop_trainer.demo --help
 ```
 
 Useful flags (defaults shown): `--exe` (the OS-resolved build path above),
-`--config Assets/StreamingAssets/demo_config.json`, `--port 50000`, `--player1` / `--player2`
+`--config unity/Assets/StreamingAssets/demo_config.json`, `--port 50000`, `--player1` / `--player2`
 (any of: `aggressive-coverage`, `wall-hugger`, `opponent-shadower`, `random`, `human`),
 `--max-steps 600`, `--seed 0`. The demo exits `2` if the build exe or config is missing.
 
@@ -129,7 +129,7 @@ Controls:
 - **P1** — move WASD, aim TFGH, fire LEFT SHIFT.
 - **P2** — move IJKL, aim numpad 8/4/5/6, fire ENTER. (Numpad aim works with Num Lock ON or OFF.)
 
-When a player is `human` the demo auto-selects `Assets/StreamingAssets/human_config.json` (real-time
+When a player is `human` the demo auto-selects `unity/Assets/StreamingAssets/human_config.json` (real-time
 `timeScale: 1`, a more forgiving cadence) instead of `demo_config.json` — unless you pass `--config`.
 
 > **LOCAL-DEV ONLY.** `pynput` installs a GLOBAL keyboard hook that needs a real desktop session.
@@ -177,7 +177,7 @@ Flags (defaults shown), grounded in
 | `--max-steps` | `800` | per-episode step cap |
 | `--out-dir` | *(required)* | root output dir; worker `w` writes shards to `worker_<w>/` under it |
 | `--workers` | `2` | parallel workers, one build per worker (**clamped to `[1, MAX_WORKERS=8]`**) |
-| `--exe` | `build/TankTwinStickShooter.exe` | path to the Unity build |
+| `--exe` | `unity/build/TankTwinStickShooter.exe` | path to the Unity build |
 | `--base-port` | `50000` | base TCP port; worker `w` connects on `base_port + w` |
 | `--seed` | `0` | base seed; worker `w` uses `base + w*10000` |
 | `--shard-size` | *(auto)* | in-RAM **BUFFER** bound (samples per worker before a flush), **NOT a file-size knob**. Omitted → auto: derived from the byte budget so the per-worker buffer stays bounded regardless of frame resolution (the OOM-safe default). See [Memory safety](#memory-safety-the-pre-flight-guard). |
@@ -265,7 +265,7 @@ arena path Unity actually loaded (echoed as `WallLayout.map_id`), decoded throug
 
 Collection **must** receive pixel frames (the env reads a length-prefixed frame after every state;
 a build without `obs_pixels` would leave the env blocking on bytes that never arrive). So the build
-**boots** on the obs_pixels-enabled `--map` config (`custom1` → `Assets/StreamingAssets/demo_config.json`,
+**boots** on the obs_pixels-enabled `--map` config (`custom1` → `unity/Assets/StreamingAssets/demo_config.json`,
 the **same** config the demo launches with — 640×360 pixels on, arena `Arenas/custom1.json`) and
 rotates the arena via `switch_arena` at runtime. The shipped `exp-configs/maps` rotation configs
 supply **switch targets only** (their `arena_path`) and do **not** enable `obs_pixels`, so they are
@@ -332,7 +332,7 @@ Flags (defaults shown), grounded in [`_parse_args`](../src/pop_trainer/rl/train.
 |------|---------|---------|
 | `--total-timesteps` | *(required)* | total env-steps to train (`train.py:1273-1275`). |
 | `--run-dir` | *(required)* | output dir for checkpoints / sidecar / TensorBoard (`train.py:1276-1278`). |
-| `--config` | `Assets/StreamingAssets/train_config.json` | game/training config JSON forwarded to the build launch (`DEFAULT_TRAIN_CONFIG`, `train.py:94`; arg `train.py:1267-1272`). |
+| `--config` | `unity/Assets/StreamingAssets/train_config.json` | game/training config JSON forwarded to the build launch (`DEFAULT_TRAIN_CONFIG`, `train.py:94`; arg `train.py:1267-1272`). |
 | `--resume` | *(absent)* | a prior `run_dir` to resume — load the latest `model_*.zip` + `state.json` (`train.py:1279-1284`). |
 | `--encoder-checkpoint` | `None` | optional pretrained-encoder `state_dict` for the features extractor (`train.py:1285-1290`). |
 | `--freeze-encoder` | *(off)* | freeze the encoder weights during RL (`train.py:1291-1293`). |
@@ -429,7 +429,7 @@ resume stays position-exact `round_robin` as documented under [Resume](#resume).
 
 ### The training topology (`train_config.json`)
 
-The build launches under [`train_config.json`](../Assets/StreamingAssets/train_config.json): a
+The build launches under [`train_config.json`](../unity/Assets/StreamingAssets/train_config.json): a
 **single-arena AI-vs-AI** pixel config — `obs_pixels: true` @ 640×360, both `player1_ai`/`player2_ai`
 `true`, `game_maxTime: 60`, `player_maxHealth: 3`, one `arena_path` (`Arenas/custom1.json`, no
 rotation) (`train_config.json:1-22`).

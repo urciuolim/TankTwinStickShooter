@@ -91,7 +91,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 
 # The default game/training config forwarded to the build launch (single-map, obs_pixels=True,
 # timeScale<=5). Lives next to the other StreamingAssets configs.
-DEFAULT_TRAIN_CONFIG = _REPO_ROOT / "Assets" / "StreamingAssets" / "train_config.json"
+DEFAULT_TRAIN_CONFIG = _REPO_ROOT / "unity" / "Assets" / "StreamingAssets" / "train_config.json"
 
 # The 640x360 RGB pixel frame Unity renders, channels-LAST (H, W, 3). SB3 auto-applies
 # VecTransposeImage so the extractor sees (N, 3, 360, 640).
@@ -453,7 +453,11 @@ def _live_connection_factory_for_port(
     Observability: ``role`` tags the Unity log filename; ``logger`` (when given) is threaded into
     the ``Connection`` for wire-level evidence. Both default off — the no-logger path is identical.
     """
-    exe = cfg.build_path if cfg.build_path is not None else launch.default_build_path(_REPO_ROOT)
+    exe = (
+        cfg.build_path
+        if cfg.build_path is not None
+        else launch.default_build_path(_REPO_ROOT / "unity")
+    )
     # Mutable launch counter captured by the closure: each (lazy launch / reconnect / respawn) gets
     # a distinct -logFile so no prior instance's log is truncated.
     attempt = {"n": 0}

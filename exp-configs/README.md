@@ -12,7 +12,7 @@ exp-configs/
 ```
 
 Each `maps/<name>.json` is the game-config wrapper (it carries an `arena_path`). The arena
-**geometry** (walls/floor) is written by `_generate_maps.py` to `Assets/StreamingAssets/Arenas/`,
+**geometry** (walls/floor) is written by `_generate_maps.py` to `unity/Assets/StreamingAssets/Arenas/`,
 the single source of truth for that geometry.
 
 ## Maps (10)
