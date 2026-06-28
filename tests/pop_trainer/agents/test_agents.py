@@ -17,7 +17,7 @@ from pop_trainer.agents.coverage_metrics import measure_coverage
 from pop_trainer.core import state as S
 from pop_trainer.core.protocol import WallDims, WallLayout
 
-ARENA_DIR = Path(__file__).resolve().parents[3] / "exp-configs" / "maps" / "Arenas"
+ARENA_DIR = Path(__file__).resolve().parents[3] / "unity" / "Assets" / "StreamingAssets" / "Arenas"
 HARD_MAPS = ("center_block", "central_cross", "chokepoint", "scattered")
 
 
@@ -268,8 +268,11 @@ def test_family_beats_random_on_hard_maps(map_name):
 
 
 def test_family_beats_random_on_all_arenas():
-    # A broader sweep across every shipped arena (not just the hard ones) — the family wins
-    # everywhere by mean coverage.
+    # A broader sweep across every shipped arena (not just the hard ones) — the family is never
+    # beaten by Random, and wins strictly wherever the arena has coverage HEADROOM. On a
+    # degenerate arena whose reachable floor is tiny enough that BOTH agents saturate to full
+    # coverage (e.g. the nowin_test game fixture), the result is a genuine tie, not a family
+    # weakness — so strict superiority is required only when Random has not already saturated.
     for arena in ARENA_DIR.glob("*.json"):
         layout = _layout_from_arena(arena.stem)
         fam = np.mean(
@@ -284,7 +287,12 @@ def test_family_beats_random_on_all_arenas():
                 for s in range(3)
             ]
         )
-        assert fam > rnd, f"{arena.stem}: family {fam:.3f} <= random {rnd:.3f}"
+        if rnd >= 1.0:
+            # Random already covers everything reachable — the family cannot beat a perfect
+            # score; assert it at least matches (never worse).
+            assert fam >= rnd, f"{arena.stem}: family {fam:.3f} < random {rnd:.3f} (saturated)"
+        else:
+            assert fam > rnd, f"{arena.stem}: family {fam:.3f} <= random {rnd:.3f}"
 
 
 # --- RandomAgent (kept) ----------------------------------------------------------------------
@@ -328,6 +336,37 @@ def test_random_agent_different_seeds_differ():
     a = [agents.RandomAgent(seed=1).act(None) for _ in range(10)]
     b = [agents.RandomAgent(seed=2).act(None) for _ in range(10)]
     assert a != b
+
+
+# --- NoOpAgent (the stationary curriculum floor) ---------------------------------------------
+
+
+def test_noop_agent_satisfies_protocol():
+    # act-only is the runtime-checkable Agent surface; the stateless NoOpAgent passes.
+    assert isinstance(agents.NoOpAgent(), core.Agent)
+
+
+@pytest.mark.parametrize(
+    "obs",
+    [None, np.zeros(S.STATE_LEN, dtype=np.float32), [0.0] * S.STATE_LEN, [1.0, 2.0, 3.0]],
+    ids=["none", "ndarray", "state_list", "short_list"],
+)
+def test_noop_agent_returns_zero_action_for_any_obs(obs):
+    # Obs-agnostic: the zero action [0,0,0,0,0] regardless of the observation type / contents.
+    out = agents.NoOpAgent().act(obs)
+    assert out == [0.0, 0.0, 0.0, 0.0, 0.0]
+    assert len(out) == agents.ACTION_LEN
+
+
+def test_noop_agent_is_stateless_and_not_map_aware():
+    # The floor has no reset / set_map (stateless): act alone, never required to track a map.
+    agent = agents.NoOpAgent()
+    assert not hasattr(agent, "set_map")
+    assert not hasattr(agent, "reset")
+
+
+def test_noop_agent_is_exported():
+    assert "NoOpAgent" in agents.__all__
 
 
 # --- validate_action -------------------------------------------------------------------------

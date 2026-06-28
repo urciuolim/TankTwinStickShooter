@@ -1,12 +1,12 @@
 # models
 
 Reusable **torch model definitions** — the ablation-ready vision encoders. Definitions only: no
-training loops, no losses, no datasets (those belong to the future `pretraining` / `rl`). The
-encoder is the single standardized vision module the whole stack shares, and it exports to a
-Unity-Sentis-clean ONNX graph at deploy.
+training loops, no losses, no datasets (those belong to the [`rl`](rl.md) trainer and the future
+`pretraining` phase, never here). The encoder is the single standardized vision module the whole
+stack shares, and it exports to a Unity-Sentis-clean ONNX graph at deploy.
 
 **Boundary:** torch is allowed here; **nothing internal is imported** (it doesn't even need
-`core`). No cycles. It shares `core`'s leaf position as something the future consumers build on.
+`core`). No cycles. It shares `core`'s leaf position as something its consumers build on.
 
 ## Key classes / entry points
 
@@ -39,18 +39,20 @@ Nothing internal. Just `torch` (a leaf alongside [core](core.md) in the dependen
 
 ## Pushes to (downstream)
 
-Nothing internal **yet** — the consumers are not built:
+One internal consumer is built; the other is still future:
 
+- [rl](rl.md) — `EncoderExtractor` wraps `build_encoder`/`Encoder` and reads its `embed` flat
+  embedding as the SB3 policy/value feature extractor (it owns the `state_dict` load + freeze; there
+  is no `models.from_pretrained`). **Built** — the M1 trainer.
 - (Future `pretraining` reads `Encoder.features` for the supervised-decode heads.)
-- (Future `rl` reads `Encoder.embed` as the policy/value feature extractor.)
 - Unity-Sentis runs the exported ONNX graph at deploy.
 
 ## Where it sits in the run
 
-Off to the side of the live loop today: the encoder is the standardized vision backbone that
-the (not-yet-built) pretraining and RL phases will share, and the deployable ONNX artifact. It
-consumes the pixel frames that [env](env.md) produces and [data](data.md) records, but only once
-those consumers exist.
+Off to the side of the live loop today: the encoder is the standardized vision backbone that the
+RL phase already shares (via [rl](rl.md)'s `EncoderExtractor`) and the future pretraining phase
+will share too, plus the deployable ONNX artifact. It consumes the pixel frames that [env](env.md)
+produces and [data](data.md) records.
 
 ---
 [← back to index](../README.md)

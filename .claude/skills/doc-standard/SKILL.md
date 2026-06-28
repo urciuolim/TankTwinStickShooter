@@ -21,7 +21,7 @@ Someone onboarding who wants to (a) grasp the whole system fast, then (b) drill 
   6. *(optional)* a small **mermaid** class-interaction diagram when it clarifies.
   7. A **"← back to index"** relative link to `../README.md`.
 - **`docs/architecture.md`** — the cross-component **class-to-class interaction map** in one mermaid graph, plus the dependency direction (`core` is the dependency-free root; everything points inward). The big picture on one page.
-- **`docs/runbook.md`** — the end-to-end path: clone → `uv sync` → build the Unity game → run the demo / collection. Copy-pasteable commands grounded in the actual entry points + config (READ them — `demo.py`'s `main`, the `BuildScript` method, the config keys). Do NOT run them — the infra-manager accuracy-check executes them to verify.
+- **`docs/runbook.md`** — the end-to-end path: clone → `uv sync` → build the Unity game → play an episode / collect. Copy-pasteable commands grounded in the actual entry points + config (READ them — `play.py`'s `main`, the `BuildScript` method, the config keys). Do NOT run them — the infra-manager accuracy-check executes them to verify.
 
 ## Navigation rules (the "website" feel)
 - Every page links to its neighbours with **relative `.md` links** (`[env](env.md)`, `[back](../README.md)`) — clickable on GitHub AND followable in a local viewer.

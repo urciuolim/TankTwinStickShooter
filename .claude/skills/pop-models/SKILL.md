@@ -21,4 +21,4 @@ description: Contract + boundaries for the models/ component of src/pop_trainer.
 
 **Boundaries:** imports `core` only (e.g. the state schema for head output shapes). torch allowed here (NOT in core). Imports nothing from `env / data / pretraining / rl`. No cycles.
 
-**Inspiration (do NOT copy):** the flat/spatial/heatmap paradigms in `reference/tank_twin_m1/_pretrain_pixels_train.py`; Unity ml-agents `encoders.py` (IMPALA-ResNet + the proven ONNX→Sentis export path).
+**Inspiration (do NOT copy):** the flat/spatial/heatmap paradigms from the retired M1 `tank_twin` pixel-pretraining reference (in git history); Unity ml-agents `encoders.py` (IMPALA-ResNet + the proven ONNX→Sentis export path).

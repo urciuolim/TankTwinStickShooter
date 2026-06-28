@@ -28,7 +28,7 @@ Two protocols, on purpose, because of how :func:`typing.runtime_checkable` works
   :class:`StatefulAgent` exists for STATIC typing.
 
 The map hook (:meth:`StatefulAgent.set_map`) is how a map-aware agent receives the static
-wall layout once per episode. The env / demo / collection call it via ``getattr`` ONLY when
+wall layout once per episode. The env / play / collection call it via ``getattr`` ONLY when
 the agent exposes it (it is never required), passing the
 :class:`pop_trainer.core.protocol.WallLayout` from ``info["map"]``. Map-agnostic agents (e.g.
 ``RandomAgent``) simply do not implement it. ``WallLayout`` is referenced under

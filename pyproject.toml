@@ -25,23 +25,20 @@ dependencies = [
     "stable-baselines3>=2.9,<3",
     "gymnasium>=1.3,<2",
     # Training-metrics observability (CTO-approved, board): SB3 logger writes
-    # progress.csv + tfevents; plot_metrics renders the CSV to a PNG dashboard.
-    # NOT in the pure-logic import path — matplotlib is imported only inside
-    # tank_twin.plot_metrics, and tensorboard is loaded lazily by SB3's logger.
+    # progress.csv + tfevents; a metrics-plot step renders the CSV to a PNG dashboard.
+    # NOT in the pure-logic import path — matplotlib is for that plot step (no in-tree
+    # consumer yet) and tensorboard is loaded lazily by SB3's logger.
     # Upper-bounded to the resolved minor lines (repo "pin it" etiquette).
     "matplotlib>=3.11,<3.12",
     "tensorboard>=2.20,<2.21",
-    # Pillow: the pixel-capture verify (scripts/verify_pixel_capture.py) writes the
-    # decoded RGB frames to PNG for the CTO's eyeball check. Already present transitively
-    # (via matplotlib) and resolved at 12.2.0; pinned top-level so the verify's PNG write
-    # is an explicit, declared dependency (repo "pin it" etiquette). Not in the pure-logic
-    # / env / trainer import path — only the verify script imports PIL.
+    # Pillow: pinned for the planned pixel-capture PNG-write path (decode RGB frames to PNG for
+    # an eyeball check). Already present transitively (via matplotlib) and resolved at 12.2.0;
+    # pinned top-level so the PNG write is an explicit, declared dependency (repo "pin it"
+    # etiquette). NOT in the pure-logic / env / trainer import path; no in-tree consumer yet.
     "pillow>=12.2,<13",
-    # lmdb: PNG-in-LMDB pixel-pretraining data path (scripts/transcode_pixel_png_lmdb.py
-    # writes it; LmdbPngPixelDataset reads it). Lets the 640x360 pretrain avoid the ~600 GB
-    # flat uint8 memmap. NOT in the pure-logic path: imported ONLY by that transcode script
-    # and the dataset class, both behind the optional --frames-backend lmdb_png. cp312 wheels
-    # ship for win_amd64 + manylinux x86_64 (this box + the GCP Linux cluster).
+    # lmdb: pinned for the planned PNG-in-LMDB pixel-pretraining data path (lets the 640x360
+    # pretrain avoid the ~600 GB flat uint8 memmap). NOT in the pure-logic path; no in-tree
+    # consumer yet. cp312 wheels ship for win_amd64 + manylinux x86_64 (this box + GCP Linux).
     "lmdb>=2.2,<3",
     # onnx: REQUIRED by torch 2.9's legacy torch.onnx.export to serialize the model proto
     # (we use dynamo=False, so onnx alone is needed — NOT onnxscript/onnxruntime). It is the
@@ -102,13 +99,8 @@ dev = [
 line-length = 100
 # First-party roots for import sorting (I).
 src = ["src", "tests"]
-# Scope ruff to the new package + tests. Keeps unrelated tooling (boardroom/)
-# and the un-migrated 2021 scripts out of BOTH the lint and format gates.
-# The legacy scripts migrate in A6/A7; the per-file-ignores below are staged
-# for that (ruff format ignores per-file-ignores, so excluding the dir is the
-# only way to keep `ruff format --check` green until those files are ported).
+# Scope ruff to the package + tests; keep unrelated tooling out of both gates.
 include = ["src/**/*.py", "tests/**/*.py", "pyproject.toml"]
-extend-exclude = ["PythonScripts", "reference"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
@@ -116,12 +108,9 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 [tool.ruff.lint.per-file-ignores]
 # Tests may use assert-heavy / fixture patterns; relax bugbear-style nags.
 "tests/**" = ["B", "SIM"]
-# Legacy 2021 scripts are NOT migrated yet — exempt them entirely until A6/A7.
-"PythonScripts/*.py" = ["E", "F", "I", "UP", "B", "SIM"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-norecursedirs = ["reference", "PythonScripts"]
 markers = [
     "integration: tests requiring a live Unity build or socket (opt-in; deselect with -m 'not integration')",
     "e2e: end-to-end pipeline tests; either import torch/sb3 OR need a live Unity build; run with -m e2e, skip with -m 'not e2e'",

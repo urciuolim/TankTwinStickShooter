@@ -79,10 +79,11 @@ Testing target:
 
 Move from loose scripts toward a package, while keeping old script entry points during migration.
 
-Proposed package layout:
+Proposed package layout (historical — realized instead as the `src/pop_trainer/` package; the
+2021 tree this migrated from lives in git history):
 
 ```text
-PythonScripts/
+<2021 trainer root>/
   tank_twin/
     __init__.py
     config.py
@@ -336,7 +337,8 @@ Tasks:
 - Add deterministic seeds to local training/eval commands.
 - Create a small baseline scripted opponent.
 - Create a model evaluation command that can run a few matches and print a concise summary.
-- Create a model inference command suitable for demos and human-vs-model play.
+- Create a model inference command suitable for watching trained agents and human-vs-model play
+  (built: `python -m pop_trainer.play` with `rl:<checkpoint.zip>` / `human` player forms).
 - Preserve population/tournament concepts, but move them behind cleaner APIs.
 
 Acceptance criteria:

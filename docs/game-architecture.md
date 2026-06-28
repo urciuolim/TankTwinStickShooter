@@ -24,15 +24,47 @@ How the existing game actually runs, traced from code (game-sim-engineer + train
 
 Known latent bug for later: `human_matchmaking.get_human_stats` passes a path string to `json.load` (`human_matchmaking.py:43`), so the "existing human" branch is broken as written.
 
+## Observability logging (verbose-gated, ZERO wire impact)
+
+The C# side has structured observability logging — added to diagnose the reset/restart-handshake
+hang — that is gated **entirely** on the existing `verbose` config flag (`DriverController.verbose`,
+`DriverController.cs:51`). When `verbose` is false (the default) **none** of it runs, and it never
+touches the socket, the 52-float state, message ordering, or any control flow either way; the lines
+go to `Debug.Log`, not the wire.
+
+- **Pure helpers (unit-tested in EditMode).** [`DriverLog`](../unity/Assets/Scripts/DriverLog.cs) formats
+  one stable, grep-able line — `[tag] wall=<ISO-8601 UtcNow 'o'> k=v …` — and
+  [`DeadZoneTracker`](../unity/Assets/Scripts/DeadZoneTracker.cs) is a pure state machine that detects
+  ENTER/EXIT of the FixedUpdate **dead-zone** (`ingame && state == null`, the window that services
+  no socket I/O — the prime hang suspect) and reports its duration. Both read NO clock and touch NO
+  Unity/socket state (the duration is fed in by the caller), mirroring the existing
+  `WallMessage.Build` pure-helper pattern.
+- **Verbose-gated `Debug.Log` instrumentation** in
+  [`DriverController`](../unity/Assets/Scripts/DriverController.cs) and
+  [`GameController`](../unity/Assets/Scripts/GameController.cs) emits the handshake events
+  (`start_received` / `restart_received` / `ingame_flip` / `switch_arena_received` /
+  `arena_switched`), the dead-zone enter/exit + state null↔populated transitions
+  (`DriverController.cs:236-250`), and the per-step `ReadPixels` GPU-readback timing
+  (`readpixels`, `DriverController.cs:447-459`).
+- **Unscaled monotonic clock.** Durations come from `Stopwatch` / `DateTime.UtcNow`, **NEVER**
+  `Time.time` (which is frozen by `Time.timeScale = 0` inside `FixedUpdate`, so it would report
+  zero) — `DriverController.cs:64-66`.
+- **Paired to the Python logs by wall-clock.** The `wall=<UtcNow>` field correlates these C# lines
+  to the Python JSONL `ts_wall` field, so the two stacks merge across files. When `--config` points
+  at a build whose config sets `verbose: true`, route each build's C# log to its own
+  `unity-<role>-<port>.log` via `core.launch`'s `-logFile` / `unity_log_path` (the
+  [rl](components/rl.md#observability-logging) integrator does this). See the operator's guide:
+  [runbook → Observability logs](runbook.md#observability-logs).
+
 ## Config / arena source-of-truth map (consolidated 2026-06-18, cleanup A4)
 
-There is ONE canonical location for the shipped config + arenas; the rest are explicit fallbacks. The duplicate `PythonScripts/Assets/` tree (stale 2021 copy) was DELETED — its only consumer was a dead `os.path.exists("./Assets/config.json")` pre-flight in `preamble.py` that never read the file; that check is now removed.
+There is ONE canonical location for the shipped config + arenas; the rest are explicit fallbacks. A stale 2021 duplicate config/arena tree once shadowed this; it was removed (see git history).
 
 `DriverController.ResolveConfigPath` (`DriverController.cs:124-137`) precedence, highest first:
-1. **`--config <path>` / `-config <path>` CLI arg** — explicit override. The Python local-play host (`play_local.launch_build`) passes this when a config is selected; otherwise omits it and lets the build fall back.
-2. **`Assets/StreamingAssets/config.json` — CANONICAL DEFAULT (= the M1 training topology, AI-vs-AI).** Ships inside every build (StreamingAssets is copied into the player), so a built player resolves here when **no `--config` is passed**. The M1 trainer's env (`src/tank_twin/env.py`) launches the build with *only* `[game_path, port]` (no `--config`, by design — that path is the frozen RL seam), so this default MUST be the AI-vs-AI training config (`player1_ai`+`player2_ai` true, both socket-driven; `timeScale` 5 to run the socket-clocked sim faster). M0 human play does **not** rely on this default: `play_local.py` / the input-controls docs always pass `--config config_2p.json` (or `config_2p_keyboard.json`) for the human presets. Sibling presets `config_2p.json` / `config_2p_keyboard.json` live here too (selected via the `--config` arg above).
-3. **`Assets/config.json` — legacy last-resort fallback.** Used only in-editor / when no StreamingAssets copy exists (the working-dir relative path). KEPT intentionally; do not delete.
+1. **`--config <path>` / `-config <path>` CLI arg** — explicit override. A local-play host passes this when a config is selected; otherwise it omits the arg and lets the build fall back.
+2. **`unity/Assets/StreamingAssets/config.json` — CANONICAL DEFAULT (= the M1 training topology, AI-vs-AI).** Ships inside every build (StreamingAssets is copied into the player), so a built player resolves here when **no `--config` is passed**. The trainer's env (`src/pop_trainer/env/tank_env.py`) launches the build with *only* `[game_path, port]` (no `--config`, by design — that path is the frozen RL seam), so this default MUST be the AI-vs-AI training config (`player1_ai`+`player2_ai` true, both socket-driven; `timeScale` 5 to run the socket-clocked sim faster). M0 human play does **not** rely on this default: the local-play host / the input-controls docs always pass `--config config_2p.json` (or `config_2p_keyboard.json`) for the human presets. Sibling presets `config_2p.json` / `config_2p_keyboard.json` live here too (selected via the `--config` arg above).
+3. **`unity/Assets/config.json` — legacy last-resort fallback.** Used only in-editor / when no StreamingAssets copy exists (the working-dir relative path). KEPT intentionally; do not delete.
 
-Arena resolution (`DriverController.ResolveArenaPath`, `DriverController.cs:142-152`): the config's `arena_path` is taken as-is if absolute or if it exists relative to the working dir (legacy `Assets/Arenas/...` form), else resolved **relative to the directory of the resolved config file** — so config + its `Arenas/` travel together. Canonical arenas live in `Assets/StreamingAssets/Arenas/` (`default.json`, `custom1.json`, `nowin_test.json`).
+Arena resolution (`DriverController.ResolveArenaPath`, `DriverController.cs:142-152`): the config's `arena_path` is taken as-is if absolute or if it exists relative to the working dir (legacy `Assets/Arenas/...` form), else resolved **relative to the directory of the resolved config file** — so config + its `Arenas/` travel together. Canonical arenas live in `unity/Assets/StreamingAssets/Arenas/` (`default.json`, `custom1.json`, `nowin_test.json`).
 
-Net: edit configs/arenas under `Assets/StreamingAssets/`. `Assets/config.json` is a deliberate fallback, not a duplicate.
+Net: edit configs/arenas under `unity/Assets/StreamingAssets/`. `unity/Assets/config.json` is a deliberate fallback, not a duplicate.

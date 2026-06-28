@@ -14,8 +14,10 @@ end to end via the [runbook](runbook.md).
 
 The built + GO'd slice of the target architecture. The dependency direction is
 **`core ← {models, env, data, agents} ← demo`** — `core` is the dependency-free root and every
-component points inward toward it. (`pretraining` / `rl` / `eval` / `population` / `deployment`
-/ `imitation` are namespace placeholders, not yet built — not documented here.)
+component points inward toward it. The online-RL component [rl](components/rl.md) has its first two
+seams (the policy↔encoder seam and the self-play opponent seam) and is documented.
+(`pretraining` / `eval` / `population` / `deployment` / `imitation` are namespace placeholders, not
+yet built — not documented here.)
 
 ## Component map at a glance
 
@@ -26,7 +28,8 @@ graph TD
     env["env<br/>TankEnv gym wrapper"]
     agents["agents<br/>map-aware coverage policies"]
     data["data<br/>dataset pipeline"]
-    demo["demo<br/>runnable entry point"]
+    play["play<br/>runnable entry point<br/>(human / rule-based / rl:&lt;ckpt&gt;)"]
+    rl["rl<br/>online RL (SB3) — encoder + self-play seams"]
     unity["Unity sim<br/>(TCP-JSON + pixel frames)"]
 
     env --> core
@@ -35,9 +38,14 @@ graph TD
     data --> core
     data --> env
     data --> agents
-    demo --> core
-    demo --> env
-    demo --> agents
+    play --> core
+    play --> env
+    play --> agents
+    play -.->|"rl:&lt;ckpt&gt; only — lazy sb3 PPO.load"| rl
+    rl -.->|wraps Encoder| models
+    rl -.->|SelfPlayWrapper wraps| env
+    rl -.->|make_agent roster| agents
+    rl -.->|split_state_for_opponent| core
     env <-->|socket| unity
 
     classDef root fill:#d4edda,stroke:#28a745;
@@ -45,7 +53,11 @@ graph TD
 ```
 
 Solid arrows are import-time dependencies (A → B means "A imports B"). `models` imports nothing
-internal — it only shares `core`'s place as a leaf the future `pretraining` / `rl` consume.
+internal — it only shares `core`'s place as a leaf; [rl](components/rl.md)'s `EncoderExtractor`
+now wraps its `Encoder` (the seam exists), while the future `pretraining` will consume it too. `rl`
+spans four internal deps: beyond `models`, its self-play seam wraps `env` (`SelfPlayWrapper`) and
+reuses `agents` (`make_agent` roster) + `core` (`split_state_for_opponent`); it imports nothing from
+`data` or `pretraining`.
 
 ## Navigation index
 
@@ -56,10 +68,11 @@ internal — it only shares `core`'s place as a leaf the future `pretraining` / 
 | [env](components/env.md) | `TankEnv` — the Gymnasium wrapper over the Unity socket; the simulator swap point. |
 | [agents](components/agents.md) | The model-free decision-makers: the map-aware `CoverageAgent` family (+ presets) + the `RandomAgent` baseline + the coverage-measurement harness. |
 | [data](components/data.md) | The dataset pipeline: a multi-worker collection CLI (`collect_runner`) → `(frame, state, action)` samples → shards → map-aware splits. |
-| [demo](components/demo.md) | `python -m pop_trainer.demo` — launch the live build and watch two agents play. |
+| [play](components/play.md) | `python -m pop_trainer.play` — launch the live build and play one episode with any pairing of human / rule-based / trained `rl:<ckpt>` players. |
+| [rl](components/rl.md) | Online RL (SB3 PPO); ships two seams — the policy↔encoder seam (`EncoderExtractor` wrapping the shared `Encoder`) and the self-play opponent seam (`SelfPlayWrapper` + `OpponentProvider` over the scripted-agent roster). |
 
 - [Architecture](architecture.md) — the cross-component class-to-class interaction map.
-- [Runbook](runbook.md) — clone → `uv sync` → build the Unity game → run the demo / collection.
+- [Runbook](runbook.md) — clone → `uv sync` → build the Unity game → play an episode / collect.
 
 ## How this gets built
 

@@ -1,8 +1,8 @@
 # Arena (map) JSON format
 
 The reference for the arena-config JSON the Unity build loads — the `"Floor"` / `"Walls"`
-geometry every map under `exp-configs/maps/Arenas/` and `Assets/StreamingAssets/Arenas/` uses.
-This is the same `Walls` shape that Unity's [`WallMessage.Build`](../Assets/Scripts/WallMessage.cs)
+geometry every map under `unity/Assets/StreamingAssets/Arenas/` uses.
+This is the same `Walls` shape that Unity's [`WallMessage.Build`](../unity/Assets/Scripts/WallMessage.cs)
 emits and that `pop_trainer`'s [`core.protocol.parse_walls_message`](../src/pop_trainer/core/protocol.py)
 parses into a `WallLayout` (see the [core seam writeup](components/core.md#the-wall-message--protocol-seam-walllayout--infomap)).
 
@@ -21,7 +21,7 @@ An arena is one JSON object with a `"Floor"` block and a `"Walls"` block. Each b
   y-rows that have a tile in that column.
 
 **The `Walls` block defines the map's wall geometry — NOT the observation.** Unity renders
-these walls and emits them once per map via [`WallMessage.Build`](../Assets/Scripts/WallMessage.cs);
+these walls and emits them once per map via [`WallMessage.Build`](../unity/Assets/Scripts/WallMessage.cs);
 `pop_trainer` parses that into a `WallLayout` and surfaces it as `info["map"]` map-state (see the
 [core seam writeup](components/core.md#the-wall-message--protocol-seam-walllayout--infomap)).
 The observation is the **real rendered pixel frame `(360, 640, 3)`** from Unity
@@ -92,7 +92,21 @@ Copy it verbatim into `Arenas/tiny.json`:
 `-6` and bottom `5` border, and columns `-1` / `0` additionally carry the interior pillar
 at rows `-1, 0`.)
 
----
-The curated map + reward sets live under `exp-configs/` (see `exp-configs/README.md`).
+## Where the arenas + the rotation live
+
+Two distinct things, in two distinct places:
+
+- **Arena GEOMETRY** — `exp-configs/_generate_maps.py` (re)writes the 10 `Arenas/<name>.json`
+  geometry files under `unity/Assets/StreamingAssets/Arenas/` (copies the 2021 `custom1` verbatim
+  as `custom1_2021`, generates the other nine), asserting point-symmetry + floor connectivity on
+  all 10 (`_generate_maps.py:123-148`). It generates only geometry — there is **no** config-wrapper
+  generation (no `exp-configs/maps/` dir of wrapper JSONs anymore). Run it from anywhere with
+  `uv run python exp-configs/_generate_maps.py`.
+- **The training ROTATION** — which of those arenas the rotation plays, and in what order, lives in
+  [`src/pop_trainer/core/maps.py`](../src/pop_trainer/core/maps.py) as the `CURATED_ROTATION` tuple
+  (the single source of truth; `maps.py:41-52`), consumed by collection via
+  [`core.maps.resolve_map_rotation`](components/core.md) (see
+  [data](components/data.md#the-rotation-scheduler--map-tagging)). The generator does NOT define the
+  rotation.
 
 [← back to index](README.md)

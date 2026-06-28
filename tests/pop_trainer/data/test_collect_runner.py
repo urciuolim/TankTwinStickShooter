@@ -205,21 +205,16 @@ def test_build_specs_rejects_empty_pairings():
 
 
 def test_build_specs_rotation_mode_switches_and_indexes():
-    # A rotation over two explicit map configs x one pairing: every plan switches to a rotation
-    # arena, the map_index decodes both, and the boot config is the FIRST rotation map config.
-    from pop_trainer.core import maps as core_maps
-
-    cfgs = [
-        str(core_maps.DEFAULT_MAPS_DIR / "center_block.json"),
-        str(core_maps.DEFAULT_MAPS_DIR / "empty.json"),
-    ]
-    specs = _build(map_values=cfgs, episodes=4, workers=2)
-    # The rotation arenas are the two configs' arena_path values, indexed by rotation order.
+    # A rotation over two explicit arena targets x one pairing: every plan switches to a rotation
+    # arena, the map_index decodes both, and the boot config is the obs_pixels --map config.
+    arenas = ["Arenas/center_block.json", "Arenas/empty.json"]
+    specs = _build(map_values=arenas, episodes=4, workers=2)
+    # The rotation arenas are exactly the passed targets, indexed by rotation order.
     for spec in specs:
         assert spec.map_index == {"Arenas/center_block.json": 0, "Arenas/empty.json": 1}
         assert spec.extra["maps"] == ["Arenas/center_block.json", "Arenas/empty.json"]
         # The build boots on the obs_pixels-enabled --map config in BOTH modes; switch_arena
-        # rotates the arena (the rotation configs do not enable obs_pixels).
+        # rotates the arena (the curated rotation is switch targets only).
         assert spec.extra["config"] == str(R.MAP_CONFIGS["custom1"])
         for plan in spec.episode_plan:
             assert plan.switch_arena in {"Arenas/center_block.json", "Arenas/empty.json"}
@@ -229,13 +224,19 @@ def test_build_specs_rotation_mode_switches_and_indexes():
 # --- selector surface --------------------------------------------------------------------
 
 
-def test_selector_surface_is_the_coverage_family_plus_random():
+def test_selector_surface_is_the_coverage_family_plus_random_and_noop():
+    # The registry now lives in pop_trainer.agents; collect_runner re-exports it. The roster is
+    # the coverage family, random, and the noop floor (a valid scripted opponent).
     assert set(R.AGENT_SELECTORS) == {
         "aggressive-coverage",
         "wall-hugger",
         "opponent-shadower",
         "random",
+        "noop",
     }
+    # The re-exported names are the SAME objects the registry owns (the de-dup is real).
+    assert R.AGENT_SELECTORS is agents.AGENT_SELECTORS
+    assert R.make_agent is agents.make_agent
 
 
 def test_every_selector_builds_a_valid_agent():
@@ -254,6 +255,7 @@ def test_make_agent_builds_the_right_types():
     assert isinstance(R.make_agent("wall-hugger"), agents.CoverageAgent)
     assert isinstance(R.make_agent("opponent-shadower"), agents.CoverageAgent)
     assert isinstance(R.make_agent("random"), agents.RandomAgent)
+    assert isinstance(R.make_agent("noop"), agents.NoOpAgent)
 
 
 # --- agent_pool_factory ------------------------------------------------------------------
@@ -555,22 +557,29 @@ def test_round_robin_rejects_empty_grid():
         R.round_robin_plan([], _PAIRS, episodes=1, worker_id=0, n_workers=1, map_index={})
 
 
-# --- arena-path resolution + rotation + map index ----------------------------------------
+# --- rotation + map index ----------------------------------------------------------------
 
 
-def test_arena_path_for_config_reads_arena_path():
-    from pop_trainer.core import maps as core_maps
+_CURATED_ROTATION = [
+    "Arenas/center_block.json",
+    "Arenas/central_cross.json",
+    "Arenas/chokepoint.json",
+    "Arenas/custom1_2021.json",
+    "Arenas/diagonal_pillars.json",
+    "Arenas/empty.json",
+    "Arenas/four_pillars.json",
+    "Arenas/opposing_l.json",
+    "Arenas/ring_fragments.json",
+    "Arenas/scattered.json",
+]
 
-    cfg = core_maps.DEFAULT_MAPS_DIR / "center_block.json"
-    assert R.arena_path_for_config(cfg) == "Arenas/center_block.json"
 
+def test_build_rotation_all_maps_yields_the_curated_rotation():
+    # The ALL_MAPS sentinel (flag with no value) yields the curated 10-map rotation, in order.
+    assert R.build_rotation([]) == _CURATED_ROTATION
+    from pop_trainer.core.maps import ALL_MAPS_SENTINEL
 
-def test_build_rotation_all_maps_yields_ten_arena_paths():
-    rotation = R.build_rotation([])  # the ALL_MAPS sentinel (flag with no value)
-    assert len(rotation) == 10
-    assert all(a.startswith("Arenas/") for a in rotation)
-    # Sorted by config path -> a stable, deterministic order.
-    assert rotation == sorted(rotation, key=lambda a: a)  # the configs are sorted by name
+    assert R.build_rotation([ALL_MAPS_SENTINEL]) == _CURATED_ROTATION
 
 
 def test_build_rotation_none_is_single_map():

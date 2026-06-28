@@ -65,10 +65,13 @@ otherwise-frozen wire; the per-step state/frame/action path is untouched.
 from __future__ import annotations
 
 import json
+import logging
+import time
 from dataclasses import dataclass, field
 
 import numpy as np
 
+from pop_trainer.core.logging_setup import LAYER_PROTOCOL
 from pop_trainer.core.state import STATE_LEN
 
 # Default recv chunk size. Reads are frame-aware (the scan below), so this is just the
@@ -104,6 +107,9 @@ WALLS_TYPE_TAG = "walls"  # the fixed value of the top-level "type" tag on a wal
 # --- switch-arena handshake wire contract (additive OUTBOUND; matches DriverController) ---
 SWITCH_ARENA_KEY = "switch_arena"  # outbound request key; value is the arena path (a str)
 ARENA_SWITCHED_KEY = "arena_switched"  # the bool ack key Unity replies with (must be True)
+
+# Outbound control/handshake keys (logged at INFO; everything else is a per-step send at DEBUG).
+_CONTROL_SEND_KEYS = frozenset({"restart", "start", "end", SWITCH_ARENA_KEY})
 
 __all__ = [
     "RECV_BUFSIZE",
@@ -194,6 +200,13 @@ class Connection:
       right after the header is parsed, BEFORE allocating/reading the payload; an over-cap
       advertised length raises ``ValueError`` (consistent with the other malformed-header
       rejections). Default :data:`DEFAULT_MAX_FRAME_BYTES`.
+
+    OBSERVABILITY (purely additive). An OPTIONAL ``logger`` (default ``None`` = no logging, zero
+    overhead, byte-identical behavior) routes wire activity to the per-connection JSONL file: each
+    SEND logs its event + byte count (INFO for control/handshake sends, DEBUG per step), each RECV
+    logs begin -> done with bytes + ``elapsed_ms``, and every timeout/closed/over-cap point logs
+    BEFORE re-raising. The frame PAYLOAD bytes are never logged — only the byte COUNT. Logging WRAPS
+    the wire; it never alters the brace-scan, the buffer logic, the size guards, or any raise.
     """
 
     def __init__(
@@ -202,26 +215,56 @@ class Connection:
         bufsize: int = RECV_BUFSIZE,
         max_object_bytes: int = DEFAULT_MAX_OBJECT_BYTES,
         max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES,
+        *,
+        logger: logging.Logger | None = None,
     ):
         self.transport = transport
         self.bufsize = bufsize
         self.max_object_bytes = max_object_bytes
         self.max_frame_bytes = max_frame_bytes
+        # OPTIONAL observability logger. None = no logging (the default, byte-identical path).
+        self.logger = logger
         # Bytes that arrived after one complete read (TCP coalescing glues the next state
         # JSON, or a trailing pixel frame, onto the current read). Drained FIRST on the next
         # JSON or frame read so nothing is lost and binary frame bytes never reach json.loads.
         self._buffer = b""
 
+    # --- observability helpers (no-op when self.logger is None) --------------------------
+
+    def _log(self, level: int, event: str, **detail) -> None:
+        """Emit one observability record at ``level`` if a logger is attached; else a no-op.
+
+        The ``self.logger is None`` early return keeps the default (no-logger) path allocation-free.
+        ``detail`` is forwarded as the JSONL formatter's per-record detail (e.g. ``bytes`` /
+        ``elapsed_ms``); the per-record ``layer`` is overridden to ``protocol`` so protocol records
+        are distinguishable from the env records sharing the same file.
+        """
+        if self.logger is None:
+            return
+        self.logger.log(level, event, extra={"detail": {"layer": LAYER_PROTOCOL, **detail}})
+
     def send(self, message) -> None:
         """Encode ``message`` (strict JSON) and write it to the transport.
 
         A ``socket.timeout`` is translated to ``ConnectionError`` (the env's reconnect
-        logic keys off that).
+        logic keys off that). Observational logging (when a logger is attached): a control/handshake
+        send (restart / start / end / switch_arena) logs at INFO, a per-step send at DEBUG, each
+        with the outgoing byte count; a send timeout logs at WARNING before the re-raise. The wire
+        bytes are unchanged.
         """
         data = encode(message)
+        if self.logger is not None:
+            is_control = isinstance(message, dict) and any(k in _CONTROL_SEND_KEYS for k in message)
+            self._log(
+                logging.INFO if is_control else logging.DEBUG,
+                "send",
+                bytes=len(data),
+                control=is_control,
+            )
         try:
             self.transport.sendall(data)
         except TimeoutError as exc:
+            self._log(logging.WARNING, "send_timeout", bytes=len(data))
             raise ConnectionError("send timed out") from exc
 
     def receive(self) -> dict:
@@ -233,8 +276,28 @@ class Connection:
         the next :meth:`receive`. On a clean single-object-per-recv wire the scan stops at
         the closing ``}`` and leaves ``self._buffer`` empty. A ``socket.timeout`` mid-read is
         translated to ``ConnectionError``.
+
+        Observational logging (when a logger is attached): a ``recv_begin`` DEBUG, then on success a
+        ``recv_done`` with the object's byte count + ``elapsed_ms`` — INFO for a handshake ack,
+        DEBUG for a per-step state object. The timeout/closed re-raises are logged inside
+        :meth:`_receive_one_json`. The decoded value is unchanged.
         """
-        return decode(self._receive_one_json())
+        if self.logger is None:
+            return decode(self._receive_one_json())
+        self._log(logging.DEBUG, "recv_begin")
+        t0 = time.monotonic()
+        raw = self._receive_one_json()
+        message = decode(raw)
+        elapsed_ms = (time.monotonic() - t0) * 1000.0
+        is_step = state_message_is_valid(message)
+        self._log(
+            logging.DEBUG if is_step else logging.INFO,
+            "recv_done",
+            bytes=len(raw),
+            elapsed_ms=elapsed_ms,
+            is_state=is_step,
+        )
+        return message
 
     def switch_arena(self, arena_path: str) -> dict:
         """Request a map change and read + validate the ``{"arena_switched": true}`` ack.
@@ -288,8 +351,10 @@ class Connection:
             try:
                 chunk = self.transport.recv(min(remaining, self.bufsize))
             except TimeoutError as exc:
+                self._log(logging.WARNING, "recv_timeout", wanted=n, got=n - remaining)
                 raise ConnectionError("recv timed out") from exc
             if not chunk:
+                self._log(logging.WARNING, "recv_closed_mid_read", wanted=n, got=n - remaining)
                 raise ConnectionError(
                     f"connection closed mid-read: wanted {n} bytes, got {n - remaining}"
                 )
@@ -314,6 +379,12 @@ class Connection:
         w, h, c, payload_len = parse_frame_header(header)
         # Reject an absurd advertised length BEFORE allocating/reading the payload.
         if payload_len > self.max_frame_bytes:
+            self._log(
+                logging.WARNING,
+                "frame_over_max_bytes",
+                payload_len=payload_len,
+                max_frame_bytes=self.max_frame_bytes,
+            )
             raise ValueError(
                 f"frame payload length {payload_len} exceeds max_frame_bytes {self.max_frame_bytes}"
             )
@@ -324,6 +395,7 @@ class Connection:
                 f"frame payload length {payload_len} != W*H*C ({w}*{h}*{c} = {w * h * c})"
             )
         payload = self._recv_exactly(payload_len)
+        self._log(logging.DEBUG, "recv_frame", bytes=payload_len, w=w, h=h)
         frame = np.frombuffer(payload, dtype=np.uint8).reshape(h, w, c)
         return np.flipud(frame).copy()
 
@@ -395,8 +467,10 @@ class Connection:
                 try:
                     chunk = self.transport.recv(self.bufsize)
                 except TimeoutError as exc:
+                    self._log(logging.WARNING, "recv_timeout", read=len(out))
                     raise ConnectionError("recv timed out") from exc
                 if not chunk:
+                    self._log(logging.WARNING, "recv_closed_mid_json", read=len(out))
                     raise ConnectionError("connection closed mid-json-object")
             out += chunk
             end = scan(out[scan_from:])
@@ -407,6 +481,12 @@ class Connection:
             # No top-level object has closed yet — guard the still-open object's size as it
             # grows so a peer that never sends a closing brace cannot flood memory.
             if len(out) > self.max_object_bytes:
+                self._log(
+                    logging.WARNING,
+                    "recv_over_max_object_bytes",
+                    read=len(out),
+                    max_object_bytes=self.max_object_bytes,
+                )
                 raise ConnectionError(
                     f"incoming JSON object exceeds max_object_bytes "
                     f"{self.max_object_bytes} (read {len(out)} bytes with no top-level close)"

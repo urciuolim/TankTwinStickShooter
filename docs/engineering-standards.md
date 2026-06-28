@@ -2,10 +2,10 @@
 
 Research-derived standards for bringing this repo "up to snuff within reason" — toward production quality, proportional to a solo-maintained research repo, not enterprise gold-plating. Derived from a three-lane research sprint (Python, Unity/C#, agent-ops), verified against live 2026 sources (Anthropic best-practices docs, a CSA Apr-2026 slopsquatting research note, current PyPI/Unity docs). Each engineer applies their section as they reach that phase; `code-reviewer` and the [Definition of Done](definition-of-done.md) enforce it.
 
-## Python (`PythonScripts/` → `pop_trainer` package)
+## Python (the `pop_trainer` package)
 
 - **Env/deps:** `uv` (one tool: env + deps + Python pin). Commit `uv.lock`; `uv python pin 3.12`. Torch GPU wheel via `[tool.uv.sources]` (CUDA index) — the one fiddly step; verify the index URL against the installed driver at setup.
-- **Layout:** `src/` layout, one installable package `pop_trainer` (core, env, data, models, agents, rl, pretraining), thin `scripts/` entry points, `tests/`. PEP 621 `pyproject.toml`; console-scripts (`train-local`, `eval-local`). Migrate incrementally — pure functions (ELO, opponent-selection, reward, state-flip) first; leave Unity-coupled scripts as shims importing the package. (The original `tank_twin` package was retired at M1 — superseded by `pop_trainer`; its M1 sources are kept inert under `reference/tank_twin_m1/`.)
+- **Layout:** `src/` layout, one installable package `pop_trainer` (core, env, data, models, agents, rl, pretraining), thin `scripts/` entry points, `tests/`. PEP 621 `pyproject.toml`; console-scripts (`train-local`, `eval-local`). Migrate incrementally — pure functions (ELO, opponent-selection, reward, state-flip) first; leave Unity-coupled scripts as shims importing the package. (The original `tank_twin` package was retired at M1 — superseded by `pop_trainer`; its M1 sources live in git history.)
 - **Lint/format:** `ruff` only (lint + format; black is retired). Modest rules `E,F,I,UP,B,SIM`, line length 100. Per-file ignores for `tests/` + legacy scripts during migration. pre-commit hook ids are `ruff-check` / `ruff-format`.
 - **Types:** light, non-strict, on pure-logic modules only. `ignore_missing_imports` for sb3/torch/gymnasium. Not `--strict`.
 - **Tests (`pytest`):** test pure functions + contracts, NOT the trainer. Targets: ELO math, opponent weighting/selection, reward logic, state-flip & 52-vector split, protocol framing (split/coalesced reads vs a fake socket), env contract via `check_env`, path/process construction (Windows vs POSIX). Coverage ~50–70% of the package, ~90% pure-logic, ~0 on torch/sb3 glue. Mark Unity-needing tests `integration` (opt-in).
@@ -13,7 +13,7 @@ Research-derived standards for bringing this repo "up to snuff within reason" �
 - **Load-bearing prerequisite:** the gym→gymnasium migration (5-tuple `step`, `reset(seed=,options=)`, `terminated`/`truncated`) must land before `check_env` passes — stage tests: pure-logic first, env-contract after the port.
 - **Overkill to avoid:** MLflow/Hydra, `--strict` mypy, ruff `D`/`ANN` rules, coverage gates >70%, release automation, testing that PPO converges.
 
-## Unity / C# (`Assets/Scripts/`)
+## Unity / C# (`unity/Assets/Scripts/`)
 
 - **Assemblies:** add THREE asmdefs only — runtime `TankTwinStickShooter` (references Newtonsoft), `…EditModeTests`, `…PlayModeTests`. Skip the 6-module split (overkill for 4 scripts). The runtime asmdef turns the stray-`UnityEditor`-import bug class into a compile error.
 - **Testing:** Unity Test Framework 1.7 (bundled; 2.x is experimental — don't). EditMode for pure logic (arena parse, config parse, the `float[52]` state encoder, protocol dispatch); a thin PlayMode smoke layer (~4 tests: scene boot, timer-end, player-death-end, bullet collision/despawn). Skip visual/UI and live-socket tests.

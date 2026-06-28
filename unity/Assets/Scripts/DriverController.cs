@@ -1,0 +1,533 @@
+﻿using System.Collections;
+using System.Collections.Generic;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+using UnityEngine.UI;
+using System.Threading;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.IO;
+using Newtonsoft.Json.Linq;
+using Newtonsoft.Json;
+using Unity.Jobs.LowLevel.Unsafe;
+using System.Runtime.CompilerServices;
+
+// Exposes the otherwise-private path-resolution helpers (ResolveConfigPath / ResolveArenaPath)
+// to the EditMode test assembly for regression coverage. Visibility-only; no logic change.
+[assembly: InternalsVisibleTo("TankTwinStickShooter.EditModeTests")]
+
+public class DriverController : MonoBehaviour
+{
+    public static DriverController instance;
+    public bool running = false;
+    public bool flip = false;
+    private bool ingame = false;
+    private int stepsSinceLastAction = 0;
+
+    Thread mThread;
+    private string connectionIP = "127.0.0.1";
+    private int connectionPort = 50000;
+    IPAddress localAdd;
+    TcpListener listener;
+    TcpClient client;
+    NetworkStream nwStream;
+    float timeScale = 1f;
+    bool aiAsync = false;
+    int actionFreq = 1;
+
+    // OPTIONAL pixel-observation channel (additive Stage-1 seam). Default OFF: when obsPixels is
+    // false NOTHING new is written to the socket and the wire is byte-identical to before. See the
+    // frame wire contract in FrameCapture.cs. Width/height default to a 16:9 frame matching the
+    // build's 1920x1080 render aspect (so the captured frame is undistorted vs the live game view).
+    bool obsPixels = false;
+    int obsPixelsWidth = 640;
+    int obsPixelsHeight = 360;
+    private FrameCapture frameCapture;
+
+    [HideInInspector]
+    public JObject actions, state, config, arena;
+    [HideInInspector]
+    public bool verbose = false;
+    [HideInInspector]
+    public float fixedDeltaTime;
+
+    // Resolved config path, cached in Awake so the optional switch_arena handshake message can
+    // resolve a relative arena path against the config directory (mirrors Awake's arena load).
+    private string resolvedConfigPath;
+
+    // The identity of the currently-loaded map, carried in the one-time wall message (Unity ->
+    // Python; see WallMessage.cs). Set in Awake from config["arena_path"] (initial load) and
+    // updated in the switch_arena branch to the new arena path. Empty string when no arena is set.
+    private string currentMapId = "";
+
+    // OBSERVABILITY (verbose-gated; no behavior/wire impact). Process-wide MONOTONIC clock for all
+    // durations -- NEVER Time.time (frozen by Time.timeScale=0 inside FixedUpdate). Started once.
+    private static readonly System.Diagnostics.Stopwatch logClock = System.Diagnostics.Stopwatch.StartNew();
+    // Tracks ENTER/EXIT of the FixedUpdate dead-zone (ingame && state==null) so the 30s reset/
+    // restart-handshake gap is measured. Pure helper; observes existing condition values only.
+    private DeadZoneTracker deadZone;
+    // One-shot latch so the populated->null state transition is logged once (in the done branch),
+    // matching null->populated which is observed at the top of FixedUpdate.
+    private bool stateWasPopulated = false;
+
+    private void Awake()
+    {
+        //JobsUtility.JobWorkerCount = 2;
+
+        string[] args = System.Environment.GetCommandLineArgs();
+        try {
+            connectionPort = int.Parse(args[1]);
+        } catch (System.FormatException e)
+        {
+            connectionPort = 50000;
+        }
+
+        string configPath = ResolveConfigPath(args);
+        resolvedConfigPath = configPath;
+
+        if (instance != null)
+        {
+            if (instance.running)
+            {
+                instance.stepsSinceLastAction = 0;
+                Reset();
+            }
+            else
+            {
+                Application.Quit();
+            }
+            Destroy(gameObject);
+            return;
+        } else
+        {
+            instance = this;
+            DontDestroyOnLoad(gameObject);
+        }
+
+        using (StreamReader file = File.OpenText(configPath))
+        using (JsonTextReader reader = new JsonTextReader(file))
+        {
+            config = (JObject)JToken.ReadFrom(reader);
+            if (config["connectionIP"] != null)
+                connectionIP = config["connectionIP"].Value<string>();
+            //if (config["connectionPort"] != null)
+                //connectionPort = config["connectionPort"].Value<int>();
+            if (config["verbose"] != null)
+                verbose = config["verbose"].Value<bool>();
+            if (config["ai_async"] != null)
+                aiAsync = config["ai_async"].Value<bool>();
+            if (config["ai_actionFreq"] != null)
+                actionFreq = config["ai_actionFreq"].Value<int>();
+            if (config["timeScale"] != null)
+            {
+                timeScale = config["timeScale"].Value<float>();
+                Time.timeScale = timeScale;
+                //Application.targetFrameRate = (int)(60*timeScale);
+            }
+            if (config["ai_fixedDeltaTime"] != null)
+                fixedDeltaTime = config["ai_fixedDeltaTime"].Value<float>();
+            if (config["obs_pixels"] != null)
+                obsPixels = config["obs_pixels"].Value<bool>();
+            if (config["obs_pixels_width"] != null)
+                obsPixelsWidth = config["obs_pixels_width"].Value<int>();
+            if (config["obs_pixels_height"] != null)
+                obsPixelsHeight = config["obs_pixels_height"].Value<int>();
+
+            if (config["arena_path"] != null)
+            {
+                string arenaPath = ResolveArenaPath(configPath, config["arena_path"].Value<string>());
+                StreamReader arenaFile = File.OpenText(arenaPath);
+                JsonTextReader arenaReader = new JsonTextReader(arenaFile);
+                arena = (JObject)JToken.ReadFrom(arenaReader);
+                // Map id for the one-time wall message = the configured arena_path (verbatim, not
+                // the resolved absolute path) so Python sees the same identity it requested.
+                currentMapId = config["arena_path"].Value<string>();
+            }
+            
+            if (verbose)
+            {
+                Debug.Log("Running in 'verbose' mode");
+                Debug.Log("Connection IP set to " + connectionIP);
+                Debug.Log("Connection Port set to " + connectionPort);
+                Debug.Log("Time scale set to " + timeScale);
+                Debug.Log("AI Async set to " + aiAsync);
+                Debug.Log("AI action frequency set to " + actionFreq);
+                Debug.Log("Fixed delta time set to " + fixedDeltaTime);
+                Debug.Log("Obs pixels set to " + obsPixels);
+                if (obsPixels)
+                    Debug.Log("Obs pixels resolution set to " + obsPixelsWidth + "x" + obsPixelsHeight);
+                if (arena != null)
+                    Debug.Log("Arena loaded from: " + config["arena_path"]);
+            }
+        }
+
+        // OPTIONAL pixel channel: only attach the capture component when enabled. Lives on the
+        // DontDestroyOnLoad driver object; it resolves the Arena Main Camera lazily each capture,
+        // so it survives the per-episode LoadScene("Arena"). Default path attaches nothing.
+        if (obsPixels)
+        {
+            frameCapture = gameObject.AddComponent<FrameCapture>();
+            frameCapture.Init(obsPixelsWidth, obsPixelsHeight);
+        }
+    }
+
+    // Resolve the config.json path so it works both in-editor and next to a built player.
+    // Precedence: explicit "--config <path>" / "-config <path>" CLI arg, then StreamingAssets,
+    // then the legacy "Assets/config.json" working-dir path as a last-resort fallback.
+    // Note: args[1] is the legacy tank_env port (parsed above), so we only honor named args here.
+    internal string ResolveConfigPath(string[] args)
+    {
+        for (int i = 0; i < args.Length - 1; i++)
+        {
+            if (args[i] == "--config" || args[i] == "-config")
+                return args[i + 1];
+        }
+
+        string streamingPath = Path.Combine(Application.streamingAssetsPath, "config.json");
+        if (File.Exists(streamingPath))
+            return streamingPath;
+
+        return "Assets/config.json";
+    }
+
+    // Resolve arena_path so it ships portably. Absolute paths are used as-is. A relative path is
+    // resolved against the directory of the resolved config file (so config + arenas travel together).
+    // The legacy "Assets/Arenas/..." form is also honored relative to the working dir if that file exists.
+    internal string ResolveArenaPath(string configPath, string arenaPath)
+    {
+        if (Path.IsPathRooted(arenaPath))
+            return arenaPath;
+
+        if (File.Exists(arenaPath))
+            return arenaPath;
+
+        string configDir = Path.GetDirectoryName(Path.GetFullPath(configPath));
+        return Path.Combine(configDir, arenaPath);
+    }
+
+    private void Start()
+    {
+        if (aiAsync)
+        {
+            //TODO: Async AI needs to be fixed, it is currently broken
+            ThreadStart ts = new ThreadStart(PythonConnection);
+            mThread = new Thread(ts);
+            mThread.Start();
+        } else
+        {
+            EstablishPythonConnection();
+        }
+        Reset();
+    }
+
+    private void FixedUpdate()
+    {
+        if (!aiAsync)
+        {
+            Time.timeScale = 0f;
+            if (instance.running)
+            {
+                // OBSERVE-ONLY (verbose-gated): read the SAME ingame/state values the if/else below
+                // uses, but do not alter the branch. Dead-zone = (ingame && state==null), the window
+                // that services no socket I/O -- the prime reset/restart-hang suspect. Also surface
+                // the state null<->populated transition (null->populated is visible right here; the
+                // populated->null nulling is logged in SendAndReceiveData's done branch).
+                if (verbose)
+                {
+                    bool deadZoneActive = ingame && state == null;
+                    DeadZoneTracker.Event dzEvent = deadZone.Observe(deadZoneActive, logClock.Elapsed.TotalMilliseconds);
+                    if (dzEvent == DeadZoneTracker.Event.Entered)
+                        Debug.Log(DriverLog.Format("deadzone_enter", System.DateTime.UtcNow, "port", connectionPort.ToString()));
+                    else if (dzEvent == DeadZoneTracker.Event.Exited)
+                        Debug.Log(DriverLog.Format("deadzone_exit", System.DateTime.UtcNow,
+                            new[] { "duration_ms", "port" },
+                            new[] { DriverLog.Ms(deadZone.LastDurationMs), connectionPort.ToString() }));
+
+                    bool statePopulated = state != null;
+                    if (statePopulated && !stateWasPopulated)
+                        Debug.Log(DriverLog.Format("state_populated", System.DateTime.UtcNow, "port", connectionPort.ToString()));
+                    stateWasPopulated = statePopulated;
+                }
+
+                if (ingame && state != null) //&& GameController.instance != null)
+                {
+                    bool done = state["done"] != null ? true : false;
+                    stepsSinceLastAction++;
+                    if (stepsSinceLastAction >= actionFreq || done)
+                    {
+                        SendAndReceiveData();
+                        stepsSinceLastAction = 0;
+                    }
+                }
+                else if (!ingame)
+                    ReceiveAndSendData();
+            }
+            else
+            {
+                listener.Stop();
+                //Debug.Log("Closed listener on port " + connectionPort);
+                Application.Quit();
+            }
+            Time.timeScale = timeScale;
+        }
+    }
+
+    private void EstablishPythonConnection()
+    {
+        localAdd = IPAddress.Parse(connectionIP);
+        listener = new TcpListener(localAdd, connectionPort);
+        listener.Start();
+        Debug.Log("Started to listen on port " + connectionPort);
+
+        client = listener.AcceptTcpClient();
+        nwStream = client.GetStream();
+        instance.running = true;
+    }
+
+    private void PythonConnection()
+    {
+        EstablishPythonConnection();
+        while (instance.running)
+        {
+            if (ingame && state != null)
+            {
+                stepsSinceLastAction++;
+                if (stepsSinceLastAction >= actionFreq)
+                {
+                    SendAndReceiveData();
+                    stepsSinceLastAction = 0;
+                }
+            }
+            else if (!ingame)
+                ReceiveAndSendData();
+        }
+        
+        listener.Stop();
+        Debug.Log("Closed listener on port " + connectionPort);
+    }
+
+    private void ReceiveAndSendData()
+    {
+        byte[] readBuffer = new byte[client.ReceiveBufferSize];
+        int bytesRead = nwStream.Read(readBuffer, 0, client.ReceiveBufferSize);
+        JObject message = null;
+
+        if (bytesRead > 0)
+        {
+            string dataReceived = Encoding.UTF8.GetString(readBuffer, 0, bytesRead);
+            message = JObject.Parse(dataReceived);
+        }
+
+        if (message != null)
+        { 
+            if (message["start"] != null && message["start"].Value<bool>())
+            {
+                if (verbose)
+                    Debug.Log(DriverLog.Format("start_received", System.DateTime.UtcNow, "port", connectionPort.ToString()));
+                else
+                    Debug.Log("Start received");
+                JObject confirmation = JObject.Parse("{starting:true}");
+                byte[] writeBuffer = Encoding.ASCII.GetBytes(confirmation.ToString());
+                nwStream.Write(writeBuffer, 0, writeBuffer.Length);
+                // One-time wall-layout message, AFTER the {starting:true} confirmation, as its
+                // OWN discrete write (see SendWallMessage / WallMessage.cs). Ordering is PINNED:
+                // confirmation first, walls second. Skipped gracefully if no arena is configured.
+                SendWallMessage();
+                if (verbose)
+                    Debug.Log(DriverLog.Format("ingame_flip", System.DateTime.UtcNow,
+                        new[] { "from", "to", "cause", "port" },
+                        new[] { "false", "true", "start", connectionPort.ToString() }));
+                ingame = true;
+            } else if (message["end"] != null && message["end"].Value<bool>())
+            {
+                if (verbose)
+                    Debug.Log(DriverLog.Format("end_received", System.DateTime.UtcNow, "port", connectionPort.ToString()));
+                else
+                    Debug.Log("End received");
+                JObject confirmation = JObject.Parse("{ending:true}");
+                byte[] writeBuffer = Encoding.ASCII.GetBytes(confirmation.ToString());
+                nwStream.Write(writeBuffer, 0, writeBuffer.Length);
+                instance.running = false;
+            } else if (message["restart"] != null && message["restart"].Value<bool>())
+            {
+                if (verbose)
+                    Debug.Log(DriverLog.Format("restart_received", System.DateTime.UtcNow,
+                        new[] { "phase", "port" },
+                        new[] { "pregame", connectionPort.ToString() }));
+                else
+                    Debug.Log("Restart received");
+                JObject confirmation = JObject.Parse("{restarting:true}");
+                byte[] writeBuffer = Encoding.ASCII.GetBytes(confirmation.ToString());
+                nwStream.Write(writeBuffer, 0, writeBuffer.Length);
+            } else if (message["switch_arena"] != null)
+            {
+                // Optional, additive handshake message. Swaps the cached arena so the NEXT
+                // LoadScene("Arena") (which fires at the start of every episode via Reset())
+                // re-places walls from the new arena in GameController.Awake(). We do NOT reload
+                // the scene here: during the pre-start handshake the active scene may be "Driver",
+                // and the start/restart handshake already triggers an Arena load momentarily.
+                string switchArenaPath = message["switch_arena"].Value<string>();
+                if (verbose)
+                    Debug.Log(DriverLog.Format("switch_arena_received", System.DateTime.UtcNow,
+                        new[] { "path", "port" },
+                        new[] { switchArenaPath, connectionPort.ToString() }));
+                else
+                    Debug.Log("Switch arena received: " + switchArenaPath);
+                string resolvedArenaPath = ResolveArenaPath(resolvedConfigPath, switchArenaPath);
+                using (StreamReader arenaFile = File.OpenText(resolvedArenaPath))
+                using (JsonTextReader arenaReader = new JsonTextReader(arenaFile))
+                {
+                    instance.arena = (JObject)JToken.ReadFrom(arenaReader);
+                }
+                // Map id = the requested switch_arena path (verbatim), mirroring Awake's choice.
+                currentMapId = switchArenaPath;
+                JObject confirmation = JObject.Parse("{arena_switched:true}");
+                byte[] writeBuffer = Encoding.ASCII.GetBytes(confirmation.ToString());
+                nwStream.Write(writeBuffer, 0, writeBuffer.Length);
+                // One-time wall-layout message, AFTER the {arena_switched:true} confirmation, as
+                // its OWN discrete write. Ordering is PINNED: confirmation first, walls second.
+                SendWallMessage();
+                if (verbose)
+                    Debug.Log(DriverLog.Format("arena_switched", System.DateTime.UtcNow,
+                        new[] { "resolved_path", "port" },
+                        new[] { resolvedArenaPath, connectionPort.ToString() }));
+                else
+                    Debug.Log("Arena switched to: " + resolvedArenaPath);
+            }
+        }
+    }
+
+    // Emits the one-time map wall-layout message (Unity -> Python) as its OWN discrete socket
+    // write. Called from the start (initial load) and switch_arena (map change) handshake branches,
+    // AFTER their respective confirmation writes (ordering PINNED in WallMessage.cs's wire contract).
+    // GUARD: if no arena is configured (instance.arena null) or it carries no "Walls" block, nothing
+    // is written -- the handshake confirmation already went out, so Python simply receives no walls
+    // message for that map. This is NEVER on the per-step RL path (state/frame/action), so that wire
+    // stays byte-for-byte unchanged.
+    private void SendWallMessage()
+    {
+        if (instance.arena == null)
+            return;
+        JToken walls = instance.arena["Walls"];
+        if (walls == null)
+            return;
+
+        JObject wallMessage = WallMessage.Build(walls, currentMapId);
+        byte[] writeBuffer = Encoding.ASCII.GetBytes(wallMessage.ToString());
+        nwStream.Write(writeBuffer, 0, writeBuffer.Length);
+        if (verbose)
+            Debug.Log("Wall message sent for map: " + currentMapId);
+    }
+
+    private void SendAndReceiveData()
+    {
+        //Debug.Log("SendAndReceiveData");
+        bool done = state["done"] != null ? true : false;
+        byte[] writeBuffer = Encoding.ASCII.GetBytes(state.ToString());
+        nwStream.Write(writeBuffer, 0, writeBuffer.Length);
+        //Debug.Log("Sent: " + state.ToString());
+
+        // OPTIONAL pixel channel (default OFF). When obsPixels is enabled, IMMEDIATELY after the
+        // raw `state` JSON above, send ONE length-prefixed binary frame (see the wire contract in
+        // FrameCapture.cs): [ 'F' | uint32_BE payloadLen=W*H*3 | uint16_BE W | uint16_BE H | uint8 C
+        // | W*H*3 raw RGB bytes ]. Sent on EVERY step where state is sent (including the done step)
+        // so the Python read is symmetric. Time.timeScale==0 here, so the frame is time-aligned
+        // with the 52-float `state`. One contiguous Write keeps bytes contiguous on our side; the
+        // Python read-exactly loop reassembles across any TCP fragmentation. When obsPixels is
+        // false this block is skipped entirely and the wire is byte-identical to before.
+        if (obsPixels && frameCapture != null)
+        {
+            int w, h;
+            // OBSERVE-ONLY: time the synchronous GPU readback (the prime GPU-stall suspect) with a
+            // MONOTONIC start/stop around CaptureRGB. This is the per-step / DEBUG-grade line (one
+            // per sent step) -- the SPAMMY one -- and is verbose-gated like the rest. The capture
+            // and the Write are unchanged; only a Stopwatch sample wraps them.
+            double captureMs = 0d;
+            long captureStart = verbose ? logClock.ElapsedTicks : 0L;
+            byte[] rgb = frameCapture.CaptureRGB(out w, out h);
+            if (verbose)
+                captureMs = (logClock.ElapsedTicks - captureStart) * 1000d / System.Diagnostics.Stopwatch.Frequency;
+            if (rgb != null)
+            {
+                byte[] frameMessage = FrameCapture.BuildFrameMessage(rgb, w, h);
+                nwStream.Write(frameMessage, 0, frameMessage.Length);
+            }
+            if (verbose)
+                Debug.Log(DriverLog.Format("readpixels", System.DateTime.UtcNow,
+                    new[] { "duration_ms", "rgb_null", "port" },
+                    new[] { DriverLog.Ms(captureMs), (rgb == null).ToString(), connectionPort.ToString() }));
+        }
+
+        if (done)
+        {
+            if (verbose)
+            {
+                Debug.Log(DriverLog.Format("game_done", System.DateTime.UtcNow, "port", connectionPort.ToString()));
+                Debug.Log(DriverLog.Format("state_nulled", System.DateTime.UtcNow,
+                    new[] { "cause", "port" },
+                    new[] { "done", connectionPort.ToString() }));
+                Debug.Log(DriverLog.Format("ingame_flip", System.DateTime.UtcNow,
+                    new[] { "from", "to", "cause", "port" },
+                    new[] { "true", "false", "done", connectionPort.ToString() }));
+            }
+            else
+                Debug.Log("Game done");
+            state = null;
+            actions = null;
+            // Keep the dead-zone/state-populated latches consistent with the nulling we just did, so
+            // the next FixedUpdate observes a clean populated->null edge rather than a stale latch.
+            stateWasPopulated = false;
+            ingame = false;
+            return;
+        }
+
+        byte[] readBuffer = new byte[client.ReceiveBufferSize];
+        int bytesRead = nwStream.Read(readBuffer, 0, client.ReceiveBufferSize);
+
+        JObject message = null;
+
+        if (bytesRead > 0)
+        {
+            string dataReceived = Encoding.UTF8.GetString(readBuffer, 0, bytesRead);
+            message = JObject.Parse(dataReceived);
+            //Debug.Log("Received: " + actions.ToString());
+        }
+
+        if (message != null)
+        {
+            if (message["restart"] != null && message["restart"].Value<bool>())
+            {
+                if (verbose)
+                    Debug.Log(DriverLog.Format("restart_received", System.DateTime.UtcNow,
+                        new[] { "phase", "port" },
+                        new[] { "midgame", connectionPort.ToString() }));
+                else
+                    Debug.Log("Restart received");
+                JObject confirmation = JObject.Parse("{restarting:true}");
+                writeBuffer = Encoding.ASCII.GetBytes(confirmation.ToString());
+                nwStream.Write(writeBuffer, 0, writeBuffer.Length);
+                GameController.instance.EndGame(-1);
+                if (verbose)
+                    Debug.Log(DriverLog.Format("ingame_flip", System.DateTime.UtcNow,
+                        new[] { "from", "to", "cause", "port" },
+                        new[] { "true", "false", "restart_midgame", connectionPort.ToString() }));
+                ingame = false;
+            } else
+            {
+                actions = message;
+            }
+        }
+    }
+
+    private void Reset()
+    {
+        instance.flip = Random.value >= .5f;
+        SceneManager.LoadScene("Arena");
+    }
+
+    private void OnApplicationQuit()
+    {
+        instance.running = false;
+    }
+}

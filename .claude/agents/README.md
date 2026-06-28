@@ -1,6 +1,6 @@
 # Agent team (v1) — charter
 
-**Status: bootstrapping.** The v0 flat team is archived in `archive/agents-v0/`. This is the in-progress v1.
+**Status: bootstrapping.** The v0 flat team was retired (it lives in git history); this is the in-progress v1.
 
 ## Operating model — a matrix
 - **Functional teams** (the "rows") each have a **manager** who owns the discipline's *practice*, defines ownership areas, dispatches workers, and is the **adversary** for their workers' output.
