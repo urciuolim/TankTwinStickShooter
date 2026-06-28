@@ -1,7 +1,8 @@
 """Tests for pop_trainer.pretraining.decoder — the StateDecoder head families.
 
-Output shapes for both head families on a tiny config + frame, and that the embed-probe reads
-``embed.detach()`` (a probe-loss backward leaves the encoder grads at zero).
+Soft-argmax localization correctness + its gradient flow; output shapes for both head families
+on a tiny config + frame; and that the embed-probe reads ``embed.detach()`` (a probe-loss
+backward leaves the encoder grads at zero) while the spatial family DOES train the encoder.
 """
 
 from __future__ import annotations
@@ -12,7 +13,11 @@ torch = pytest.importorskip("torch")
 
 from pop_trainer.models import EncoderConfig, build_encoder  # noqa: E402
 from pop_trainer.pretraining import losses  # noqa: E402
-from pop_trainer.pretraining.decoder import GROUP_OUTPUT_SIZES, StateDecoder  # noqa: E402
+from pop_trainer.pretraining.decoder import (  # noqa: E402
+    GROUP_OUTPUT_SIZES,
+    StateDecoder,
+    soft_argmax,
+)
 
 SMALL_HW = (180, 320)  # survives the NatureCNN stem+trio
 
@@ -22,9 +27,38 @@ def _decoder(trunk="nature", pooling="gap"):
     return StateDecoder(enc, SMALL_HW, hidden=32)
 
 
+def test_soft_argmax_one_hot_returns_cell_center():
+    # A sharply-peaked map at cell (i, j) -> the cell-center normalized coord ((j+.5)/w, (i+.5)/h).
+    h, w = 4, 5
+    i, j = 2, 3
+    scores = torch.full((1, 1, h, w), -50.0)
+    scores[0, 0, i, j] = 50.0  # near one-hot after spatial softmax
+    coords = soft_argmax(scores)
+    assert coords.shape == (1, 1, 2)
+    expected = torch.tensor([(j + 0.5) / w, (i + 0.5) / h])
+    assert torch.allclose(coords[0, 0], expected, atol=1e-3)
+
+
+def test_soft_argmax_uniform_returns_grid_center():
+    h, w = 4, 6
+    scores = torch.zeros(1, 1, h, w)  # uniform -> distribution mean is the grid center
+    coords = soft_argmax(scores)
+    center = torch.tensor([w / 2.0, h / 2.0]) / torch.tensor([float(w), float(h)])
+    assert torch.allclose(coords[0, 0], center, atol=1e-6)
+
+
+def test_soft_argmax_is_differentiable():
+    scores = torch.randn(2, 3, 4, 5, requires_grad=True)
+    coords = soft_argmax(scores)
+    coords.sum().backward()
+    assert scores.grad is not None
+    assert torch.isfinite(scores.grad).all()
+
+
+@pytest.mark.parametrize("trunk", ["nature", "impala"])
 @pytest.mark.parametrize("pooling", ["gap", "flatten"])
-def test_head_output_shapes_both_families(pooling):
-    model = _decoder(pooling=pooling)
+def test_head_output_shapes_both_families(trunk, pooling):
+    model = _decoder(trunk=trunk, pooling=pooling)
     x = torch.zeros(2, 3, *SMALL_HW)
     out = model(x)
     assert set(out) == {"spatial", "probe"}
@@ -72,3 +106,38 @@ def test_spatial_loss_does_backprop_into_encoder():
     total.backward()
     enc_grads = [p.grad for p in model.encoder.parameters() if p.grad is not None]
     assert len(enc_grads) > 0  # spatial heads DO train the encoder
+
+
+def test_softargmax_position_path_trains_encoder():
+    # The localization (soft-argmax) path alone must reach the encoder: restrict the loss to
+    # ONLY the position groups (player_position + bullet_position), which are produced purely by
+    # the score-conv -> spatial-softmax -> soft-argmax -> affine path (no aim/velocity/presence
+    # head involved). A grad on the encoder then proves the localization path trains the artifact.
+    model = _decoder()
+    x = torch.randn(3, 3, *SMALL_HW)  # nonzero so the score conv has signal to localize on
+    out = model(x)
+    pos_only = {
+        "player_position": out["spatial"]["player_position"],
+        "bullet_position": out["spatial"]["bullet_position"],
+    }
+    targets = {
+        "player_position": torch.ones(3, 4),
+        "bullet_position": torch.ones(3, 20),
+        "bullet_slot_mask": torch.ones(3, 20),
+    }
+    model.zero_grad(set_to_none=True)
+    total, per_group = losses.combined_loss(pos_only, targets)
+    # The combined loss carries ONLY the two position groups (nothing else can leak gradient).
+    assert set(per_group) == {"player_position", "bullet_position"}
+    total.backward()
+
+    # The encoder received gradient strictly via the soft-argmax localization path.
+    enc_grads = [p.grad for p in model.encoder.parameters() if p.grad is not None]
+    assert len(enc_grads) > 0
+    assert all(torch.isfinite(g).all() for g in enc_grads)
+    # The score conv (the head of the localization path) trained; the aim/velocity flatten heads
+    # and the presence affine did NOT (they were not in the loss), confirming the path isolation.
+    assert model.spatial_heads.score_conv.weight.grad is not None
+    assert model.spatial_heads.aim_head[0].weight.grad is None
+    assert model.spatial_heads.velocity_head[0].weight.grad is None
+    assert model.spatial_heads.presence_scale.grad is None
