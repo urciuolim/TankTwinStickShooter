@@ -1,10 +1,11 @@
 """Train CLI for the single-frame decoder: ``python -m pop_trainer.pretraining.train``.
 
-Trains the encoder + spatial heads with the combined per-group loss AND the detached embed-probe
-with its own loss, in TWO disjoint optimizer steps per batch (the probe reads ``embed.detach()``
-so its gradient never reaches the encoder regardless). Evaluates on val + test, logging per-group
-metrics for BOTH head families, then saves a checkpoint (encoder + decoder state) and a strict-JSON
-results record.
+Trains the encoder + spatial heads with the combined per-group loss (coord MSE + an auxiliary
+heatmap cross-entropy on the score maps) AND the detached embed-probe with its own loss, in TWO
+disjoint optimizer steps per batch (the probe reads ``embed.detach()`` so its gradient never
+reaches the encoder regardless, and gets NO heatmap term). Evaluates on val + test, logging
+per-group metrics for BOTH head families, then saves a checkpoint (encoder + decoder state) and a
+strict-JSON results record.
 
 Device-agnostic: ``--device auto`` picks cuda > mps > cpu, so the same command runs on a 4090
 unchanged. Determinism is seeded (torch + numpy) where reasonable.
@@ -70,6 +71,8 @@ class TrainConfig:
     num_workers: int = 0
     progress: bool = True
     eval_every: int = 1
+    heatmap_weight: float = losses.DEFAULT_HEATMAP_WEIGHT
+    heatmap_sigma: float = losses.DEFAULT_HEATMAP_SIGMA
 
 
 def should_eval_epoch(epoch: int, *, eval_every: int, total_epochs: int) -> bool:
@@ -115,6 +118,8 @@ def train_one_epoch(
     device: torch.device,
     *,
     pos_weight: float | None,
+    heatmap_weight: float = losses.DEFAULT_HEATMAP_WEIGHT,
+    heatmap_sigma: float = losses.DEFAULT_HEATMAP_SIGMA,
     on_batch: Callable[[int, float, float], None] | None = None,
 ) -> dict[str, float]:
     """One training pass: a spatial-loss step (trains encoder) + a probe-loss step per batch.
@@ -140,7 +145,12 @@ def train_one_epoch(
         out = model(frames)
 
         spatial_total, _ = losses.combined_loss(
-            out["spatial"], targets, presence_pos_weight=pos_weight
+            out["spatial"],
+            targets,
+            presence_pos_weight=pos_weight,
+            score_logits=out["spatial_score_logits"],
+            heatmap_weight=heatmap_weight,
+            heatmap_sigma=heatmap_sigma,
         )
         spatial_opt.zero_grad(set_to_none=True)
         probe_opt.zero_grad(set_to_none=True)
@@ -260,6 +270,8 @@ def run(cfg: TrainConfig) -> dict:
             probe_opt,
             device,
             pos_weight=pos_weight,
+            heatmap_weight=cfg.heatmap_weight,
+            heatmap_sigma=cfg.heatmap_sigma,
             on_batch=reporter.on_batch,
         )
         reporter.epoch_close()
@@ -298,6 +310,7 @@ def run(cfg: TrainConfig) -> dict:
             "encoder_state_dict": model.encoder.state_dict(),
             "decoder_state_dict": model.state_dict(),
             "norm_stats": splits.stats.to_json(),
+            "grid_extent": splits.extent.to_json(),
             "config": _config_json(cfg),
         },
         out_dir / "checkpoint.pt",
@@ -316,6 +329,7 @@ def run(cfg: TrainConfig) -> dict:
         "val_metrics": _sanitize(val_metrics),
         "test_metrics": _sanitize(test_metrics),
         "norm_stats": splits.stats.to_json(),
+        "grid_extent": splits.extent.to_json(),
     }
     with open(out_dir / "results.json", "w", encoding="utf-8") as fh:
         json.dump(record, fh, indent=2, allow_nan=False)
@@ -334,6 +348,8 @@ def _config_json(cfg: TrainConfig) -> dict:
         "seed": cfg.seed,
         "subset": cfg.subset,
         "eval_every": cfg.eval_every,
+        "heatmap_weight": cfg.heatmap_weight,
+        "heatmap_sigma": cfg.heatmap_sigma,
     }
 
 
@@ -401,6 +417,21 @@ def main(argv: list[str] | None = None) -> int:
             "Default 1 (every epoch). 0 disables periodic eval (end-of-run eval unchanged)."
         ),
     )
+    parser.add_argument(
+        "--heatmap-weight",
+        type=float,
+        default=losses.DEFAULT_HEATMAP_WEIGHT,
+        help=(
+            "scalar weight on the auxiliary heatmap cross-entropy (relative to unit coord MSE). "
+            "Must be strong on a coarse grid; weak weights (<=1) backfire."
+        ),
+    )
+    parser.add_argument(
+        "--heatmap-sigma",
+        type=float,
+        default=losses.DEFAULT_HEATMAP_SIGMA,
+        help="Gaussian target std in grid CELLS for the heatmap cross-entropy.",
+    )
     args = parser.parse_args(argv)
 
     cfg = TrainConfig(
@@ -420,6 +451,8 @@ def main(argv: list[str] | None = None) -> int:
         num_workers=args.num_workers,
         progress=args.progress,
         eval_every=args.eval_every,
+        heatmap_weight=args.heatmap_weight,
+        heatmap_sigma=args.heatmap_sigma,
     )
     record = run(cfg)
 

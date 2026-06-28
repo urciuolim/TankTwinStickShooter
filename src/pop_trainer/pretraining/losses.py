@@ -29,11 +29,14 @@ from torch.nn import functional as F
 __all__ = [
     "AIM_COSINE_EPS",
     "DEFAULT_GROUP_WEIGHTS",
+    "DEFAULT_HEATMAP_WEIGHT",
+    "DEFAULT_HEATMAP_SIGMA",
     "position_loss",
     "velocity_loss",
     "aim_cosine_loss",
     "presence_bce_loss",
     "bullet_position_masked_mse",
+    "heatmap_ce_loss",
     "group_losses",
     "combined_loss",
     "probe_loss",
@@ -42,6 +45,12 @@ __all__ = [
 # Floored into the aim L2-norm denominator so a zero-magnitude prediction yields a finite
 # loss (no NaN / blow-up as |pred| -> 0).
 AIM_COSINE_EPS = 1e-8
+
+# Auxiliary heatmap cross-entropy defaults. The CE rides ON TOP of the soft-argmax coord MSE; on
+# the coarse feature grid a STRONG weight (>= the unit coord scale) is required — weak weights
+# (<=1) backfire. Both knobs are grid-resolution dependent, so both are configurable.
+DEFAULT_HEATMAP_WEIGHT = 6.0
+DEFAULT_HEATMAP_SIGMA = 0.7  # Gaussian std in grid CELLS (per-axis-normalized at render time)
 
 # Sensible default per-group weights for the combined objective. Presence is weighted up a
 # touch (rare positives); the rest are unit-weighted ("good not best").
@@ -108,6 +117,51 @@ def bullet_position_masked_mse(pred: Tensor, target: Tensor, mask: Tensor) -> Te
     return se.sum() / denom
 
 
+def heatmap_ce_loss(
+    score_logits: Tensor,
+    target_grid: Tensor,
+    present_mask: Tensor,
+    *,
+    sigma: float = DEFAULT_HEATMAP_SIGMA,
+) -> Tensor:
+    """Cross-entropy between per-keypoint score maps and a Gaussian target, masked to present.
+
+    ``score_logits`` ``(B, K, h, w)`` are the raw per-keypoint score maps; ``target_grid``
+    ``(B, K, 2)`` holds each keypoint's TRUE location as fractional grid coords in ``[0, 1]``;
+    ``present_mask`` ``(B, K)`` {0,1} flags which keypoints exist (players always; bullets only
+    where present).
+
+    The target distribution per keypoint is a 2D Gaussian centered at its grid location, rendered
+    on the ``(h, w)`` cell grid (cell ``(i, j)`` center ``((j+0.5)/w, (i+0.5)/h)`` — the same
+    convention as :func:`~pop_trainer.pretraining.decoder.soft_argmax`) and normalized to sum 1 by
+    a spatial softmax. ``sigma`` is the std in grid CELLS, converted per-axis to normalized units
+    (``sfx = sigma/w``, ``sfy = sigma/h``). The loss is the CE
+    ``-(target * log_softmax(score_logits)).sum(grid)`` averaged over PRESENT keypoints only.
+    Computed as CE (NOT ``F.kl_div``: dropping the constant target-entropy term keeps the gradient
+    identical while avoiding its NaN). Returns a grad-connected zero when no keypoint is present.
+    """
+    b, k, h, w = score_logits.shape
+    device = score_logits.device
+    dtype = score_logits.dtype
+    xs = (torch.arange(w, device=device, dtype=dtype) + 0.5) / w  # (w,) column centers
+    ys = (torch.arange(h, device=device, dtype=dtype) + 0.5) / h  # (h,) row centers
+    tx = target_grid[..., 0].to(dtype)  # (B, K)
+    ty = target_grid[..., 1].to(dtype)  # (B, K)
+    sfx = sigma / w
+    sfy = sigma / h
+    dx = (xs.view(1, 1, 1, w) - tx.view(b, k, 1, 1)) / sfx  # (B, K, 1, w)
+    dy = (ys.view(1, 1, h, 1) - ty.view(b, k, 1, 1)) / sfy  # (B, K, h, 1)
+    log_t = -0.5 * (dx * dx + dy * dy)  # (B, K, h, w): unnormalized Gaussian log-density
+    target = torch.softmax(log_t.reshape(b, k, h * w), dim=-1)  # normalized to sum 1 over the grid
+    log_p = torch.log_softmax(score_logits.reshape(b, k, h * w), dim=-1)
+    ce = -(target * log_p).sum(dim=-1)  # (B, K)
+    mask = present_mask.to(dtype)
+    denom = mask.sum()
+    if denom <= 0:
+        return (ce * mask).sum() * 0.0
+    return (ce * mask).sum() / denom
+
+
 def group_losses(
     preds: dict[str, Tensor],
     targets: dict[str, Tensor],
@@ -158,15 +212,31 @@ def combined_loss(
     *,
     weights: dict[str, float] | None = None,
     presence_pos_weight: float | None = None,
+    score_logits: Tensor | None = None,
+    heatmap_weight: float = DEFAULT_HEATMAP_WEIGHT,
+    heatmap_sigma: float = DEFAULT_HEATMAP_SIGMA,
 ) -> tuple[Tensor, dict[str, Tensor]]:
     """Weighted sum of the enabled group losses for the encoder + spatial heads.
 
     Returns ``(total, per_group)`` where ``per_group`` is the un-weighted per-group scalar
     dict (for logging). ``weights`` defaults to :data:`DEFAULT_GROUP_WEIGHTS`.
+
+    When ``score_logits`` is given AND ``targets`` carries ``keypoint_grid`` + ``keypoint_present``,
+    an AUXILIARY heatmap cross-entropy term (:func:`heatmap_ce_loss`) is added on top of the coord
+    losses: ``total += heatmap_weight * ce`` (its own scalar weight, NOT routed through
+    ``weights``), and the UNWEIGHTED ``ce`` is recorded in ``per_group["heatmap"]`` for logging.
+    With ``score_logits=None`` the behavior is byte-identical to the coord-only objective.
     """
     weights = DEFAULT_GROUP_WEIGHTS if weights is None else weights
     per_group = group_losses(preds, targets, presence_pos_weight=presence_pos_weight)
-    return _weighted_sum(per_group, weights)
+    total, per_group = _weighted_sum(per_group, weights)
+    if score_logits is not None and "keypoint_grid" in targets and "keypoint_present" in targets:
+        ce = heatmap_ce_loss(
+            score_logits, targets["keypoint_grid"], targets["keypoint_present"], sigma=heatmap_sigma
+        )
+        total = total.to(ce.device) + heatmap_weight * ce
+        per_group["heatmap"] = ce
+    return total, per_group
 
 
 def probe_loss(

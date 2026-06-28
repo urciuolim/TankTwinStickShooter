@@ -28,6 +28,7 @@ stdlib + numpy + :mod:`pop_trainer.core.state` only.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -38,12 +39,15 @@ __all__ = [
     "GROUPS",
     "PLAYER_GROUPS",
     "NormStats",
+    "GridExtent",
     "player_position_targets",
     "player_velocity_targets",
     "player_aim_targets",
     "bullet_targets",
+    "keypoint_targets",
     "extract_targets",
     "fit_norm_stats",
+    "fit_grid_extent",
     "presence_pos_weight",
     "normalize",
     "denormalize",
@@ -171,6 +175,56 @@ def _finite_list(arr: np.ndarray) -> list[float]:
     return [float(x) for x in a]
 
 
+def _finite_float(x: float) -> float:
+    """``x`` as a finite float (NaN/Inf -> 0.0) for strict-JSON safety."""
+    x = float(x)
+    return x if math.isfinite(x) else 0.0
+
+
+@dataclass(frozen=True)
+class GridExtent:
+    """Fixed per-axis world->grid bounds for placing keypoint heatmap targets.
+
+    A keypoint's RAW world ``(x, y)`` maps to fractional grid coords in ``[0, 1]`` by a per-axis
+    linear rescale + clamp: ``g = clamp((world - lo) / (hi - lo), 0, 1)`` (top-down, no flip; all
+    keypoints share these bounds). Fit on the TRAIN split ONLY (:func:`fit_grid_extent`) so
+    val/test never leak, and serialized alongside the checkpoint so the map travels with the model.
+    """
+
+    x_lo: float
+    x_hi: float
+    y_lo: float
+    y_hi: float
+
+    def world_to_grid(self, xy: np.ndarray) -> np.ndarray:
+        """Map world coords ``(..., 2)`` to fractional grid coords ``(..., 2)`` in ``[0, 1]``."""
+        xy = np.asarray(xy, dtype=np.float32)
+        gx = (xy[..., 0] - self.x_lo) / (self.x_hi - self.x_lo)
+        gy = (xy[..., 1] - self.y_lo) / (self.y_hi - self.y_lo)
+        grid = np.stack((gx, gy), axis=-1)
+        return np.clip(grid, 0.0, 1.0).astype(np.float32)
+
+    def to_json(self) -> dict:
+        """Strict-JSON-serializable view (finite floats only; no NaN / Inf)."""
+        return {
+            "convention": "g = clamp((world - lo)/(hi - lo), 0, 1); per-axis, top-down, no flip.",
+            "x_lo": _finite_float(self.x_lo),
+            "x_hi": _finite_float(self.x_hi),
+            "y_lo": _finite_float(self.y_lo),
+            "y_hi": _finite_float(self.y_hi),
+        }
+
+    @classmethod
+    def from_json(cls, d: dict) -> GridExtent:
+        """Rebuild from :meth:`to_json` output."""
+        return cls(
+            x_lo=float(d["x_lo"]),
+            x_hi=float(d["x_hi"]),
+            y_lo=float(d["y_lo"]),
+            y_hi=float(d["y_hi"]),
+        )
+
+
 def _mean_std(values: np.ndarray, *, eps: float) -> tuple[np.ndarray, np.ndarray]:
     """Per-field mean/std over every row; std floored at ``eps`` (constant fields)."""
     mean = values.mean(axis=0).astype(np.float32)
@@ -216,6 +270,73 @@ def fit_norm_stats(states: np.ndarray, *, eps: float = 1e-6) -> NormStats:
     )
 
 
+def _padded_bounds(
+    values: np.ndarray, lo_pct: float, hi_pct: float, pad_frac: float, min_span: float
+) -> tuple[float, float]:
+    """Robust ``(lo, hi)`` from ``values``: ``lo_pct``/``hi_pct`` pctiles, padded, span-floored."""
+    lo = float(np.percentile(values, lo_pct))
+    hi = float(np.percentile(values, hi_pct))
+    span = hi - lo
+    pad = span * pad_frac
+    lo -= pad
+    hi += pad
+    if hi - lo < min_span:
+        center = 0.5 * (lo + hi)
+        lo = center - 0.5 * min_span
+        hi = center + 0.5 * min_span
+    return lo, hi
+
+
+def fit_grid_extent(
+    states: np.ndarray,
+    *,
+    lo_pct: float = 1.0,
+    hi_pct: float = 99.0,
+    pad_frac: float = 0.05,
+    min_span: float = 1e-3,
+) -> GridExtent:
+    """Fit per-axis world->grid bounds from entity positions (TRAIN split ONLY, no leak).
+
+    Bounds are robust percentiles (``lo_pct``/``hi_pct``) of ALL entity x / y coords — both
+    players (always present) and bullets only where their slot is present (the sentinel of absent
+    slots is excluded via the slot mask) — then padded by ``pad_frac`` of the span and floored to
+    ``min_span`` so ``hi > lo``. Deterministic. Call with the TRAIN states ONLY.
+    """
+    states = np.asarray(states)
+    pos = player_position_targets(states)  # (N, 4) [P1x, P1y, P2x, P2y]
+    player_x = pos[:, [0, 2]].ravel()
+    player_y = pos[:, [1, 3]].ravel()
+    _, bpos, slot_mask = bullet_targets(states)
+    present = slot_mask.astype(bool)[:, 0::2]  # (N, 10) per-slot presence
+    bullet_x = bpos[:, 0::2][present]
+    bullet_y = bpos[:, 1::2][present]
+    xs = np.concatenate([player_x, bullet_x])
+    ys = np.concatenate([player_y, bullet_y])
+    x_lo, x_hi = _padded_bounds(xs, lo_pct, hi_pct, pad_frac, min_span)
+    y_lo, y_hi = _padded_bounds(ys, lo_pct, hi_pct, pad_frac, min_span)
+    return GridExtent(x_lo=x_lo, x_hi=x_hi, y_lo=y_lo, y_hi=y_hi)
+
+
+def keypoint_targets(states: np.ndarray, extent: GridExtent) -> tuple[np.ndarray, np.ndarray]:
+    """Per-keypoint grid coords + presence for the 12 localizable keypoints.
+
+    Returns ``(grid, present)``: ``grid`` ``(N, 12, 2)`` fractional ``[0, 1]`` coords (via
+    :meth:`GridExtent.world_to_grid`) and ``present`` ``(N, 12)`` {0,1}. Keypoint order matches
+    the score-map conv: 2 players (P1, P2; always present) then 10 bullets (P1 slots 0-4, P2
+    slots 0-4; present = the slot's presence). Absent bullets clamp into the grid but are masked.
+    """
+    states = np.asarray(states)
+    n = states.shape[0]
+    player_world = player_position_targets(states).reshape(n, st.NUM_PLAYERS, 2)
+    presence, bpos, _ = bullet_targets(states)
+    bullet_world = bpos.reshape(n, _N_BULLET_SLOTS, 2)
+    world = np.concatenate([player_world, bullet_world], axis=1)  # (N, 12, 2)
+    grid = extent.world_to_grid(world)
+    player_present = np.ones((n, st.NUM_PLAYERS), dtype=np.float32)
+    present = np.concatenate([player_present, presence.astype(np.float32)], axis=1)  # (N, 12)
+    return grid.astype(np.float32), present.astype(np.float32)
+
+
 def presence_pos_weight(presence: np.ndarray, *, fallback: float = 1.0) -> float:
     """BCE positive-class weight for bullet presence: ``(#absent) / (#present)``.
 
@@ -241,7 +362,9 @@ def denormalize(z: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
     return np.asarray(z, dtype=np.float32) * std + mean
 
 
-def extract_targets(states: np.ndarray, stats: NormStats) -> dict[str, np.ndarray]:
+def extract_targets(
+    states: np.ndarray, stats: NormStats, *, extent: GridExtent | None = None
+) -> dict[str, np.ndarray]:
     """Build the full per-group target dict for a batch of states, normalized via ``stats``.
 
     Position / velocity are normalized; aim is left raw (cosine loss); bullet positions are
@@ -250,6 +373,9 @@ def extract_targets(states: np.ndarray, stats: NormStats) -> dict[str, np.ndarra
     ``player_position`` ``(N,4)``, ``player_velocity`` ``(N,4)``, ``player_aim`` ``(N,4)``,
     ``bullet_presence`` ``(N,10)``, ``bullet_position`` ``(N,20)``, ``bullet_slot_mask``
     ``(N,20)``.
+
+    When ``extent`` is given, ALSO emits the heatmap-supervision targets ``keypoint_grid``
+    ``(N,12,2)`` (fractional grid coords) and ``keypoint_present`` ``(N,12)``.
     """
     states = np.asarray(states)
     pos = normalize(player_position_targets(states), stats.position_mean, stats.position_std)
@@ -257,7 +383,7 @@ def extract_targets(states: np.ndarray, stats: NormStats) -> dict[str, np.ndarra
     aim = player_aim_targets(states)
     presence, raw_bpos, slot_mask = bullet_targets(states)
     bpos = normalize(raw_bpos, stats.bullet_pos_mean, stats.bullet_pos_std) * slot_mask
-    return {
+    out = {
         "player_position": pos.astype(np.float32),
         "player_velocity": vel.astype(np.float32),
         "player_aim": aim.astype(np.float32),
@@ -265,3 +391,8 @@ def extract_targets(states: np.ndarray, stats: NormStats) -> dict[str, np.ndarra
         "bullet_position": bpos.astype(np.float32),
         "bullet_slot_mask": slot_mask.astype(np.float32),
     }
+    if extent is not None:
+        grid, kp_present = keypoint_targets(states, extent)
+        out["keypoint_grid"] = grid
+        out["keypoint_present"] = kp_present
+    return out

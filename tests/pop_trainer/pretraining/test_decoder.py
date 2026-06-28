@@ -14,8 +14,12 @@ torch = pytest.importorskip("torch")
 from pop_trainer.models import EncoderConfig, build_encoder  # noqa: E402
 from pop_trainer.pretraining import losses  # noqa: E402
 from pop_trainer.pretraining.decoder import (  # noqa: E402
+    _N_BULLET_KEYPOINTS,
+    _N_KEYPOINTS,
+    _N_PLAYER_KEYPOINTS,
     GROUP_OUTPUT_SIZES,
     StateDecoder,
+    _CoordAffine,
     soft_argmax,
 )
 
@@ -55,16 +59,38 @@ def test_soft_argmax_is_differentiable():
     assert torch.isfinite(scores.grad).all()
 
 
+def test_coord_affine_is_per_keypoint_and_broadcasts_over_batch():
+    # Per-keypoint affine: scale/bias are (k, 2), and a (B, k, 2) coord forward broadcasts the
+    # params over the batch dim, returning (B, k, 2).
+    for k in (_N_PLAYER_KEYPOINTS, _N_BULLET_KEYPOINTS):
+        affine = _CoordAffine(k)
+        assert affine.scale.shape == (k, 2)
+        assert affine.bias.shape == (k, 2)
+        coords = torch.rand(4, k, 2)
+        out = affine(coords)
+        assert out.shape == (4, k, 2)
+
+
+def test_spatial_heads_use_per_keypoint_affines():
+    model = _decoder()
+    assert model.spatial_heads.player_affine.scale.shape == (_N_PLAYER_KEYPOINTS, 2)
+    assert model.spatial_heads.bullet_affine.scale.shape == (_N_BULLET_KEYPOINTS, 2)
+
+
 @pytest.mark.parametrize("trunk", ["nature", "impala"])
 @pytest.mark.parametrize("pooling", ["gap", "flatten"])
 def test_head_output_shapes_both_families(trunk, pooling):
     model = _decoder(trunk=trunk, pooling=pooling)
     x = torch.zeros(2, 3, *SMALL_HW)
     out = model(x)
-    assert set(out) == {"spatial", "probe"}
+    assert set(out) == {"spatial", "probe", "spatial_score_logits"}
     for fam in ("spatial", "probe"):
         for name, width in GROUP_OUTPUT_SIZES.items():
             assert out[fam][name].shape == (2, width), (fam, name)
+    # the score logits ride at TOP LEVEL (never inside a family dict, so eval never concats them).
+    feat = model.encoder.features(x)
+    fh, fw = feat.shape[2], feat.shape[3]
+    assert out["spatial_score_logits"].shape == (2, _N_KEYPOINTS, fh, fw)
 
 
 def test_probe_loss_does_not_backprop_into_encoder():
@@ -137,7 +163,29 @@ def test_softargmax_position_path_trains_encoder():
     assert all(torch.isfinite(g).all() for g in enc_grads)
     # The score conv (the head of the localization path) trained; the aim/velocity flatten heads
     # and the presence affine did NOT (they were not in the loss), confirming the path isolation.
-    assert model.spatial_heads.score_conv.weight.grad is not None
+    assert model.spatial_heads.score_conv[-1].weight.grad is not None
     assert model.spatial_heads.aim_head[0].weight.grad is None
     assert model.spatial_heads.velocity_head[0].weight.grad is None
     assert model.spatial_heads.presence_scale.grad is None
+
+
+def test_heatmap_only_loss_trains_encoder():
+    # The auxiliary heatmap CE alone (no coord groups) must reach the encoder via the score maps,
+    # proving the new term trains the reusable artifact.
+    model = _decoder()
+    x = torch.randn(3, 3, *SMALL_HW)  # nonzero signal for the score conv to localize on
+    out = model(x)
+    targets = {
+        "keypoint_grid": torch.rand(3, _N_KEYPOINTS, 2),
+        "keypoint_present": torch.ones(3, _N_KEYPOINTS),
+    }
+    model.zero_grad(set_to_none=True)
+    total, per_group = losses.combined_loss({}, targets, score_logits=out["spatial_score_logits"])
+    # ONLY the heatmap term contributes (no coord groups passed).
+    assert set(per_group) == {"heatmap"}
+    total.backward()
+    enc_grads = [p.grad for p in model.encoder.parameters() if p.grad is not None]
+    assert len(enc_grads) > 0
+    assert all(torch.isfinite(g).all() for g in enc_grads)
+    # the score conv (head of the localization path) trained from the heatmap term.
+    assert model.spatial_heads.score_conv[-1].weight.grad is not None

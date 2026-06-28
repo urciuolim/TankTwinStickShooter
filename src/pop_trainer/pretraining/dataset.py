@@ -1,10 +1,10 @@
 """Shard-streaming dataset for the single-frame decoder (torch ``Dataset``).
 
 Builds a :class:`~pop_trainer.data.readers.DatasetIndex` over a decode-v1 directory, splits it
-map-aware (group key = ``map_id``, 60/20/20 default, no leak), and serves ``(frame, target_dict)`` rows
-by lazily fetching one frame from its shard. The last-read shard's arrays are cached so a run of
-rows in the same shard does not re-open the ``.npz`` every ``__getitem__`` — but frames are
-never bulk-loaded into RAM.
+map-aware (group key = ``map_id``, 60/20/20 default, no leak), and serves ``(frame, target_dict)``
+rows by lazily fetching one frame from its shard. The last-read shard's arrays are cached so a
+run of rows in the same shard does not re-open the ``.npz`` every ``__getitem__`` — but frames
+are never bulk-loaded into RAM.
 
 decode-v1 shards live in ``worker_*/`` SUBDIRS, so the index is built with a RECURSIVE glob
 (``**/shard_*.npz``); a flat-layout dir works too. Frames are ``uint8 (H, W, 3)`` -> float32
@@ -15,9 +15,10 @@ scales by the SAME integer factor as the height (native 360 -> factor 1/2/4 -> 3
 the native frame aspect is preserved. Resize is deterministic area-interpolation.
 
 Targets are extracted per-row from the 52-float state via
-:mod:`pop_trainer.pretraining.targets`, normalized by a :class:`~...targets.NormStats` that is
-fit on the TRAIN split ONLY (no val/test leak). Build the three split views with
-:func:`build_splits` so they share one index and one stats object.
+:mod:`pop_trainer.pretraining.targets`, normalized by a :class:`~...targets.NormStats` and placed
+on the feature grid by a :class:`~...targets.GridExtent` (heatmap supervision), BOTH fit on the
+TRAIN split ONLY (no val/test leak). Build the three split views with :func:`build_splits` so they
+share one index, one stats object, and one extent.
 
 torch + numpy + :mod:`pop_trainer.data` + :mod:`pop_trainer.pretraining.targets`; nothing from
 ``env`` / ``rl``.
@@ -108,11 +109,13 @@ class DecodeDataset(Dataset):
         index: readers.DatasetIndex,
         sample_indices: np.ndarray,
         stats: T.NormStats,
+        extent: T.GridExtent,
         resolution: int,
     ) -> None:
         self._index = index
         self._samples = np.asarray(sample_indices, dtype=np.int64)
         self._stats = stats
+        self._extent = extent
         self._factor = _downsample_factor(index.frame_hw[0], resolution)
         self._cache = _ShardCache(shard_paths)
         self.resolution = resolution
@@ -121,6 +124,11 @@ class DecodeDataset(Dataset):
     def stats(self) -> T.NormStats:
         """The TRAIN-fit normalization stats this view applies (shared across splits)."""
         return self._stats
+
+    @property
+    def extent(self) -> T.GridExtent:
+        """The TRAIN-fit world->grid extent this view applies (shared across splits)."""
+        return self._extent
 
     def sample_shards(self) -> np.ndarray:
         """``(len(self),)`` int64 shard id per LOCAL index ``i`` (for shard-grouped sampling).
@@ -142,21 +150,27 @@ class DecodeDataset(Dataset):
         frame = arrays[schema.ARRAY_FRAMES][row]
         state = arrays[schema.ARRAY_STATES][row]
         x = _frame_to_chw(frame, self._factor)
-        tgt = T.extract_targets(state[None, :], self._stats)
+        tgt = T.extract_targets(state[None, :], self._stats, extent=self._extent)
         target = {k: torch.from_numpy(v[0]) for k, v in tgt.items()}
         return x, target
 
 
 class SplitDatasets:
-    """The three map-aware split views (``train`` / ``val`` / ``test``) + the shared stats."""
+    """The three map-aware split views (``train`` / ``val`` / ``test``) + the shared TRAIN-fits."""
 
     def __init__(
-        self, train: DecodeDataset, val: DecodeDataset, test: DecodeDataset, stats: T.NormStats
+        self,
+        train: DecodeDataset,
+        val: DecodeDataset,
+        test: DecodeDataset,
+        stats: T.NormStats,
+        extent: T.GridExtent,
     ) -> None:
         self.train = train
         self.val = val
         self.test = test
         self.stats = stats
+        self.extent = extent
 
 
 def _collect_train_states(
@@ -210,11 +224,12 @@ def build_splits(
     _log_split_visibility(split, total=len(index))
     train_states = _collect_train_states(shard_paths, index, split.train)
     stats = T.fit_norm_stats(train_states)
+    extent = T.fit_grid_extent(train_states)
 
     def view(idxs: np.ndarray) -> DecodeDataset:
-        return DecodeDataset(shard_paths, index, idxs, stats, resolution)
+        return DecodeDataset(shard_paths, index, idxs, stats, extent, resolution)
 
-    return SplitDatasets(view(split.train), view(split.val), view(split.test), stats)
+    return SplitDatasets(view(split.train), view(split.val), view(split.test), stats, extent)
 
 
 _MIN_MAPS_PER_SPLIT = 2
