@@ -1,0 +1,29 @@
+# gpu-host.toml.example -- copy to `gpu-host.toml` (git-ignored) and fill in.
+#
+# Tells scripts/gpu_run.py where a CUDA GPU lives when this machine has none.
+# If THIS machine has a local NVIDIA GPU, you do not need this file at all --
+# gpu_run.py detects local CUDA and runs there. Configure [remote] only when the
+# GPU is a separate box (e.g. a Tailnet-connected machine).
+#
+# TT_GPU_* environment variables override any value here.
+
+[remote]
+# Hostname or Tailnet IP of the GPU box. (required to enable remote dispatch)
+host = "your-gpu-host-or-tailnet-ip"
+
+# SSH user on the GPU box. (required)
+user = "your-username"
+
+# Optional SSH private key; omit to use your default SSH agent/config.
+# ssh_key = "~/.ssh/id_ed25519"
+
+# Path to THIS repo's checkout on the GPU box. (required for remote dispatch)
+# Windows example: "C:/Users/You/TankTwinStickShooter"
+# Linux example:   "/home/you/TankTwinStickShooter"
+remote_dir = "C:/path/to/TankTwinStickShooter"
+
+# Shell on the GPU box, for command chaining + env-setting:
+#   "cmd"        -> Windows cmd.exe (default OpenSSH shell on Windows)
+#   "powershell" -> Windows PowerShell
+#   "posix"      -> Linux/macOS (bash/zsh)
+remote_shell = "cmd"
