@@ -34,11 +34,16 @@ from pop_trainer.pretraining.dataset import build_splits
 from pop_trainer.pretraining.decoder import StateDecoder
 from pop_trainer.pretraining.device import resolve_device
 from pop_trainer.pretraining.progress import ProgressReporter
-from pop_trainer.pretraining.sampler import ShardGroupedBatchSampler
+from pop_trainer.pretraining.sampler import (
+    DEFAULT_SHARD_WINDOW,
+    ShardWindowBatchSampler,
+    cache_capacity_for_window,
+)
 from pop_trainer.pretraining.targets import NormStats, presence_pos_weight
 
 __all__ = [
     "TrainConfig",
+    "build_train_loader",
     "seed_everything",
     "should_eval_epoch",
     "train_one_epoch",
@@ -71,6 +76,7 @@ class TrainConfig:
     num_workers: int = 0
     progress: bool = True
     eval_every: int = 1
+    shard_window: int = DEFAULT_SHARD_WINDOW
     heatmap_weight: float = losses.DEFAULT_HEATMAP_WEIGHT
     heatmap_sigma: float = losses.DEFAULT_HEATMAP_SIGMA
 
@@ -218,6 +224,33 @@ def _make_loader(ds: Dataset, batch_size: int, *, shuffle: bool, num_workers: in
     return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
 
 
+def build_train_loader(
+    train_ds,
+    *,
+    batch_size: int,
+    window: int,
+    seed: int,
+    num_workers: int = 0,
+) -> tuple[DataLoader, ShardWindowBatchSampler]:
+    """Build the windowed multi-shard train loader and size the dataset cache to match it.
+
+    Single source of truth for the window/cache coupling: the cache capacity is
+    ``cache_capacity_for_window(window)`` (= ``window + 1``) and the ``C >= window`` invariant is
+    guarded here so it can never silently regress — a smaller cache than the window would re-read
+    in-flight shards per sample (the loader perf pathology). Returns the loader and its sampler so
+    the caller can ``set_epoch`` each epoch.
+    """
+    capacity = cache_capacity_for_window(window)
+    if capacity < window:  # invariant guard: window shards must all stay resident
+        raise ValueError(f"cache capacity {capacity} < window {window}; would re-read shards")
+    train_ds.set_cache_capacity(capacity)
+    sampler = ShardWindowBatchSampler(
+        train_ds.sample_shards(), batch_size=batch_size, window=window, seed=seed
+    )
+    loader = DataLoader(train_ds, batch_sampler=sampler, num_workers=num_workers)
+    return loader, sampler
+
+
 def run(cfg: TrainConfig) -> dict:
     """Run training + eval per ``cfg`` and write the checkpoint + results record. Returns it.
 
@@ -243,11 +276,12 @@ def run(cfg: TrainConfig) -> dict:
     probe_opt = torch.optim.Adam(model.probe_parameters(), lr=cfg.lr)
     pos_weight = _fit_pos_weight(splits.train)
 
-    train_sampler = ShardGroupedBatchSampler(
-        splits.train.sample_shards(), batch_size=cfg.batch_size, seed=cfg.seed
-    )
-    train_loader = DataLoader(
-        splits.train, batch_sampler=train_sampler, num_workers=cfg.num_workers
+    train_loader, train_sampler = build_train_loader(
+        splits.train,
+        batch_size=cfg.batch_size,
+        window=cfg.shard_window,
+        seed=cfg.seed,
+        num_workers=cfg.num_workers,
     )
     val_loader = _make_loader(
         splits.val, cfg.batch_size, shuffle=False, num_workers=cfg.num_workers
@@ -348,6 +382,7 @@ def _config_json(cfg: TrainConfig) -> dict:
         "seed": cfg.seed,
         "subset": cfg.subset,
         "eval_every": cfg.eval_every,
+        "shard_window": cfg.shard_window,
         "heatmap_weight": cfg.heatmap_weight,
         "heatmap_sigma": cfg.heatmap_sigma,
     }
@@ -402,6 +437,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument(
+        "--shard-window",
+        type=int,
+        default=DEFAULT_SHARD_WINDOW,
+        help=(
+            "number of shards kept in flight; each train batch draws rows round-robin across "
+            f"them for cross-shard (cross-map) diversity. Default {DEFAULT_SHARD_WINDOW}. RAM is "
+            "~(window + 1) x ~0.4 GB resident (the bounded shard cache holds window + 1 shards)."
+        ),
+    )
+    parser.add_argument(
         "--progress",
         dest="progress",
         action=argparse.BooleanOptionalAction,
@@ -451,6 +496,7 @@ def main(argv: list[str] | None = None) -> int:
         num_workers=args.num_workers,
         progress=args.progress,
         eval_every=args.eval_every,
+        shard_window=args.shard_window,
         heatmap_weight=args.heatmap_weight,
         heatmap_sigma=args.heatmap_sigma,
     )

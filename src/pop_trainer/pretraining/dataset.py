@@ -2,9 +2,10 @@
 
 Builds a :class:`~pop_trainer.data.readers.DatasetIndex` over a decode-v1 directory, splits it
 map-aware (group key = ``map_id``, 60/20/20 default, no leak), and serves ``(frame, target_dict)``
-rows by lazily fetching one frame from its shard. The last-read shard's arrays are cached so a
-run of rows in the same shard does not re-open the ``.npz`` every ``__getitem__`` — but frames
-are never bulk-loaded into RAM.
+rows by lazily fetching one frame from its shard. A bounded LRU cache keeps the recently-read
+shards' arrays resident so rows in those shards do not re-open the ``.npz`` every ``__getitem__``;
+its capacity is set to match the windowed sampler (``set_cache_capacity``). Frames are never
+bulk-loaded into RAM.
 
 decode-v1 shards live in ``worker_*/`` SUBDIRS, so the index is built with a RECURSIVE glob
 (``**/shard_*.npz``); a flat-layout dir works too. Frames are ``uint8 (H, W, 3)`` -> float32
@@ -27,6 +28,7 @@ torch + numpy + :mod:`pop_trainer.data` + :mod:`pop_trainer.pretraining.targets`
 from __future__ import annotations
 
 import logging
+from collections import OrderedDict
 from pathlib import Path
 
 import numpy as np
@@ -79,20 +81,33 @@ def _resolve_shard_paths(shard_dir: Path, shard_files: list[str], pattern: str) 
     return [by_name[f] for f in shard_files]
 
 
-class _ShardCache:
-    """Single-entry cache of one shard's arrays so consecutive same-shard rows reuse the read."""
+class _LruShardCache:
+    """Bounded LRU cache of decompressed shard arrays, keyed by shard index.
 
-    def __init__(self, shard_paths: list[Path]) -> None:
+    Holds up to ``capacity`` shards resident; a hit moves the shard to most-recently-used, a miss
+    decompresses it and evicts the least-recently-used shard when full. Sized at ``window + 1`` by
+    the windowed sampler (:func:`...sampler.cache_capacity_for_window`), every shard in flight
+    stays resident for its whole lifetime, so each shard is decompressed exactly once per epoch.
+    Capacity 1 reduces to single-shard streaming (sequential val/test access reads each shard once).
+    """
+
+    def __init__(self, shard_paths: list[Path], capacity: int = 1) -> None:
+        if capacity < 1:
+            raise ValueError(f"capacity must be >= 1, got {capacity}")
         self._paths = shard_paths
-        self._idx: int | None = None
-        self._arrays: dict[str, np.ndarray] | None = None
+        self._capacity = int(capacity)
+        self._entries: OrderedDict[int, dict[str, np.ndarray]] = OrderedDict()
 
     def arrays(self, shard_idx: int) -> dict[str, np.ndarray]:
-        if shard_idx != self._idx:
-            self._arrays = shards.read_shard(self._paths[shard_idx])
-            self._idx = shard_idx
-        assert self._arrays is not None
-        return self._arrays
+        entry = self._entries.get(shard_idx)
+        if entry is None:
+            entry = shards.read_shard(self._paths[shard_idx])
+            self._entries[shard_idx] = entry
+            if len(self._entries) > self._capacity:
+                self._entries.popitem(last=False)
+        else:
+            self._entries.move_to_end(shard_idx)
+        return entry
 
 
 class DecodeDataset(Dataset):
@@ -117,8 +132,17 @@ class DecodeDataset(Dataset):
         self._stats = stats
         self._extent = extent
         self._factor = _downsample_factor(index.frame_hw[0], resolution)
-        self._cache = _ShardCache(shard_paths)
+        self._shard_paths = shard_paths
+        self._cache = _LruShardCache(shard_paths)
         self.resolution = resolution
+
+    def set_cache_capacity(self, capacity: int) -> None:
+        """Resize the backing shard cache to hold ``capacity`` shards (rebuilds it empty).
+
+        The windowed train loader sets this to ``window + 1`` so every shard the sampler keeps in
+        flight stays resident; val/test keep the capacity-1 default (sequential streaming).
+        """
+        self._cache = _LruShardCache(self._shard_paths, capacity)
 
     @property
     def stats(self) -> T.NormStats:
@@ -131,11 +155,11 @@ class DecodeDataset(Dataset):
         return self._extent
 
     def sample_shards(self) -> np.ndarray:
-        """``(len(self),)`` int64 shard id per LOCAL index ``i`` (for shard-grouped sampling).
+        """``(len(self),)`` int64 shard id per LOCAL index ``i`` (for windowed shard sampling).
 
-        Lets a sampler group local indices by their backing shard so consecutive ``__getitem__``
-        calls hit the same ``.npz`` and the single-entry cache decompresses each shard once per
-        pass — without reaching into this view's private split positions.
+        Lets a sampler reason over each local index's backing shard so it can keep a bounded
+        window of shards in flight (and size the LRU cache to match) — without reaching into this
+        view's private split positions.
         """
         return self._index.sample_shard[self._samples].astype(np.int64)
 
@@ -177,7 +201,7 @@ def _collect_train_states(
     shard_paths: list[Path], index: readers.DatasetIndex, train_idx: np.ndarray
 ) -> np.ndarray:
     """Gather the TRAIN-split states (only the small 52-float vectors) to fit norm stats."""
-    cache = _ShardCache(shard_paths)
+    cache = _LruShardCache(shard_paths)
     order = np.argsort(index.sample_shard[train_idx], kind="stable")
     out = np.empty((train_idx.shape[0], schema.STATE_LEN), dtype=np.float32)
     for pos in order:
