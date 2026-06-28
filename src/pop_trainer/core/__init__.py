@@ -20,7 +20,7 @@ Modules:
   type-only decision-maker interface ``agents`` implements and ``env`` consumes (keeping
   ``env`` torch-free).
 * :mod:`pop_trainer.core.launch` — stdlib-only live-build launch + socket-connect helpers
-  (the windowed ``Popen`` arg-list + a bounded connect retry/backoff) shared by the demo and
+  (the windowed ``Popen`` arg-list + a bounded connect retry/backoff) shared by the play app and
   the collection runner.
 * :mod:`pop_trainer.core.logging_setup` — stdlib-``logging``-only per-process structured-JSONL
   observability setup (per-process file routing + a strict-JSON line formatter) every layer

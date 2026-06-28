@@ -40,9 +40,9 @@ release and THEN terminates the build process (terminate -> wait(10) -> kill on 
 PIXELS. Collection MUST receive pixel frames (the env reads a length-prefixed frame after every
 state; a build without ``obs_pixels`` would leave the env blocking on bytes that never arrive). The
 no-rotation default ``--map`` resolves to ``unity/Assets/StreamingAssets/demo_config.json`` — the
-SAME obs_pixels-enabled config the demo launches with (640x360, arena ``Arenas/custom1.json``
+SAME obs_pixels-enabled config the play app launches with (640x360, arena ``Arenas/custom1.json``
 resolved against the config dir) — so the captured ``(frame, state)`` rows are byte-for-byte the
-demo's / RL's observation pipeline, with no drift. A rotation run boots on the SAME obs_pixels
+play / RL observation pipeline, with no drift. A rotation run boots on the SAME obs_pixels
 ``--map`` config and only the arena rotates via ``switch_arena`` (the curated rotation is arena
 switch TARGETS, not boot configs). The env is built with the matching ``frame_shape`` either way.
 """
@@ -120,8 +120,8 @@ def frame_nbytes(frame_shape: Sequence[int]) -> int:
 
 
 # Map name -> the obs_pixels-enabled build config it launches with (the single-map / no-rotation
-# default). Reusing the demo config keeps collection's frames byte-identical to the demo's / RL's
-# pipeline (640x360 pixels on, arena Arenas/custom1.json resolved against the config dir).
+# default). Reusing the demo_config.json config keeps collection's frames byte-identical to the
+# play / RL pipeline (640x360 pixels on, arena Arenas/custom1.json resolved against the config dir).
 _STREAMING_ASSETS = _REPO_ROOT / "unity" / "Assets" / "StreamingAssets"
 MAP_CONFIGS: dict[str, Path] = {
     "custom1": _STREAMING_ASSETS / "demo_config.json",
@@ -464,7 +464,7 @@ def build_specs(
     config (``config``) in BOTH modes, then rotates via ``switch_arena``. ``obs_pixels`` is a
     LAUNCH-time config flag (the env blocks on a frame that never arrives without it), so the build
     must boot on an obs_pixels-enabled config. The curated rotation is just arena switch TARGETS
-    (the ``switch_arena`` paths), never a boot config. The ``--map`` config (the demo config)
+    (the ``switch_arena`` paths), never a boot config. The ``--map`` config (demo_config.json)
     enables obs_pixels, so the build boots correctly and the runtime ``switch_arena`` changes only
     the arena, not the pixel channel.
 
@@ -500,8 +500,8 @@ def build_specs(
         map_index = build_map_index(rotation)
         sidecar_maps = rotation
     else:
-        # Single-map mode: one arena, int 0, no switch. The sole pairing is pairings[0]. The demo
-        # --map config's arena is the documented constant (no JSON read needed here).
+        # Single-map mode: one arena, int 0, no switch. The sole pairing is pairings[0]. The
+        # demo_config.json --map arena is the documented constant (no JSON read needed here).
         map_index = {}  # no echo lookup -> the intended int 0 is used (tag_source "intended")
         sidecar_maps = [_DEFAULT_MAP_ARENA]
         pairings = [pairings[0]]

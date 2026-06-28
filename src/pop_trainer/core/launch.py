@@ -2,7 +2,7 @@
 
 The two side-effecting steps every live consumer shares: build the windowed-launch ``Popen``
 arg-list for the build, and open a TCP socket to its listener with a bounded retry/backoff.
-Both the demo (one local watch) and the collection runner (one build per worker) need them, so
+Both play (one local watch) and the collection runner (one build per worker) need them, so
 they live in ``core`` — the dependency-free root — and stay STDLIB-ONLY (``subprocess`` /
 ``socket`` / ``time`` / ``pathlib``). No internal imports (no ``env`` / ``data`` / ``agents`` /
 ``models`` / ``rl`` / ``pretraining`` / ``tank_twin``), so there is no import cycle and ``core``

@@ -3,7 +3,7 @@
 ``agents`` is the natural home for "selector name to a :class:`pop_trainer.core.agent.Agent`",
 so this module OWNS that map: :data:`AGENT_SELECTORS` (a selector name -> a seed-taking factory)
 and :func:`make_agent` (look up + build, raising on an unknown name). Both the collection runner
-(:mod:`pop_trainer.data.collect_runner`) and the demo (:mod:`pop_trainer.demo`) import it from
+(:mod:`pop_trainer.data.collect_runner`) and the play app (:mod:`pop_trainer.play`) import it from
 here rather than each duplicating it, and ``rl`` can reuse the SAME selectors without reaching
 into ``data`` (a forbidden import).
 
@@ -12,7 +12,7 @@ The roster is the one map-aware coverage family (its three presets), the map-agn
 the signature is uniform even for the stateless agents (``noop`` ignores it).
 
 Boundary: a clean leaf — imports ONLY ``agents`` siblings (the agent classes) + ``core`` (the
-``Agent`` type). Nothing from ``data`` / ``demo`` / ``env`` / ``models`` / ``rl`` /
+``Agent`` type). Nothing from ``data`` / ``play`` / ``env`` / ``models`` / ``rl`` /
 ``pretraining`` / ``tank_twin``.
 """
 

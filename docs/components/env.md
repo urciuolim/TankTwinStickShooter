@@ -56,7 +56,7 @@ a **no-op zero action** `[0.0, 0.0, 0.0, 0.0, 0.0]`. Both wire actions are captu
 (`self.last_p1_action` / `self.last_p2_action`) and surfaced in `info["p1_action"]` /
 `info["p2_action"]` (`tank_env.py:344-387`).
 
-The **driver** ([data](data.md) collection / [demo](demo.md)) owns each agent and the player2
+The **driver** ([data](data.md) collection / [play](play.md)) owns each agent and the player2
 **perspective flip** — it computes player2's first-person view via
 `core.state.split_state_for_opponent` and passes the resulting `a2` into `env.step(a1, a2)`. The
 env exposes self-play perspective **helpers** the driver MAY use — `player2_frame()` (R/B channel
@@ -118,7 +118,7 @@ is called **twice** in the handshake: once after the start send to reach the `st
 again to reach the first `state` (`tank_env.py:279,285`).
 
 The env surfaces the `WallLayout` in `info["map"]` but does **not** itself notify any agent — both
-players are driver-side, so the [data](data.md) collection and [demo](demo.md) loops hand the
+players are driver-side, so the [data](data.md) collection and [play](play.md) loops hand the
 layout to a map-aware [agent](agents.md) (e.g. a `CoverageAgent`) via the OPTIONAL `set_map` hook.
 The env stays `agents`-free.
 
@@ -158,7 +158,8 @@ routes every inbound object by tag regardless of read order (`tank_env.py:239-30
 
 - [data](data.md) — collection drives `TankEnv` (the same observation pipeline RL trains on), and
   rotates the arena per episode via `reset(options={"switch_arena": ...})`.
-- [demo](demo.md) — constructs a `TankEnv` over a live socket and runs one episode.
+- [play](play.md) — constructs a `TankEnv` over a live socket and runs one episode (human,
+  rule-based, or a trained `rl:` agent acting on the pixel frame).
 - [rl](rl.md) — consumes `TankEnv` as both its training set and a **same-width** (`M_eval ==
   N_train`) eval set, each over its own live socket and on a **disjoint port block**:
   `SelfPlayWrapper` wraps each for PPO training, and `evaluate_winrate` re-wraps the eval envs for
@@ -170,8 +171,8 @@ routes every inbound object by tag regardless of read order (`tank_env.py:239-30
 
 The hinge. The env IS the boundary between the trainer and the Unity simulator: it owns the
 socket handshake, the per-step wire exchange, and the reward — but **neither player**. The driver
-([data](data.md) / [demo](demo.md)) supplies both `a1` and `a2`; both `data` collection and the
-`demo` run their episodes through it.
+([data](data.md) / [play](play.md)) supplies both `a1` and `a2`; both `data` collection and
+`play` run their episodes through it.
 
 ```mermaid
 graph LR

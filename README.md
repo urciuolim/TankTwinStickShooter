@@ -21,7 +21,7 @@ The training stack (`src/pop_trainer/`) is rebuilt component-by-component, each 
 | `models` | composable, ablation-ready vision encoders (ONNX / Unity-Sentis-clean) |
 | `data` | a multi-worker collection runner — parallel builds, **map + pairing rotation**, echo-tagged shards |
 | `rl` | **end-to-end PPO on pixels** — `EncoderExtractor`, a self-play opponent seam, eval + ELO, multi-env (`SubprocVecEnv`), checkpoint/resume |
-| `demo` | launch the live build and watch two policies play |
+| `play` | launch the live build and play one episode — any pairing of human, rule-based, or a trained `rl:<ckpt>` agent |
 
 ### Multi-map data collection
 
@@ -37,7 +37,7 @@ The collector rotates arenas *and* policy pairings between episodes — one long
 ```bash
 uv sync                                          # Python 3.12 env (managed by uv)
 # build the Unity game -> unity/build/TankTwinStickShooter.exe  (see docs/runbook.md)
-uv run python -m pop_trainer.demo                # watch two policies play one episode
+uv run python -m pop_trainer.play                # watch / play one episode (human, rule-based, or rl:<ckpt>)
 uv run python -m pop_trainer.data.collect_runner --out-dir runs/demo --maps   # collect a rotating dataset
 uv run python -m pop_trainer.rl.train \
   --config unity/Assets/StreamingAssets/train_config.json --run-dir runs/train   # train a PPO agent on pixels

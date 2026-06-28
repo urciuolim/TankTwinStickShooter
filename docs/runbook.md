@@ -36,11 +36,11 @@ uv run pytest -m e2e
 
 ## 2. Build the Unity game
 
-The trainer/demo needs a standalone build of the simulator for the host OS. The headless build
+The trainer / play app needs a standalone build of the simulator for the host OS. The headless build
 entry points live in [`BuildScript`](../unity/Assets/Editor/BuildScript.cs): one method per platform,
 each invoked via the Unity 6.5 editor in batchmode. Both build the enabled scenes, exit non-zero
 on failure (so the batchmode caller can detect it), and ship `StreamingAssets` (`config.json` +
-`Arenas/*.json` + the demo / human configs) into the player automatically.
+`Arenas/*.json` + the `demo_config.json` / `human_config.json` configs) into the player automatically.
 
 ### Windows
 
@@ -75,38 +75,52 @@ hands the inner binary to the launcher (see §3).
 > For how the built game runs (it is a **Python-clocked simulator** with no standalone human
 > mode), see [game architecture](game-architecture.md).
 
-## 3. Run the demo (live build + two agents)
+## 3. Play an episode (live build + any two players)
 
-With the build in place, watch two visibly-different policies play one episode:
+With the build in place, run one episode with any pairing of player forms:
 
 ```bash
-uv run python -m pop_trainer.demo
+uv run python -m pop_trainer.play
 ```
 
 This launches the build **windowed** with `unity/Assets/StreamingAssets/demo_config.json` (which enables
 `obs_pixels` at 640×360 — required, since the env always reads a pixel frame each step), connects
-over TCP, runs one episode of `player1 = aggressive-coverage` vs `player2 = opponent-shadower`,
+over TCP, runs one episode of the default `player1 = aggressive-coverage` vs `player2 = opponent-shadower`,
 prints a trace, and tears down.
+
+**Three player forms** on each of `--player1` / `--player2`:
+
+- `human` — keyboard play (see below).
+- a rule-based selector — one of `aggressive-coverage`, `wall-hugger`, `opponent-shadower`,
+  `random`, `noop`.
+- `rl:<checkpoint.zip>` — a trained Stable-Baselines3 PPO model loaded from that path (a bare
+  `*.zip` path also works). Any matchup is valid: rl-vs-human, rl-vs-rulebased, rl-vs-rl, etc. The
+  RL model is loaded predict-only (`PPO.load`); `stable_baselines3` / `torch` are imported **lazily**
+  — only when an `rl:` player is requested — so human / rule-based play stays torch-free. Example:
+
+```bash
+uv run python -m pop_trainer.play --player1 rl:runs/train/model.zip --player2 opponent-shadower
+```
 
 **No `--exe` needed on any OS.** The default executable is resolved for the current platform by
 [`core.launch.default_build_path`](../src/pop_trainer/core/launch.py)
-([`demo.DEFAULT_EXE`](../src/pop_trainer/demo.py)): on **Windows** it is
+([`play.DEFAULT_EXE`](../src/pop_trainer/play.py)): on **Windows** it is
 `unity/build/TankTwinStickShooter.exe`; on **macOS** it is the binary *inside* the
 `unity/build/TankTwinStickShooter.app` bundle (`Contents/MacOS/`, discovered by globbing the bundle —
 you don't type the inner name); on **Linux** the bare `unity/build/TankTwinStickShooter` binary. So
-`python -m pop_trainer.demo` works as-is once the platform build from §2 is present — pass `--exe`
+`python -m pop_trainer.play` works as-is once the platform build from §2 is present — pass `--exe`
 only to point at a build elsewhere.
 
 See the full flag surface:
 
 ```bash
-uv run python -m pop_trainer.demo --help
+uv run python -m pop_trainer.play --help
 ```
 
 Useful flags (defaults shown): `--exe` (the OS-resolved build path above),
 `--config unity/Assets/StreamingAssets/demo_config.json`, `--port 50000`, `--player1` / `--player2`
-(any of: `aggressive-coverage`, `wall-hugger`, `opponent-shadower`, `random`, `human`),
-`--max-steps 600`, `--seed 0`. The demo exits `2` if the build exe or config is missing.
+(each: `human`, a selector above, or `rl:<checkpoint.zip>`),
+`--max-steps 600`, `--seed 0`. Play exits `2` if the build exe, config, or an `rl:` checkpoint is missing.
 
 ### Human-vs-human play (two players, one keyboard)
 
@@ -119,18 +133,21 @@ uv sync --extra human
 Then make either or both players keyboard-driven. Two humans share ONE keyboard:
 
 ```bash
-uv run python -m pop_trainer.demo --player1 human --player2 human
+uv run python -m pop_trainer.play --player1 human --player2 human
 ```
 
-One human + one bot is also valid, e.g. `--player1 human --player2 opponent-shadower`.
+One human + one bot is also valid, e.g. `--player1 human --player2 opponent-shadower` (or play a
+human against a trained agent: `--player1 human --player2 rl:runs/train/model.zip`).
 
 Controls:
 
 - **P1** — move WASD, aim TFGH, fire LEFT SHIFT.
 - **P2** — move IJKL, aim numpad 8/4/5/6, fire ENTER. (Numpad aim works with Num Lock ON or OFF.)
 
-When a player is `human` the demo auto-selects `unity/Assets/StreamingAssets/human_config.json` (real-time
+When a player is `human` the play app auto-selects `unity/Assets/StreamingAssets/human_config.json` (real-time
 `timeScale: 1`, a more forgiving cadence) instead of `demo_config.json` — unless you pass `--config`.
+(An `rl:` player does **not** change the default cadence — it runs at the bots config unless a human
+is also present or `--config` is given.)
 
 > **LOCAL-DEV ONLY.** `pynput` installs a GLOBAL keyboard hook that needs a real desktop session.
 > Human play is NOT part of the headless GCP / cluster path — that path is bot-vs-bot collection /
@@ -267,11 +284,11 @@ arena path Unity actually loaded (echoed as `WallLayout.map_id`), decoded throug
 Collection **must** receive pixel frames (the env reads a length-prefixed frame after every state;
 a build without `obs_pixels` would leave the env blocking on bytes that never arrive). So the build
 **boots** on the obs_pixels-enabled `--map` config (`custom1` → `unity/Assets/StreamingAssets/demo_config.json`,
-the **same** config the demo launches with — 640×360 pixels on, arena `Arenas/custom1.json`) and
+the **same** config the play app launches with — 640×360 pixels on, arena `Arenas/custom1.json`) and
 rotates the arena via `switch_arena` at runtime. The curated rotation supplies **arena switch
 targets directly** (the `Arenas/<name>.json` strings) and is never used as the boot config. Either
 way the captured `(frame, state)` rows are byte-for-byte the
-demo's / RL's observation pipeline. `main` exits `2` if the build exe or the resolved boot config is
+play / RL observation pipeline. `main` exits `2` if the build exe or the resolved boot config is
 missing.
 
 > **Episode budget.** The coverage family fully sweeps a map only by ~800 decisions on the live
@@ -287,7 +304,7 @@ integrator is [`python -m pop_trainer.rl.train`](../src/pop_trainer/rl/train.py)
 composes the RL seams (encoder extractor, self-play wrapper, eval callback) into one SB3 PPO run with
 checkpointing and a resumable sidecar — see the [rl component page](components/rl.md#the-train_local-integrator-seam).
 
-Like the demo (§3) and collection (§4), this **launches a live windowed Unity build** (needs the §2
+Like play (§3) and collection (§4), this **launches a live windowed Unity build** (needs the §2
 build present) and reads a pixel frame each step — `train_config.json` enables `obs_pixels` at
 640×360, required since the env always reads a pixel frame.
 

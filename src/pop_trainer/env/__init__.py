@@ -10,7 +10,7 @@ no stable-baselines3.
 
 The env owns NEITHER player — it is a PURE TRANSPORT. ``TankEnv.step(action,
 opponent_action=None)`` sends ``{1: a1, 2: a2}`` where BOTH actions come from the CALLER
-(``opponent_action=None`` defaults to a zero no-op). The DRIVER (collection / demo / the
+(``opponent_action=None`` defaults to a zero no-op). The DRIVER (collection / play / the
 future training wrapper) runs both policies and computes player2's perspective-flipped view
 via :func:`pop_trainer.core.state.split_state_for_opponent`. BOTH actions are captured in
 ``info["p1_action"]`` / ``info["p2_action"]``.

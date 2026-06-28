@@ -30,7 +30,7 @@ occupancy-entropy + an ESS guardrail) that validates the family against ``Random
 
 THE SELECTOR REGISTRY. :mod:`pop_trainer.agents.registry` owns the canonical ``string -> agent``
 map (:data:`AGENT_SELECTORS` + :func:`make_agent`) — the SINGLE source of truth re-exported here
-that :mod:`pop_trainer.data.collect_runner` and :mod:`pop_trainer.demo` import (rather than
+that :mod:`pop_trainer.data.collect_runner` and :mod:`pop_trainer.play` import (rather than
 duplicating). The roster is the coverage family's three presets, ``random``, and ``noop``.
 
 :class:`HumanAgent` (:mod:`pop_trainer.agents.human_agent`) is a KEYBOARD-driven agent for live

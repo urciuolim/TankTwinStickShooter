@@ -18,7 +18,7 @@ step message ``{1: a1, 2: a2}`` where BOTH actions come from the CALLER. ``a1`` 
 action passed to ``step``; ``a2`` is the ``opponent_action`` the caller supplies (a no-op zero
 action when omitted). BOTH players' actions are captured on the env and surfaced in ``info``
 (``info["p1_action"]`` / ``info["p2_action"]``) and stored as ``self.last_p1_action`` /
-``self.last_p2_action``. The DRIVER (the data-collection / demo loop) owns each agent, computes
+``self.last_p2_action``. The DRIVER (the data-collection / play loop) owns each agent, computes
 player2's perspective-flipped first-person view via
 :func:`core.state.split_state_for_opponent`, and passes the resulting ``a2`` to ``step``.
 

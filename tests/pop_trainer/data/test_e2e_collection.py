@@ -40,7 +40,7 @@ def test_live_small_collection_two_workers_two_maps(tmp_path, capsys):
     # 2 workers, 2 episodes each over a 2-map rotation (forces >=1 switch_arena), a small step cap
     # for a fast run. A SINGLE pairing keeps the grid = 2 cells (one per map), so with this small
     # episode budget the round-robin is guaranteed to cover BOTH maps (worker 0 -> map A, worker 1
-    # -> map B). The boot config stays the obs_pixels-enabled --map (demo) config.
+    # -> map B). The boot config stays the obs_pixels-enabled --map (demo_config.json) config.
     exit_code = R.main(
         [
             "--maps",

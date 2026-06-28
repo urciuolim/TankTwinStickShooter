@@ -1,6 +1,6 @@
 """Tests for the canonical agent-selector registry (``pop_trainer.agents.registry``).
 
-The SINGLE source of truth for ``string -> agent`` that ``data.collect_runner`` and ``demo``
+The SINGLE source of truth for ``string -> agent`` that ``data.collect_runner`` and ``play``
 import. No socket / env / data import — selectors are built and type-checked directly.
 """
 

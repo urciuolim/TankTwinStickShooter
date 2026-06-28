@@ -22,7 +22,7 @@ torch-free: NO `load`/`save`/`train` hooks (those arrive with the NN agent in `r
 `core.Agent` gains an OPTIONAL `set_map(layout)` method. Map-aware agents implement it and
 rebuild their grid; map-agnostic agents (`RandomAgent`) DO NOT implement it and are simply
 never called with it (or no-op). `env` calls `player2.set_map(layout)` at reset IF the agent
-exposes it (`getattr`/`hasattr` — never required); the demo / collection do the same for
+exposes it (`getattr`/`hasattr` — never required); the play app / collection do the same for
 `player1`. The hook is additive and torch-free; the env seam is otherwise unchanged.
 
 **Contains:**
@@ -34,15 +34,15 @@ exposes it (`getattr`/`hasattr` — never required); the demo / collection do th
 - **The canonical agent-selector registry (`agents/registry.py`).** The `make_agent(selector,
   *, seed=None)` + `AGENT_SELECTORS` string→`core.Agent` map is OWNED HERE — `agents/` is the
   natural home for "string → agent". It is the SINGLE source of truth; `data/collect_runner.py`
-  and `demo.py` MUST import it from `agents` (they previously each duplicated it — that mirror is
+  and `play.py` MUST import it from `agents` (they previously each duplicated it — that mirror is
   removed). The roster: `aggressive-coverage`, `wall-hugger`, `opponent-shadower`, `random`,
   and `noop`. `make_agent` raises `ValueError` on an unknown selector (listing valid names).
-  - `demo.py`'s extra `"human"` selector is NOT in this registry — it needs a shared keyboard
-    listener a per-seed factory cannot express, so it stays a SPECIAL PATH in `demo.main`
-    (`HUMAN_SELECTOR` + `PLAYER_CHOICES = sorted(AGENT_SELECTORS) + [HUMAN_SELECTOR]`). The
-    registry move must preserve that demo behavior exactly.
+  - `play.py`'s extra `"human"` form is NOT in this registry — it needs a shared keyboard
+    listener a per-seed factory cannot express, so it stays a SPECIAL PATH in `play.main`
+    (`HUMAN_SELECTOR`, classified by `parse_player_spec`). The registry move must preserve that
+    behavior exactly.
   - Boundary stays a clean leaf: `agents/registry.py` imports only `agents` siblings + `core`.
-    `data/` and `demo.py` import DOWN into `agents` (the allowed `core ← agents ← {data, demo}`
+    `data/` and `play.py` import DOWN into `agents` (the allowed `core ← agents ← {data, play}`
     direction). This de-duplicates and lets `rl/` reuse the SAME selectors without `rl → data`
     (a FORBIDDEN import).
 - `HumanAgent` (`agents/human_agent.py`) — a KEYBOARD-driven `core.Agent` for live human play
@@ -56,7 +56,7 @@ exposes it (`getattr`/`hasattr` — never required); the demo / collection do th
     same for aim; `fire = 1.0` iff the fire key is down. Diagonals may leave `(1,1)`
     un-normalized — the wire/`validate_action` coerces to `[-1, 1]`.
   - **Two players, ONE listener:** a SINGLE shared keyboard listener tracks the pressed-key
-    set; TWO `HumanAgent`s (P1 keymap, P2 keymap) read the SAME state object. The demo builds
+    set; TWO `HumanAgent`s (P1 keymap, P2 keymap) read the SAME state object. The play app builds
     one listener and both agents share it (start on play, stop on teardown).
   - **`pynput` is an OPTIONAL, LAZY dependency** (pyproject `[project.optional-dependencies]`
     extra `human`; pin `pynput>=1.8,<2`). Imported INSIDE the listener/HumanAgent constructor,

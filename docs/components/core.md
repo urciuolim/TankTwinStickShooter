@@ -13,7 +13,7 @@ from here instead of re-hardcoding them. All JSON is strict.
   pure accessors (`position` / `velocity` / `aim` / `iter_bullets`), and the self-play
   **perspective transforms** `flip_frame_perspective` (R/B channel swap on a pixel frame) and
   `split_state_for_opponent` (swap the two 26-float halves). These are consumed **driver-side**:
-  the [data](data.md) collection / [demo](demo.md) loops call `split_state_for_opponent` to build
+  the [data](data.md) collection / [play](play.md) loops call `split_state_for_opponent` to build
   player2's flipped first-person view before passing its action to `env.step` (the env is a pure
   transport and does not flip perspective itself). The state is the supervised-decode *objective*,
   NOT the policy observation — the observation is the pixel frame.
@@ -48,8 +48,8 @@ from here instead of re-hardcoding them. All JSON is strict.
   `Popen` arg-list builder that launches the build **windowed** (`-screen-fullscreen 0` at
   1280×720; `-batchmode` deliberately absent), with the port positional + `--config` JSON;
   [`connect`](../../src/pop_trainer/core/launch.py) opens a TCP socket to `127.0.0.1:port` with a
-  bounded retry/backoff (the build needs a moment to boot its listener). Shared by both the
-  [demo](demo.md) (one local watch) and the [data](data.md) collection runner (one build per
+  bounded retry/backoff (the build needs a moment to boot its listener). Shared by both
+  [play](play.md) (one local watch) and the [data](data.md) collection runner (one build per
   worker).
   - **Optional Unity log routing.** `build_launch_cmd` takes an optional keyword
     `unity_log_path` (`launch.py:94-132`): when given it appends Unity's standard
@@ -154,8 +154,9 @@ Every other component depends on `core`:
 - [data](data.md) — `state` (`STATE_LEN` + `validate`), `config.EnvConfig`,
   `protocol.Connection`, `agent.Agent`, `launch` (the collection runner launches + connects one
   build per worker), and `maps.resolve_map_rotation` (the shared `--maps` rotation contract).
-- [demo](demo.md) — `protocol.Connection` / `WallLayout`, `config.EnvConfig`, `agent.Agent`, and
-  `launch` (`build_launch_cmd` / `connect`).
+- [play](play.md) — `protocol.Connection` / `WallLayout`, `config.EnvConfig`, `agent.Agent`,
+  `state.split_state_for_opponent` / `flip_frame_perspective`, and `launch` (`build_launch_cmd` /
+  `connect`).
 
 ## Where it sits in the run
 

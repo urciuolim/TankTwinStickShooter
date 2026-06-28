@@ -14,13 +14,13 @@ baseline and the stationary [`NoOpAgent`](../../src/pop_trainer/agents/noop_agen
 explorer / aim-sweep / spray / perimeter / rules variants are **deleted** — subsumed by the one
 family, its aim/fire layer, and the `opponent-shadower` preset. A central **selector registry**
 ([`registry.py`](../../src/pop_trainer/agents/registry.py)) is now the SINGLE source of truth for
-`string → agent`, imported by both [data](data.md) and [demo](demo.md).
+`string → agent`, imported by both [data](data.md) and [play](play.md).
 
 **Boundary:** imports [`core`](core.md) only (the `Agent` Protocol, the `state` schema, the
 `protocol.WallLayout` type) plus numpy + stdlib — and `pynput` LAZILY, listener-only (see
 [`HumanAgent`](#humanagent--keyboard-driven-live-play) below). No torch; nothing from `env` /
 `data` / `models` / `rl` / `pretraining`; nothing from `tank_twin`. `agents` stays a **leaf** the
-consumers build on: [data](data.md), [demo](demo.md), and [rl](rl.md) import `agents`, never the
+consumers build on: [data](data.md), [play](play.md), and [rl](rl.md) import `agents`, never the
 reverse. The `human`-extra `pynput` import is the ONE exception to the import boundary, and it is
 lazy: `import pop_trainer.agents` succeeds core-only, without `pynput` installed.
 
@@ -73,7 +73,7 @@ lazy: `import pop_trainer.agents` succeeds core-only, without `pynput` installed
 
 A SEPARATE family from the coverage surface: `HumanAgent` is **not** a data-collection coverage
 agent — it is a **live-play input agent** for human-vs-human (or human-vs-bot) testing, consumed
-only by [demo](demo.md). It exercises none of the coverage harness above.
+only by [play](play.md). It exercises none of the coverage harness above.
 
 - [`HumanAgent`](../../src/pop_trainer/agents/human_agent.py) — a KEYBOARD-driven
   [`core.agent.Agent`](core.md) whose `act(obs)` **IGNORES the observation** (the action comes from
@@ -163,13 +163,13 @@ rather than in any consumer:
 
 Both re-exported from [`agents/__init__.py`](../../src/pop_trainer/agents/__init__.py) and **imported
 by BOTH** [`data.collect_runner`](../../src/pop_trainer/data/collect_runner.py) (`collect_runner.py:64`)
-and [`demo`](../../src/pop_trainer/demo.py) (`demo.py:50`) — they no longer each define their own copy
+and [`play`](../../src/pop_trainer/play.py) — they no longer each define their own copy
 (the de-dup). It also lets [rl](rl.md) reuse the SAME selectors without reaching into `data` (a
 forbidden import).
 
-The **`"human"`** selector is **NOT** a registry entry — it is a special path in [demo](demo.md): it
-needs a shared `KeyboardListener` / `KeyboardState` a per-agent seed factory cannot express, so demo
-wires it outside `AGENT_SELECTORS` (see [demo](demo.md#human-play---player1-human--player2-human)).
+The **`"human"`** form is **NOT** a registry entry — it is a special path in [play](play.md): it
+needs a shared `KeyboardListener` / `KeyboardState` a per-agent seed factory cannot express, so play
+wires it outside `AGENT_SELECTORS` (see [play](play.md#human-play---player1-human--player2-human)).
 
 ## Pulls from (upstream)
 
@@ -185,19 +185,19 @@ The `registry` is the **shared selector source** all consumers build from (`stri
 - [data](data.md) — `collect_runner` imports `AGENT_SELECTORS` / `make_agent` from here
   (`collect_runner.py:64`); collection pairs a `player1` + `player2` agent to drive episodes (both
   driver-side; the env owns neither player), and calls `set_map` on **both** via `_maybe_set_map`.
-- [demo](demo.md) — imports the SAME registry (`demo.py:50`); the `--player1` / `--player2`
-  selectors (`aggressive-coverage` / `wall-hugger` / `opponent-shadower` / `random` / `noop`) build
-  agents through `make_agent`. The `human` choice (NOT a registry selector) wires a `HumanAgent` per
-  player over ONE shared `KeyboardListener` / `KeyboardState` (`pynput` loaded lazily, listener-only)
-  for live human play.
+- [play](play.md) — imports the SAME registry; the `--player1` / `--player2` rule-based selectors
+  (`aggressive-coverage` / `wall-hugger` / `opponent-shadower` / `random` / `noop`) build agents
+  through `make_agent`. The `human` form (NOT a registry selector) wires a `HumanAgent` per player
+  over ONE shared `KeyboardListener` / `KeyboardState` (`pynput` loaded lazily, listener-only) for
+  live human play.
 - [rl](rl.md) — can reuse the SAME selectors (e.g. `noop`, the curriculum floor the learner first
   faces) via the registry, without reaching into `data` (a forbidden import).
 
 ## Where it sits in the run
 
 The opponents and data-collection drivers. Agents are what actually *play* — the driver
-([data](data.md) / [demo](demo.md)) advances **both** player1 and player2 (the env is a pure
-transport that owns neither), so a recorded trajectory (or a demo episode) is the product of
+([data](data.md) / [play](play.md)) advances **both** player1 and player2 (the env is a pure
+transport that owns neither), so a recorded trajectory (or a play episode) is the product of
 whichever pair of agents was chosen. The coverage family's job is to make those
 trajectories sweep the map broadly, so the supervised-decode corpus sees the whole state space.
 
