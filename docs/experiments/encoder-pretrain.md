@@ -2,7 +2,7 @@
 
 **Living source of truth** for the single-frame encoder decode benchmark: method · decisions · results in one place. Update this as decisions land and the sweep runs.
 
-- **Status:** harness built + GPU-validated; **flat-val hit twice** — first the position-blind GAP heads (fixed by the soft-argmax decoder), then the soft-argmax decoder's own **predict-center basin** (coord-only escape gradient too weak; capacity fix insufficient, §6) → **heatmap-CE fix landed + validated** (§6/§10): spike-validated (~0.4–0.5 wu), then production was flat until the **shard-grouped sampler** (single-episode, no-diversity batches) was found to starve it — with cross-shard batch diversity (validated by a one-off on-disk reshuffle) val drops **4.06 → 0.40 wu in 3 epochs**. Next = **productionize the diverse-batch fix** (a reshuffle step / shuffle-buffer sampler so new datasets don't re-break) + full-run confirm → sweep.
+- **Status:** harness built + GPU-validated; **flat-val hit twice** — first the position-blind GAP heads (fixed by the soft-argmax decoder), then the soft-argmax decoder's own **predict-center basin** (coord-only escape gradient too weak; capacity fix insufficient, §6) → **heatmap-CE fix landed + validated** (§6/§10): spike-validated (~0.4–0.5 wu), then production was flat until the **shard-grouped sampler** (single-episode, no-diversity batches) was found to starve it — with cross-shard batch diversity (validated by a one-off on-disk reshuffle) val drops **4.06 → 0.40 wu in 3 epochs**. **Sweep 1 (3 of 10 cells) now landed** (§2 → Experimental log): the fix holds at full training scale (~0.30 wu), **`impala × flatten @ 180` leads**, with **aim (~41°) + presence (F1 ~0.46)** the architecture-independent bottlenecks. Next = **productionize the diverse-batch fix** (committed reshuffle / shuffle-buffer sampler so new datasets don't re-break) → continue the sweep (resolution axis) + close the per-metric gaps (§6 To do).
 - **Owner:** Brian (CTO-delegated eval/encoder direction).
 - **Tracking:** [#3](https://github.com/urciuolim/TankTwinStickShooter/issues/3) (parent) · [#5–8](https://github.com/urciuolim/TankTwinStickShooter/issues/5) (phases) · [#12](https://github.com/urciuolim/TankTwinStickShooter/issues/12) (follow-up). **Code:** PR #11. **Plan:** PR #4.
 - **Last updated:** 2026-06-28.
@@ -17,6 +17,35 @@
 - **Decision rule** *(to finalize before the sweep):* pick the config on the accuracy↔compute **Pareto frontier** that clears the downstream-RL "good enough" bar. **[OPEN]**
 - **Non-goals:** not best-possible (architecture exploration is later, [#12](https://github.com/urciuolim/TankTwinStickShooter/issues/12)); not the competitive eval framework; single-frame only.
 
+### 1.1 Provisional target bands
+
+These are **interim, physically-motivated sanity bars** — *not* the committed gate. The real decision criterion is the downstream **encoder→RL transfer probe** (§4); decode error is only a cheap proxy. The bands below answer "is a decode number tactically meaningful, or still near zero-skill?" so we can read the sweep without an RL run in the loop. All bands are derived from in-game physical constants (cited), not from external benchmarks.
+
+**Grounding constants** (game scale this is all derived from):
+
+| Constant | Value | Source |
+|---|---|---|
+| Arena extent | 16.72 × 7.95 wu | `runs/*/results.json` → `grid_extent` |
+| Sim timestep `dt` | 0.02 s (50 Hz) | `exp-configs/maps/*.json:14` (`ai_fixedDeltaTime`) |
+| Tank body | 0.75 × 0.5 wu (≈0.31 wu radius) | `Assets/Prefabs/Tank.prefab:225`; `tank.png` @64 PPU |
+| Bullet | 0.08 × 0.04 wu | `Assets/Prefabs/Bullet.prefab:81` |
+| Player speed | 3 wu/s → 0.06 wu/step | `Assets/Scripts/PlayerController.cs:12` |
+| Bullet speed | 15 wu/s → 0.30 wu/step | `Assets/Scripts/BulletController.cs:8` |
+| Pixel size @180 / @360 | ~0.048 / ~0.024 wu/px | arena ÷ frame rows |
+| Presence imbalance | ~29:1 (absent:present) | `results.json` → `presence_pos_weight` 28.9 |
+
+**Target bands** (lower better except F1; "Sweep-1 best" = best cell to date, `spatial / probe`):
+
+| Metric | Zero-skill (chance) | 🟡 Good | 🟢 Excellent | Sweep-1 best | Basis & citation |
+|---|---|---|---|---|---|
+| **Position** (wu) | ~5.0 | ≤ 0.30 | ≤ 0.10 | 0.302 / 0.539 | *Good* = one tank radius (~0.31 wu) ≈ one bullet-step (0.30 wu) ≈ 6 px @180 → "knows which tank-width cell." *Excellent* ≈ 2 px @180, near the pixel floor. *Chance* = RMS distance from arena center over `grid_extent` (predict-the-mean). |
+| **Aim** (°) | 90 | ≤ 10 | ≤ 3–5 | 41.3 / 41.2 | A tank of radius 0.31 wu at a ~5 wu engagement range subtends ±atan(0.31/5) ≈ **3.5°**, so sub-5° is "reliably on-target"; ≤10° lands at close range / leads roughly. *Chance* = E[\|θ\|] for θ∼Uniform(−180°,180°) = **90°** (derivation). |
+| **Bullet-pos** (wu) | ~5.0 | ≤ 0.50 | ≤ 0.30 | 1.322 / 2.043 | To dodge, you must localize a bullet to within ~one tank radius / one step of its travel (0.30 wu/step). Bullets are tiny (0.08×0.04 wu) and fast, so this is strictly harder than player position. *Chance* as for position. |
+| **Presence** (F1) | ~0.06 | ≥ 0.70 | ≥ 0.85 | 0.386 / 0.464 | Harsh under ~29:1 imbalance. *Chance* = always-predict-present → precision 1/30, recall 1 → F1 ≈ 0.065 (always-absent → 0). The deficit is **precision** (recall already ~0.94) and is **calibration, not discrimination** — Exp #2 measured **PR-AUC ~0.79** (~24× chance), so recalibration lifts F1 to ~0.74–0.76 and **clears Good on held-out test** (optimism gap ~0); not an encoder/resolution limit. |
+| **Velocity** | *TBD* | *TBD* | *TBD* | 0.772 / 0.762 | **[OPEN]** — band deferred until the field's unit & normalization are pinned from `results.json` → `norm_stats` (stored as wu/s vs per-step displacement changes the scale). |
+
+**Caveats.** (1) Single seed (0); bands are read against one run per cell. (2) Tank/bullet footprints are the *sprite draw size*, not a physics collider radius — a collider, if different, would shift the position/aim bands slightly. (3) These are **proxy** bars: a cell can clear every band and still underperform on RL transfer, or vice-versa — the transfer probe overrides. (4) Engagement range of ~5 wu for the aim band is an assumption (≈⅓ of arena width); closer fights tolerate looser aim, longer fights demand tighter.
+
 ---
 
 ## 2. Results
@@ -28,17 +57,108 @@ Per-cell decode performance from the 10-cell sweep. **Pending the decoder fix + 
 | Config | Res | Params | Latency (ms) | Position err (wu) | Aim err (°) | Velocity err | Presence F1 | Bullet-pos err |
 |---|---|---|---|---|---|---|---|---|
 | nature × gap | 360 |  |  |  |  |  |  |  |
-| nature × gap | 180 |  |  |  |  |  |  |  |
+| nature × gap | 180 | 0.137M | — | 4.205 / 12.833 | 85.0 / 84.8 | 1.717 / 3.468 | 0.143 / 0.230 | 5.191 / 12.533 |
 | nature × flatten | 360 |  |  |  |  |  |  |  |
 | nature × flatten | 180 |  |  |  |  |  |  |  |
 | impala × gap | 360 |  |  |  |  |  |  |  |
-| impala × gap | 180 |  |  |  |  |  |  |  |
+| impala × gap | 180 | 0.100M | — | 0.302 / 4.050 | 51.6 / 55.9 | 0.772 / 0.871 | 0.364 / 0.329 | 1.453 / 4.100 |
 | impala × gap | 90 |  |  |  |  |  |  |  |
 | impala × flatten | 360 |  |  |  |  |  |  |  |
-| impala × flatten | 180 |  |  |  |  |  |  |  |
+| impala × flatten | 180 | 0.100M | — | 0.326 / 0.539 | 41.3 / 41.2 | 0.757 / 0.762 | 0.386 / 0.464 | 1.322 / 2.043 |
 | impala × flatten | 90 |  |  |  |  |  |  |  |
 
 *(`nature@90` dropped — NatureCNN's ÷4 stem underflows a 90-row frame.)*
+*(Filled cells = test-set metrics from **Sweep 1**, below. **Params** = encoder-only (the reusable artifact); flatten's larger decoder/embed cost is noted in Sweep 1. **Latency** not yet profiled.)*
+
+### Experimental log
+
+A rolling registry of experiments on this benchmark — completed **and** planned. The §2 table above always holds the latest per-cell numbers; each entry below records, for a completed experiment, *what ran / what it showed / what it implies*, and for a planned one, the *goal / rationale / what will run / its gate*. Entries aren't deleted when done — their status flips, so the log stays a full history.
+
+| # | Experiment | Status | Outcome / goal |
+|---|---|---|---|
+| 1 | **Sweep 1** — trunk × pooling @180 | ✅ Done (2026-06-28) | Leader = `impala × flatten @ 180`; aim (~41°) & presence (F1 ~0.46) are architecture-independent bottlenecks |
+| 2 | **Presence calibration probe** — threshold sweep + PR-AUC on Sweep 1 checkpoints | ✅ Done (2026-06-28) | **Calibration-limited (val + test)** — leader PR-AUC ~0.79; recalibration lifts F1 ~0.49 → ~0.74–0.76, clears the ≥0.70 band on held-out test (gap ~0), no retrain/resolution needed |
+| 3 | **Readout fixes on the leader** — aim reparam + presence loss + bullet-pos sharpen, re-run `impala × flatten @180` | 📋 Planned · needs sampler GO | Decloak the true metric ceiling at 180 before spending on resolution |
+| 4 | **Resolution axis (gated)** — `impala × flatten @360` (+ `impala × gap @360` confirm), multi-seed winner | 📋 Planned · conditional on #3 | Test the one config (resolution) that can move aim/bullet-pos; lock the winner |
+| 5 | **Principal cut + encoder→RL transfer probe** | 📋 Planned · high VOI | Validate the decode proxy against real RL usefulness (§7.1) |
+
+#### 1 · Sweep 1 — trunk (impala vs nature) × pooling (gap vs flatten) at 180 — ✅ done (2026-06-28)
+
+**What ran.** The first three of the ten cells, chosen to settle the two architecture axes (trunk, pooling) at a single mid resolution before spending compute on the resolution axis — and to confirm the diverse-batch sampler fix holds on full production runs (not just the one-off reshuffle spike, §6/§10). Cells: `impala × gap`, `impala × flatten`, `nature × gap`, all at 180 (320×180). Config: 12 epochs, batch 256, lr 3e-3, seed 0, `datasets/decode-v2_reshuffled` (70.8k train / 22.7k val / 26.4k test), heatmap-CE decoder (`heatmap_weight=6.0`, `heatmap_sigma=0.7`), on the local RTX 4090 (`--device cuda`). All three completed clean — no NaNs/errors. Runs: `runs/pc-{impala-gap,impala-flatten,nature-gap}-180`.
+
+**Results** (test set, `spatial / embed-probe`; see §2 table for the full row):
+
+| Cell | Position (wu) | Aim (°) | Presence F1 | Bullet-pos (wu) |
+|---|---|---|---|---|
+| impala × gap | **0.302** / 4.050 | 51.6 / 55.9 | 0.364 / 0.329 | 1.453 / 4.100 |
+| impala × flatten | 0.326 / **0.539** | **41.3** / **41.2** | **0.386** / **0.464** | **1.322** / **2.043** |
+| nature × gap | 4.205 / 12.833 | 85.0 / 84.8 | 0.143 / 0.230 | 5.191 / 12.533 |
+
+**Gap to target & how to close it.** Bands from §1.1 (🟡 Good / 🟢 Excellent). "Leader best" = `impala × flatten @ 180` (the chosen direction), as `spatial / probe`. Gap is measured against 🟡 Good on the **embed-probe** (the RL-relevant artifact) unless noted.
+
+| Metric | 🟡 Good / 🟢 Excellent | Leader best (spatial / probe) | Gap to Good | Next step to close the gap |
+|---|---|---|---|---|
+| **Position** (wu) | ≤ 0.30 / ≤ 0.10 | 0.326 / 0.539 | spatial **met**; probe ~1.8× over | Keep **flatten** (preserves location); push **resolution 360** for sub-pixel heatmap peaks + a few more epochs / LR-decay tail. Closest to done — likely clears Good with the 360 run already queued. |
+| **Aim** (°) | ≤ 10 / ≤ 3–5 | 41.3 / 41.2 | ~4× over (need −31°) | **Biggest lever.** Re-parameterize aim as a `(sinθ, cosθ)` unit-vector regression with a von-Mises / cosine-distance loss, **up-weight the aim term**, and verify label correctness. The turret/barrel cue is tiny in pixels → **360 resolution** should help materially. Candidate for a dedicated angular head. |
+| **Bullet-pos** (wu) | ≤ 0.50 / ≤ 0.30 | 1.322 / 2.043 | ~2.6× over (spatial) | Bullets are 0.08×0.04 wu and move 0.30 wu/step → **resolution-limited**: raise to **360**, **sharpen the heatmap** (↑`heatmap_weight`, ↓`heatmap_sigma`) for crisper peaks, and up-weight bullet-pos. Couples with presence (below) — only scored where a bullet is detected. |
+| **Presence** (F1) | ≥ 0.70 / ≥ 0.85 | 0.386 / 0.464 | ~0.24 F1 short | **✅ Confirmed calibration-limited, val + test (Exp #2)** — PR-AUC ~0.79 (~24× chance); recalibration lifts F1 to **~0.74–0.76, clears the band on held-out test (optimism gap ~0), no retrain**. It's a precision problem (recall already ~0.94), F1-optimal threshold ~0.9 not 0.5. Fix: **lower `pos_weight`** toward single digits and/or pick the threshold on a val PR curve; focal loss optional. **Not** resolution-bound. |
+| **Velocity** | *TBD (§1.1)* | 0.772 / 0.762 | *unknown* | First **pin the unit/normalization** from `norm_stats` to set a band. Caveat: single-frame velocity is **partially ill-posed** (no temporal signal beyond static motion cues) → may be inherently capped until a 2-frame input is considered. |
+
+Three findings:
+
+1. **Sampler fix confirmed in production.** Both impala cells land at ~0.3 wu spatial position — matching the reshuffle spike's 4.06 → ~0.40 wu prediction. No regression to the old flat-val basin. The diverse-batch productionization holds on full runs.
+2. **impala ≫ nature, decisively.** `nature × gap` never escaped the predict-the-center basin (4.2 wu position, 85° aim, presence F1 0.14) — NatureCNN's shallow trunk lacks the capacity to localize here. impala is the trunk going forward.
+3. **flatten beats gap where it counts.** On the spatial head the two are near-tied (gap edges position 0.302 vs 0.326; flatten wins aim, presence, bullet-pos). But on the **detached embed-probe** — the embedding RL actually reuses — it's not close: flatten retains position at **0.539 wu vs gap's 4.050 wu**, presence F1 0.464 vs 0.329. This is the expected "GAP averages away position" effect; gap's spatial head only looks good because it reads the pre-pooled feature map. Cost: flatten's decoder is ~3.6M params vs gap's ~1.2M (encoder is identical at 0.10M); the larger embedding is the price of spatial retention.
+
+**Leader so far:** `impala × flatten @ 180` — best embed-probe retention, which is the property the downstream RL encoder needs.
+
+**Open caveats.** Aim error (~41°) and presence F1 (~0.39) are still weak across the board — aim is genuinely hard and presence fights a ~29:1 class imbalance (high recall ~0.94, low precision ~0.23). Single seed (0) only; no resolution sweep yet.
+
+**Proposed next steps.** Formalized as planned experiments **#2–#5** below (and tracked as actions in §6 To-do #5–#6).
+
+#### 2 · Presence calibration probe — ✅ done (2026-06-28, val + test confirmed)
+
+**Goal.** Determine whether the presence F1 gap (Sweep 1: ~0.39–0.49 vs the §1.1 ≥0.70 band) is **calibration**- or **discrimination**-limited, and recover F1 without a retrain.
+
+**What ran.** Read-only diagnostic on the 3 Sweep 1 checkpoints (no training): rebuilt encoder+decoder from each saved `config` via the production builders, `eval()`+`no_grad()`, reproduced the exact production **val** split, took `sigmoid(bullet_presence logits)` over all 10 slots (micro-averaged), and computed PR-AUC (average precision), ROC-AUC, and an F1 threshold sweep (0.01–0.99). On the local 4090 (CUDA). **Sanity passed:** val size = 22,661 (= `n_val`); F1@0.5 reproduced each `results.json` val presence F1 to 4 dp; base rate = **3.26%** (matches §9.1). Scratch script (throwaway, no production edits): `.scratch/presence_calibration_probe.py`.
+
+**Results (val split):**
+
+| Checkpoint | Family | PR-AUC | ROC-AUC | F1@0.5 | best thr | F1@best | P/R@best | gain |
+|---|---|---|---|---|---|---|---|---|
+| **impala × flatten (leader)** | **spatial** | **0.790** | 0.986 | 0.483 | 0.92 | **0.746** | 0.74 / 0.76 | +0.263 |
+| **impala × flatten (leader)** | **probe** | **0.778** | 0.985 | 0.491 | 0.87 | **0.730** | 0.69 / 0.78 | +0.239 |
+| impala × gap | spatial | 0.794 | 0.983 | 0.425 | 0.94 | 0.743 | 0.77 / 0.71 | +0.317 |
+| impala × gap | probe | 0.700 | 0.982 | 0.359 | 0.93 | 0.694 | 0.66 / 0.73 | +0.336 |
+| nature × gap | spatial | 0.135 | 0.896 | 0.186 | 0.01 | 0.193 | 0.13 / 0.40 | +0.007 |
+| nature × gap | probe | 0.171 | 0.916 | 0.264 | 0.01 | 0.264 | 0.15 / 0.94 | +0.000 |
+
+**Verdict — calibration-limited (leader, decisively).** PR-AUC ≈ 0.79 against a 3.26% base rate is **~24× chance** (chance AP ≈ 0.033); ROC-AUC ≈ 0.99 — the encoder *already separates present/absent well at 180*. Pure recalibration lifts leader F1 **0.49 → 0.73–0.75, clearing the §1.1 "Good" band (≥0.70) with no retraining**. The F1-optimal threshold sits far out at **~0.87–0.92** (logit ≈ +2 to +2.4), not 0.5 — the textbook fingerprint of `pos_weight≈28.9` inflating positive logits to buy recall (R≈0.93/P≈0.33 at 0.5) at precision's cost. Both impala cells are calibration-limited; `nature × gap` is *discrimination*-limited (PR-AUC ~0.15 ≈ chance, thresholding can't help) — but that only re-confirms the dead trunk, it doesn't affect the decision.
+
+**Test confirmation (val→test transfer) — ✅ holds.** The val-selected threshold was applied *fixed* to the held-out **test** split. Sanity passed: test size = 26,445 (= `n_test`); test F1@0.5 reproduced each `results.json` test F1 to 4 dp. Test base rate drifted modestly (3.26% val → **2.74%** test, the expected map-mix effect), but the optimal threshold barely moved, and the **optimism gap is negligible** (+0.0002 to +0.0023 F1) — the recalibration did not overfit val.
+
+| Checkpoint | Family | val-thr | test PR-AUC | F1@val-thr (test) | F1@test-best | optimism gap |
+|---|---|---|---|---|---|---|
+| **impala × flatten (leader)** | **spatial** | 0.92 | 0.802 | **0.762** | 0.763 | +0.0002 |
+| **impala × flatten (leader)** | **probe** | 0.87 | 0.799 | **0.739** | 0.739 | +0.0007 |
+| impala × gap | spatial | 0.94 | 0.792 | 0.744 | 0.746 | +0.0023 |
+| impala × gap | probe | 0.93 | 0.677 | 0.681 | 0.682 | +0.0009 |
+
+The leader clears the §1.1 "Good" band (≥0.70) on truly held-out test in **both** families (spatial 0.762, probe 0.739). `impala × gap` probe lands just under (0.681), consistent with its weaker PR-AUC (0.68 — partly discrimination-bound). Scratch script: `.scratch/presence_threshold_transfer.py`.
+
+**Implication for #3.** The presence fix is **"lower `pos_weight` toward single digits and/or pick the threshold on a val PR curve"** — **not** a resolution problem. Presence clears the band on recalibration alone (confirmed on held-out test), cleanly separating it from aim (~41°) and bullet-pos (~1.3 wu), the genuinely resolution-bound metrics. Focal loss is optional polish. **Caveat:** single-seed (seed 0), n-of-1 per cell; lowering `pos_weight` in #3 recenters the operating point near 0.5 rather than changing this conclusion.
+
+#### 3 · Readout fixes on the leader — 📋 planned (needs sampler GO)
+
+**Goal.** Decloak the true metric ceiling at 180 by fixing the architecture-independent readout problems *before* spending compute on resolution. **What runs:** apply aim re-parameterization (`(sinθ,cosθ)` + angular loss, up-weighted), the presence loss/threshold change from #2, and bullet-pos heatmap sharpening; re-run **only** `impala × flatten @ 180` (1 cell). **Why this order:** running the full grid through a broken readout confounds the fixes with config and forces a re-run (§4 one-factor attribution). **Gate:** aim/presence/bullet-pos vs the §1.1 bands at 180. Sits on the **productionized sampler** (in flight) so results land on the committed pipeline, not the one-off reshuffle.
+
+#### 4 · Resolution axis (gated) — 📋 planned (conditional on #3)
+
+**Goal.** Test the one config with a mechanistic reason to move aim/bullet-pos — resolution — and lock the winner. **What runs:** `impala × flatten @ 360` (and `@ 90` for the Pareto point); `impala × gap @ 360` to confirm the flatten≫gap embed-probe gap isn't resolution-specific; **≥3 seeds** on the eventual winner (§4). **Gate:** only run the cells #3 shows are still short of band; the **`nature` rows are likely droppable** (Sweep 1 shows nature dominated) — fill only for a complete-grid writeup. **Decision:** pick the accuracy↔compute Pareto cell that clears the bar (§1 decision rule).
+
+#### 5 · Principal cut + encoder→RL transfer probe — 📋 planned (high VOI)
+
+**Goal.** Validate that decode accuracy actually predicts RL usefulness — the proxy-metric (Goodhart) risk in §7.1. **Why:** higher value-of-information than sweep cells 4–10, and the encoder *weights* are throwaway once JEPA lands (§8) — the durable output is this probe + architecture intuition. **What runs:** a thin probe wiring the frozen leader encoder into PPO vs from-scratch. **Note:** touches the RL seam → needs Mike's sign-off (§8 phase 5). **Gate:** does the pretrained encoder help PPO? — the real verdict the decode bench is a proxy for.
 
 ---
 
@@ -103,14 +223,20 @@ Accomplishments to date (the harness build-out + the flat-val root-cause). Metri
 | 2026-06-27 | **✅ Spike — heatmap CE supervision works (strong yes, one caveat)** | A throwaway spike validated adding a **cross-entropy heatmap term** on top of coord regression. **Strong relative win:** at heatmap weight **≈6–10** (σ=0.7), val position error reached **~0.4–0.5 wu — ~5× below coord-only's ~2.2 floor** in the spike harness and **~13× below the ~5.5 trivial** (§9.4). `hm_ce` fell ~4.09 (uniform) → ~2.1, confirming the score map sharpened onto the true cell; the world→grid map (linear, x∈[−8,8], y∈[−4.1,4.1]) checked out — a trained soft-argmax lands **0.042 grid-cells** from the true player on the coarse 6×10 grid. See the two regime findings and the caveat in §10. |
 | 2026-06-27 | **✅ Dataset audit → bullet-presence label bug fixed + split visibility shipped** | A read-only `decode-v2` audit (§9) found two defects gating the bullet fields and the eval. **(1) Bullet-presence label bug:** the `pos_x >= 0` presence rule mislabeled **51% of on-board bullets** (the left half of a centered arena, valid negative x) as *absent* — so the heatmap decoder would never be supervised to fire on the left. Fixed: `bullet_present` now keys on the −100 sentinel (`> -50`), single-sourced in `core/state.py` with `targets.py` delegating; regression test added; **no dataset regeneration** (raw states on disk are correct — a Python label-derivation bug only). **(2) One-map val split:** `build_splits`/`train.py` defaults 0.1→0.2 (val + test each seat ≥2 maps at 10 maps) plus INFO/WARN visibility on realized per-split map-counts + sample fractions; `split_groups` stays pure. Eng-manager + platform gate **GO**; RL seam confirmed untouched (52-float layout / sentinel / socket-actions). Commit `c936c19`. |
 | 2026-06-28 | **✅ Heatmap-CE landed; production flat root-caused to the SAMPLER; fix validated by reshuffle** | Brought CE heatmap supervision into the production decoder (`losses.heatmap_ce_loss` + `targets.GridExtent`/`keypoint_targets`, fit TRAIN-only & serialized; score-logits surfaced top-level so val-eval concat stays flat; `--heatmap-weight`/`--heatmap-sigma`; coord MSE kept; **98 tests GO**). But the 12-epoch production learn-check was **FLAT (val 4.06 wu; `hm_ce` pinned at `ln 60` = the score map never sharpens)** — even the always-present player keypoints. **Not a decoder bug:** an isolation test on the *exact production code paths* but with RANDOM shuffled batches escaped (val → **0.39 wu**) while coord-only stayed stuck (~4.2) → heatmap-CE is both **necessary and sufficient-with-diversity**. **Root cause = the `ShardGroupedBatchSampler`:** it confines every batch to one shard (one episode/map), so a batch has ~no positional diversity and the heatmap gradient can't break symmetry out of the uniform map. **Validated end-to-end** by a one-off on-disk reshuffle (mix all 10 maps into every shard; `map_id` preserved → *identical* val maps, apples-to-apples): the same production trainer + heatmap-CE on the reshuffled data drops val **4.06 → 0.66 → 0.44 → 0.40 wu over epochs 0–2** (preliminary; full 12-epoch run in progress, §2 to be filled). Net fix = **heatmap-CE + cross-shard batch diversity**. |
+| 2026-06-28 | **✅ Sweep 1 — trunk + pooling decided; full-run confirms the reshuffle win** | Ran the first **3 of 10 cells** (`impala × {gap, flatten}`, `nature × gap` @180, full 12 epochs, batch 256, lr 3e-3, seed 0, on `decode-v2_reshuffled`, local 4090). Three findings (full writeup + per-cell numbers in §2 → Experimental log → **Sweep 1**; target-band gap analysis added at **§1.1**): **(1)** the diverse-batch fix **holds at full training scale** — both impala cells reach val/test position **~0.30 wu** (spatial), no regression to the flat basin (matches the reshuffle preview). **(2) impala ≫ nature** — nature never left the predict-center basin (4.2 wu / 85° / F1 0.14); impala is the trunk. **(3) flatten ≫ gap on the embed-probe** (the RL-relevant artifact): **0.54 vs 4.05 wu** position, F1 0.46 vs 0.33 — gap's spatial head only looks competitive because it reads the *pre-pooled* map; once pooled, GAP averages position away. Cost: flatten decoder ~3.6M vs gap ~1.2M (encoder identical 0.10M). **Leader = `impala × flatten @ 180`.** Remaining bottlenecks are **architecture-independent**: aim ~41° (≫ ≤10° bar) and presence F1 ~0.46 (< 0.70 bar) cap every cell. §2 rows filled. |
 
 ### To do
 Open next steps + decisions (was §7's "next steps / open questions") — all **📋 to do** unless flagged otherwise.
 
-1. 🟠 **Productionize the diverse-batch fix, then full-run confirm → run the 10-cell sweep.** Heatmap-CE is landed and the flat-val is fully root-caused (§6 2026-06-28): the `ShardGroupedBatchSampler` gives single-episode batches with no positional diversity, which starves the heatmap gradient; cross-shard diversity (proven via a one-off reshuffle) drops val **4.06 → 0.40 wu**. Next: (a) **productionize** the diverse-batch fix so new datasets don't re-break — either a committed **reshuffle step** in data prep or a **shuffle-buffer sampler** (+ multi-shard cache) that mixes shards while keeping each read ~once; **validate the production code by running it on the pristine `decode-v2_original`** and reproducing the win; (b) finish the **full 12-epoch confirm** + fill §2; (c) heads-up to Mike on PR #11 re: the decoder-approach change + the sampler finding. *(One-off validation artifacts: `datasets/decode-v2_reshuffled` (shuffled), `datasets/decode-v2_original` (pristine backup) — both git-ignored, local only.)*
+1. 🟠 **Productionize the diverse-batch fix** (the full-run confirm is now ✅ done — Sweep 1). Heatmap-CE is landed and the flat-val is fully root-caused (§6 2026-06-28): the `ShardGroupedBatchSampler` gives single-episode batches with no positional diversity, which starves the heatmap gradient; cross-shard diversity drops val **4.06 → 0.40 wu**. ✅ **(b) Full 12-epoch confirm + §2 fill — DONE via Sweep 1** (impala cells land ~0.30 wu at full training scale). Still open: (a) **productionize** the diverse-batch fix so new datasets don't re-break — either a committed **reshuffle step** in data prep or a **shuffle-buffer sampler** (+ multi-shard cache) that mixes shards while keeping each read ~once; **validate the production code by running it on the pristine `decode-v2_original`** and reproducing the win (Sweep 1 used the *one-off* `decode-v2_reshuffled` artifact, not a committed sampler); (c) heads-up to Mike on PR #11 re: the decoder-approach change + the sampler finding. *(One-off validation artifacts: `datasets/decode-v2_reshuffled` (shuffled), `datasets/decode-v2_original` (pristine backup) — both git-ignored, local only.)*
 2. 📋 **Decide sweep scope** — full 10-cell (matches Mike's ask) vs. the **principal cut** (2–3 cells + an encoder→RL transfer probe, which is higher value-of-information than cells 4–10; see §7 proxy-metric risk). **[OPEN]**
 3. ✅ **[DONE — data] Bullet-presence labels fixed** (commit `c936c19`). The `pos_x >= 0` rule that mislabeled **51% of on-board bullets** (left-half, §9.1) now keys on the −100 sentinel (`bullet_present` → `pos_x > -50`), single-sourced in `core/state.py` with `targets.py` delegating; regression test added; stats refit automatically. No dataset regeneration. Eng + platform gate GO. → the heatmap decoder is now supervised on the full arena.
 4. ✅ **[DONE — eval] One-map val split mitigated** (commit `c936c19`). `build_splits`/`train.py` defaults raised 0.1→0.2 so val + test each seat ≥2 maps at 10 maps, plus INFO/WARN logging of realized per-split fractions (§9.2). The full **fractions-vs-k-fold eval policy for the final comparison remains [OPEN]** — fold into the seeds/scope pre-registration (#2 above, §4).
+5. 🟠 **Continue the sweep — resolution axis for the leader** (next batch, "Sweep 2"). From Sweep 1's leader `impala × flatten @ 180`: (a) run `impala × flatten @ {360, 90}` — is 180 on the accuracy↔compute Pareto frontier, or does 360 buy enough to justify the cost? (b) `impala × gap @ 360` to confirm the flatten≫gap embed-probe gap isn't resolution-specific; (c) **multi-seed the eventual winner** (≥3 seeds, per §4) before locking the decision. The `nature` rows are likely droppable — Sweep 1 shows nature dominated — fill them only if a complete trunk comparison is wanted for the writeup.
+6. 🟠 **Close the per-metric gaps** (architecture-independent; won't move with trunk/pooling — see the §2 Sweep 1 gap table + bands at §1.1).
+   - **Aim (~41° vs ≤10° bar) — biggest lever.** Re-parameterize as a `(sinθ, cosθ)` unit-vector regression with a von-Mises / cosine-distance loss, up-weight the aim term, verify label correctness; the turret cue is tiny in pixels → expect **360 resolution** to help materially.
+   - **Presence (F1 ~0.46 vs ≥0.70 bar) — ✅ confirmed calibration, *not* balance — val + test (Exp #2).** PR-AUC measured at **~0.79** (~24× chance) on the leader → discrimination is fine; the deficit is **precision** (recall already ~0.94), the fingerprint of *over*-correcting imbalance (`pos_weight≈29`, F1-optimal threshold ~0.9 not 0.5). **Recalibration alone lifts F1 to ~0.74–0.76, clearing the band on held-out test (optimism gap ~0) — no retrain, no resolution.** A "more balanced dataset" is the **wrong lever** (pushes further toward saturated recall + distorts the ~2.7–3.3% deploy prior). Action for #3: **lower `pos_weight`** toward single digits and/or **pick the threshold on a val PR curve**; focal loss optional.
+   - **Bullet-pos (~1.3 wu vs ≤0.5 bar) — resolution-limited.** Bullets are 0.08×0.04 wu (~1–2 px @180): raise to **360**, **sharpen the heatmap** (↑`heatmap_weight`, ↓`heatmap_sigma`), up-weight bullet-pos; couples with presence (only scored where detected).
 
 ### Background
 - **RL-from-pixels resolutions (~June 2026):** the field trains from-scratch encoders at **64–96px** — DrQ-v2 at 84×84 [2], DreamerV3 at 64×64 [3], all tracing back to the 84×84 Atari-DQN preprocessing norm [1]; ≥224px appears only with frozen pretrained encoders. Our smallest (160×90) is ~2× the 84×84 norm; 640×360 is ~33× (off-map) → motivates [#12](https://github.com/urciuolim/TankTwinStickShooter/issues/12).
