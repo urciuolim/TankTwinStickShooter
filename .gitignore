@@ -103,6 +103,3 @@ __pycache__/
 # research-lane byproducts
 .scratch/
 cleanrl/
-
-# local GPU host config (per-machine; see gpu-host.toml.example)
-gpu-host.toml

@@ -4,10 +4,9 @@ The harness must run on a 4090 (cuda) unchanged AND on this mac (mps) AND on a C
 ``resolve_device`` maps the CLI ``--device`` to a concrete torch device string, defaulting to
 the best available accelerator. torch + os only; nothing internal.
 
-The ``TT_DEVICE`` env var lets ``scripts/gpu_run.py`` steer device selection for the default
-(``"auto"``) path -- e.g. it sets ``TT_DEVICE=cuda`` where it dispatches the job -- so training,
-profiling, AND ad-hoc diagnostics land on the GPU instead of silently defaulting to MPS. An
-explicit ``--device`` always wins over the env (the escape hatch).
+The ``TT_DEVICE`` env var steers device selection for the default (``"auto"``) path -- set
+``TT_DEVICE=cuda`` to force training / profiling / ad-hoc diagnostics onto the GPU instead of
+silently defaulting to MPS. An explicit ``--device`` always wins over the env (the escape hatch).
 """
 
 from __future__ import annotations
