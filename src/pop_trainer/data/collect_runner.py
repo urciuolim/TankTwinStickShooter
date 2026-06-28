@@ -40,11 +40,13 @@ release and THEN terminates the build process (terminate -> wait(10) -> kill on 
 PIXELS. Collection MUST receive pixel frames (the env reads a length-prefixed frame after every
 state; a build without ``obs_pixels`` would leave the env blocking on bytes that never arrive). The
 no-rotation default ``--map`` resolves to ``unity/Assets/StreamingAssets/demo_config.json`` — the
-SAME obs_pixels-enabled config the play app launches with (640x360, arena ``Arenas/custom1.json``
-resolved against the config dir) — so the captured ``(frame, state)`` rows are byte-for-byte the
-play / RL observation pipeline, with no drift. A rotation run boots on the SAME obs_pixels
-``--map`` config and only the arena rotates via ``switch_arena`` (the curated rotation is arena
-switch TARGETS, not boot configs). The env is built with the matching ``frame_shape`` either way.
+SAME obs_pixels-enabled config the play app launches with (arena ``Arenas/custom1.json`` resolved
+against the config dir) — so the captured ``(frame, state)`` rows are byte-for-byte the play / RL
+observation pipeline, with no drift. A rotation run boots on the SAME obs_pixels ``--map`` config
+and only the arena rotates via ``switch_arena`` (the curated rotation is arena switch TARGETS, not
+boot
+configs). The env's ``frame_shape`` is DERIVED from the boot config's ``obs_pixels_*`` either way
+(:func:`core.obs.frame_shape_from_config`), so it always matches the build's rendered frame.
 """
 
 from __future__ import annotations
@@ -66,6 +68,7 @@ from pop_trainer.core import agent as core_agent
 from pop_trainer.core import launch
 from pop_trainer.core import maps as core_maps
 from pop_trainer.core.config import EnvConfig
+from pop_trainer.core.obs import DEFAULT_FRAME_SHAPE, frame_shape_from_config
 from pop_trainer.core.protocol import Connection
 from pop_trainer.data import collect, schema
 from pop_trainer.data.collect import CollectionSpec, EpisodePlan, collect_parallel
@@ -81,6 +84,8 @@ __all__ = [
     "MAP_CONFIGS",
     "MAPS_SIDECAR_NAME",
     "FRAME_SHAPE",
+    "FRAME_HEIGHT",
+    "FRAME_WIDTH",
     "frame_nbytes",
     "make_agent",
     "build_rotation",
@@ -103,11 +108,12 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 # OS-aware default to the launchable build binary (.exe / .app inner / bare); --exe overrides it.
 DEFAULT_EXE = launch.default_build_path(_REPO_ROOT / "unity")
 
-# Rendered pixel-frame dimensions (W x H) — MUST match the launched config's obs_pixels_*.
-FRAME_WIDTH = 640
-FRAME_HEIGHT = 360
-# TankEnv frame_shape is (H, W, 3).
-FRAME_SHAPE = (FRAME_HEIGHT, FRAME_WIDTH, 3)
+# The pixel frame_shape (H, W, 3) is DERIVED from the launched boot config's obs_pixels_*
+# (frame_shape_from_config) so the env byte-read matches the build's rendered frame (one source of
+# truth). FRAME_SHAPE is only the FALLBACK default (640x360, the DriverController default) for a
+# config that declares no obs_pixels_* keys; FRAME_HEIGHT / FRAME_WIDTH expose its dimensions.
+FRAME_SHAPE = DEFAULT_FRAME_SHAPE
+FRAME_HEIGHT, FRAME_WIDTH, _ = FRAME_SHAPE
 
 
 def frame_nbytes(frame_shape: Sequence[int]) -> int:
@@ -121,7 +127,8 @@ def frame_nbytes(frame_shape: Sequence[int]) -> int:
 
 # Map name -> the obs_pixels-enabled build config it launches with (the single-map / no-rotation
 # default). Reusing the demo_config.json config keeps collection's frames byte-identical to the
-# play / RL pipeline (640x360 pixels on, arena Arenas/custom1.json resolved against the config dir).
+# play / RL pipeline (pixels on, arena Arenas/custom1.json resolved against the config dir); the
+# env frame_shape is derived from that config's obs_pixels_*.
 _STREAMING_ASSETS = _REPO_ROOT / "unity" / "Assets" / "StreamingAssets"
 MAP_CONFIGS: dict[str, Path] = {
     "custom1": _STREAMING_ASSETS / "demo_config.json",
@@ -446,7 +453,7 @@ def build_specs(
     workers: int,
     base_port: int,
     seed: int,
-    frame_shape: tuple[int, int, int] = FRAME_SHAPE,
+    frame_shape: tuple[int, int, int] | None = None,
     shard_size: int | None = None,
 ) -> list[CollectionSpec]:
     """Turn collection params into a list of N :class:`CollectionSpec` (one per worker).
@@ -468,6 +475,12 @@ def build_specs(
     enables obs_pixels, so the build boots correctly and the runtime ``switch_arena`` changes only
     the arena, not the pixel channel.
 
+    FRAME SHAPE: ``frame_shape`` is DERIVED from the boot ``config``'s ``obs_pixels_*`` (the SAME
+    keys the Unity build reads) via :func:`core.obs.frame_shape_from_config` when the caller passes
+    ``None`` (the default) — so a 64x64 boot config auto-yields a ``(64, 64, 3)`` env with no
+    manual sync. An explicit ``frame_shape`` overrides the derivation (the test seam). The
+    derived/overridden shape is carried in each spec's ``extra["frame_shape"]`` to the worker.
+
     ``workers`` is CLAMPED to ``[1, MAX_WORKERS]``. Each worker gets a distinct ``worker_id``
     (0..N-1), its own ``out_dir`` subdir (so shard files never clash), its slice of the round-robin
     as ``episode_plan``, the shared ``max_steps`` + ``map_index``, a distinct ``seed``
@@ -482,6 +495,10 @@ def build_specs(
         raise ValueError(f"episodes must be >= 1, got {episodes}")
     if not pairings:
         raise ValueError("at least one pairing is required")
+    # DERIVE the frame_shape from the boot config's obs_pixels_* unless the caller overrode it, so
+    # the env byte-read matches the build's rendered frame with no hand-synced constant.
+    if frame_shape is None:
+        frame_shape = frame_shape_from_config(config)
     # Validate every selector named by any pairing eagerly so a bad CLI fails before launch.
     for p1, p2 in pairings:
         make_agent(p1, seed=seed)
@@ -787,8 +804,9 @@ def main(argv: list[str] | None = None) -> int:
     # the on-disk shard — is the OOM surface. Resolve the EFFECTIVE shard_size (auto -> the byte
     # budget for this frame, so the printed estimate matches what the workers will actually buffer),
     # estimate the peak across all workers, ALWAYS print the estimate, then abort BEFORE launching
-    # any build if it blows the budget (unless --allow-oversized).
-    fb = frame_nbytes(FRAME_SHAPE)
+    # any build if it blows the budget (unless --allow-oversized). The frame size is the DERIVED
+    # boot-config shape the specs carry — so the estimate matches what the workers actually buffer.
+    fb = frame_nbytes(specs[0].extra["frame_shape"])
     effective_shard_size = (
         args.shard_size if args.shard_size is not None else collect.default_shard_size(fb)
     )

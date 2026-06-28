@@ -38,8 +38,11 @@ from pop_trainer.models import (  # noqa: E402  (after importorskip, by design)
 # stack; half-canonical 180x320 runs the SAME code path and is fast).
 SMALL_HW = (180, 320)
 
-# Every {trunk} x {pooling} cell of the ablation grid.
-ALL_CELLS = [(t, p) for t in TRUNKS for p in POOLINGS]
+# Every {trunk} x {pooling} cell of the canonical-frame, Sentis-deployable ablation grid. The
+# DreamerV3 trunk is a SMALL-frame RL trunk (GroupNorm, not a Sentis-clean deploy target) and is
+# covered by its own tests below, so it is excluded from the deployable-grid sweep here.
+DEPLOY_TRUNKS = [t for t in TRUNKS if t != "dreamer"]
+ALL_CELLS = [(t, p) for t in DEPLOY_TRUNKS for p in POOLINGS]
 
 # The named ablation configs the contract calls out, including the IMPALA-plain (residual off)
 # variant that isolates whether the skip connections earn their keep.
@@ -418,6 +421,90 @@ def test_proto_scanner_recovers_known_ops():
 
     ops = _scan_proto_op_types(_FakePath())
     assert ops == ["Conv", "Relu", "ReduceMean"]
+
+
+# --- the DreamerV3 trunk: survives small frames where the NatureCNN stem collapses -------
+
+# DreamerV3's canonical input is a 64x64 RGB frame; the four stride-2 blocks take it 64 -> 4.
+DREAMER_HW = (64, 64)
+
+
+def test_dreamer_trunk_spatial_map_default_depth():
+    """DreamerV3 trunk at 64x64, cnn_depth=32: feature map is (B, 256, 4, 4); embedding finite.
+
+    Four stride-2 blocks halve the spatial dims each (64 -> 32 -> 16 -> 8 -> 4) while channels
+    double from cnn_depth (32 -> 64 -> 128 -> 256 = 8*cnn_depth), so the map is (B, 256, 4, 4)
+    and the flatten embedding is 256*4*4 = 4096.
+    """
+    enc = build_encoder(EncoderConfig(trunk="dreamer", pooling="flatten")).eval()
+    x = torch.zeros(2, 3, *DREAMER_HW)
+    with torch.no_grad():
+        feats = enc.features(x)
+        emb = enc.embed(x)
+
+    assert feats.shape == (2, 256, 4, 4)
+    assert enc.out_channels == 256
+    assert emb.shape == (2, 256 * 4 * 4)  # 4096
+    assert emb.shape[1] == 4096
+    assert torch.isfinite(emb).all()
+    # the statically-derived flatten D agrees with the realized embedding
+    assert enc.embedding_dim(DREAMER_HW) == 4096
+
+
+def test_dreamer_trunk_scales_with_cnn_depth():
+    """cnn_depth flows ONLY to the dreamer trunk: depth 16 -> (B, 128, 4, 4), out_channels 128.
+
+    Output channels are 8*cnn_depth, so halving the depth halves every channel width while the
+    64 -> 4 spatial schedule is unchanged.
+    """
+    enc = build_encoder(EncoderConfig(trunk="dreamer", pooling="flatten", cnn_depth=16)).eval()
+    x = torch.zeros(1, 3, *DREAMER_HW)
+    with torch.no_grad():
+        feats = enc.features(x)
+        emb = enc.embed(x)
+
+    assert feats.shape == (1, 128, 4, 4)
+    assert enc.out_channels == 128
+    assert emb.shape == (1, 128 * 4 * 4)  # 2048
+    assert torch.isfinite(emb).all()
+
+
+def test_dreamer_no_batchnorm():
+    """The DreamerV3 trunk uses no BatchNorm (an on-policy-RL footgun) — norm is GroupNorm."""
+    enc = build_encoder(EncoderConfig(trunk="dreamer", pooling="flatten"))
+    norms = [m for m in enc.trunk.modules() if isinstance(m, torch.nn.modules.batchnorm._BatchNorm)]
+    assert not norms, "DreamerV3 trunk must not contain BatchNorm"
+    assert any(isinstance(m, torch.nn.GroupNorm) for m in enc.trunk.modules())
+
+
+def test_dreamer_bad_cnn_depth_rejected():
+    """cnn_depth < 1 fails loudly at construction (the dreamer-only depth knob is validated)."""
+    with pytest.raises(ValueError, match="cnn_depth"):
+        EncoderConfig(trunk="dreamer", pooling="flatten", cnn_depth=0)
+
+
+# --- regression: the NatureCNN path at the canonical 360x640 is unchanged ----------------
+
+
+def test_nature_canonical_regression_unchanged():
+    """NatureCNN at the canonical 360x640 still produces the expected (B, 64, h, w) map.
+
+    Locks the byte-for-byte 360x640 NatureCNN path against the dreamer addition: out_channels is
+    the NatureCNN trio's last width (64), the stem+trio crush the frame well below an eighth of
+    the input, and the flatten embedding D is the expected positive int.
+    """
+    enc = build_encoder(EncoderConfig(trunk="nature", pooling="flatten")).eval()
+    h, w = CANONICAL_HW  # (360, 640)
+    x = torch.zeros(1, 3, h, w)
+    with torch.no_grad():
+        feats = enc.features(x)
+        emb = enc.embed(x)
+
+    assert enc.out_channels == 64
+    assert feats.shape[:2] == (1, 64)
+    assert feats.shape[2] < h // 8 and feats.shape[3] < w // 8
+    assert emb.shape == (1, 64 * feats.shape[2] * feats.shape[3])
+    assert enc.embedding_dim(CANONICAL_HW) == emb.shape[1]
 
 
 # --- 4. determinism nicety -------------------------------------------------------------

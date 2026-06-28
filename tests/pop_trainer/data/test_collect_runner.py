@@ -165,7 +165,11 @@ def test_build_specs_extra_carries_launch_params_and_pool():
     assert extra["exe"] == str(R.DEFAULT_EXE)
     # Single-map boot config is the --map config.
     assert extra["config"] == str(R.MAP_CONFIGS["custom1"])
-    assert tuple(extra["frame_shape"]) == R.FRAME_SHAPE
+    # frame_shape is DERIVED from the boot config's obs_pixels_* (one source of truth), so it equals
+    # whatever resolution that config declares — not a hardcoded constant.
+    from pop_trainer.core.obs import frame_shape_from_config
+
+    assert tuple(extra["frame_shape"]) == frame_shape_from_config(R.MAP_CONFIGS["custom1"])
     # The maps-list (int -> arena) is carried for the sidecar; single map -> the boot arena.
     assert extra["maps"] == ["Arenas/custom1.json"]
 

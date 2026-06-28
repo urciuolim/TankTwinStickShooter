@@ -26,7 +26,7 @@ pytest.importorskip("stable_baselines3")
 import gymnasium as gym  # noqa: E402  (after importorskip, by design)
 from torch import nn  # noqa: E402
 
-from pop_trainer.models import EncoderConfig, build_encoder  # noqa: E402
+from pop_trainer.models import DreamerCNN, EncoderConfig, NatureCNN, build_encoder  # noqa: E402
 from pop_trainer.rl import EncoderExtractor  # noqa: E402
 
 # The canonical obs is the real Unity RGB frame: 360 rows x 640 cols, 3 channels. 84x84 collapses
@@ -34,10 +34,19 @@ from pop_trainer.rl import EncoderExtractor  # noqa: E402
 OBS_HW = (360, 640)
 OBS_SHAPE = (3, *OBS_HW)
 
+# A SMALL frame (DreamerV3's canonical 64x64): the extractor must pick the dreamer trunk here.
+SMALL_OBS_HW = (64, 64)
+SMALL_OBS_SHAPE = (3, *SMALL_OBS_HW)
+
 
 def _obs_space() -> gym.spaces.Box:
     """A channels-first float-[0,1] pixel Box, the shape SB3 hands the extractor."""
     return gym.spaces.Box(low=0.0, high=1.0, shape=OBS_SHAPE, dtype=np.float32)
+
+
+def _small_obs_space() -> gym.spaces.Box:
+    """A 64x64 channels-first float-[0,1] pixel Box (the small-frame DreamerV3 path)."""
+    return gym.spaces.Box(low=0.0, high=1.0, shape=SMALL_OBS_SHAPE, dtype=np.float32)
 
 
 def _expected_features_dim() -> int:
@@ -63,6 +72,43 @@ def test_in_channels_derived_from_obs_space():
     """The encoder's input channels come from the obs space, not a hard-coded 3."""
     extractor = EncoderExtractor(_obs_space())
     assert extractor.encoder.trunk.in_channels == OBS_SHAPE[0]
+
+
+# --- trunk selection by resolution -----------------------------------------------------
+
+
+def test_canonical_obs_selects_nature_trunk():
+    """The canonical 360x640 obs builds the unchanged NatureCNN trunk (deployment path)."""
+    extractor = EncoderExtractor(_obs_space())
+    assert isinstance(extractor.encoder.trunk, NatureCNN)
+    # the canonical features_dim is unchanged by the dreamer addition
+    assert extractor.features_dim == _expected_features_dim()
+
+
+def test_small_obs_selects_dreamer_trunk_with_probed_features_dim():
+    """A 64x64 obs builds the DreamerV3 trunk; features_dim is a positive int from a dummy probe.
+
+    At 64x64 the four stride-2 dreamer blocks give a (256, 4, 4) map, so the flatten features_dim
+    is 256*4*4 = 4096 — derived by the extractor's dummy forward, not a hardcoded spatial dim.
+    """
+    extractor = EncoderExtractor(_small_obs_space())
+    assert isinstance(extractor.encoder.trunk, DreamerCNN)
+    assert isinstance(extractor.features_dim, int)
+    assert extractor.features_dim == 4096
+
+    # the probe matches an independently built dreamer encoder's static D
+    enc = build_encoder(EncoderConfig(trunk="dreamer", pooling="flatten"))
+    assert extractor.features_dim == enc.embedding_dim(input_hw=SMALL_OBS_HW)
+
+
+def test_small_obs_forward_returns_batched_embedding():
+    """forward over (N, 3, 64, 64) in [0,1] returns (N, features_dim) on the dreamer path."""
+    extractor = EncoderExtractor(_small_obs_space()).eval()
+    n = 2
+    obs = torch.rand(n, *SMALL_OBS_SHAPE)
+    with torch.no_grad():
+        out = extractor(obs)
+    assert out.shape == (n, extractor.features_dim)
 
 
 # --- 2. forward ------------------------------------------------------------------------

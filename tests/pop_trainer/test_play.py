@@ -16,7 +16,10 @@ from pop_trainer.core import state as S
 from pop_trainer.core.config import EnvConfig
 from pop_trainer.env.tank_env import TankEnv
 
-FRAME_H, FRAME_W = play.FRAME_HEIGHT, play.FRAME_WIDTH
+# A fixed test frame shape for the pure episode loop (play derives the real one from the launched
+# config; run_play_episode is shape-agnostic, so any consistent shape exercises the wire).
+FRAME_H, FRAME_W = 360, 640
+FRAME_SHAPE = (FRAME_H, FRAME_W, 3)
 
 
 # --- wire-byte builders (mirror tests/pop_trainer/env/test_tank_env.py) -------------------
@@ -156,7 +159,7 @@ def _make_env(blobs, *, max_steps=100):
     conn = P.Connection(transport)
     env = TankEnv(
         connection=conn,
-        frame_shape=play.FRAME_SHAPE,
+        frame_shape=FRAME_SHAPE,
         env_config=EnvConfig(max_steps=max_steps),
     )
     return env, transport
@@ -367,7 +370,7 @@ def test_rl_player1_sees_the_unflipped_current_frame():
 
     assert predict.calls >= 1
     seen = predict.seen_frame  # the FIRST step's frame (recorded on every call; first == this fill)
-    assert seen.shape == play.FRAME_SHAPE
+    assert seen.shape == FRAME_SHAPE
     # Unflipped: R==10, G==20, B==30 everywhere (the env's raw frame).
     assert int(seen[0, 0, 0]) == 10
     assert int(seen[0, 0, 1]) == 20
@@ -388,13 +391,13 @@ def test_rl_player2_sees_the_flipped_frame():
     play.run_play_episode(env, _state_adapter(_FixedAgent(), slot=S.PLAYER_1), rl_player2)
 
     seen = predict.seen_frame
-    assert seen.shape == play.FRAME_SHAPE
+    assert seen.shape == FRAME_SHAPE
     # Flipped: the (10, 20, 30) source becomes (30, 20, 10) — R/B swapped, G held.
     assert int(seen[0, 0, 0]) == 30
     assert int(seen[0, 0, 1]) == 20
     assert int(seen[0, 0, 2]) == 10
     # And it equals flip_frame_perspective of the env's raw frame.
-    raw = np.full(play.FRAME_SHAPE, 0, dtype=np.uint8)
+    raw = np.full(FRAME_SHAPE, 0, dtype=np.uint8)
     raw[:, :, 0], raw[:, :, 1], raw[:, :, 2] = fill
     np.testing.assert_array_equal(seen, S.flip_frame_perspective(raw))
 
@@ -403,7 +406,7 @@ def test_rl_adapter_acts_deterministically_via_predict():
     # The PixelsAdapter calls predict(frame, deterministic=True) and returns predict's action[0].
     predict = _RecordingPredict(action=(0.1, 0.2, 0.3, 0.4, 1.0))
     adapter = play.make_rl_player("ignored.zip", slot=S.PLAYER_1, model=_ModelWith(predict))
-    frame = np.zeros(play.FRAME_SHAPE, dtype=np.uint8)
+    frame = np.zeros(FRAME_SHAPE, dtype=np.uint8)
     action = adapter.act(frame, _flat_state(0))
     np.testing.assert_allclose(np.asarray(action), (0.1, 0.2, 0.3, 0.4, 1.0), rtol=1e-6)
 

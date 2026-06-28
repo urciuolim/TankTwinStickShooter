@@ -68,6 +68,7 @@ __all__ = [
     "Trunk",
     "NatureCNN",
     "ImpalaResNet",
+    "DreamerCNN",
     "Pooling",
     "GlobalAveragePool",
     "Flatten",
@@ -84,7 +85,7 @@ __all__ = [
 # draws). Used as the default export spatial axes; encoders are size-agnostic at build time.
 CANONICAL_HW = (360, 640)
 
-TrunkName = Literal["nature", "impala"]
+TrunkName = Literal["nature", "impala", "dreamer"]
 PoolingName = Literal["gap", "flatten"]
 
 
@@ -240,6 +241,55 @@ class ImpalaResNet(Trunk):
         return self.out_relu(self.stages(self.stem(x)))
 
 
+class DreamerCNN(Trunk):
+    """DreamerV3-style conv trunk that survives SMALL frames (e.g. 64x64).
+
+    Where :class:`NatureCNN` / :class:`ImpalaResNet` crush a 640x360 frame with a stride-4 stem
+    before the body, DreamerV3 takes an already-small frame and downsamples gently: a stack of
+    **four** ``Conv2d(kernel=4, stride=2, padding=1) -> norm -> SiLU`` blocks whose channels
+    DOUBLE from ``cnn_depth``. At ``cnn_depth=32`` that is ``32 -> 64 -> 128 -> 256`` while the
+    spatial dims halve each block (``64 -> 32 -> 16 -> 8 -> 4``), producing the
+    ``(B, 8*cnn_depth, h, w)`` map (``(B, 256, 4, 4)`` for a 64x64 input). No flatten/linear here
+    — the DreamerV3 FC to a fixed ``features_dim`` is the pooling+consumer's job, kept external so
+    any pooling composes (with :class:`Flatten` the flat embedding is ``8*cnn_depth*h*w``; the SB3
+    policy head supplies the FC).
+
+    The norm is :class:`~torch.nn.GroupNorm` with one group (a channel-wise LayerNorm over the
+    spatial map), NOT BatchNorm: BatchNorm's running stats are an on-policy-RL footgun, and
+    DreamerV3 uses LayerNorm. Activation is :class:`~torch.nn.SiLU`. ``cnn_depth`` sets the base
+    width; in the paper the depth, kernel, and minres scale with model size, so the widths here
+    are a tunable default, not a fixed constant.
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 3,
+        cnn_depth: int = 32,
+        num_blocks: int = 4,
+    ) -> None:
+        super().__init__()
+        self.in_channels = in_channels
+        blocks: list[nn.Module] = []
+        prev = in_channels
+        width = cnn_depth
+        for _ in range(num_blocks):
+            blocks.append(
+                nn.Sequential(
+                    nn.Conv2d(prev, width, kernel_size=4, stride=2, padding=1),
+                    nn.GroupNorm(1, width),  # one-group GroupNorm == channel-wise LayerNorm
+                    nn.SiLU(inplace=True),
+                )
+            )
+            prev = width
+            width *= 2
+        self.conv = nn.Sequential(*blocks)
+        self.out_channels = prev
+
+    def forward(self, x: Tensor) -> Tensor:
+        """Return the spatial feature map ``(B, out_channels, h, w)`` for NCHW ``x``."""
+        return self.conv(x)
+
+
 # --- pooling (spatial map -> flat embedding; swappable ablation variable) ---------------
 
 
@@ -364,7 +414,11 @@ class Encoder(nn.Module):
 # --- config-driven composition ----------------------------------------------------------
 
 # Trunk / pooling registries: the swappable pieces of the {trunk} x {pooling} ablation grid.
-TRUNKS: dict[str, type[Trunk]] = {"nature": NatureCNN, "impala": ImpalaResNet}
+TRUNKS: dict[str, type[Trunk]] = {
+    "nature": NatureCNN,
+    "impala": ImpalaResNet,
+    "dreamer": DreamerCNN,
+}
 POOLINGS: dict[str, type[Pooling]] = {"gap": GlobalAveragePool, "flatten": Flatten}
 
 
@@ -383,6 +437,10 @@ class EncoderConfig:
     them only when ``trunk == "impala"`` and never passes them to the :class:`NatureCNN` trunk,
     so they are inert (harmless defaults) for a nature config.
 
+    ``cnn_depth`` is DREAMER-ONLY: it sets the :class:`DreamerCNN` base channel width that
+    doubles per stride-2 block (output channels are ``8*cnn_depth``). :func:`build_encoder`
+    passes it only when ``trunk == "dreamer"``; it is inert for nature / impala configs.
+
     Frozen + validated so a config is a stable, hashable record of one ablation cell.
     """
 
@@ -391,6 +449,7 @@ class EncoderConfig:
     in_channels: int = 3
     residual: bool = True
     blocks_per_stage: int = 2
+    cnn_depth: int = 32
 
     def __post_init__(self) -> None:
         if self.trunk not in TRUNKS:
@@ -401,21 +460,26 @@ class EncoderConfig:
             raise ValueError(f"in_channels must be >= 1, got {self.in_channels}")
         if self.blocks_per_stage < 1:
             raise ValueError(f"blocks_per_stage must be >= 1, got {self.blocks_per_stage}")
+        if self.cnn_depth < 1:
+            raise ValueError(f"cnn_depth must be >= 1, got {self.cnn_depth}")
 
 
 def build_encoder(cfg: EncoderConfig) -> Encoder:
     """Assemble the :class:`Encoder` named by ``cfg`` (the one-liner ablation factory).
 
     Looks the trunk and pooling classes up in :data:`TRUNKS` / :data:`POOLINGS` and composes
-    them. The impala-only fields (``residual``, ``blocks_per_stage``) are passed to the trunk
-    ONLY when ``trunk == "impala"``; the nature trunk never receives them. Each ablation cell
-    is a single call::
+    them. The trunk-specific fields are passed ONLY to their trunk: the impala-only fields
+    (``residual``, ``blocks_per_stage``) reach :class:`ImpalaResNet` only when
+    ``trunk == "impala"``, and the dreamer-only ``cnn_depth`` reaches :class:`DreamerCNN` only
+    when ``trunk == "dreamer"``; the :class:`NatureCNN` trunk receives neither. Each ablation
+    cell is a single call::
 
         build_encoder(EncoderConfig("nature", "flatten"))  # "just NatureCNN"
         build_encoder(EncoderConfig("nature", "gap"))
         build_encoder(EncoderConfig("impala", "gap"))                    # IMPALA-residual
         build_encoder(EncoderConfig("impala", "gap", residual=False))    # IMPALA-plain
         build_encoder(EncoderConfig("impala", "gap", blocks_per_stage=3))  # deeper
+        build_encoder(EncoderConfig("dreamer", "flatten"))               # DreamerV3 (small frames)
     """
     if cfg.trunk == "impala":
         trunk: Trunk = ImpalaResNet(
@@ -423,6 +487,8 @@ def build_encoder(cfg: EncoderConfig) -> Encoder:
             blocks_per_stage=cfg.blocks_per_stage,
             residual=cfg.residual,
         )
+    elif cfg.trunk == "dreamer":
+        trunk = DreamerCNN(in_channels=cfg.in_channels, cnn_depth=cfg.cnn_depth)
     else:
         trunk = TRUNKS[cfg.trunk](in_channels=cfg.in_channels)
     pooling = POOLINGS[cfg.pooling]()

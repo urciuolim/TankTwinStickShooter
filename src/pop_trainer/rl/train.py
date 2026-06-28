@@ -60,6 +60,11 @@ from pop_trainer.core.logging_setup import (
     setup_system_logger,
     unity_log_path,
 )
+from pop_trainer.core.obs import (
+    DEFAULT_FRAME_SHAPE,
+    frame_shape_from_config,
+    validate_frame_shape,
+)
 from pop_trainer.core.protocol import Connection
 from pop_trainer.env.tank_env import TankEnv
 from pop_trainer.rl.elo import elo_change
@@ -93,9 +98,10 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 # timeScale<=5). Lives next to the other StreamingAssets configs.
 DEFAULT_TRAIN_CONFIG = _REPO_ROOT / "unity" / "Assets" / "StreamingAssets" / "train_config.json"
 
-# The 640x360 RGB pixel frame Unity renders, channels-LAST (H, W, 3). SB3 auto-applies
-# VecTransposeImage so the extractor sees (N, 3, 360, 640).
-DEFAULT_FRAME_SHAPE = (360, 640, 3)
+# The channels-LAST (H, W, 3) pixel frame is DERIVED from the launched game config's obs_pixels_*
+# (the one source of truth the Unity build also reads); core.DEFAULT_FRAME_SHAPE (640x360, the
+# DriverController default) is only the fallback when a config declares no obs_pixels_* keys. SB3
+# auto-applies VecTransposeImage so the extractor sees (N, 3, H, W).
 
 # Phase-1 round cap (1-min / 300-step rounds — intentional, see the milestone notes).
 DEFAULT_MAX_STEPS = 300
@@ -1035,6 +1041,15 @@ def train_local(cfg: TrainConfig) -> Path:
     set_random_seed(cfg.seed)
     cfg.run_dir.mkdir(parents=True, exist_ok=True)
 
+    # FAIL FAST on a frame_shape <-> game_config desync BEFORE any build launches: the env reads
+    # exactly prod(frame_shape) bytes per frame, so a mismatch with the build's actual obs_pixels
+    # W/H would corrupt every frame. This guards a directly-constructed TrainConfig too (main()
+    # already derives the shape, but this is the anti-silent-desync invariant for any caller). Only
+    # when the config file is actually present — an absent path is the launch's own failure surface
+    # (and the test seam constructs fabricated config paths it never reads).
+    if Path(cfg.game_config).exists():
+        validate_frame_shape(cfg.frame_shape, cfg.game_config)
+
     # Set up the training-system logger (the main process) at the chosen level. INFO by default;
     # DEBUG when the single switch is set. This is purely observational.
     sys_logger = setup_system_logger(cfg.effective_log_dir, level=cfg.log_level)
@@ -1388,10 +1403,15 @@ def main(argv: list[str] | None = None) -> Path:
         level_from_env(debug=args.debug, env_value=os.environ.get(LOG_LEVEL_ENV_VAR))
         == logging.DEBUG
     )
+    # DERIVE the pixel frame_shape from the LAUNCHED config's obs_pixels_* so the env byte-read
+    # matches the build's rendered frame (one source of truth) — no hand-synced constant. Missing
+    # keys fall back to core.DEFAULT_FRAME_SHAPE; a malformed value fails here.
+    frame_shape = frame_shape_from_config(args.config)
     cfg = TrainConfig(
         total_timesteps=args.total_timesteps,
         game_config=args.config,
         run_dir=args.run_dir,
+        frame_shape=frame_shape,
         n_envs=args.n_envs,
         frame_stack=args.frame_stack,
         encoder_checkpoint=args.encoder_checkpoint,
