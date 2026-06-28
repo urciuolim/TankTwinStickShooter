@@ -24,7 +24,7 @@ A supervised **inverse-renderer** that decodes the 52-float wire state from ONE 
 - tank **position** (pos_x,pos_y x2 players) → regression (MSE in normalized space); metric = position error in WORLD units.
 - tank **velocity** (vec_x,vec_y x2) → regression; metric = velocity error.
 - tank **aim** (aim_x,aim_y x2) → per-player COSINE/angular loss (NOT MSE — MSE collapses a unit target to 0); metric = angular error (deg).
-- **bullet presence** (5 slots x2 players = 10 bits; `pos_x < ABSENT_BULLET_SENTINEL`-sentinel = absent) → BCE (pos-weighted for the ~8%-present imbalance); metric = accuracy + F1.
+- **bullet presence** (5 slots x2 players = 10 bits; a slot is absent ONLY when its `pos_x` is the `ABSENT_BULLET_SENTINEL` (-100), tested via `bullet_present` as `pos_x > -50` — NOT `pos_x >= 0`: the arena is origin-centered so left-half bullets have valid negative x) → BCE (pos-weighted for the ~3.3%-present imbalance); metric = accuracy + F1.
 - **bullet position** (present slots only) → MASKED regression (absent slots zeroed + masked out of the loss); metric = position error over present slots.
 
 **Two head families, BOTH reported:**

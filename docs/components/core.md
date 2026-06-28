@@ -10,7 +10,11 @@ from here instead of re-hardcoding them. All JSON is strict.
 - [`core.state`](../../src/pop_trainer/core/state.py) — the **52-float game-state schema**, the
   single source of truth for the wire state Unity emits (`GameController.UpdateState`, the
   frozen RL seam). Layout constants (`STATE_LEN = 52`, P1 = indices 0..25, P2 = 26..51),
-  pure accessors (`position` / `velocity` / `aim` / `iter_bullets`), and the self-play
+  pure accessors (`position` / `velocity` / `aim` / `iter_bullets`, plus `bullet_present` — a
+  bullet slot is occupied iff `pos_x > ABSENT_BULLET_SENTINEL / 2` (i.e. `> -50`), NOT `pos_x >= 0`:
+  the arena is centered on the origin (min x ≈ -8) so real on-board bullets legitimately have
+  negative x, and only the `-100` sentinel marks an absent slot; the `-50` midpoint cleanly
+  separates the two and is robust to float noise — `state.py:132-143`), and the self-play
   **perspective transforms** `flip_frame_perspective` (R/B channel swap on a pixel frame) and
   `split_state_for_opponent` (swap the two 26-float halves). These are consumed **driver-side**:
   the [data](data.md) collection / [demo](demo.md) loops call `split_state_for_opponent` to build

@@ -15,12 +15,38 @@ torch = pytest.importorskip("torch")
 
 from pop_trainer.models import EncoderConfig, build_encoder  # noqa: E402
 from pop_trainer.pretraining import losses  # noqa: E402
+from pop_trainer.pretraining import train as train_mod  # noqa: E402
 from pop_trainer.pretraining.decoder import StateDecoder  # noqa: E402
 from pop_trainer.pretraining.train import TrainConfig, run  # noqa: E402
 
 from ._fixtures import make_fixture  # noqa: E402
 
 SMALL_HW = (180, 320)
+
+
+def test_train_config_split_frac_defaults():
+    cfg = TrainConfig(data_dir="d", out_dir="o")
+    assert cfg.val_frac == 0.2
+    assert cfg.test_frac == 0.2
+
+
+def test_main_parses_split_frac_args(monkeypatch):
+    captured = {}
+
+    def fake_run(cfg):
+        captured["cfg"] = cfg
+        empty_fam = {"spatial": {}, "probe": {}}
+        return {"loss_trajectory": [], "val_metrics": empty_fam, "test_metrics": empty_fam}
+
+    monkeypatch.setattr(train_mod, "run", fake_run)
+    rc = train_mod.main(["--val-frac", "0.3", "--test-frac", "0.25"])
+    assert rc == 0
+    assert captured["cfg"].val_frac == 0.3
+    assert captured["cfg"].test_frac == 0.25
+    # default when omitted
+    train_mod.main([])
+    assert captured["cfg"].val_frac == 0.2
+    assert captured["cfg"].test_frac == 0.2
 
 
 def test_combined_loss_decreases_over_steps():

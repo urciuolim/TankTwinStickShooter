@@ -76,6 +76,30 @@ def test_bullet_presence_and_sentinel_mask():
     assert mask[0, 2] == 0.0
 
 
+def test_negative_x_bullet_is_present_not_absent():
+    # Regression: the arena is centered on the origin, so a bullet at a real NEGATIVE x is a
+    # valid on-board bullet. Only the -100 sentinel marks an absent slot.
+    assert st.bullet_present(-3.0) is True
+    # P1 slot 0 holds a left-half bullet (x=-3.0); P1 slot 1 is the absent sentinel.
+    s = _make_state(
+        p1_pos=(0, 0),
+        p1_vel=(0, 0),
+        p1_aim=(1, 0),
+        p2_pos=(0, 0),
+        p2_vel=(0, 0),
+        p2_aim=(1, 0),
+        bullets={(st.PLAYER_1, 0): (-3.0, -4.0, 1.0, 0.0)},
+    )
+    presence, pos, mask = T.bullet_targets(s[None, :])
+    # Negative-x slot is PRESENT, its position carried through, and UNMASKED.
+    assert presence[0, 0] == 1.0
+    assert pos[0, 0] == -3.0 and pos[0, 1] == -4.0
+    assert mask[0, 0] == 1.0 and mask[0, 1] == 1.0
+    # Sentinel slot (P1 slot 1) is ABSENT and masked out.
+    assert presence[0, 1] == 0.0
+    assert mask[0, 2] == 0.0 and mask[0, 3] == 0.0
+
+
 def test_fit_norm_stats_bullet_present_only_and_no_leak():
     # Train states: bullet present only in a couple of rows; absent sentinels must NOT skew stats.
     rng = np.random.default_rng(0)

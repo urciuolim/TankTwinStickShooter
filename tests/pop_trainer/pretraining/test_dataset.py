@@ -6,6 +6,8 @@ produces the expected (C, H, W) per resolution, and target extraction matches th
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 import pytest
 
@@ -80,6 +82,20 @@ def test_stats_fit_on_train_only(tmp_path):
     # all three views share the same TRAIN-fit stats object
     assert splits.train.stats is splits.val.stats
     assert splits.val.stats is splits.test.stats
+
+
+def test_build_splits_logs_counts_and_warns_on_thin_split(tmp_path, caplog):
+    # 4 maps with the default 0.2/0.2: val/test each seat round(0.2*4)=1 map (<2) -> warning.
+    make_fixture(tmp_path, n_maps=4, workers=2, shards_per_worker=2)
+    with caplog.at_level(logging.INFO, logger="pop_trainer.pretraining.dataset"):
+        build_splits(tmp_path, resolution=360, seed=0)
+    info_msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+    # per-split map counts + sample fractions are surfaced at INFO
+    assert any("split val:" in m and "maps" in m for m in info_msgs)
+    assert any("split train:" in m for m in info_msgs)
+    # the single-map val/test splits raise a WARNING
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("seats only 1 map" in m for m in warnings)
 
 
 def test_limit_subsets(tmp_path):

@@ -34,7 +34,10 @@ training), per `__init__.py:19`.
 - [`pretraining.targets`](../../src/pop_trainer/pretraining/targets.py) — **pure numpy,
   torch-free** per-group target extraction + TRAIN-fit normalization. Reads via the
   [`core.state`](core.md) named accessors / index constants (`PLAYER_STRIDE`, `POS_X`/`POS_Y`,
-  `bullet_field_indices`, …), **never magic indices** (`targets.py:62-119`).
+  `bullet_field_indices`, …), **never magic indices** (`targets.py:62-119`). The bullet-presence
+  rule is **not duplicated here**: `bullet_targets` delegates to [`core.state.bullet_present`](core.md)
+  (single source of truth — a slot is present iff `pos_x > -50`, the `-100`-sentinel midpoint, NOT
+  `pos_x >= 0`; `targets.py:117`).
   [`fit_norm_stats`](../../src/pop_trainer/pretraining/targets.py) fits per-field
   [`NormStats`](../../src/pop_trainer/pretraining/targets.py) on the **TRAIN split ONLY** (no
   val/test leak): position/velocity standardized over every row, bullet position over **present
@@ -73,7 +76,7 @@ the spatial heads AND the detached probe, so both families are reported with one
 | `player_position` `(N,4)` | standardized over all rows | **MSE** in normalized space | mean **L2 error in WORLD units** (de-normalized) |
 | `player_velocity` `(N,4)` | standardized over all rows | **MSE** in normalized space | mean **L2 error in WORLD units** |
 | `player_aim` `(N,4)` | left **raw** (unit direction) | per-player **COSINE distance** `1-cos` (NOT MSE — MSE collapses a unit target toward 0) | mean per-player **angular error in DEGREES** |
-| `bullet_presence` `(N,10)` | {0,1}, slot present iff its `pos_x` is on-board | pos-weighted **BCE-with-logits** (`pos_weight = absent/present`, fit on TRAIN) | accuracy / precision / recall / **F1** |
+| `bullet_presence` `(N,10)` | {0,1}, slot present iff `core.state.bullet_present(pos_x)` (`pos_x > -50`) | pos-weighted **BCE-with-logits** (`pos_weight = absent/present`, fit on TRAIN) | accuracy / precision / recall / **F1** |
 | `bullet_position` `(N,20)` | standardized over **present slots only**; absent slots zeroed | **MASKED MSE** (absent slots excluded from numerator AND denominator) | **L2 error in WORLD units** over present slots |
 
 The masked bullet-position loss (`bullet_position_masked_mse`, `losses.py:96-108`) divides the
@@ -99,8 +102,15 @@ group key = `map_id`, so no map leaks across train/val/test, `dataset.py:192` �
   deterministic **area** interpolation (`dataset.py:45-61`). Frames are `uint8 (H,W,3)` →
   float32 `[0,1]` NCHW.
 - [`build_splits`](../../src/pop_trainer/pretraining/dataset.py) wires the index + split +
-  **TRAIN-only** `NormStats` consistently across the three views (`dataset.py:174-208`); `limit`
-  caps the total indexed samples for smoke runs. The subset is **shard-local**: `_subset_index`
+  **TRAIN-only** `NormStats` consistently across the three views (`dataset.py:177-217`); `limit`
+  caps the total indexed samples for smoke runs. It **defaults to a 60/20/20 map-aware split**
+  (`val_frac=0.2`, `test_frac=0.2`, `dataset.py:182-183`). The split allocates by map COUNT
+  (`round(frac * G)`), so with only ~10 maps the old 0.1/0.1 seated a **single** arena per val/test
+  split (high-variance, one geometry); 0.2 seats **>=2 maps** each at G=10. `build_splits` logs the
+  realized per-split map count + sample fraction at **INFO** and **WARNs** when a split seats `<2`
+  maps (`_log_split_visibility`, `dataset.py:223-252`). This logging lives **only in the dataset.py
+  wrapper** — the underlying [`DatasetIndex.split`](data.md) / `data.readers.split_groups` stay
+  **PURE** (grouped map-aware split, no logging). The subset is **shard-local**: `_subset_index`
   spreads the budget evenly across shards and keeps a **contiguous per-shard prefix** of rows
   (not a global stride), so a smoke still touches each shard once per pass and preserves map
   coverage (`dataset.py:211-240`).
@@ -146,10 +156,12 @@ per-group for **both families** (`evaluate`, `train.py:121-150`), writes a **che
 `results.json` (`json.dump(..., allow_nan=False)`, with NaN/Inf sanitized to `0.0` via `_finite` /
 `_sanitize`, `train.py:205-260`). Device-agnostic via `--device` (auto → cuda > mps > cpu).
 
-Key flags (`train.py:265-284`): `--trunk {nature,impala}`, `--pooling {gap,flatten}`,
+Key flags (`train.py:356-395`): `--trunk {nature,impala}`, `--pooling {gap,flatten}`,
 `--resolution {360,180,90}`, `--epochs`, `--batch-size`, `--lr`, `--subset`/`--limit` (alias,
-caps total indexed samples), `--seed`, `--device`, `--num-workers`. Defaults: `--data
-datasets/decode-v1`, `--out runs/decode-smoke`.
+caps total indexed samples), `--val-frac` / `--test-frac` (map-aware split fractions **by map
+COUNT**, both default **0.2** for a 60/20/20 split that seats >=2 maps at G=10, `train.py:368-377`),
+`--seed`, `--device`, `--num-workers`. Defaults: `--data datasets/decode-v1`, `--out
+runs/decode-smoke`.
 
 ### profile — `python -m pop_trainer.pretraining.profile`
 

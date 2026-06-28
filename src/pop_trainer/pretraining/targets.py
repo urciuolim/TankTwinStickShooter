@@ -114,7 +114,7 @@ def bullet_targets(states: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarr
         py = states[:, idx + st.BULLET_POS_Y]
         pos[:, slot * 2] = px
         pos[:, slot * 2 + 1] = py
-        presence[:, slot] = (px >= 0).astype(np.float32)
+        presence[:, slot] = st.bullet_present(px).astype(np.float32)
     slot_mask = np.repeat(presence, 2, axis=1).astype(np.float32)
     return presence, pos, slot_mask
 
@@ -219,7 +219,7 @@ def fit_norm_stats(states: np.ndarray, *, eps: float = 1e-6) -> NormStats:
 def presence_pos_weight(presence: np.ndarray, *, fallback: float = 1.0) -> float:
     """BCE positive-class weight for bullet presence: ``(#absent) / (#present)``.
 
-    Bullet slots are overwhelmingly absent (~1% present), so plain BCE collapses to
+    Bullet slots are overwhelmingly absent (~3.3% present), so plain BCE collapses to
     "always absent". A ``pos_weight`` of absent/present re-balances the loss. Compute on the
     TRAIN presence targets ONLY (no leak). Falls back to ``fallback`` if no slots are present.
     """

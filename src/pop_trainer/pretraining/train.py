@@ -64,6 +64,8 @@ class TrainConfig:
     lr: float = 3e-4
     seed: int = 0
     device: str = "auto"
+    val_frac: float = 0.2
+    test_frac: float = 0.2
     subset: int | None = None
     num_workers: int = 0
     progress: bool = True
@@ -216,7 +218,14 @@ def run(cfg: TrainConfig) -> dict:
     device = torch.device(resolve_device(cfg.device))
     h, w = input_hw(cfg.resolution)
 
-    splits = build_splits(cfg.data_dir, resolution=cfg.resolution, seed=cfg.seed, limit=cfg.subset)
+    splits = build_splits(
+        cfg.data_dir,
+        resolution=cfg.resolution,
+        seed=cfg.seed,
+        val_frac=cfg.val_frac,
+        test_frac=cfg.test_frac,
+        limit=cfg.subset,
+    )
     encoder = build_encoder(EncoderConfig(trunk=cfg.trunk, pooling=cfg.pooling))
     model = StateDecoder(encoder, (h, w)).to(device)
 
@@ -356,6 +365,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="auto")
     parser.add_argument(
+        "--val-frac",
+        type=float,
+        default=0.2,
+        help="map-aware val fraction by map COUNT; 0.2 seats >=2 maps at G=10 (default).",
+    )
+    parser.add_argument(
+        "--test-frac",
+        type=float,
+        default=0.2,
+        help="map-aware test fraction by map COUNT; 0.2 seats >=2 maps at G=10 (default).",
+    )
+    parser.add_argument(
         "--subset",
         "--limit",
         dest="subset",
@@ -393,6 +414,8 @@ def main(argv: list[str] | None = None) -> int:
         lr=args.lr,
         seed=args.seed,
         device=args.device,
+        val_frac=args.val_frac,
+        test_frac=args.test_frac,
         subset=args.subset,
         num_workers=args.num_workers,
         progress=args.progress,

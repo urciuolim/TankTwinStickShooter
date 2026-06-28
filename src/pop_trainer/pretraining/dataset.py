@@ -1,7 +1,7 @@
 """Shard-streaming dataset for the single-frame decoder (torch ``Dataset``).
 
 Builds a :class:`~pop_trainer.data.readers.DatasetIndex` over a decode-v1 directory, splits it
-map-aware (group key = ``map_id``, 80/10/10, no leak), and serves ``(frame, target_dict)`` rows
+map-aware (group key = ``map_id``, 60/20/20 default, no leak), and serves ``(frame, target_dict)`` rows
 by lazily fetching one frame from its shard. The last-read shard's arrays are cached so a run of
 rows in the same shard does not re-open the ``.npz`` every ``__getitem__`` — but frames are
 never bulk-loaded into RAM.
@@ -25,6 +25,7 @@ torch + numpy + :mod:`pop_trainer.data` + :mod:`pop_trainer.pretraining.targets`
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import numpy as np
@@ -36,6 +37,8 @@ from pop_trainer.data import readers, schema, shards
 from pop_trainer.pretraining import targets as T
 
 __all__ = ["RESOLUTIONS", "DecodeDataset", "SplitDatasets", "build_splits"]
+
+logger = logging.getLogger(__name__)
 
 # Allowed target heights for the load-time downsample (native frame height is 360).
 RESOLUTIONS: tuple[int, ...] = (360, 180, 90)
@@ -176,8 +179,8 @@ def build_splits(
     *,
     resolution: int = 180,
     seed: int = 0,
-    val_frac: float = 0.1,
-    test_frac: float = 0.1,
+    val_frac: float = 0.2,
+    test_frac: float = 0.2,
     limit: int | None = None,
     pattern: str = "**/shard_*.npz",
 ) -> SplitDatasets:
@@ -188,6 +191,11 @@ def build_splits(
     TRAIN split ONLY, and returns the three views sharing that index + stats. ``limit`` caps the
     TOTAL number of indexed samples (a deterministic stride subset) for smoke runs. Raises
     ``ValueError`` if the recursive glob finds no shards.
+
+    The split allocates by map COUNT (``round(frac * G)``), so with only ~10 maps smaller
+    fractions produce a single-map val/test split; the default 0.2/0.2 seats >=2 maps each at
+    G=10. The realized per-split map counts + sample fractions are logged at INFO, with a WARNING
+    when any split seats fewer than 2 maps.
     """
     data_dir = Path(data_dir)
     index = readers.build_index(data_dir, pattern=pattern)
@@ -199,6 +207,7 @@ def build_splits(
 
     shard_paths = _resolve_shard_paths(data_dir, index.shard_files, pattern)
     split = index.split(val_frac=val_frac, test_frac=test_frac, seed=seed)
+    _log_split_visibility(split, total=len(index))
     train_states = _collect_train_states(shard_paths, index, split.train)
     stats = T.fit_norm_stats(train_states)
 
@@ -206,6 +215,44 @@ def build_splits(
         return DecodeDataset(shard_paths, index, idxs, stats, resolution)
 
     return SplitDatasets(view(split.train), view(split.val), view(split.test), stats)
+
+
+_MIN_MAPS_PER_SPLIT = 2
+
+
+def _log_split_visibility(split: readers.Split, *, total: int) -> None:
+    """Log the realized per-split map COUNTS + SAMPLE fractions; warn on a thin (<2 map) split.
+
+    Surfaces the map-aware split's allocation (which seats whole maps, not rows) so a degenerate
+    single-map val/test split is observable. PURE-side-effect: reads the already-computed
+    :class:`~pop_trainer.data.readers.Split` (its group-id + sample-index arrays) and only logs;
+    it does not alter the split.
+    """
+    samples = (split.train, split.val, split.test)
+    groups = (split.train_groups, split.val_groups, split.test_groups)
+    denom = max(1, total)
+    for name, idxs, grp in zip(_SPLIT_LOG_NAMES, samples, groups, strict=True):
+        n_maps = int(grp.shape[0])
+        frac = float(idxs.shape[0]) / denom
+        logger.info(
+            "split %s: %d maps, %d samples (%.3f of %d)",
+            name,
+            n_maps,
+            int(idxs.shape[0]),
+            frac,
+            total,
+        )
+        if n_maps < _MIN_MAPS_PER_SPLIT:
+            logger.warning(
+                "split %s seats only %d map(s) (<%d): val/test on a single arena is "
+                "low-signal; raise val_frac/test_frac (default 0.2 seats >=2 maps at G=10)",
+                name,
+                n_maps,
+                _MIN_MAPS_PER_SPLIT,
+            )
+
+
+_SPLIT_LOG_NAMES = ("train", "val", "test")
 
 
 def _subset_index(index: readers.DatasetIndex, limit: int) -> readers.DatasetIndex:
