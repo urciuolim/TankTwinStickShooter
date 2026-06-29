@@ -234,7 +234,9 @@ def test_memory_bound(tmp_path):
     """Peak resident frame memory stays bounded to ~two shards, not a full-dataset load."""
     src = tmp_path / "src"
     out = tmp_path / "out"
-    n_shards, rows_per_shard = 8, 60
+    # Shards big enough that frame bytes dominate fixed per-process allocation, so the real
+    # tracemalloc peak is a meaningful multiple of one shard's frames (see FACTOR below).
+    n_shards, rows_per_shard = 8, 800
     _write_source(src, n_shards=n_shards, rows_per_shard=rows_per_shard)
 
     frame_bytes_per_shard = rows_per_shard * HW[0] * HW[1] * schema.FRAME_CHANNELS
@@ -262,11 +264,17 @@ def test_memory_bound(tmp_path):
 
     # never more than one source shard's frames alive during scatter
     assert max_live_shards == 1
-    # probe-reported resident frames bounded to ~2 shards (shard + pack buffer / one bucket)
+    # peak_resident is the code's OWN accounting of resident frame bytes (reported to the
+    # probe), so these two bounds check the algorithm's self-reported footprint, not RSS.
     assert peak_resident <= 3 * frame_bytes_per_shard
     assert peak_resident < total_frame_bytes
-    # real measured peak (tracemalloc sees numpy buffers here) is far below a full load
-    assert tm_peak < total_frame_bytes
+    # Independent cross-check on the REAL process allocation (tracemalloc): the correct
+    # two-pass algorithm peaks at ~4-5 shard-sized frame copies here (one loaded shard/bucket
+    # plus its pass-2 permute + compression transients), so FACTOR=6 passes with margin yet
+    # stays well under an 8-shard full load (which would need >=8x) — catching a regression
+    # that abandoned out-of-core streaming and loaded the dataset whole.
+    factor = 6
+    assert tm_peak < factor * frame_bytes_per_shard
 
 
 def test_no_actions_dataset(tmp_path):
@@ -297,6 +305,7 @@ def test_manifest_strict_json_and_data_card(tmp_path):
     )
 
     manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    src_manifest = json.loads((src / "manifest.json").read_text(encoding="utf-8"))
     # strict serialize (no NaN/Inf) must succeed
     json.dumps(manifest, allow_nan=False)
     for key in (
@@ -309,6 +318,14 @@ def test_manifest_strict_json_and_data_card(tmp_path):
         "machine",
     ):
         assert key in manifest
+    # LOAD-BEARING (issue #13): the derived dataset's identity is its OWN name, distinct from
+    # the source's, so a future manifest_id hashing `dataset` diverges from the source's id.
+    assert manifest["dataset"] == out.name
+    assert manifest["dataset"] != src_manifest["dataset"]
+    assert src_manifest["dataset"] == "synthetic-src"
+    # NO new top-level keys vs the source: provenance (source path/seed/split-mode) lives in
+    # `descriptions`, not a structured derived_from/content_id (that is #13 territory).
+    assert set(manifest) == set(src_manifest)
     assert manifest["collection"]["command"][0] == "shuffle_dataset" or manifest["collection"][
         "command"
     ][0].startswith("python")

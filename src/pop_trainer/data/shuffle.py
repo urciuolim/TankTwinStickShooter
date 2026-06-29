@@ -30,8 +30,11 @@ frame memory is bounded to ~TWO output shards, regardless of dataset size.
   resident.
 * Pass 2 (permute): load each bucket's spill (sized ~one output shard, fits in RAM),
   permute its rows with a per-bucket seeded rng, write the final ``.npz`` via
-  :func:`pop_trainer.data.shards.write_shard`, then DELETE the spill — so peak DISK is
-  bounded to ~the dataset plus one output shard, never doubled.
+  :func:`pop_trainer.data.shards.write_shard`, then DELETE the spill. The per-bucket spills
+  are raw UNCOMPRESSED records whereas the source ``.npz`` is ``savez_compressed``, so peak
+  DISK is ~ the compressed source + the uncompressed spill volume (~the uncompressed frame
+  volume, e.g. ~83 GB on the real set) + one output shard — NOT "~the dataset" (which would
+  misread as the compressed footprint). The RAM bound (~two output shards) is unaffected.
 
 ROW ALIGNMENT: every per-frame array (``frames``/``states``/``map_ids``/
 ``episode_ids``/``step_idxs``/``actions``) is scattered and permuted by the SAME index
@@ -587,6 +590,9 @@ def shuffle_dataset(
 
         def route(mids: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
             codes = code_lut[mids]
+            assert (codes >= 0).all(), (
+                "unassigned (-1) map id in split LUT; would route rows to a garbage bucket"
+            )
             gc = np.empty(mids.shape[0], dtype=np.int64)
             bk = np.empty(mids.shape[0], dtype=np.int64)
             for code, name in enumerate(SPLIT_NAMES):
