@@ -49,6 +49,46 @@ def test_main_parses_split_frac_args(monkeypatch):
     assert captured["cfg"].test_frac == 0.2
 
 
+def test_parse_group_weights_valid():
+    parsed = train_mod.parse_group_weights(["player_aim=5.0", "bullet_presence=2"])
+    assert parsed == {"player_aim": 5.0, "bullet_presence": 2.0}
+
+
+def test_parse_group_weights_empty_and_none():
+    assert train_mod.parse_group_weights([]) == {}
+    assert train_mod.parse_group_weights(None) == {}
+
+
+def test_parse_group_weights_unknown_group():
+    with pytest.raises(ValueError, match="unknown group"):
+        train_mod.parse_group_weights(["not_a_group=1.0"])
+
+
+def test_parse_group_weights_malformed_token():
+    with pytest.raises(ValueError, match="malformed"):
+        train_mod.parse_group_weights(["player_aim"])
+    with pytest.raises(ValueError, match="malformed"):
+        train_mod.parse_group_weights(["player_aim=abc"])
+
+
+def test_main_parses_group_and_pos_weight_args(monkeypatch):
+    captured = {}
+
+    def fake_run(cfg):
+        captured["cfg"] = cfg
+        empty_fam = {"spatial": {}, "probe": {}}
+        return {"loss_trajectory": [], "val_metrics": empty_fam, "test_metrics": empty_fam}
+
+    monkeypatch.setattr(train_mod, "run", fake_run)
+    train_mod.main(["--group-weights", "player_aim=5.0", "--presence-pos-weight", "12.5"])
+    assert captured["cfg"].group_weights == {"player_aim": 5.0}
+    assert captured["cfg"].presence_pos_weight == 12.5
+    # omitting both leaves the default (byte-identical) path: None / None.
+    train_mod.main([])
+    assert captured["cfg"].group_weights is None
+    assert captured["cfg"].presence_pos_weight is None
+
+
 def test_combined_loss_decreases_over_steps():
     torch.manual_seed(0)
     model = StateDecoder(build_encoder(EncoderConfig("nature", "gap")), SMALL_HW, hidden=32)
@@ -110,3 +150,13 @@ def test_run_end_to_end_writes_strict_json(tmp_path):
         assert {"player_position", "player_aim", "bullet_presence", "bullet_position"} <= groups
     # loss trajectory has one entry per epoch
     assert len(record["loss_trajectory"]) == 2
+    # presence calibration: spatial family, a selected threshold, and val/test metric dicts.
+    cal = loaded["presence_calibration"]
+    assert cal["family"] == "spatial"
+    assert isinstance(cal["selected_threshold"], float)
+    for split in ("val", "test"):
+        assert {"accuracy", "precision", "recall", "f1"} <= set(cal[split])
+    # self-describing config carries the effective per-group weights + the pos_weight override.
+    cfg_json = loaded["config"]
+    assert set(cfg_json["group_weights"]) == set(losses.DEFAULT_GROUP_WEIGHTS)
+    assert cfg_json["presence_pos_weight_override"] is None

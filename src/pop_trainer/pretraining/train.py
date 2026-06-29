@@ -43,6 +43,7 @@ from pop_trainer.pretraining.targets import NormStats, presence_pos_weight
 
 __all__ = [
     "TrainConfig",
+    "parse_group_weights",
     "build_train_loader",
     "seed_everything",
     "should_eval_epoch",
@@ -79,6 +80,32 @@ class TrainConfig:
     shard_window: int = DEFAULT_SHARD_WINDOW
     heatmap_weight: float = losses.DEFAULT_HEATMAP_WEIGHT
     heatmap_sigma: float = losses.DEFAULT_HEATMAP_SIGMA
+    group_weights: dict[str, float] | None = None
+    presence_pos_weight: float | None = None
+
+
+def parse_group_weights(items: list[str] | None) -> dict[str, float]:
+    """PURE: parse ``["player_aim=5.0", "bullet_presence=2"]`` into ``{name: float}``.
+
+    Each token is ``name=value``; ``name`` must be one of :data:`losses.DEFAULT_GROUP_WEIGHTS`
+    and ``value`` must parse as a float. Empty / ``None`` input returns ``{}`` (the default-weight
+    path). Raises ``ValueError`` on an unknown group name or a malformed token.
+    """
+    if not items:
+        return {}
+    out: dict[str, float] = {}
+    for token in items:
+        name, sep, raw = token.partition("=")
+        if not sep or not name:
+            raise ValueError(f"malformed group weight {token!r}; expected NAME=VALUE")
+        if name not in losses.DEFAULT_GROUP_WEIGHTS:
+            valid = ", ".join(sorted(losses.DEFAULT_GROUP_WEIGHTS))
+            raise ValueError(f"unknown group {name!r}; valid groups: {valid}")
+        try:
+            out[name] = float(raw)
+        except ValueError as exc:
+            raise ValueError(f"malformed group weight {token!r}; value must be a float") from exc
+    return out
 
 
 def should_eval_epoch(epoch: int, *, eval_every: int, total_epochs: int) -> bool:
@@ -124,6 +151,7 @@ def train_one_epoch(
     device: torch.device,
     *,
     pos_weight: float | None,
+    weights: dict[str, float] | None = None,
     heatmap_weight: float = losses.DEFAULT_HEATMAP_WEIGHT,
     heatmap_sigma: float = losses.DEFAULT_HEATMAP_SIGMA,
     on_batch: Callable[[int, float, float], None] | None = None,
@@ -153,6 +181,7 @@ def train_one_epoch(
         spatial_total, _ = losses.combined_loss(
             out["spatial"],
             targets,
+            weights=weights,
             presence_pos_weight=pos_weight,
             score_logits=out["spatial_score_logits"],
             heatmap_weight=heatmap_weight,
@@ -163,7 +192,9 @@ def train_one_epoch(
         spatial_total.backward()
         spatial_opt.step()
 
-        probe_total, _ = losses.probe_loss(out["probe"], targets, presence_pos_weight=pos_weight)
+        probe_total, _ = losses.probe_loss(
+            out["probe"], targets, weights=weights, presence_pos_weight=pos_weight
+        )
         probe_opt.zero_grad(set_to_none=True)
         probe_total.backward()
         probe_opt.step()
@@ -179,14 +210,14 @@ def train_one_epoch(
 
 
 @torch.no_grad()
-def evaluate(
-    model: StateDecoder, loader: DataLoader, device: torch.device, stats: NormStats
-) -> dict[str, dict]:
-    """Evaluate per-group metrics for both head families over ``loader`` (concatenated).
+def _accumulate(
+    model: StateDecoder, loader: DataLoader, device: torch.device
+) -> tuple[dict[str, dict[str, torch.Tensor]], dict[str, torch.Tensor]]:
+    """Run one forward pass over ``loader``, returning concatenated preds + targets.
 
-    Accumulates predictions / targets across the loader and computes the metrics once, so
-    presence F1 / world-unit errors are over the whole split. Returns
-    ``{"spatial": {...}, "probe": {...}}``.
+    Returns ``({"spatial": {group: tensor}, "probe": {group: tensor}}, {group: tensor})`` with
+    predictions detached on CPU. The families share the single forward pass per batch so callers
+    can derive metrics (or calibrate a threshold) without re-running the model.
     """
     model.eval()
     fam_preds: dict[str, dict[str, list]] = {"spatial": {}, "probe": {}}
@@ -201,13 +232,27 @@ def evaluate(
             tgt_acc.setdefault(k, []).append(v)
 
     if not tgt_acc:
-        return {"spatial": {}, "probe": {}}
+        return {"spatial": {}, "probe": {}}, {}
     targets_cat = {k: torch.cat(v, dim=0) for k, v in tgt_acc.items()}
-    result: dict[str, dict] = {}
+    preds_cat: dict[str, dict[str, torch.Tensor]] = {}
     for fam in ("spatial", "probe"):
-        preds_cat = {k: torch.cat(v, dim=0) for k, v in fam_preds[fam].items()}
-        result[fam] = metrics.group_metrics(preds_cat, targets_cat, stats)
-    return result
+        preds_cat[fam] = {k: torch.cat(v, dim=0) for k, v in fam_preds[fam].items()}
+    return preds_cat, targets_cat
+
+
+def evaluate(
+    model: StateDecoder, loader: DataLoader, device: torch.device, stats: NormStats
+) -> dict[str, dict]:
+    """Evaluate per-group metrics for both head families over ``loader`` (concatenated).
+
+    Accumulates predictions / targets across the loader and computes the metrics once, so
+    presence F1 / world-unit errors are over the whole split. Returns
+    ``{"spatial": {...}, "probe": {...}}``.
+    """
+    fam_preds, targets_cat = _accumulate(model, loader, device)
+    if not targets_cat:
+        return {"spatial": {}, "probe": {}}
+    return {fam: metrics.group_metrics(fam_preds[fam], targets_cat, stats) for fam in fam_preds}
 
 
 def _fit_pos_weight(train_ds: Dataset, *, cap: int = 4096) -> float:
@@ -274,7 +319,11 @@ def run(cfg: TrainConfig) -> dict:
 
     spatial_opt = torch.optim.Adam(model.spatial_parameters(), lr=cfg.lr)
     probe_opt = torch.optim.Adam(model.probe_parameters(), lr=cfg.lr)
-    pos_weight = _fit_pos_weight(splits.train)
+    pos_weight = (
+        cfg.presence_pos_weight
+        if cfg.presence_pos_weight is not None
+        else _fit_pos_weight(splits.train)
+    )
 
     train_loader, train_sampler = build_train_loader(
         splits.train,
@@ -304,6 +353,7 @@ def run(cfg: TrainConfig) -> dict:
             probe_opt,
             device,
             pos_weight=pos_weight,
+            weights=cfg.group_weights,
             heatmap_weight=cfg.heatmap_weight,
             heatmap_sigma=cfg.heatmap_sigma,
             on_batch=reporter.on_batch,
@@ -334,8 +384,23 @@ def run(cfg: TrainConfig) -> dict:
                 flush=True,
             )
 
-    val_metrics = evaluate(model, val_loader, device, splits.stats)
-    test_metrics = evaluate(model, test_loader, device, splits.stats)
+    val_preds, val_targets = _accumulate(model, val_loader, device)
+    test_preds, test_targets = _accumulate(model, test_loader, device)
+    val_metrics = (
+        {fam: metrics.group_metrics(val_preds[fam], val_targets, splits.stats) for fam in val_preds}
+        if val_targets
+        else {"spatial": {}, "probe": {}}
+    )
+    test_metrics = (
+        {
+            fam: metrics.group_metrics(test_preds[fam], test_targets, splits.stats)
+            for fam in test_preds
+        }
+        if test_targets
+        else {"spatial": {}, "probe": {}}
+    )
+
+    presence_calibration = _calibrate_presence(val_preds, val_targets, test_preds, test_targets)
 
     out_dir = Path(cfg.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -362,12 +427,52 @@ def run(cfg: TrainConfig) -> dict:
         "val_trajectory": _sanitize(val_trajectory),
         "val_metrics": _sanitize(val_metrics),
         "test_metrics": _sanitize(test_metrics),
+        "presence_calibration": _sanitize(presence_calibration),
         "norm_stats": splits.stats.to_json(),
         "grid_extent": splits.extent.to_json(),
     }
     with open(out_dir / "results.json", "w", encoding="utf-8") as fh:
         json.dump(record, fh, indent=2, allow_nan=False)
     return record
+
+
+def _calibrate_presence(
+    val_preds: dict[str, dict[str, torch.Tensor]],
+    val_targets: dict[str, torch.Tensor],
+    test_preds: dict[str, dict[str, torch.Tensor]],
+    test_targets: dict[str, torch.Tensor],
+) -> dict:
+    """Pick a presence logit threshold on VAL spatial presence and report it on val + test.
+
+    Calibrates on the SPATIAL family only (the encoder readout we ship; the probe is diagnostic).
+    The threshold maximizes F1 on VAL ``bullet_presence`` logits + targets, then the SAME threshold
+    is applied to TEST — no val/test leak. Reported alongside the untouched threshold-0 presence F1
+    in ``val_metrics`` / ``test_metrics``.
+    """
+    val_logits = val_preds.get("spatial", {}).get("bullet_presence")
+    if val_logits is None or "bullet_presence" not in val_targets:
+        return {
+            "family": "spatial",
+            "selected_threshold": 0.0,
+            "val": {"accuracy": 0.0, "precision": 0.0, "recall": 0.0, "f1": 0.0},
+            "test": {"accuracy": 0.0, "precision": 0.0, "recall": 0.0, "f1": 0.0},
+        }
+    threshold, val_at = metrics.select_presence_threshold(
+        val_logits, val_targets["bullet_presence"]
+    )
+    test_logits = test_preds.get("spatial", {}).get("bullet_presence")
+    if test_logits is None or "bullet_presence" not in test_targets:
+        test_at = {"accuracy": 0.0, "precision": 0.0, "recall": 0.0, "f1": 0.0}
+    else:
+        test_at = metrics.presence_metrics_at_threshold(
+            test_logits, test_targets["bullet_presence"], threshold
+        )
+    return {
+        "family": "spatial",
+        "selected_threshold": _finite(threshold),
+        "val": val_at,
+        "test": test_at,
+    }
 
 
 def _config_json(cfg: TrainConfig) -> dict:
@@ -385,6 +490,8 @@ def _config_json(cfg: TrainConfig) -> dict:
         "shard_window": cfg.shard_window,
         "heatmap_weight": cfg.heatmap_weight,
         "heatmap_sigma": cfg.heatmap_sigma,
+        "group_weights": {**losses.DEFAULT_GROUP_WEIGHTS, **(cfg.group_weights or {})},
+        "presence_pos_weight_override": cfg.presence_pos_weight,
     }
 
 
@@ -477,7 +584,28 @@ def main(argv: list[str] | None = None) -> int:
         default=losses.DEFAULT_HEATMAP_SIGMA,
         help="Gaussian target std in grid CELLS for the heatmap cross-entropy.",
     )
+    parser.add_argument(
+        "--group-weights",
+        nargs="*",
+        metavar="GROUP=W",
+        default=None,
+        help=(
+            "up-weight specific per-group losses in BOTH head families, e.g. "
+            "--group-weights player_aim=5.0 bullet_presence=2.0. Unlisted groups stay 1.0. "
+            "Omit the flag for the default unit weighting."
+        ),
+    )
+    parser.add_argument(
+        "--presence-pos-weight",
+        type=float,
+        default=None,
+        help=(
+            "override the auto-fit bullet-presence pos_weight; when omitted it is auto-fit "
+            "from TRAIN."
+        ),
+    )
     args = parser.parse_args(argv)
+    group_weights = parse_group_weights(args.group_weights)
 
     cfg = TrainConfig(
         data_dir=args.data,
@@ -499,6 +627,8 @@ def main(argv: list[str] | None = None) -> int:
         shard_window=args.shard_window,
         heatmap_weight=args.heatmap_weight,
         heatmap_sigma=args.heatmap_sigma,
+        group_weights=group_weights or None,
+        presence_pos_weight=args.presence_pos_weight,
     )
     record = run(cfg)
 

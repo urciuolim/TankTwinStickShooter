@@ -53,6 +53,64 @@ def test_presence_metrics_f1():
     assert m["accuracy"] == 0.5
 
 
+def test_presence_metrics_at_threshold_matches_zero():
+    logits = np.array([[5.0, -5.0, 5.0, -5.0]])
+    target = np.array([[1.0, 1.0, 0.0, 0.0]])
+    assert metrics.presence_metrics_at_threshold(logits, target, 0.0) == metrics.presence_metrics(
+        logits, target
+    )
+
+
+def test_presence_metrics_at_threshold_shifts_predictions():
+    # logits 1,2,3,4; targets present at the two HIGH slots (3,4).
+    logits = np.array([[1.0, 2.0, 3.0, 4.0]])
+    target = np.array([[0.0, 0.0, 1.0, 1.0]])
+    # threshold 0 -> predicts all present: recall 1.0, precision 0.5.
+    low = metrics.presence_metrics_at_threshold(logits, target, 0.0)
+    assert low["recall"] == 1.0
+    assert low["precision"] == 0.5
+    # threshold 2.5 -> predicts only the two high slots present: perfect.
+    high = metrics.presence_metrics_at_threshold(logits, target, 2.5)
+    assert high["precision"] == 1.0
+    assert high["recall"] == 1.0
+    assert high["f1"] == 1.0
+
+
+def test_select_presence_threshold_lifts_f1():
+    # threshold-0 F1 is poor (many false positives); a positive threshold separates cleanly.
+    logits = np.array([[1.0, 1.2, 0.8, 5.0, 6.0, 5.5]])
+    target = np.array([[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]])
+    f1_at_zero = metrics.presence_metrics(logits, target)["f1"]
+    thr, sel = metrics.select_presence_threshold(logits, target)
+    assert sel["f1"] > f1_at_zero
+    assert sel["f1"] == 1.0
+    # the selected threshold lands between the negative and positive clusters.
+    assert 1.2 <= thr < 5.0
+    # applying the SAME threshold to a held-out array with identical structure works.
+    held = np.array([[0.9, 1.1, 5.2, 6.1]])
+    held_tgt = np.array([[0.0, 0.0, 1.0, 1.0]])
+    held_m = metrics.presence_metrics_at_threshold(held, held_tgt, thr)
+    assert held_m["f1"] == 1.0
+
+
+def test_select_presence_threshold_empty():
+    thr, m = metrics.select_presence_threshold(np.zeros((0, 10)), np.zeros((0, 10)))
+    assert thr == 0.0
+    assert m == {"accuracy": 0.0, "precision": 0.0, "recall": 0.0, "f1": 0.0}
+
+
+def test_select_presence_threshold_tiebreak_smallest():
+    # all-present target: every candidate threshold below the data yields perfect F1; the
+    # ascending scan keeps only STRICTLY greater F1, so the smallest tying threshold wins.
+    logits = np.array([[1.0, 2.0, 3.0]])
+    target = np.array([[1.0, 1.0, 1.0]])
+    thr, m = metrics.select_presence_threshold(logits, target)
+    assert m["f1"] == 1.0
+    # candidates are [min-1, 1, 2, 3]; min-1 == 0.0 already predicts all present (perfect),
+    # so the tie-break picks it.
+    assert thr == 0.0
+
+
 def test_bullet_position_error_present_only():
     stats = _stats()  # 20-wide bullet stats, std=2
     # 1 row, 10 slots (20 floats). slot0 present, off by normalized 0.5 on x -> 1.0 world.

@@ -27,6 +27,8 @@ __all__ = [
     "velocity_error_world",
     "aim_angular_error_deg",
     "presence_metrics",
+    "presence_metrics_at_threshold",
+    "select_presence_threshold",
     "bullet_position_error_world",
     "group_metrics",
 ]
@@ -83,13 +85,15 @@ def aim_angular_error_deg(pred: np.ndarray, target: np.ndarray, *, eps: float = 
     return float(np.degrees(np.arccos(cos)).mean())
 
 
-def presence_metrics(logits: np.ndarray, target: np.ndarray) -> dict[str, float]:
-    """Accuracy + precision / recall / F1 for bullet presence (logits thresholded at 0).
+def presence_metrics_at_threshold(
+    logits: np.ndarray, target: np.ndarray, threshold: float
+) -> dict[str, float]:
+    """Accuracy + precision / recall / F1 for bullet presence at an arbitrary logit threshold.
 
-    ``logits`` ``(N, 10)`` raw head outputs (a logit > 0 predicts present); ``target`` {0,1}.
-    Returns ``{"accuracy", "precision", "recall", "f1"}`` as floats.
+    ``logits`` ``(N, 10)`` raw head outputs (a logit ``> threshold`` predicts present); ``target``
+    {0,1}. Returns ``{"accuracy", "precision", "recall", "f1"}`` as floats.
     """
-    pred = (to_numpy(logits) > 0.0).astype(np.int64).ravel()
+    pred = (to_numpy(logits) > threshold).astype(np.int64).ravel()
     tgt = (to_numpy(target) > 0.5).astype(np.int64).ravel()
     if pred.size == 0:
         return {"accuracy": 0.0, "precision": 0.0, "recall": 0.0, "f1": 0.0}
@@ -101,6 +105,50 @@ def presence_metrics(logits: np.ndarray, target: np.ndarray) -> dict[str, float]
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
     return {"accuracy": accuracy, "precision": precision, "recall": recall, "f1": f1}
+
+
+def presence_metrics(logits: np.ndarray, target: np.ndarray) -> dict[str, float]:
+    """Accuracy + precision / recall / F1 for bullet presence (logits thresholded at 0).
+
+    ``logits`` ``(N, 10)`` raw head outputs (a logit > 0 predicts present); ``target`` {0,1}.
+    Returns ``{"accuracy", "precision", "recall", "f1"}`` as floats.
+    """
+    return presence_metrics_at_threshold(logits, target, 0.0)
+
+
+def select_presence_threshold(
+    logits: np.ndarray, target: np.ndarray, *, candidates: np.ndarray | None = None
+) -> tuple[float, dict[str, float]]:
+    """PURE: pick the logit threshold maximizing presence F1 on the GIVEN data.
+
+    Returns ``(selected_threshold, metrics_at_that_threshold)``. The threshold is intended to be
+    chosen on VAL and then applied to TEST via :func:`presence_metrics_at_threshold`, so there is
+    no val/test leak.
+
+    When ``candidates is None`` the candidate set is built from the raw logit values:
+    ``np.unique(logits.ravel())`` as breakpoints, with ``min - 1.0`` PREPENDED so the
+    "predict everything present" boundary is included (the predicate is ``> t``, matching
+    :func:`presence_metrics_at_threshold`). Candidates are evaluated in ASCENDING order and a
+    candidate replaces the incumbent only on a STRICTLY GREATER F1, so ties break to the SMALLEST
+    threshold. Empty input (``logits.size == 0``) returns
+    ``(0.0, {"accuracy": 0.0, "precision": 0.0, "recall": 0.0, "f1": 0.0})``.
+    """
+    flat = to_numpy(logits).ravel()
+    if flat.size == 0:
+        return 0.0, {"accuracy": 0.0, "precision": 0.0, "recall": 0.0, "f1": 0.0}
+    if candidates is None:
+        uniq = np.unique(flat)
+        cand = np.concatenate(([uniq[0] - 1.0], uniq))
+    else:
+        cand = np.sort(to_numpy(candidates).ravel())
+    best_thr = float(cand[0])
+    best_metrics = presence_metrics_at_threshold(logits, target, best_thr)
+    for thr in cand[1:]:
+        m = presence_metrics_at_threshold(logits, target, float(thr))
+        if m["f1"] > best_metrics["f1"]:
+            best_thr = float(thr)
+            best_metrics = m
+    return best_thr, best_metrics
 
 
 def bullet_position_error_world(
