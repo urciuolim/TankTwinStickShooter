@@ -22,7 +22,7 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
-from pop_trainer.data.manifest import MANIFEST_NAME, add_description
+from pop_trainer.data.manifest import MANIFEST_NAME, add_description, manifest_id
 
 __all__ = ["main"]
 
@@ -105,6 +105,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     manifest = _load_manifest(dataset_dir)
+    # Recompute the content fingerprint (never trust the stored field) and display it.
+    print(f"manifest_id: {manifest_id(manifest)}")
 
     if args.list:
         _print_descriptions(manifest)
