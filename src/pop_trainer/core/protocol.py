@@ -25,6 +25,13 @@ Design notes:
   scan and RETAINS any trailing bytes in an internal buffer for the next read (TCP can
   coalesce back-to-back writes into one ``recv``). It never feeds extra bytes into
   ``json.loads``.
+* OUTBOUND WRITES ARE LENGTH-PREFIXED (Python -> Unity). :meth:`Connection.send` prepends a
+  4-byte BIG-ENDIAN uint32 = the UTF-8 JSON byte length, then the JSON (see
+  :func:`encode_framed`). Unity reads exactly those 4 bytes, then reads EXACTLY that many
+  bytes, then ``JObject.Parse`` — a read-exactly frame that fixes the dormant desync from
+  Unity's old single-``Read`` parse. The prefix counts ONLY the JSON payload. INBOUND
+  (Unity -> Python) JSON stays UNFRAMED — :meth:`receive`'s brace-scan already tolerates it,
+  and the pixel channel keeps its own 10-byte header — so only this direction gains a prefix.
 * A ``socket.timeout`` (an alias of the builtin ``TimeoutError`` since Python 3.10) on
   send or recv is re-raised as ``ConnectionError``; a ``recv`` returning ``b""`` mid-read
   also raises ``ConnectionError`` (the env's reconnect path keys off ``ConnectionError``).
@@ -90,6 +97,16 @@ DEFAULT_MAX_OBJECT_BYTES = 4 * 1024 * 1024  # 4 MiB
 # BEFORE any allocation/read of the payload. Tunable per-Connection.
 DEFAULT_MAX_FRAME_BYTES = 8 * 1024 * 1024  # 8 MiB
 
+# --- outbound length-prefix framing (Python -> Unity control/step writes) ----------------
+# Every control/handshake/step SEND is prefixed with a 4-byte BIG-ENDIAN uint32 giving the
+# byte length of the UTF-8 JSON that follows. Unity reads exactly those 4 bytes, then reads
+# EXACTLY that many bytes, then JObject.Parse — a read-exactly frame, never recv(bufsize)-as-
+# the-contract. The prefix counts ONLY the JSON payload (it excludes the 4 prefix bytes).
+# Big-endian to match the existing pixel-frame header convention below. INBOUND (Unity ->
+# Python) JSON stays UNFRAMED: receive() already brace-scans one complete object and the pixel
+# channel carries its own 10-byte header, so only this outbound direction gains the prefix.
+SEND_LENGTH_PREFIX_LEN = 4
+
 # --- pixel frame wire contract (additive; big-endian, matches the Unity frame writer) ---
 FRAME_TAG = 0x46  # ASCII 'F' — magic/type byte at offset 0 of every frame message
 FRAME_CHANNELS = 3  # RGB24; the C byte at offset 9 must equal this
@@ -121,7 +138,9 @@ __all__ = [
     "WALLS_TYPE_TAG",
     "SWITCH_ARENA_KEY",
     "ARENA_SWITCHED_KEY",
+    "SEND_LENGTH_PREFIX_LEN",
     "encode",
+    "encode_framed",
     "decode",
     "parse_frame_header",
     "Connection",
@@ -140,6 +159,18 @@ def encode(message) -> bytes:
     exactly as the step protocol relies on (``json.dumps`` does this coercion).
     """
     return json.dumps(message).encode("utf-8")
+
+
+def encode_framed(message) -> bytes:
+    """Serialize a message to length-prefixed wire bytes (STRICT JSON). Pure: no socket.
+
+    Returns a 4-byte BIG-ENDIAN uint32 (the UTF-8 JSON byte length) followed by that JSON,
+    the exact bytes :meth:`Connection.send` writes. Unity's read-exactly framed read consumes
+    the 4-byte prefix then exactly that many JSON bytes. The prefix counts ONLY the JSON
+    payload (it excludes itself). Big-endian to match the pixel-frame header convention.
+    """
+    payload = encode(message)
+    return len(payload).to_bytes(SEND_LENGTH_PREFIX_LEN, "big") + payload
 
 
 def decode(data) -> dict:
@@ -244,27 +275,30 @@ class Connection:
         self.logger.log(level, event, extra={"detail": {"layer": LAYER_PROTOCOL, **detail}})
 
     def send(self, message) -> None:
-        """Encode ``message`` (strict JSON) and write it to the transport.
+        """Encode ``message`` (strict JSON), LENGTH-PREFIX it, and write it to the transport.
 
-        A ``socket.timeout`` is translated to ``ConnectionError`` (the env's reconnect
-        logic keys off that). Observational logging (when a logger is attached): a control/handshake
-        send (restart / start / end / switch_arena) logs at INFO, a per-step send at DEBUG, each
-        with the outgoing byte count; a send timeout logs at WARNING before the re-raise. The wire
-        bytes are unchanged.
+        The wire bytes are a 4-byte BIG-ENDIAN uint32 (the UTF-8 JSON byte length) followed by
+        that JSON (:func:`encode_framed`), so Unity's read-exactly framed read consumes exactly
+        one message — fixing the old single-``Read`` desync. A ``socket.timeout`` is translated
+        to ``ConnectionError`` (the env's reconnect logic keys off that). Observational logging
+        (when a logger is attached): a control/handshake send (restart / start / end /
+        switch_arena) logs at INFO, a per-step send at DEBUG. The logged ``bytes`` is the JSON
+        payload length (the value carried in the prefix), not the prefixed total.
         """
-        data = encode(message)
+        payload = encode(message)
+        data = len(payload).to_bytes(SEND_LENGTH_PREFIX_LEN, "big") + payload
         if self.logger is not None:
             is_control = isinstance(message, dict) and any(k in _CONTROL_SEND_KEYS for k in message)
             self._log(
                 logging.INFO if is_control else logging.DEBUG,
                 "send",
-                bytes=len(data),
+                bytes=len(payload),
                 control=is_control,
             )
         try:
             self.transport.sendall(data)
         except TimeoutError as exc:
-            self._log(logging.WARNING, "send_timeout", bytes=len(data))
+            self._log(logging.WARNING, "send_timeout", bytes=len(payload))
             raise ConnectionError("send timed out") from exc
 
     def receive(self) -> dict:

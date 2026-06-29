@@ -103,8 +103,10 @@ DEFAULT_TRAIN_CONFIG = _REPO_ROOT / "unity" / "Assets" / "StreamingAssets" / "tr
 # DriverController default) is only the fallback when a config declares no obs_pixels_* keys. SB3
 # auto-applies VecTransposeImage so the extractor sees (N, 3, H, W).
 
-# Phase-1 round cap (1-min / 300-step rounds — intentional, see the milestone notes).
-DEFAULT_MAX_STEPS = 300
+# Python-side SAFETY cap only. Since the episode-boundary handshake, Unity's own ~300-step round
+# timer drives the boundary (it stamps `done`); this is set generously ABOVE it so Unity's `done`,
+# not this cap, ends every normal round. The intentional 300-step round is enforced Unity-side.
+DEFAULT_MAX_STEPS = 600
 
 # Every roster opponent starts at this rating; Phase-1 persists the ELO structure so resume can
 # restore it (a simple from-eval update is wired below but optional).

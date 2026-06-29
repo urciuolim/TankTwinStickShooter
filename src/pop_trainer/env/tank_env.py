@@ -57,10 +57,31 @@ WITHOUT this option is byte-identical to the no-switch handshake; the switch is 
 and never touches the per-step wire. The walls layout last received (after the switch ack or the
 start ack) is stored on ``self.current_map`` so ``info["map"]`` reflects the switched arena.
 
+Round boundary — Python NEVER sends ``restart`` mid-round (the wedge fix):
+
+The episode boundary is driven OFF UNITY'S OWN CLOCK, not off a Python-side step cap. Unity
+ends the round itself (a winner, OR its round-timer expiring) and emits ``done``/``winner`` on
+that step, then sits in a "round-over, waiting-for-restart" state still SERVICING the socket.
+That ``done`` is what makes the step ``terminated``; SB3 then calls :meth:`reset` which sends
+``{"restart": True}`` — now landing in Unity's clean waiting state, NEVER mid-round. So a
+``restart`` is only ever sent from :meth:`reset` (and :meth:`close`), and only when Unity has
+already finished the round. ``max_steps`` is NOT the normal episode boundary; it is a GENEROUS
+SAFETY CAP set ABOVE Unity's round length (Unity's ``game_maxTime`` / ``ai_actionFreq`` bounds
+the round to ~300 RL steps; :data:`DEFAULT_MAX_STEPS` is 600 so the cap never preempts Unity).
+
+Safety-cap corner case: if ``max_steps`` ever fires (a stuck round that Unity never decided),
+:meth:`step` truncates the episode but does NOT itself send any ``restart`` — it just returns
+``truncated``. The subsequent :meth:`reset` is what sends the ``restart``; even though Unity is
+technically still mid-round there, the redesigned Unity driver handles a ``restart`` from the
+mid-round read WITHOUT the synchronous-scene-reload collapse (it acks, abandons the round, and
+defers the next-round load), so the handshake stays clean. The env never emits a RAW mid-round
+restart on its own.
+
 Episode boundaries (gymnasium 5-tuple; see :mod:`pop_trainer.env.rewards`):
 
-* ``terminated`` — the game decided the round (a winner or a bare ``done``).
-* ``truncated`` — ``max_steps`` reached on an undecided step, OR a LOST CONNECTION.
+* ``terminated`` — Unity decided the round (a winner or a bare ``done``). The NORMAL boundary.
+* ``truncated`` — the ``max_steps`` SAFETY cap reached on an undecided step, OR a LOST
+  CONNECTION. The safety truncation never sends a restart by itself (see above).
 * a dropped connection (``core.protocol`` raises ``ConnectionError``) is translated to a
   ``truncated`` step with reward ``0.0`` and ``info["lost_connection"] = True`` — the game
   is counted as ending with no winner, NOT a crash.
@@ -123,6 +144,7 @@ from pop_trainer.core.protocol import (
     WallLayout,
     is_walls_message,
     parse_walls_message,
+    state_message_is_valid,
 )
 from pop_trainer.env.rewards import shaped_step_reward, time_penalty_per_step
 
@@ -136,6 +158,16 @@ ACTION_HIGH = 1.0
 # declares the expected shape (it must match what Unity renders). The default is a small
 # placeholder for tests / introspection — production passes the build's real frame shape.
 DEFAULT_FRAME_SHAPE = (36, 60, 3)
+
+# Generous SAFETY cap on env steps per episode — NOT the normal round boundary. Unity ends
+# the round on its OWN clock (a winner, or its round-timer): with game_maxTime=60,
+# ai_fixedDeltaTime=0.02, ai_actionFreq=10 the round is ceil(60/0.02)/10 = ~300 RL steps. This
+# cap is set ABOVE that (600) so it never preempts Unity's ``done`` in the normal case; it only
+# trips on a round Unity somehow never decided, and even then the env does NOT send a raw
+# mid-round restart (the next reset's restart advances Unity through the waiting-state handshake).
+# Used as the env's fallback when no ``env_config`` is supplied; a caller that passes an
+# ``EnvConfig`` should likewise keep ``max_steps`` strictly above Unity's round length.
+DEFAULT_MAX_STEPS = 600
 
 
 def _ms_since(t0: float) -> float:
@@ -188,7 +220,9 @@ class TankEnv(gymnasium.Env):
             the transport.
         env_config: an :class:`pop_trainer.core.config.EnvConfig` (only ``max_steps`` is used
             by the env loop; the socket-address fields belong to the caller's factory).
-            Defaults to ``EnvConfig()``.
+            ``max_steps`` is the GENEROUS SAFETY cap, NOT the round boundary (Unity's clock is)
+            — keep it strictly above Unity's round length. Defaults to
+            ``EnvConfig(max_steps=DEFAULT_MAX_STEPS)`` (600).
         reward_config: a :class:`pop_trainer.core.config.RewardConfig` (win / loss / time
             budgets). Defaults to ``RewardConfig()``.
         frame_shape: the ``(H, W, 3)`` shape of the rendered pixel frame, fixing
@@ -239,7 +273,11 @@ class TankEnv(gymnasium.Env):
         # reset/step via _ensure_connected. So constructing with a factory launches no Unity.
         self.conn: Connection | None = connection
 
-        self.env_config = env_config if env_config is not None else EnvConfig()
+        # No env_config -> default the SAFETY cap to DEFAULT_MAX_STEPS (above Unity's ~300-step
+        # round), not EnvConfig's bare 300; an explicitly supplied env_config is honored as-is.
+        self.env_config = (
+            env_config if env_config is not None else EnvConfig(max_steps=DEFAULT_MAX_STEPS)
+        )
         self.reward_config = reward_config if reward_config is not None else RewardConfig()
         self.max_steps = self.env_config.max_steps
         self.survivor = survivor
@@ -366,7 +404,7 @@ class TankEnv(gymnasium.Env):
         """
         t0 = time.monotonic()
         self.conn.send({"restart": True})
-        self.conn.receive()  # restart ack
+        self._receive_restart_ack()
         self._log(logging.INFO, "handshake_restart_ack", elapsed_ms=_ms_since(t0))
 
         # !ingame window (after the restart ack, before the start send): optional map change.
@@ -420,6 +458,27 @@ class TankEnv(gymnasium.Env):
                 return message
             self.current_map = parse_walls_message(message)
 
+    def _receive_restart_ack(self):
+        """Read the restart ack, DRAINING any leading stray mid-round ``state`` (+ its frame) first.
+
+        In the NORMAL flow the env only sends ``restart`` after a ``done``-terminated step, so Unity
+        is already in the waiting state and the very next inbound object is the restart ack. In the
+        SAFETY-CAP corner case (the ``max_steps`` cap truncated an undecided round, then ``reset``
+        sends ``restart`` while Unity is technically still mid-round) Unity's per-step send/read
+        order means it emits ONE more ``state`` (+ pixel frame) BEFORE it reads the restart and
+        acks. That stray state+frame would otherwise be mis-read as the ack and desync the wire. So
+        we skip any leading state message — consuming its trailing frame too — and return on the
+        first non-state object (the restart ack). This keeps the round-over -> restart handshake
+        clean even in the corner case, with NO raw mid-round restart ever emitted by the env.
+        """
+        while True:
+            message = self.conn.receive()
+            if not state_message_is_valid(message):
+                return message
+            # A stray mid-round state carries a trailing pixel frame on the wire; consume it so the
+            # next receive lands on the ack, not the binary frame bytes.
+            self.conn.receive_frame()
+
     def step(self, action, opponent_action=None):
         """Send ``{1: a1, 2: a2}``, read the next ``state`` + frame, return the gymnasium
         5-tuple ``(obs, reward, terminated, truncated, info)``.
@@ -441,11 +500,14 @@ class TankEnv(gymnasium.Env):
         :func:`pop_trainer.env.rewards.shaped_step_reward`: a per-step time penalty accrues
         every step and the win/loss terminal is ADDED on the decided step.
 
-        ``terminated`` is a decided game (winner / ``done``); ``truncated`` is ``max_steps``
-        reached OR a dropped connection. On a dropped connection the step truncates with
-        reward ``0.0`` and ``info["lost_connection"] = True`` (the game is counted as ending
-        with no winner); ``last_p1_action`` / ``last_p2_action`` keep their last good values and
-        the action keys are omitted from that step's ``info``. The env reconnects (if a
+        ``terminated`` is a decided game (Unity's ``winner`` / ``done`` — the NORMAL boundary);
+        ``truncated`` is the ``max_steps`` SAFETY cap reached OR a dropped connection. The
+        safety-cap truncation does NOT itself send any ``restart`` — it only returns
+        ``truncated``; the next :meth:`reset` is the sole sender of ``restart`` (the env never
+        emits a raw mid-round restart). On a dropped connection the step truncates with reward
+        ``0.0`` and ``info["lost_connection"] = True`` (the game is counted as ending with no
+        winner); ``last_p1_action`` / ``last_p2_action`` keep their last good values and the
+        action keys are omitted from that step's ``info``. The env reconnects (if a
         ``connection_factory`` was given) so the next ``reset`` can start a fresh episode.
 
         Guards lazy lifecycle: if the env is "not running" (stepped before any ``reset``, or
@@ -493,6 +555,9 @@ class TankEnv(gymnasium.Env):
 
         winner = int(received["winner"]) if "winner" in received else None
         done = bool("done" in received)
+        # SAFETY cap only (above Unity's round length): a truncation here returns truncated but
+        # sends NO restart. The next reset's restart is what advances Unity. Unity's own done is
+        # the normal boundary and is checked above via winner/done.
         max_steps_reached = self.step_counter >= self.max_steps
 
         reward, terminated, truncated = shaped_step_reward(

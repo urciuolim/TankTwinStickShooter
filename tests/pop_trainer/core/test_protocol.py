@@ -67,11 +67,41 @@ def test_decode_accepts_bytes_and_str():
     assert P.decode('{"x": 1}') == {"x": 1}
 
 
-def test_send_writes_strict_json_bytes():
+def test_send_writes_length_prefixed_strict_json_bytes():
+    # Connection.send now LENGTH-PREFIXES the strict-JSON payload (4-byte big-endian uint32 of the
+    # UTF-8 JSON length, then the JSON) so Unity can read-exactly. This is encode_framed's output.
     t = FakeTransport()
     conn = P.Connection(t)
     conn.send({"start": True})
-    assert bytes(t.sent) == P.encode({"start": True})
+    payload = P.encode({"start": True})
+    expected = len(payload).to_bytes(P.SEND_LENGTH_PREFIX_LEN, "big") + payload
+    assert bytes(t.sent) == expected
+    assert bytes(t.sent) == P.encode_framed({"start": True})
+
+
+def test_encode_framed_round_trips_prefix_and_payload():
+    # The pure framing encoder: a 4-byte big-endian length prefix counting ONLY the JSON payload,
+    # then the JSON. The prefix value must equal the trailing payload byte count.
+    msg = {1: [0.5, -0.5, 0.0, 0.0, 1.0], 2: [0.0, 0.0, 0.0, 0.0, 0.0]}
+    framed = P.encode_framed(msg)
+    prefix, payload = framed[: P.SEND_LENGTH_PREFIX_LEN], framed[P.SEND_LENGTH_PREFIX_LEN :]
+    declared = int.from_bytes(prefix, "big")
+    assert declared == len(payload)
+    # The payload is exactly the unframed strict-JSON encode, and decodes back to the message.
+    assert payload == P.encode(msg)
+    assert P.decode(payload) == {"1": [0.5, -0.5, 0.0, 0.0, 1.0], "2": [0.0, 0.0, 0.0, 0.0, 0.0]}
+
+
+def test_encode_framed_prefix_is_big_endian():
+    # Pin the byte order against the Unity DriverProtocol.DecodeLengthPrefix (big-endian).
+    framed = P.encode_framed({"end": True})
+    payload = P.encode({"end": True})
+    assert framed[: P.SEND_LENGTH_PREFIX_LEN] == len(payload).to_bytes(4, "big")
+    assert framed[3] == len(payload) & 0xFF  # least-significant byte last (big-endian)
+
+
+def test_send_length_prefix_len_is_four():
+    assert P.SEND_LENGTH_PREFIX_LEN == 4
 
 
 def test_receive_splits_two_coalesced_objects():
@@ -459,8 +489,8 @@ def test_switch_arena_sends_request_and_reads_ack():
     t = FakeTransport(recv_chunks=[P.encode({P.ARENA_SWITCHED_KEY: True})])
     conn = P.Connection(t)
     ack = conn.switch_arena(path)
-    # The exact bytes on the wire are the strict-JSON switch request (string value).
-    assert bytes(t.sent) == P.encode({P.SWITCH_ARENA_KEY: path})
+    # The exact bytes on the wire are the LENGTH-PREFIXED strict-JSON switch request (string value).
+    assert bytes(t.sent) == P.encode_framed({P.SWITCH_ARENA_KEY: path})
     assert ack == {P.ARENA_SWITCHED_KEY: True}
 
 
