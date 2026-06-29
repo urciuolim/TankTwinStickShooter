@@ -24,12 +24,20 @@ stdlib only.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Any
 
-__all__ = ["MANIFEST_NAME", "MANIFEST_SCHEMA_VERSION", "build_manifest", "add_description"]
+__all__ = [
+    "MANIFEST_NAME",
+    "MANIFEST_SCHEMA_VERSION",
+    "build_manifest",
+    "add_description",
+    "manifest_id",
+]
 
 MANIFEST_NAME = "manifest.json"
-MANIFEST_SCHEMA_VERSION = 2
+MANIFEST_SCHEMA_VERSION = 3
 
 _COLLECTION_KEYS = (
     "seed",
@@ -56,6 +64,28 @@ _MACHINE_KEYS = (
     "ram_total_gb",
     "python",
 )
+
+
+def manifest_id(manifest: dict) -> str:
+    """Return a stable content fingerprint (bare 64-char lowercase sha256 hex) of ``manifest``.
+
+    The id is computed over the manifest's CANONICAL content — every top-level key EXCEPT
+    ``descriptions`` (free-form human/agent annotations that must not change identity) and
+    ``manifest_id`` itself (the embedded value must not feed its own hash). The remaining content is
+    serialized with strict, sorted, separator-pinned JSON (``sort_keys=True``, no whitespace,
+    ``ensure_ascii=True``, ``allow_nan=False``) so the hash is insertion-order- and platform-
+    independent. Pairs cleanly over v1/v2 manifests lacking a ``manifest_id`` key (the filter
+    handles absence). Callers ALWAYS recompute via this function and never trust any stored field.
+    """
+    content = {k: v for k, v in manifest.items() if k not in ("descriptions", "manifest_id")}
+    payload = json.dumps(
+        content,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _require_keys(name: str, mapping: Any, keys: tuple[str, ...]) -> None:
@@ -99,21 +129,24 @@ def build_manifest(
     pairings = [list(pair) for pair in collection["pairings"]]
     per_map_samples = {str(k): int(v) for k, v in collection["per_map_samples"].items()}
 
-    return {
+    # Type-pin hashed numeric fields so e.g. 32 and 32.0 fingerprint identically (the JSON
+    # serializer renders int 32 as "32" but float 32.0 as "32.0"). Nullable git fields and
+    # string fields are left untouched.
+    result = {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "created_utc": created_utc,
         "dataset": dataset,
         "descriptions": [] if descriptions is None else list(descriptions),
         "collection": {
-            "seed": collection["seed"],
+            "seed": int(collection["seed"]),
             "command": list(collection["command"]),
-            "workers": collection["workers"],
-            "episodes": collection["episodes"],
-            "max_steps": collection["max_steps"],
+            "workers": int(collection["workers"]),
+            "episodes": int(collection["episodes"]),
+            "max_steps": int(collection["max_steps"]),
             "maps": list(collection["maps"]),
             "pairings": pairings,
-            "total_shards": collection["total_shards"],
-            "total_samples": collection["total_samples"],
+            "total_shards": int(collection["total_shards"]),
+            "total_samples": int(collection["total_samples"]),
             "per_map_samples": per_map_samples,
         },
         "provenance": {
@@ -122,7 +155,7 @@ def build_manifest(
             "build": {
                 "path": provenance["build"]["path"],
                 "mtime_utc": provenance["build"]["mtime_utc"],
-                "size_bytes": provenance["build"]["size_bytes"],
+                "size_bytes": int(provenance["build"]["size_bytes"]),
             },
         },
         "machine": {
@@ -132,11 +165,17 @@ def build_manifest(
             "release": machine["release"],
             "arch": machine["arch"],
             "processor": machine["processor"],
-            "cpu_count": machine["cpu_count"],
-            "ram_total_gb": machine["ram_total_gb"],
+            "cpu_count": int(machine["cpu_count"]),
+            "ram_total_gb": float(machine["ram_total_gb"]),
             "python": machine["python"],
         },
     }
+    # Embed the content fingerprint as a top-level key. ``manifest_id`` excludes both
+    # ``descriptions`` and ``manifest_id`` itself, so computing over the 7-key dict here equals
+    # computing over the final 8-key dict (self-consistent). The embedded value is informational;
+    # callers ALWAYS recompute via manifest_id() and never trust the stored field.
+    result["manifest_id"] = manifest_id(result)
+    return result
 
 
 def add_description(manifest: dict, *, author: str, text: str, added_utc: str) -> dict:

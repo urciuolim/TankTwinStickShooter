@@ -15,6 +15,7 @@ import tracemalloc
 import numpy as np
 import pytest
 
+from pop_trainer.data import manifest as manifest_mod
 from pop_trainer.data import readers, schema, shards, shuffle
 
 HW = (24, 24)
@@ -323,9 +324,13 @@ def test_manifest_strict_json_and_data_card(tmp_path):
     assert manifest["dataset"] == out.name
     assert manifest["dataset"] != src_manifest["dataset"]
     assert src_manifest["dataset"] == "synthetic-src"
-    # NO new top-level keys vs the source: provenance (source path/seed/split-mode) lives in
-    # `descriptions`, not a structured derived_from/content_id (that is #13 territory).
-    assert set(manifest) == set(src_manifest)
+    # The ONLY new top-level key vs the (v2) source is `manifest_id` (#13 PR1): the derived
+    # manifest is built via build_manifest (schema v3), which embeds the content fingerprint.
+    # Source path/seed/split-mode provenance still lives in `descriptions`, not a structured
+    # derived_from key. The source here is a hand-built v2 dict lacking manifest_id.
+    assert set(manifest) == set(src_manifest) | {"manifest_id"}
+    assert "manifest_id" not in src_manifest
+    assert manifest["manifest_id"] == manifest_mod.manifest_id(manifest)
     assert manifest["collection"]["command"][0] == "shuffle_dataset" or manifest["collection"][
         "command"
     ][0].startswith("python")

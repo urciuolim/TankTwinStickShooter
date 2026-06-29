@@ -75,6 +75,7 @@ def test_happy_path_shape():
         "collection",
         "provenance",
         "machine",
+        "manifest_id",
     }
     assert result["schema_version"] == manifest.MANIFEST_SCHEMA_VERSION
     assert result["created_utc"] == "2026-06-25T12:00:00+00:00"
@@ -154,8 +155,8 @@ def test_non_dict_sub_dict_raises():
         _build(machine=["not", "a", "dict"])
 
 
-def test_schema_version_is_2():
-    assert manifest.MANIFEST_SCHEMA_VERSION == 2
+def test_schema_version_is_3():
+    assert manifest.MANIFEST_SCHEMA_VERSION == 3
 
 
 def test_descriptions_default_is_empty_list():
@@ -206,3 +207,76 @@ def test_add_description_does_not_mutate_input():
     assert m["descriptions"] is inner_before
     assert len(original) == 1
     assert out["descriptions"] is not inner_before
+
+
+def test_manifest_id_deterministic():
+    # Two builds with identical inputs produce identical ids; the id is stable across calls.
+    a = _build()
+    b = _build()
+    assert a["manifest_id"] == b["manifest_id"]
+    assert manifest.manifest_id(a) == manifest.manifest_id(a)
+
+
+def test_manifest_id_golden():
+    # Golden fingerprint over the canonical fixture's build_manifest output.
+    #
+    # Regenerate procedure: this hex is RECOMPUTED from build_manifest()'s output over the fixture
+    # assembled by _build() (the _collection/_provenance/_machine defaults above). To re-pin, print
+    # _build()["manifest_id"] and paste it here. Only re-pin when the canonical content or the
+    # type-pinning in build_manifest legitimately changes (a surprise change means a regression).
+    result = _build()
+    assert (
+        result["manifest_id"] == "45edcc53d444ef3099cb15cd9aa3b3da54ec8c51369f07697ff0c1c611b9d027"
+    )
+
+
+def test_manifest_id_embedded_matches_recompute():
+    result = _build()
+    assert result["manifest_id"] == manifest.manifest_id(result)
+
+
+def test_manifest_id_invariant_under_add_description():
+    m = _build()
+    before = m["manifest_id"]
+    out = manifest.add_description(m, author="claude", text="note", added_utc="t1")
+    # Annotating leaves the recomputed id AND the stored embedded id unchanged.
+    assert manifest.manifest_id(out) == manifest.manifest_id(m)
+    assert out["manifest_id"] == before
+
+
+def test_manifest_id_self_exclusion_idempotent():
+    m = _build()
+    without = {k: v for k, v in m.items() if k != "manifest_id"}
+    injected = {**without, "manifest_id": "deadbeef" * 8}
+    assert manifest.manifest_id(without) == manifest.manifest_id(injected)
+
+
+def test_manifest_id_key_order_independent():
+    m = _build()
+    reordered = dict(reversed(list(m.items())))
+    assert manifest.manifest_id(reordered) == manifest.manifest_id(m)
+
+
+def test_manifest_id_v2_backcompat():
+    # A hand-built v2-shaped dict (no manifest_id key) fingerprints cleanly and matches the id of
+    # the same content (absence of the key is handled by the exclusion filter).
+    v2 = {
+        "schema_version": 2,
+        "created_utc": "2026-06-25T12:00:00+00:00",
+        "dataset": "old_run",
+        "descriptions": [],
+        "collection": {"seed": 7, "total_samples": 100},
+        "provenance": {"git_commit": "abc123"},
+        "machine": {"hostname": "host"},
+    }
+    assert "manifest_id" not in v2
+    computed = manifest.manifest_id(v2)
+    assert len(computed) == 64
+    assert computed == manifest.manifest_id(dict(v2))
+
+
+def test_manifest_id_type_pinning():
+    # Two builds differing only in int-vs-float of a coerced field hash identically.
+    int_build = _build(machine=_machine(ram_total_gb=32))
+    float_build = _build(machine=_machine(ram_total_gb=32.0))
+    assert int_build["manifest_id"] == float_build["manifest_id"]
