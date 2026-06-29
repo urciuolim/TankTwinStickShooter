@@ -337,6 +337,15 @@ uv run python -m pop_trainer.rl.train --total-timesteps 10000 --run-dir runs/tra
 uv run python -m pop_trainer.rl.train --total-timesteps 10000 --run-dir runs/train-b --port 50002 --eval-port 50003
 ```
 
+Tune the PPO hyperparameters / encoder trunk from the CLI (every flag has an SB3-faithful default,
+so omitting them reproduces today's run bit-for-bit):
+
+```bash
+# linear LR decay, a deeper rollout, and an explicit resnet trunk
+uv run python -m pop_trainer.rl.train --total-timesteps 200000 --run-dir runs/train-tuned \
+  --learning-rate 1e-4 --lr-schedule linear --n-steps 1024 --ent-coef 0.01 --trunk resnet
+```
+
 See the full flag surface:
 
 ```bash
@@ -344,36 +353,54 @@ uv run python -m pop_trainer.rl.train --help
 ```
 
 Flags (defaults shown), grounded in [`_parse_args`](../src/pop_trainer/rl/train.py)
-(`train.py:1261-1362`):
+(`train.py:1372-1546`):
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `--total-timesteps` | *(required)* | total env-steps to train (`train.py:1273-1275`). |
-| `--run-dir` | *(required)* | output dir for checkpoints / sidecar / TensorBoard (`train.py:1276-1278`). |
-| `--config` | `unity/Assets/StreamingAssets/train_config.json` | game/training config JSON forwarded to the build launch (`DEFAULT_TRAIN_CONFIG`, `train.py:94`; arg `train.py:1267-1272`). |
-| `--resume` | *(absent)* | a prior `run_dir` to resume — load the latest `model_*.zip` + `state.json` (`train.py:1279-1284`). |
-| `--encoder-checkpoint` | `None` | optional pretrained-encoder `state_dict` for the features extractor (`train.py:1285-1290`). |
-| `--freeze-encoder` | *(off)* | freeze the encoder weights during RL (`train.py:1291-1293`). |
-| `--frame-stack` | `1` | `VecFrameStack` depth (`1` = passthrough, `train.py:1294`). |
+| `--total-timesteps` | *(required)* | total env-steps to train (arg `train.py:1384-1386`). |
+| `--run-dir` | *(required)* | output dir for checkpoints / sidecar / TensorBoard (arg `train.py:1387-1389`). |
+| `--config` | `unity/Assets/StreamingAssets/train_config.json` | game/training config JSON forwarded to the build launch (`DEFAULT_TRAIN_CONFIG`, `train.py:99`; arg `train.py:1378-1383`). |
+| `--resume` | *(absent)* | a prior `run_dir` to resume — load the latest `model_*.zip` + `state.json` (arg `train.py:1390-1395`). |
+| `--encoder-checkpoint` | `None` | optional pretrained-encoder `state_dict` for the features extractor (arg `train.py:1396-1401`). |
+| `--freeze-encoder` | *(off)* | freeze the encoder weights during RL (arg `train.py:1402-1404`). |
+| `--frame-stack` | `1` | `VecFrameStack` depth (`1` = passthrough; arg `train.py:1405`). |
 | `--n-envs` | `1` | parallel **training** envs. `1` → a single in-process `DummyVecEnv`. `N > 1` → a `SubprocVecEnv` of `N` Unity builds, each on its OWN port `game_port + i` (`i` in `0..N-1`) in its OWN process (`start_method="spawn"`, Windows-safe). The eval set is built at the SAME width (`M == N`, time-multiplexed). See [Multi-env training](#multi-env-training-n-envs--1). |
-| `--n-steps` | `2048` | PPO rollout length — **THE memory lever at `--n-envs > 1`** (lower it for more envs; the rollout buffer scales `n_steps × n_envs`). Default `2048` (`TrainConfig.n_steps`, `train.py:206`). |
-| `--allow-oversized` | *(off)* | skip the pre-flight rollout-buffer memory **abort** (the estimate is still printed). Use only when the box has RAM the conservative guard does not model (guard `check_rl_memory_budget`, `train.py:344-392`; it charges `n_envs` Unity instances, not `n_envs + 1`, since train/eval sets never coexist). |
-| `--seed` | `0` | master seed — threaded into SB3, the env, and the opponent provider (`train.py:1313`). |
-| `--opponents` | *(absent → full `DEFAULT_ROSTER`)* | comma-separated self-play roster selectors (e.g. `noop,random`), parsed to an ordered tuple and **validated** against [`AGENT_SELECTORS`](../src/pop_trainer/agents/registry.py) (`aggressive-coverage`, `noop`, `opponent-shadower`, `random`, `wall-hugger`); an unknown selector exits 2 with the valid list **before any Unity launch**. **Omitting** the flag trains against the full 5-selector [`DEFAULT_ROSTER`](../src/pop_trainer/rl/selfplay.py) (the omit path passes no kwarg, so the dataclass default owns it) (`train.py:1314-1319,1357-1361`; omit plumbing `train.py:1375`). |
-| `--opponent-strategy` | `round_robin` | opponent rotation: `round_robin` (resumable) or `uniform` (seed-only resume) — the two `choices` (`train.py:1320-1325`). |
-| `--eval-freq` | `10000` | env-steps between win-rate evals (`0` = off) (`train.py:1326-1328`). |
-| `--eval-episodes` | `10` | greedy episodes per opponent per eval (`train.py:1329-1331`). |
-| `--checkpoint-freq` | `10000` | env-steps between checkpoints (the sidecar rides this cadence) (`train.py:1332-1334`). |
-| `--port` | `50000` | base TCP port → `game_port`. Training env `i` listens on `game_port + i` for `i` in `0..n_envs-1` (at `--n-envs 1` that is just `--port`); the training block is `[game_port, game_port + n_envs - 1]` (`training_ports`, `train.py:558-560`). |
-| `--eval-port` | *(absent → `game_port + n_envs`)* | base TCP port for the **eval block** → `eval_port`. There are `M == n_envs` eval builds (same width as training) on `[eval_port, eval_port + n_envs - 1]`. When omitted the base is `game_port + n_envs` — the **first port AFTER the training range** `[game_port, game_port + n_envs - 1]` (so at `--n-envs 1` it is `port + 1` as before; at `--n-envs 4 --port 50000` the eval block is `50004..50007`) (`effective_eval_port`, `train.py:257-267`; `eval_ports`, `train.py:563-570`). When set it **must differ from `--port`** AND its **whole block must NOT overlap the training block** — either is rejected by `TrainConfig.__post_init__` with a `ValueError` (rejection `train.py:238-255`). The eval and training builds never run concurrently (time-multiplexed), but disjoint blocks keep a relaunched-but-not-yet-reaped instance from clashing on bind. |
-| `--log-dir` | *(absent → `run_dir/logs`)* | directory for the per-process observability logs (the JSONL `training-system.log` + `env-<role>-<port>.log` + the paired per-launch Unity `unity-<role>-<port>-<attempt>.log`). See [Observability logs](#observability-logs) (`effective_log_dir`, `train.py:269-272`). |
-| `--debug` | *(off → INFO)* | the SINGLE switch: crank ALL observability logs to DEBUG (per-step send/recv/step). Equivalent to setting `POP_LOG_LEVEL=DEBUG`; resolved via `level_from_env` (arg `train.py:1350-1355`, resolution `train.py:1377-1380`). |
+| `--n-steps` | `2048` | PPO rollout length — **THE memory lever at `--n-envs > 1`** (lower it for more envs; the rollout buffer scales `n_steps × n_envs`). Default `2048` (`TrainConfig.n_steps`, `train.py:238`). |
+| `--batch-size` | `64` | PPO minibatch size (`TrainConfig.batch_size`, `train.py:239`; arg `train.py:1419-1424`). |
+| `--learning-rate` | `3e-4` | PPO learning rate. Combined with `--lr-schedule` below (`train.py:237`; arg `train.py:1425-1430`). |
+| `--lr-schedule` | `constant` | learning-rate schedule: `constant` (pass `--learning-rate` as a fixed float — bit-for-bit today's behavior) or `linear` (decay it to 0 across training via SB3's `progress_remaining` callable, [`_resolve_learning_rate`](../src/pop_trainer/rl/train.py), `train.py:805-816`). The two `choices` (`LR_SCHEDULES`, `train.py:120`; arg `train.py:1431-1436`). |
+| `--trunk` | `auto` | the encoder **trunk override** threaded to [`EncoderExtractor`](components/rl.md#the-encoder-seam). `auto` keeps the extractor's **size-based** selection (`gn-cnn` for a ≤128px frame, `cnn` for the canonical 360×640); an explicit `cnn` / `resnet` / `gn-cnn` forces that registry trunk. The four `choices` (`TRUNK_CHOICES`, `train.py:124`; arg `train.py:1485-1490`). |
+| `--net-arch` | `[64, 64]` | the policy/value MLP-head architecture. Omitted → SB3's implicit `[64, 64]` made EXPLICIT; or a per-head spec `'pi=64,64:vf=64,64'` parsed to `{"pi": [...], "vf": [...]}` ([`_parse_net_arch`](../src/pop_trainer/rl/train.py), `train.py:1351-1368`; arg `train.py:1479-1484`). |
+| `--n-epochs` | `10` | PPO epochs per rollout (`TrainConfig.n_epochs`, `train.py:240`; arg `train.py:1437-1442`). |
+| `--gamma` | `0.99` | discount factor (`train.py:241`; arg `train.py:1443-1448`). |
+| `--gae-lambda` | `0.95` | GAE lambda (`train.py:242`; arg `train.py:1449-1454`). |
+| `--clip-range` | `0.2` | PPO clip range (`train.py:243`; arg `train.py:1455-1460`). |
+| `--ent-coef` | `0.0` | entropy coefficient (`train.py:244`; arg `train.py:1461-1466`). |
+| `--vf-coef` | `0.5` | value-function loss coefficient (`train.py:245`; arg `train.py:1467-1472`). |
+| `--max-grad-norm` | `0.5` | gradient-clipping max norm (`train.py:246`; arg `train.py:1473-1478`). |
+| `--allow-oversized` | *(off)* | skip the pre-flight rollout-buffer memory **abort** (the estimate is still printed). Use only when the box has RAM the conservative guard does not model (guard `check_rl_memory_budget`, `train.py:401-449`; it charges `n_envs` Unity instances, not `n_envs + 1`, since train/eval sets never coexist). |
+| `--seed` | `0` | master seed — threaded into SB3, the env, and the opponent provider (arg `train.py:1496`). |
+| `--opponents` | *(absent → full `DEFAULT_ROSTER`)* | comma-separated self-play roster selectors (e.g. `noop,random`), parsed to an ordered tuple and **validated** against [`AGENT_SELECTORS`](../src/pop_trainer/agents/registry.py) (`aggressive-coverage`, `noop`, `opponent-shadower`, `random`, `wall-hugger`); an unknown selector exits 2 with the valid list **before any Unity launch** (`train.py:1540-1544`). **Omitting** the flag trains against the full 5-selector [`DEFAULT_ROSTER`](../src/pop_trainer/rl/selfplay.py) (the omit path passes no kwarg, so the dataclass default owns it) (arg `train.py:1497-1502`). |
+| `--opponent-strategy` | `round_robin` | opponent rotation: `round_robin` (resumable) or `uniform` (seed-only resume) — the two `choices` (arg `train.py:1503-1508`). |
+| `--eval-freq` | `10000` | env-steps between win-rate evals (`0` = off) (arg `train.py:1509-1511`). |
+| `--eval-episodes` | `10` | greedy episodes per opponent per eval (arg `train.py:1512-1514`). |
+| `--checkpoint-freq` | `10000` | env-steps between checkpoints (the sidecar rides this cadence) (arg `train.py:1515-1517`). |
+| `--port` | `50000` | base TCP port → `game_port`. Training env `i` listens on `game_port + i` for `i` in `0..n_envs-1` (at `--n-envs 1` that is just `--port`); the training block is `[game_port, game_port + n_envs - 1]` (`training_ports`, `train.py:619-621`; arg `train.py:1518-1520`). |
+| `--eval-port` | *(absent → `game_port + n_envs`)* | base TCP port for the **eval block** → `eval_port`. There are `M == n_envs` eval builds (same width as training) on `[eval_port, eval_port + n_envs - 1]`. When omitted the base is `game_port + n_envs` — the **first port AFTER the training range** `[game_port, game_port + n_envs - 1]` (so at `--n-envs 1` it is `port + 1` as before; at `--n-envs 4 --port 50000` the eval block is `50004..50007`) (`effective_eval_port`, `train.py:308-318`; `eval_ports`, `train.py:624-631`; arg `train.py:1521-1526`). When set it **must differ from `--port`** AND its **whole block must NOT overlap the training block** — either is rejected by `TrainConfig.__post_init__` with a `ValueError` (rejection `train.py:280-297`). The eval and training builds never run concurrently (time-multiplexed), but disjoint blocks keep a relaunched-but-not-yet-reaped instance from clashing on bind. |
+| `--log-dir` | *(absent → `run_dir/logs`)* | directory for the per-process observability logs (the JSONL `training-system.log` + `env-<role>-<port>.log` + the paired per-launch Unity `unity-<role>-<port>-<attempt>.log`). See [Observability logs](#observability-logs) (`effective_log_dir`, `train.py:320-323`; arg `train.py:1527-1532`). |
+| `--debug` | *(off → INFO)* | the SINGLE switch: crank ALL observability logs to DEBUG (per-step send/recv/step). Equivalent to setting `POP_LOG_LEVEL=DEBUG`; resolved via `level_from_env` (arg `train.py:1533-1538`, resolution `train.py:1559-1563`). |
+
+The PPO hyperparameters and the encoder trunk are **now fully on the CLI** (the rows above):
+`--learning-rate` / `--lr-schedule`, `--n-steps`, `--batch-size`, `--n-epochs`, `--gamma`,
+`--gae-lambda`, `--clip-range`, `--ent-coef`, `--vf-coef`, `--max-grad-norm`, `--net-arch`, and
+`--trunk`. Every default keeps SB3's own default exact, so a run with **no** new flags reproduces
+today's run bit-for-bit (`train.py:235-247`).
 
 **Knobs NOT on the CLI** (they use `TrainConfig` dataclass defaults — override in code, not the
-command line): `frame_shape` (the 640×360×3 frame), the PPO hyperparameters other than `--n-steps`
-(`learning_rate`, `batch_size`, `n_epochs`, `gamma`, `gae_lambda`, `clip_range`), and `build_path`
-(`None` → the OS-aware [`core.launch.default_build_path`](../src/pop_trainer/core/launch.py)) — see
-`train.py:204-216`.
+command line): `frame_shape` (DERIVED from the launched config's `obs_pixels_*` by the CLI path via
+[`core.obs.frame_shape_from_config`](components/core.md#the-observation-resolution-contract-coreobs),
+then `validate_frame_shape`d against that config — `train.py:1112-1119,1564-1572`) and `build_path`
+(`None` → the OS-aware [`core.launch.default_build_path`](../src/pop_trainer/core/launch.py)).
 
 ### Multi-env training (`--n-envs > 1`)
 
@@ -400,30 +427,30 @@ uv run python -m pop_trainer.rl.train \
 With `--port 50000 --n-envs 4`:
 
 - **Training port block** = `[50000, 50003]` — builds on `50000, 50001, 50002, 50003`
-  (`training_ports`, `train.py:558-560`).
+  (`training_ports`, `train.py:619-621`).
 - **Eval port block** = `[50004, 50007]` — auto-assigned `game_port + n_envs` = `50000 + 4 = 50004`
   as its low end (the first port after the training range), `M == N == 4` eval builds on
-  `50004..50007` (no `--eval-port` needed; `effective_eval_port`, `train.py:257-267`; `eval_ports`,
-  `train.py:563-570`). The eval block is validated disjoint from the training block
-  (`train.py:238-255`).
+  `50004..50007` (no `--eval-port` needed; `effective_eval_port`, `train.py:308-318`; `eval_ports`,
+  `train.py:624-631`). The eval block is validated disjoint from the training block
+  (`train.py:285-297`).
 
 In general at `--port P --n-envs N`: training = `[P, P + N - 1]`, eval = `[P + N, P + 2N - 1]`.
 
 > **Memory — the rollout buffer is the OOM surface at high `--n-envs`.** The SB3 PPO `RolloutBuffer`
 > stores `(n_steps, n_envs, *obs_shape)` uint8 frames (1 byte/element), so its obs cost is
 > approximately **`n_steps × n_envs × frame_bytes × frame_stack`** (`estimate_rl_memory_bytes`,
-> `train.py:330-341`). **Lowering `--n-steps` is the primary lever** — halve it to roughly halve the
+> `train.py:387-398`). **Lowering `--n-steps` is the primary lever** — halve it to roughly halve the
 > buffer at a fixed `--n-envs` (which is why the 4-env example drops to `--n-steps 512`).
 >
-> A **pre-flight guard** runs at startup (`check_rl_memory_budget`, `train.py:344-392`; called in
-> `train_local`, `train.py:1062-1080`): it reads `psutil.virtual_memory().available`, adds **~1 GB per
-> live Unity instance** for **`n_envs` instances** — NOT `n_envs + 1` — because the eval and training
-> instance SETS **never coexist** (the eval cycle tears the `N` training builds down before launching
-> the `M == N` eval builds, so peak concurrent = `max(N_train, M_eval) = n_envs`;
-> `UNITY_INSTANCE_BYTES = 1 GB`, `train.py:123`; `unity_instances = n_envs`, `train.py:372`). It adds
+> A **pre-flight guard** runs at startup (`check_rl_memory_budget`, `train.py:401-449`; called in
+> `train_local`, `train.py:1070`, at `train.py:1151`): it reads `psutil.virtual_memory().available`,
+> adds **~1 GB per live Unity instance** for **`n_envs` instances** — NOT `n_envs + 1` — because the
+> eval and training instance SETS **never coexist** (the eval cycle tears the `N` training builds down
+> before launching the `M == N` eval builds, so peak concurrent = `max(N_train, M_eval) = n_envs`;
+> `UNITY_INSTANCE_BYTES = 1 GB`, `train.py:143`; `unity_instances = n_envs`, `train.py:429`). It adds
 > that to the buffer estimate, **always prints the estimate line**, and **aborts with exit code `2`
 > BEFORE any build launches** when the modelled total exceeds **60 % of available RAM**
-> (`MEMORY_MARGIN = 0.6`, `train.py:127`) — unless `--allow-oversized` (which still prints the estimate,
+> (`MEMORY_MARGIN = 0.6`, `train.py:147`) — unless `--allow-oversized` (which still prints the estimate,
 > then proceeds). If the guard aborts, lower `--n-steps` or `--n-envs` (or pass `--allow-oversized`
 > only if the box has RAM the conservative guard does not model). `timeScale` **MUST stay ≤ 5** for the
 > training builds too — the collection cap applies (see below).
@@ -448,9 +475,10 @@ resume stays position-exact `round_robin` as documented under [Resume](#resume).
 ### The training topology (`train_config.json`)
 
 The build launches under [`train_config.json`](../unity/Assets/StreamingAssets/train_config.json): a
-**single-arena AI-vs-AI** pixel config — `obs_pixels: true` @ 640×360, both `player1_ai`/`player2_ai`
-`true`, `game_maxTime: 60`, `player_maxHealth: 3`, one `arena_path` (`Arenas/custom1.json`, no
-rotation) (`train_config.json:1-22`).
+**single-arena AI-vs-AI** pixel config — `obs_pixels: true` with `obs_pixels_width: 640` /
+`obs_pixels_height: 360` (the keys the env's `frame_shape` is derived from), both
+`player1_ai`/`player2_ai` `true`, `game_maxTime: 60`, `player_maxHealth: 3`, one `arena_path`
+(`Arenas/custom1.json`, no rotation) (`train_config.json:1-22`).
 
 > **`timeScale` MUST stay ≤ 5 (hard operational rule).** `train_config.json` ships `timeScale: 5`
 > (`train_config.json:5`). Collection at `timeScale ≤ 5` is bit-identical to 1×; **`timeScale ≥ 10`
@@ -459,13 +487,15 @@ rotation) (`train_config.json:1-22`).
 ### Resume
 
 `--resume <prior run_dir>` continues a previous run: it picks the **highest-step** `model_*.zip` in
-that dir (`_latest_checkpoint`, `train.py:967-986`), does `PPO.load(env=...)`, restores the opponent
-position + ELO from that dir's `state.json` sidecar (`train.py:1110-1115`), and continues with
-`reset_num_timesteps=False` (`train.py:1100,1176`). Resuming a dir with no parseable `model_*.zip`
-raises `FileNotFoundError` (`train.py:1106-1109`).
+that dir (`_latest_checkpoint`, `train.py:1045-1064`), does `PPO.load(env=...)` (`train.py:1197`),
+restores the opponent position + ELO from that dir's `state.json` sidecar (`train.py:1199-1202`), and
+continues with `reset_num_timesteps=False` (flag set `train.py:1187`, `learn()` call
+`train.py:1263-1266`). Resuming a dir with no parseable `model_*.zip` raises `FileNotFoundError`
+(`train.py:1194-1196`).
 
 > **CRITICAL — sub-cadence smoke runs are NOT resumable.** The checkpoint cadence (`--checkpoint-freq`,
-> default **10_000** env-steps; `train.py:199`) controls when a `model_*.zip` is written. A run whose
+> default **10_000** env-steps; `TrainConfig.checkpoint_freq`, `train.py:230`) controls when a
+> `model_*.zip` is written. A run whose
 > `--total-timesteps` is **below the checkpoint cadence** writes **no intermediate `model_*.zip`** —
 > only the final `state.json` — and therefore **cannot be `--resume`d** (resume needs a checkpoint zip
 > and will raise `FileNotFoundError`). For a resumable checkpoint, keep `--total-timesteps >=` the
@@ -496,7 +526,7 @@ never contend:
   the first launch, `-1` for the first relaunch, …) is **load-bearing**: Unity's `-logFile`
   truncates its target on every launch, so giving each launch a DISTINCT file means a respawn / lazy
   re-launch / reconnect **never wipes the prior (possibly hung) instance's C# log** — prior logs
-  survive for post-mortem (`_attempt_unity_log_path`, `train.py:416-427`).
+  survive for post-mortem (`_attempt_unity_log_path`, `train.py:473-484`).
 
 So a **1-train + 1-eval run** (the default `--n-envs 1`, ports 50000/50001) that never relaunches
 produces **5 files** (the Unity logs carry the `-0` first-launch suffix):
@@ -551,6 +581,23 @@ print(f'random    cov={rnd.coverage_fraction:.2f} entropy={rnd.occupancy_entropy
 
 On this 12×12 open map the coverage agent reaches `cov≈0.85` vs the baseline `cov≈0.33`. (The
 kinematic harness is optimistic vs the live engine — see the operational note above.)
+
+## 7. Inspect a checkpoint (CLI)
+
+After a [training run](#5-run-rl-training-cli) writes a `model_*.zip`, inspect it with the
+[`utils.model_info`](components/utils.md) tool — no Unity, no env, no GPU:
+
+```bash
+uv run python -m pop_trainer.utils.model_info runs/train-smoke/model_10000_steps.zip
+```
+
+It loads the checkpoint on CPU (the saved learning-rate / clip-range schedules are skipped on load,
+so no env or training context is needed) and prints the observation + action spaces, the full
+`model.policy` repr, the **active encoder trunk** class name (`CnnTrunk` / `ResNetTrunk` /
+`GroupNormCNN`), and **id-deduped** per-section parameter counts (total / trainable / frozen) — the
+dedupe matters because SB3 shares the one features-extractor instance across the policy's pi/vf
+references, so a naive sum would triple-count the encoder. See the
+[utils component page](components/utils.md).
 
 ---
 [← back to index](README.md)

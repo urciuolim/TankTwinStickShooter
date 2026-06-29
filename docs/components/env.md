@@ -18,6 +18,14 @@ nothing from `models` / `data` / `agents` / the Unity-side code.
   - **Observation = the real rendered pixel frame** (`(H, W, 3)` uint8) read via
     `core.protocol.Connection.receive_state_and_frame`. The 52-float wire state is NOT in
     `observation_space` — it rides in `info["state"]` as the supervised-decode objective.
+  - **`frame_shape` is config-derived (one source of truth).** The env reads exactly
+    `prod(frame_shape)` bytes per frame, so its shape MUST match the build's `obs_pixels_width/height`.
+    The constructor takes a `frame_shape` (`(H, W, 3)`, default `DEFAULT_FRAME_SHAPE`, the
+    unit-test value — `tank_env.py:160,253,290-292`); every **live** caller
+    ([play](play.md) / [rl.train](rl.md) / [data](data.md)) passes the shape derived from the
+    launched config via [`core.obs.frame_shape_from_config`](core.md#the-observation-resolution-contract-coreobs),
+    so the env auto-matches whatever resolution the build renders (640×360 today). [rl](rl.md) also
+    `validate_frame_shape`s its configured shape against the launched config before any build starts.
   - `ACTION_DIM = 5`: the action is `[move_x, move_y, aim_x, aim_y, fire]` in `[-1, 1]`.
   - **Injected transport** (`connection` or `connection_factory`), exactly like
     `core.protocol.Connection` — so the env is unit-testable against an in-process fake socket

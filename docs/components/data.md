@@ -79,7 +79,10 @@ package is named `data` (not `datasets` — that name collides with the git-igno
   connects via [`core.launch.connect`](core.md), and builds the bare
   [`TankEnv`](env.md) (which owns neither player) — wrapping `env.close` so closing the env also
   reaps the launched build. The build is launched **once** per worker on the boot config and rotates
-  arenas at runtime via `switch_arena`.
+  arenas at runtime via `switch_arena`. The env's pixel `frame_shape` is **DERIVED from the boot
+  config's `obs_pixels_*`** via [`core.obs.frame_shape_from_config`](core.md#the-observation-resolution-contract-coreobs)
+  (carried to each worker in `spec.extra["frame_shape"]`, `collect.py:498-501,563`; an explicit
+  `frame_shape` is the test seam), so the env byte-read matches the build's rendered frame.
   [`agent_pool_factory`](../../src/pop_trainer/data/collect_runner.py) is the module-level (spawn-safe)
   factory that builds the worker's `{selector → agent}` pool once up front — covering every selector
   its plan pairs — so each selector's RNG stream is continuous across the episodes it plays
@@ -177,7 +180,8 @@ exit code `2` BEFORE launching any build (unless `--allow-oversized`).
 
 - [core](core.md) — `state` (`STATE_LEN`, `validate`), `config.EnvConfig`,
   `protocol.Connection`, `agent.Agent`, `launch` (`build_launch_cmd` / `connect` — the shared
-  build-launch + socket-connect seam `collect_runner` uses per worker), and
+  build-launch + socket-connect seam `collect_runner` uses per worker),
+  `obs.frame_shape_from_config` (derive the boot config's pixel `frame_shape`), and
   `maps.resolve_map_rotation` (the shared `--maps` rotation-resolution contract).
 - [env](env.md) — `TankEnv` (collection drives episodes through it).
 - [agents](agents.md) — the `player1` / `player2` policies (the coverage / random presets), and

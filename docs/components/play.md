@@ -83,8 +83,11 @@ All in [`play.py`](../../src/pop_trainer/play.py):
 shipped `unity/Assets/StreamingAssets/config.json` has no `obs_pixels` key (the build defaults it off
 and sends no frame). So play launches the build with
 [`unity/Assets/StreamingAssets/demo_config.json`](../../unity/Assets/StreamingAssets/demo_config.json), which
-sets `"obs_pixels": true` at 640×360, and constructs the env with `frame_shape=(360, 640, 3)` to
-match. That config lives inside `StreamingAssets` so its relative `arena_path`
+sets `"obs_pixels": true` plus `obs_pixels_width`/`obs_pixels_height` (640×360 today). The env's
+`frame_shape` is then **DERIVED from that SAME launched config** via
+[`core.obs.frame_shape_from_config`](core.md#the-observation-resolution-contract-coreobs)
+(`play.py:489-491,517`), so the env always matches whatever resolution the build renders — no
+hand-synced hardcoded shape. That config lives inside `StreamingAssets` so its relative `arena_path`
 (`Arenas/custom1.json`) resolves against the config directory. An `rl:` player needs pixels too —
 it acts on the frame — so it runs on the same obs_pixels config.
 
@@ -107,7 +110,8 @@ an actionable message naming the extra.
 ## Pulls from (upstream)
 
 - [core](core.md) — `protocol.Connection` / `WallLayout`, `config.EnvConfig`, `agent.Agent`,
-  `state.split_state_for_opponent` / `flip_frame_perspective` (the perspective flips), and `launch`
+  `state.split_state_for_opponent` / `flip_frame_perspective` (the perspective flips),
+  `obs.frame_shape_from_config` (derive the env `frame_shape` from the launched config), and `launch`
   (`build_launch_cmd` / `connect`).
 - [env](env.md) — `TankEnv` and its `player2_frame()` first-person view.
 - [agents](agents.md) — the rule-based selectors for both players, plus

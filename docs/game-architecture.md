@@ -24,6 +24,73 @@ How the existing game actually runs, traced from code (game-sim-engineer + train
 
 Known latent bug for later: `human_matchmaking.get_human_stats` passes a path string to `json.load` (`human_matchmaking.py:43`), so the "existing human" branch is broken as written.
 
+## The Python-driven round boundary + length-prefix framing
+
+Two related transport changes hardened the episode boundary. The **wire data contract is
+unchanged** — the 52-float state, the integer-keyed `{1: a1, 2: a2}` step, the pixel-frame header —
+only the *control framing* and *who decides the round ends* changed. The Python side is
+[`core.protocol`](components/core.md) + [`env`](components/env.md#episode-boundaries); the Unity side
+is [`DriverProtocol.cs`](../unity/Assets/Scripts/DriverProtocol.cs),
+[`DriverController.cs`](../unity/Assets/Scripts/DriverController.cs), and
+[`GameController.cs`](../unity/Assets/Scripts/GameController.cs).
+
+### The round boundary is now driven off Unity's OWN clock
+
+Previously a Python-side step cap drove restarts, which could fire **mid-round** and collapse into a
+synchronous scene reload inside the socket read. Now:
+
+1. Unity ends the round on its **own clock** — a winner OR the round-timer expiring — and
+   `GameController.EndGame` stamps `done` / `winner` onto the state and sets `roundOver = true`
+   (`GameController.cs:321-347`).
+2. `roundOver` **FREEZES** the round: while set, `FixedUpdate` early-returns so `UpdateState()` no
+   longer overwrites the `done`/`winner`-stamped state — this guarantees the **done step + its frame
+   are delivered to Python exactly once** (`GameController.cs:32-39,184-188`).
+3. `EndGame` **no longer `LoadScene`s** (`GameController.cs:339-347`). The scene reload is **deferred**
+   to the next `start` Python sends (`DriverController` handles `start` by loading `Arena`,
+   `DriverController.cs:363-409,568`). Unity goes `ingame = false` and **KEEPS servicing the socket**
+   while waiting.
+4. On the Python side, that `done` makes the step `terminated`; SB3 then calls `reset()`, which sends
+   `{"restart": True}` — now landing in Unity's **clean waiting state, never mid-round**. So a
+   `restart` is only ever sent from `reset` / `close`, and only after Unity already finished the round
+   (`tank_env.py:60-78`).
+5. `max_steps` is no longer the normal boundary — it is a **generous safety cap (`DEFAULT_MAX_STEPS =
+   600`)** set ABOVE Unity's ~300-step round (`game_maxTime` / `ai_actionFreq`-bounded), so it never
+   preempts Unity. If it ever fires (a stuck round), `step` truncates but sends **no** restart itself;
+   the redesigned Unity driver also survives a `restart` arriving on the safety-cap mid-round read
+   without the old synchronous-reload collapse (`DriverController.cs:537-557`).
+
+### Length-prefix framing on the Python → Unity control/step channel
+
+Unity's old single `nwStream.Read(ReceiveBufferSize)` assumed one JSON object per `recv` — a dormant
+desync. Now every Python → Unity **control / step** message is **length-prefixed**: a 4-byte
+BIG-ENDIAN uint32 = the UTF-8 JSON byte length, then exactly that many JSON bytes. Unity reads
+exactly those 4 bytes, then exactly that many bytes, then `JObject.Parse` — a **read-exactly frame**.
+
+- The pure helpers live in the new [`DriverProtocol.cs`](../unity/Assets/Scripts/DriverProtocol.cs)
+  (unit-testable in an EditMode test, no MonoBehaviour / socket): `DecodeLengthPrefix` /
+  `EncodeLengthPrefix` (the symmetric big-endian writer pinned by the test so the byte order stays in
+  lockstep with the Python `encode_framed`) and `Classify` (maps a parsed inbound `JObject` to its
+  control action: `Start` / `End` / `Restart` / `SwitchArena` / `Action` / `Unknown`, so the
+  waiting-state read and the safety-cap mid-round read share ONE tested dispatch —
+  `DriverProtocol.cs:20-77`).
+- `DriverController.ReadExactly(n)` loops over the stream until `n` bytes arrive
+  (`DriverController.cs:316-343`).
+- The prefix counts ONLY the JSON payload. **Inbound (Unity → Python) JSON stays UNFRAMED** —
+  Python's `receive()` brace-scans one complete object — and the **pixel-frame header (10 bytes) is
+  unchanged**, so only the Python→Unity control/step direction gained the prefix. The Python writer
+  is `core.protocol.Connection.send` / `encode_framed` (`protocol.py:100-108,277-302`); see the
+  [core protocol page](components/core.md#key-modules--entry-points).
+
+### FrameCapture full-view supersampling (wire-identical)
+
+[`FrameCapture`](../unity/Assets/Scripts/FrameCapture.cs) now renders the **full 16:9 view** into a
+1280×720 intermediate (no crop — the WHOLE arena is in every frame), then **area-averages** down to
+the obs dims via a progressive 2× bilinear-halving chain (each 2× step is a 2×2 box average, so every
+source pixel contributes — thin ~1px sprites like the tank wireframe + barrel survive the downscale,
+`FrameCapture.cs:5-9,51-62,203-204`). This is an **obs-quality** change only: the frame-message wire
+contract (`BuildFrameMessage`, the 10-byte big-endian header + RGB24 bottom-up payload) is
+**byte-identical**, so [`core.protocol.receive_frame`](components/core.md) is untouched.
+
 ## Observability logging (verbose-gated, ZERO wire impact)
 
 The C# side has structured observability logging — added to diagnose the reset/restart-handshake

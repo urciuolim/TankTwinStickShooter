@@ -26,10 +26,23 @@ from here instead of re-hardcoding them. All JSON is strict.
   `parse_walls_message` → an immutable [`WallLayout`](../../src/pop_trainer/core/protocol.py)),
   and the **switch-arena handshake** (`Connection.switch_arena` — the one additive outbound
   write; see below).
+  - **Outbound length-prefix framing (Python → Unity).** `Connection.send` (and the pure
+    [`encode_framed`](../../src/pop_trainer/core/protocol.py)) prepend a **4-byte big-endian uint32**
+    = the UTF-8 JSON byte length, then the JSON (`SEND_LENGTH_PREFIX_LEN = 4`, `protocol.py:108`;
+    `send` `protocol.py:277-302`). Unity reads exactly those 4 bytes, then exactly that many bytes,
+    then parses — a **read-exactly frame** that fixes the dormant desync of Unity's old single-`Read`
+    parse. The prefix counts ONLY the JSON payload. **INBOUND (Unity → Python) JSON stays UNFRAMED**
+    — `receive`'s brace-scan already tolerates it — and the pixel-frame channel keeps its own 10-byte
+    header, so **only the outbound control/step direction gains a prefix** (`protocol.py:100-107`).
+    See the [Unity/protocol page](../game-architecture.md#the-python-driven-round-boundary--length-prefix-framing)
+    for the matching `DriverProtocol.cs` read-exactly side.
 - [`core.config`](../../src/pop_trainer/core/config.py) — frozen, strict-JSON config
   dataclasses [`RunConfig`](../../src/pop_trainer/core/config.py) /
   [`EnvConfig`](../../src/pop_trainer/core/config.py) /
   [`RewardConfig`](../../src/pop_trainer/core/config.py) (reject unknown keys).
+- [`core.obs`](../../src/pop_trainer/core/obs.py) — the **observation-resolution contract**: the
+  single source of truth for the env's pixel `frame_shape`. stdlib only (`json` + `pathlib`), so it
+  stays in the pure import path. See [the section below](#the-observation-resolution-contract-coreobs).
 - [`core.maps`](../../src/pop_trainer/core/maps.py) — the **map-rotation resolution contract**
   (stdlib + `pathlib` + `json` only). [`CURATED_ROTATION`](../../src/pop_trainer/core/maps.py) is
   the **single source of truth for the training rotation**: a hard-coded 10-entry tuple of
@@ -135,6 +148,34 @@ is **byte-identical** to today.
 The caller is [`env`](env.md): `TankEnv.reset(options={"switch_arena": <path>})` fires this in the
 `!ingame` window and then drains the optional walls message. See the [env](env.md#map-rotation-resetoptionsswitch_arena) page for the reset hook.
 
+## The observation-resolution contract (`core.obs`)
+
+The Unity build sizes its RenderTexture / Texture2D from `obs_pixels_width` / `obs_pixels_height` in
+the **game config** at runtime (`DriverController → FrameCapture.Init(w, h)`) and ships actual W/H on
+the wire. The Python env reads exactly `prod(frame_shape)` bytes per frame, so its pixel
+`frame_shape` MUST match that config — `core.obs` makes the **config the ONE source of truth** for
+both sides, so there is no hand-synced hardcoded resolution that can silently desync (`obs.py:1-16`).
+
+The config read is a plain **strict-`json`** parse of the two keys (NOT a typed `core.config`
+dataclass — those reject unknown keys and are the wrong surface for `obs_pixels_*`):
+
+- [`frame_shape_from_config(config_path)`](../../src/pop_trainer/core/obs.py) (`obs.py:51-78`) —
+  reads the RAW game-config JSON and returns the **channels-last** `(obs_pixels_height,
+  obs_pixels_width, 3)` (HEIGHT first — gymnasium pixel obs is channels-last). A **missing** key
+  falls back to [`DEFAULT_FRAME_SHAPE = (360, 640, 3)`](../../src/pop_trainer/core/obs.py)
+  (the build's own DriverController default, `obs.py:28`); a present-but-malformed value (non-int /
+  non-positive / bool) is a **clear `ValueError`** — a silent default there would re-introduce the
+  very desync this module prevents (`obs.py:31-48`).
+- [`validate_frame_shape(frame_shape, config_path)`](../../src/pop_trainer/core/obs.py)
+  (`obs.py:81-98`) — the anti-silent-desync guard: raises a clear `ValueError` naming BOTH shapes
+  (and the config) when `frame_shape` ≠ the config's derived shape; a no-op on a match.
+
+Every live entry point derives its `frame_shape` from the config it actually launches with:
+[play](play.md), [rl.train](rl.md) (which ALSO `validate_frame_shape`s the configured shape against
+the launched config before any build launches, `train.py:1112-1119`), and the
+[data](data.md) collection runner all call `frame_shape_from_config`. The derived resolution is also
+what drives the [models](models.md) trunk auto-selection (small vs large frame).
+
 ## Pulls from (upstream)
 
 Nothing internal. **`core` is the dependency-free root** — stdlib + numpy only.
@@ -149,14 +190,18 @@ Every other component depends on `core`:
   `agent.Agent`, and `logging_setup.LAYER_ENV` (the optional observability logger's layer tag).
 - [agents](agents.md) — `agent.Agent` Protocol + the `state` schema.
 - [rl](rl.md) — `launch` (incl. the `build_launch_cmd` `unity_log_path` kwarg),
-  `protocol.Connection`, `config`, and `logging_setup` (the integrator wires the per-process
+  `protocol.Connection`, `config`, `obs` (`frame_shape_from_config` / `validate_frame_shape` /
+  `DEFAULT_FRAME_SHAPE`), and `logging_setup` (the integrator wires the per-process
   `system` / `env` loggers + the `--debug` / `POP_LOG_LEVEL` level switch via `level_from_env`).
 - [data](data.md) — `state` (`STATE_LEN` + `validate`), `config.EnvConfig`,
   `protocol.Connection`, `agent.Agent`, `launch` (the collection runner launches + connects one
-  build per worker), and `maps.resolve_map_rotation` (the shared `--maps` rotation contract).
+  build per worker), `obs.frame_shape_from_config` (derive the boot config's frame shape), and
+  `maps.resolve_map_rotation` (the shared `--maps` rotation contract).
 - [play](play.md) — `protocol.Connection` / `WallLayout`, `config.EnvConfig`, `agent.Agent`,
-  `state.split_state_for_opponent` / `flip_frame_perspective`, and `launch` (`build_launch_cmd` /
-  `connect`).
+  `state.split_state_for_opponent` / `flip_frame_perspective`, `obs.frame_shape_from_config` (derive
+  the launched config's frame shape), and `launch` (`build_launch_cmd` / `connect`).
+- [utils](utils.md) — no direct `core` import today; it is a leaf sink reaching the stack's
+  artifacts (SB3 checkpoints + the [models](models.md) trunk) by attribute.
 
 ## Where it sits in the run
 

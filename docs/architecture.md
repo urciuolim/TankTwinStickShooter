@@ -11,7 +11,8 @@ The cross-component class-to-class interaction map for the built + GO'd slice of
 core  ←  { models, env, agents, data }  ←  play
 ```
 
-- [core](components/core.md) — stdlib + numpy only; imports nothing internal.
+- [core](components/core.md) — stdlib + numpy only; imports nothing internal (now incl. the
+  `obs` observation-resolution contract).
 - [models](components/models.md) — torch only; imports nothing internal.
 - [env](components/env.md) — imports `core` (+ gymnasium, numpy).
 - [agents](components/agents.md) — imports `core` (+ numpy).
@@ -20,11 +21,13 @@ core  ←  { models, env, agents, data }  ←  play
   composition-root app — the only relaxation; sb3/torch import only inside its RL-player factory).
 - [rl](components/rl.md) — imports `core`, `env`, `models`, `agents` (+ torch / gymnasium / numpy /
   stable-baselines3).
+- [utils](components/utils.md) — a **leaf SINK**: it MAY import `core` / `models` / `rl` (+ sb3 /
+  torch), but **nothing in `pop_trainer` imports it**, so it can never create a cycle.
 
 No import cycles: `data` and `play` sit at the top, `core` at the bottom, `models` off to the
-side. `play` is a LEAF (imported by nothing), so its lazy `play → rl` edge adds no cycle.
-(`pretraining` / `eval` / `population` / `deployment` / `imitation` are not built yet and are
-omitted.)
+side, `utils` off to the side as a one-way sink. `play` is a LEAF (imported by nothing), so its lazy
+`play → rl` edge adds no cycle. (`pretraining` / `eval` / `population` / `deployment` / `imitation`
+are not built yet and are omitted.)
 
 ## Class-to-class interaction map
 
@@ -32,15 +35,20 @@ omitted.)
 graph TD
     subgraph core["core (contract layer — dep-free root)"]
         State["state.py<br/>52-float schema +<br/>split_state_for_opponent /<br/>flip_frame_perspective"]
-        Protocol["protocol.py<br/>Connection, encode/decode,<br/>receive_frame, WallLayout,<br/>parse_walls_message"]
+        Protocol["protocol.py<br/>Connection (send=length-prefixed),<br/>encode/decode, receive_frame,<br/>WallLayout, parse_walls_message"]
         Config["config.py<br/>RunConfig / EnvConfig /<br/>RewardConfig"]
+        Obs["obs.py<br/>frame_shape_from_config /<br/>validate_frame_shape"]
         Maps["maps.py<br/>resolve_map_rotation"]
         AgentProto["agent.py<br/>Agent / StatefulAgent<br/>(Protocol)"]
         Launch["launch.py<br/>build_launch_cmd / connect<br/>(stdlib leaf)"]
     end
 
     subgraph models["models (torch; no internal deps)"]
-        Encoder["Encoder = Trunk × Pooling<br/>build_encoder / export_onnx"]
+        Encoder["Encoder = Trunk × Pooling<br/>TRUNKS: cnn / resnet / gn-cnn<br/>build_encoder / export_onnx"]
+    end
+
+    subgraph utils["utils (leaf CLI sink)"]
+        ModelInfo["model_info.py<br/>inspect SB3 ckpt:<br/>spaces / trunk / param counts"]
     end
 
     subgraph rl["rl (online RL; SB3)"]
@@ -90,7 +98,7 @@ graph TD
     Encoder -.->|leaf, no internal import| core
 
     %% rl wiring: the encoder seam wraps models; the self-play seam wraps env + reuses core/agents
-    EncoderExtractor -.->|wraps build_encoder(nature,flatten) @360×640| Encoder
+    EncoderExtractor -.->|"wraps build_encoder(trunk by size or --trunk, flatten)"| Encoder
     SelfPlay -.->|"wraps env; step(a1,a2)"| TankEnv
     SelfPlay -.->|"from_roster → make_agent"| AgentImpls
     SelfPlay -.->|split_state_for_opponent| State
@@ -114,6 +122,16 @@ graph TD
     Play --> Protocol
     Play --> Launch
     Play -.->|"rl:&lt;ckpt&gt; only — lazy sb3 PPO.load(ckpt)"| rl
+
+    %% obs-resolution wiring: every live entry derives frame_shape from its launched config
+    %% (the derived resolution also drives the rl extractor's trunk auto-selection)
+    Play -.->|frame_shape_from_config| Obs
+    Runner -.->|frame_shape_from_config| Obs
+    rl -.->|"frame_shape_from_config + validate_frame_shape"| Obs
+
+    %% utils: a one-way sink — loads an SB3 ckpt + reads the models trunk by attribute
+    ModelInfo -.->|"PPO.load + .encoder.trunk (by attr)"| rl
+    ModelInfo -.->|names the active trunk class| Encoder
 
     classDef root fill:#d4edda,stroke:#28a745;
     class core root;
@@ -156,9 +174,32 @@ graph TD
   `maps.json` sidecar / `map_index`. See
   [data](components/data.md#the-rotation-scheduler--map-tagging).
 - **`models` is detached** from the live loop today — it's the shared vision backbone, and the
-  deployable ONNX artifact. The seam to consume it now exists: [`rl`](components/rl.md)'s
+  deployable ONNX artifact. Its trunks are named by architecture (`cnn` / `resnet` / `gn-cnn`); the
+  small-frame `gn-cnn` (DreamerV3-style GroupNorm CNN) survives ≤128px frames where the `cnn`
+  stride-4 stem collapses. The seam to consume it now exists: [`rl`](components/rl.md)'s
   `EncoderExtractor` wraps the `Encoder` and reads its `embed` flat embedding as the SB3 policy /
-  value feature extractor. The future `pretraining` (which reads `Encoder.features`) is still unbuilt.
+  value feature extractor, **auto-selecting the trunk by obs resolution** (or honoring an explicit
+  `--trunk` override). The future `pretraining` (which reads `Encoder.features`) is still unbuilt.
+- **The observation-resolution seam (`core.obs`).** The env's pixel `frame_shape` is the ONE
+  source of truth derived from the launched config's `obs_pixels_width/height` via
+  `core.obs.frame_shape_from_config` — every live entry (`play` / `rl.train` / the collection
+  runner) derives it, so the env byte-read always matches the build's rendered W/H, and the derived
+  resolution is what drives the `models` trunk auto-selection above. `rl.train` also
+  `validate_frame_shape`s its configured shape against the launched config before any build starts.
+  See [core](components/core.md#the-observation-resolution-contract-coreobs).
+- **The transport handshake (Python-driven round boundary + length-prefix framing).** The episode
+  boundary is now driven off **Unity's own clock** — Unity ends the round (winner OR timer), freezes
+  it (`roundOver`), delivers the `done` step+frame once, and KEEPS servicing the socket while waiting;
+  Python's `done → terminated → reset()` sends `restart` into the clean waiting state (never
+  mid-round). Python → Unity control/step writes are now **length-prefixed** (4-byte big-endian +
+  JSON, the new `DriverProtocol.cs` read-exactly side); inbound JSON + the pixel-frame header are
+  unchanged. The wire DATA contract is byte-identical. See
+  [Unity/protocol](game-architecture.md#the-python-driven-round-boundary--length-prefix-framing).
+- **`utils` is a one-way sink** off the graph: `utils.model_info` (`python -m
+  pop_trainer.utils.model_info <ckpt>`) loads an SB3 checkpoint on CPU and reports its obs/action
+  spaces, the active [`models`](components/models.md) trunk, and id-deduped per-section param counts.
+  Nothing imports it, so it can reach across components without a cycle. See
+  [utils](components/utils.md).
 - **`rl` now spans four internal deps**, not just `models`: the self-play seam adds `env` (the
   `TankEnv` `SelfPlayWrapper` wraps), `agents` (`make_agent` for the opponent roster), and `core`
   (`split_state_for_opponent` for the perspective flip, plus `core.launch` for the re-derived live
