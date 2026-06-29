@@ -16,20 +16,28 @@ torch + numpy + the pretraining/models/data components; nothing from ``env`` / `
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
+import os
+import platform
 import random
+import socket
+import subprocess
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 import numpy as np
+import psutil
 import torch
 from torch.utils.data import DataLoader, Dataset
 
+from pop_trainer.data.manifest import MANIFEST_NAME, manifest_id
 from pop_trainer.models import EncoderConfig, build_encoder
-from pop_trainer.pretraining import losses, metrics
+from pop_trainer.pretraining import card, losses, metrics
 from pop_trainer.pretraining.dataset import build_splits
 from pop_trainer.pretraining.decoder import StateDecoder
 from pop_trainer.pretraining.device import resolve_device
@@ -414,6 +422,7 @@ def run(cfg: TrainConfig) -> dict:
         },
         out_dir / "checkpoint.pt",
     )
+    _write_model_card(out_dir, model, cfg, device, h, w, pos_weight, val_metrics, test_metrics)
 
     record = {
         "config": _config_json(cfg),
@@ -507,6 +516,153 @@ def _sanitize(obj):
     if isinstance(obj, float):
         return _finite(obj)
     return obj
+
+
+def _git_provenance() -> tuple[str | None, bool | None]:
+    """Return ``(git_commit, git_dirty)`` from the local checkout, or ``(None, None)`` on failure.
+
+    Both via ``subprocess`` arg-lists (no shell string). Any failure (git absent, not a repo)
+    yields ``(None, None)`` — the card is informational provenance, not a gate, so it never crashes
+    the run.
+    """
+    try:
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        dirty = bool(
+            subprocess.run(
+                ["git", "status", "--porcelain"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+        )
+        return commit, dirty
+    except (OSError, subprocess.SubprocessError):
+        return None, None
+
+
+def _sha256_file(path: Path) -> str:
+    """Return the bare 64-char lowercase sha256 hex of ``path``'s bytes (chunked read)."""
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _dataset_pointer(data_dir: str) -> dict:
+    """Resolve the dataset card pointer (name / RECOMPUTED manifest_id / path) for ``data_dir``.
+
+    Loads ``<data_dir>/manifest.json`` (strict JSON) and recomputes its content fingerprint via
+    :func:`manifest_id` (never trusts the stored field). If the manifest is absent, prints a LOUD
+    warning to stderr and falls back to ``manifest_id=None`` with the dir's name — a missing
+    manifest must NOT abort the run.
+    """
+    manifest_path = Path(data_dir) / MANIFEST_NAME
+    if manifest_path.exists():
+        with open(manifest_path, encoding="utf-8") as fh:
+            m = json.load(fh)
+        return {"name": m["dataset"], "manifest_id": manifest_id(m), "path": str(data_dir)}
+    print(
+        f"WARNING: dataset manifest not found at {manifest_path}; "
+        "model card dataset.manifest_id will be null",
+        file=sys.stderr,
+        flush=True,
+    )
+    return {"name": Path(data_dir).name, "manifest_id": None, "path": str(data_dir)}
+
+
+def _machine_block() -> dict:
+    """Fingerprint the TRAINING machine: the 9 fields the manifest's machine block carries.
+
+    stdlib ``platform`` / ``os`` / ``socket`` plus ``psutil`` for total RAM (a pinned dependency).
+    Describes the box this run trained on, NOT the dataset's collection machine.
+    """
+    return {
+        "hostname": socket.gethostname(),
+        "platform": platform.platform(),
+        "system": platform.system(),
+        "release": platform.release(),
+        "arch": platform.machine(),
+        "processor": platform.processor(),
+        "cpu_count": os.cpu_count(),
+        "ram_total_gb": round(psutil.virtual_memory().total / (1024**3), 2),
+        "python": platform.python_version(),
+    }
+
+
+def _write_model_card(
+    out_dir: Path,
+    model: StateDecoder,
+    cfg: TrainConfig,
+    device: torch.device,
+    h: int,
+    w: int,
+    pos_weight: float | None,
+    val_metrics: dict,
+    test_metrics: dict,
+) -> Path:
+    """Build + atomically write ``out_dir/model_card.json`` from the just-trained run state.
+
+    RAW (un-sanitized) ``val_metrics`` / ``test_metrics`` are passed straight to
+    :func:`card.build_card`, whose ``_nullify_nonfinite`` is the SINGLE null-mapping policy point
+    for the card. Param counts split into encoder vs head; provenance hashes the just-written
+    checkpoint. Structural / build_card validation errors surface (they indicate a real bug); only a
+    missing dataset manifest is tolerated (handled in :func:`_dataset_pointer`).
+    """
+    encoder_params = int(sum(p.numel() for p in model.encoder.parameters()))
+    total_params = int(sum(p.numel() for p in model.parameters()))
+    git_commit, git_dirty = _git_provenance()
+    dataset_pointer = _dataset_pointer(cfg.data_dir)
+
+    card_dict = card.build_card(
+        name=Path(cfg.out_dir).name or dataset_pointer["name"],
+        created_utc=datetime.now(UTC).isoformat(),
+        architecture={
+            "trunk": cfg.trunk,
+            "pooling": cfg.pooling,
+            "resolution": cfg.resolution,
+            "input_hw": [h, w],
+            "trunk_class": type(model.encoder.trunk).__name__,
+            "pooling_class": type(model.encoder.pooling).__name__,
+            "decoder_class": type(model).__name__,
+            "encoder_params": encoder_params,
+            "head_params": total_params - encoder_params,
+            "total_params": total_params,
+            "embedding_dim": model.encoder.embedding_dim((h, w)),
+        },
+        hyperparameters={
+            "lr": cfg.lr,
+            "batch_size": cfg.batch_size,
+            "epochs": cfg.epochs,
+            "seed": cfg.seed,
+            "heatmap_weight": cfg.heatmap_weight,
+            "heatmap_sigma": cfg.heatmap_sigma,
+            "presence_pos_weight": float(pos_weight if pos_weight is not None else 1.0),
+            "optimizer": "Adam",
+            "device": str(device),
+        },
+        dataset=dataset_pointer,
+        metrics={"val": val_metrics, "test": test_metrics},
+        provenance={
+            "git_commit": git_commit,
+            "git_dirty": git_dirty,
+            "weights_filename": "checkpoint.pt",
+            "weights_sha256": _sha256_file(out_dir / "checkpoint.pt"),
+        },
+        machine=_machine_block(),
+    )
+
+    path = out_dir / card.CARD_NAME
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(card_dict, fh, indent=2, allow_nan=False)
+    tmp.replace(path)
+    return path
 
 
 def main(argv: list[str] | None = None) -> int:
