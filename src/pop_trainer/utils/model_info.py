@@ -135,7 +135,7 @@ def _resolve_trunk_class(policy: object) -> str | None:
     """Return ``policy.features_extractor.encoder.trunk.__class__.__name__`` or ``None`` if absent.
 
     The Phase-1 ``CnnPolicy`` uses our :class:`~pop_trainer.rl.extractor.EncoderExtractor`, whose
-    ``.encoder.trunk`` is the active vision trunk (NatureCNN / DreamerCNN / IMPALA). A policy built
+    ``.encoder.trunk`` is the active vision trunk (cnn / resnet / gn-cnn). A policy built
     with a different extractor has no such path, so this returns ``None`` rather than raising.
     """
     extractor = getattr(policy, "features_extractor", None)

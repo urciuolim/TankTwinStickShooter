@@ -18,12 +18,20 @@ description: Contract + boundaries for the rl/ component of src/pop_trainer. Loa
 - self-play opponent management + ELO (rating logic lives HERE, not in core).
 
 **`EncoderExtractor` contract (T2, Phase 1):**
-- An `stable_baselines3.common.torch_layers.BaseFeaturesExtractor` subclass. FIXED architecture:
-  **NatureCNN trunk + flatten pooling at 360×640** (`EncoderConfig(trunk="nature", pooling="flatten")`).
-  NO trunk/pooling/resolution config knobs in Phase 1 — the encoder/resolution ablation is a
-  teammate's SEPARATE `models` benchmark; do not re-expose it here.
-- `__init__(observation_space, *, checkpoint: Path | None = None, freeze: bool = False)`:
-  - build the encoder via `models.build_encoder`;
+- An `stable_baselines3.common.torch_layers.BaseFeaturesExtractor` subclass. Default architecture:
+  **the `cnn` trunk + flatten pooling at 360×640** (`EncoderConfig(trunk="cnn", pooling="flatten")`);
+  a SMALL frame (max spatial dim ≤ `SMALL_FRAME_MAX_DIM`) auto-selects the `gn-cnn` trunk. Pooling /
+  resolution stay FIXED here — that ablation is a teammate's SEPARATE `models` benchmark; do not
+  re-expose them.
+- **Trunk override (CTO-authorized — this RELAXES the former "no trunk knobs" clause):** the
+  extractor takes an optional `trunk` kwarg. `None` / `"auto"` keeps the size-based selection
+  above; an explicit `"cnn"` / `"resnet"` / `"gn-cnn"` REPLACES it using the `models.TRUNKS`
+  registry. `rl.train` threads `TrainConfig.trunk` (CLI `--trunk`, default `auto`) through
+  `_build_policy_kwargs → features_extractor_kwargs`. This is the ONLY architecture knob exposed in
+  `rl`; pooling/resolution remain fixed.
+- `__init__(observation_space, *, checkpoint: Path | None = None, freeze: bool = False, trunk: str | None = None)`:
+  - resolve the trunk (size rule for `None`/`"auto"`, else the explicit registry key) and build the
+    encoder via `models.build_encoder`;
   - compute `features_dim` = `encoder.embedding_dim(input_hw)` at the obs `H×W` (the obs space's
     spatial dims) and pass it to `super().__init__(observation_space, features_dim)`;
   - if `checkpoint` is not None → `encoder.load_state_dict(torch.load(checkpoint))` — THIS extractor
@@ -37,7 +45,7 @@ description: Contract + boundaries for the rl/ component of src/pop_trainer. Loa
     params). Freeze works ONLY by `requires_grad=False` so the grad stays `None`. The freeze TEST
     asserts **encoder weights UNCHANGED after one optimizer step (or grads are `None`)**, NOT
     optimizer membership.
-  * 84×84 FAILS this encoder (the stem collapses the map) — the obs is **360×640**.
+  * 84×84 FAILS the `cnn` trunk (the stem collapses the map) — the canonical obs is **360×640**.
   * `models.from_pretrained` does NOT exist — the extractor owns the `load_state_dict`.
 
 **Boundaries:** imports `core`, `env`, `models`, `agents`. Does NOT import `pretraining` or `data`

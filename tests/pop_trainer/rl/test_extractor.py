@@ -13,6 +13,8 @@ T2 contract:
    is not vacuous.
 4. CHECKPOINT ROUND-TRIP: save extractor A's encoder state_dict (after perturbing it), build
    extractor B from that checkpoint, and confirm B's weights restored to A's.
+5. TRUNK SELECTION: trunk=None/"auto" reproduces the size-based selection; an explicit trunk
+   override REPLACES it.
 """
 
 from __future__ import annotations
@@ -26,15 +28,21 @@ pytest.importorskip("stable_baselines3")
 import gymnasium as gym  # noqa: E402  (after importorskip, by design)
 from torch import nn  # noqa: E402
 
-from pop_trainer.models import DreamerCNN, EncoderConfig, NatureCNN, build_encoder  # noqa: E402
+from pop_trainer.models import (  # noqa: E402  (after importorskip, by design)
+    CnnTrunk,
+    EncoderConfig,
+    GroupNormCNN,
+    ResNetTrunk,
+    build_encoder,
+)
 from pop_trainer.rl import EncoderExtractor  # noqa: E402
 
 # The canonical obs is the real Unity RGB frame: 360 rows x 640 cols, 3 channels. 84x84 collapses
-# the NatureCNN stem, so the extractor + tests use 360x640 everywhere.
+# the cnn-trunk stem, so the extractor + tests use 360x640 everywhere.
 OBS_HW = (360, 640)
 OBS_SHAPE = (3, *OBS_HW)
 
-# A SMALL frame (DreamerV3's canonical 64x64): the extractor must pick the dreamer trunk here.
+# A SMALL frame (the gn-cnn trunk's canonical 64x64): the extractor must pick the gn-cnn trunk here.
 SMALL_OBS_HW = (64, 64)
 SMALL_OBS_SHAPE = (3, *SMALL_OBS_HW)
 
@@ -45,13 +53,13 @@ def _obs_space() -> gym.spaces.Box:
 
 
 def _small_obs_space() -> gym.spaces.Box:
-    """A 64x64 channels-first float-[0,1] pixel Box (the small-frame DreamerV3 path)."""
+    """A 64x64 channels-first float-[0,1] pixel Box (the small-frame gn-cnn path)."""
     return gym.spaces.Box(low=0.0, high=1.0, shape=SMALL_OBS_SHAPE, dtype=np.float32)
 
 
 def _expected_features_dim() -> int:
-    """The flatten embedding D a fresh nature encoder reports at the canonical resolution."""
-    enc = build_encoder(EncoderConfig(trunk="nature", pooling="flatten"))
+    """The flatten embedding D a fresh cnn encoder reports at the canonical resolution."""
+    enc = build_encoder(EncoderConfig(trunk="cnn", pooling="flatten"))
     d = enc.embedding_dim(input_hw=OBS_HW)
     assert isinstance(d, int)
     return d
@@ -77,38 +85,72 @@ def test_in_channels_derived_from_obs_space():
 # --- trunk selection by resolution -----------------------------------------------------
 
 
-def test_canonical_obs_selects_nature_trunk():
-    """The canonical 360x640 obs builds the unchanged NatureCNN trunk (deployment path)."""
+def test_canonical_obs_selects_cnn_trunk():
+    """The canonical 360x640 obs builds the unchanged cnn trunk (deployment path)."""
     extractor = EncoderExtractor(_obs_space())
-    assert isinstance(extractor.encoder.trunk, NatureCNN)
-    # the canonical features_dim is unchanged by the dreamer addition
+    assert isinstance(extractor.encoder.trunk, CnnTrunk)
+    # the canonical features_dim is unchanged by the gn-cnn addition
     assert extractor.features_dim == _expected_features_dim()
 
 
-def test_small_obs_selects_dreamer_trunk_with_probed_features_dim():
-    """A 64x64 obs builds the DreamerV3 trunk; features_dim is a positive int from a dummy probe.
+def test_small_obs_selects_gn_cnn_trunk_with_probed_features_dim():
+    """A 64x64 obs builds the gn-cnn trunk; features_dim is a positive int from a dummy probe.
 
-    At 64x64 the four stride-2 dreamer blocks give a (256, 4, 4) map, so the flatten features_dim
+    At 64x64 the four stride-2 gn-cnn blocks give a (256, 4, 4) map, so the flatten features_dim
     is 256*4*4 = 4096 — derived by the extractor's dummy forward, not a hardcoded spatial dim.
     """
     extractor = EncoderExtractor(_small_obs_space())
-    assert isinstance(extractor.encoder.trunk, DreamerCNN)
+    assert isinstance(extractor.encoder.trunk, GroupNormCNN)
     assert isinstance(extractor.features_dim, int)
     assert extractor.features_dim == 4096
 
-    # the probe matches an independently built dreamer encoder's static D
-    enc = build_encoder(EncoderConfig(trunk="dreamer", pooling="flatten"))
+    # the probe matches an independently built gn-cnn encoder's static D
+    enc = build_encoder(EncoderConfig(trunk="gn-cnn", pooling="flatten"))
     assert extractor.features_dim == enc.embedding_dim(input_hw=SMALL_OBS_HW)
 
 
 def test_small_obs_forward_returns_batched_embedding():
-    """forward over (N, 3, 64, 64) in [0,1] returns (N, features_dim) on the dreamer path."""
+    """forward over (N, 3, 64, 64) in [0,1] returns (N, features_dim) on the gn-cnn path."""
     extractor = EncoderExtractor(_small_obs_space()).eval()
     n = 2
     obs = torch.rand(n, *SMALL_OBS_SHAPE)
     with torch.no_grad():
         out = extractor(obs)
     assert out.shape == (n, extractor.features_dim)
+
+
+# --- trunk override (the CTO-authorized knob) ------------------------------------------
+
+
+@pytest.mark.parametrize("auto", [None, "auto"])
+def test_auto_reproduces_size_based_selection(auto):
+    """trunk=None / "auto" keeps the size rule: cnn at canonical, gn-cnn at a small frame."""
+    canonical = EncoderExtractor(_obs_space(), trunk=auto)
+    assert isinstance(canonical.encoder.trunk, CnnTrunk)
+    small = EncoderExtractor(_small_obs_space(), trunk=auto)
+    assert isinstance(small.encoder.trunk, GroupNormCNN)
+
+
+def test_explicit_trunk_override_replaces_size_rule():
+    """An explicit trunk override forces that registry trunk regardless of the obs resolution.
+
+    The canonical 360x640 obs would auto-select cnn, but trunk="resnet" forces the ResNet trunk;
+    and a small 64x64 obs would auto-select gn-cnn, but trunk="cnn" forces the CnnTrunk.
+    """
+    forced_resnet = EncoderExtractor(_obs_space(), trunk="resnet")
+    assert isinstance(forced_resnet.encoder.trunk, ResNetTrunk)
+
+    forced_cnn = EncoderExtractor(_obs_space(), trunk="cnn")
+    assert isinstance(forced_cnn.encoder.trunk, CnnTrunk)
+
+    forced_gn = EncoderExtractor(_obs_space(), trunk="gn-cnn")
+    assert isinstance(forced_gn.encoder.trunk, GroupNormCNN)
+
+
+def test_unknown_trunk_override_rejected():
+    """An out-of-registry explicit trunk fails loudly at construction (lineage names are gone)."""
+    with pytest.raises(ValueError, match="unknown trunk"):
+        EncoderExtractor(_obs_space(), trunk="bogus-trunk")
 
 
 # --- 2. forward ------------------------------------------------------------------------

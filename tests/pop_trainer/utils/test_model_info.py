@@ -30,7 +30,7 @@ pytest.importorskip("stable_baselines3")
 import gymnasium as gym  # noqa: E402  (after importorskip, by design)
 from stable_baselines3 import PPO  # noqa: E402
 
-from pop_trainer.models import DreamerCNN  # noqa: E402
+from pop_trainer.models import GroupNormCNN  # noqa: E402
 from pop_trainer.rl.extractor import EncoderExtractor  # noqa: E402
 from pop_trainer.utils.model_info import (  # noqa: E402
     collect_model_info,
@@ -119,7 +119,7 @@ def test_collect_reports_spaces_trunk_and_deduped_total():
 
     assert info.observation_space == repr(model.observation_space)
     assert info.action_space == repr(model.action_space)
-    assert info.trunk_class == DreamerCNN.__name__
+    assert info.trunk_class == GroupNormCNN.__name__
 
     # total == sum of numel over id-deduped model.policy.parameters() (extractor counted once).
     assert info.policy.total == _unique_policy_param_numel(model)
@@ -196,7 +196,7 @@ def test_main_smoke_prints_report(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "observation space:" in out
     assert "action space:" in out
-    assert DreamerCNN.__name__ in out
+    assert GroupNormCNN.__name__ in out
     assert "trainable=" in out
     assert "frozen=" in out
 
@@ -205,6 +205,6 @@ def test_format_model_info_renders_sections():
     """format_model_info includes the trunk name and both param-count section names."""
     model = _build_tiny_ppo()
     text = format_model_info(collect_model_info(model))
-    assert DreamerCNN.__name__ in text
+    assert GroupNormCNN.__name__ in text
     assert "policy:" in text
     assert "features_extractor:" in text
