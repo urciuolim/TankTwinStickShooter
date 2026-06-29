@@ -31,7 +31,9 @@ Unity 6.5 (2D twin-stick tank game) as the simulator + a Python 3.12 reinforceme
 ## The gate is NOT optional (YOU MUST)
 The platform/infra team is the checks-and-balances, and it must NEVER be bypassed — not for time pressure, not for "technical difficulties" (agent deaths, app restarts, flaky tooling). The flow is always `build → gate → docs → commit`:
 - Every deliverable goes through the infra-manager GATE: the independent read-only reviewers (code-reviewer / repo-steward / evaluation) emit GO/NO-GO, and at GO the documentarian updates `./docs/`. Only then does the Director commit.
-- If a gate agent dies or the tooling fails, RE-RUN it. The Director's inline `ruff`/`pytest`/smoke checks SUPPLEMENT the gate — they NEVER replace the independent review or the docs step, and never license a self-certified commit.
+- The Director's inline `ruff`/`pytest`/smoke checks SUPPLEMENT the gate — they NEVER replace the independent review or the docs step, and never license a self-certified commit.
+- If ANY team/agent is ERRORING (research, engineering, or platform/infra — it may be a Claude Code app issue): STOP and FLAG it to the user. Do NOT bypass it, do NOT blindly re-run or grind, do NOT self-certify. The user decides how to proceed.
+- The user MAY explicitly authorize a deviation (a bypass, or a specific way to use a team) — then follow the user's instruction. But NEVER suggest or propose deviating from the established path yourself.
 - Seam changes additionally require a LIVE gated run + explicit CTO sign-off (see Don't touch).
 
 A process abandoned under pressure is not a process. The whole point of the checks-and-balances is that they are not skippable.
