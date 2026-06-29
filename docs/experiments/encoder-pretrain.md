@@ -412,6 +412,43 @@ The spike's coord-only baseline **escaped to ~2.2**, not the production "pinned 
 
 ---
 
+## 11. Encoder candidate scoping — DreamerV3 & JEPA-RL (research, 2026-06-29)
+
+Produced by the research team this session (literature + OSS-source lanes, cross-checked + adversarially vetted; no spikes). Informs the **§8 JEPA roadmap** (the ViT-vs-CNN fork) and issue **#12**.
+
+**Question.** For the encoder-pretrain → frozen-embedding → RL track (leader `impala × flatten @ 180`; weak axes aim ~41°, bullet-pos ~1.3 wu): (1) Is the DreamerV3 image encoder a viable *frozen*-encoder candidate? (2) What encoders do JEPA-based RL/control projects actually use, and is any viable for us?
+
+### 11.1 Q1 — DreamerV3 encoder: **NOT viable**
+- **Architecture:** a small 4-stage stride-2 conv (SiLU) down to a coarse spatial bottleneck (paper "until 4×4"; current repo `minres 4` → ~`[3,16]`), then flatten — i.e. the **same class as our Impala/Nature trunks**, no expected gain on aim/bullet-pos, the same resolution-bound limit we already hit. Kernel/norm differ by version (official JAX: k5 + RMSNorm; NM512 torch port: k4 + channel-wise LayerNorm) — not a differentiator.
+- **Resolution:** 64×64 canonical (Atari 96×96) — genuinely fits our 64–96px exploration (#12).
+- **Trained jointly** as the world-model posterior under one optimizer with a pixel-reconstruction decoder + dynamics/representation KL. **No frozen-export path; no published precedent** for reusing a trained Dreamer encoder as a standalone frozen trunk for a separate policy. (Adversarial correction: symlog is applied to *vector* obs + prediction targets, **NOT image inputs** — images are `/255 − 0.5`.)
+- **Verdict:** the only liftable idea is the reconstruction auxiliary objective, which our **label-supervised state-decode already supersedes** (ground-truth state is a stronger, more targeted localization signal than pixel reconstruction).
+
+### 11.2 Q2 — JEPA-RL landscape: **bifurcated; neither half fits now**
+- **Regime 1 — large frozen ViT foundation encoders.** I-JEPA (ViT-B/L/H @224–448px); V-JEPA / V-JEPA2 / **V-JEPA2-AC** (ViT-L 300M – g ~1B @256–384px; the canonical "JEPA-for-control" exemplar — frozen encoder + action-conditioned latent planner); **DINO-WM** (frozen **DINOv2** ViT-S/14 @224px — *NB: DINOv2 features, not JEPA-trained; common mislabel*). All **224px+, 21M–1B params, natural-image/video domain** → a **fundamental resolution + domain mismatch** for our 64–96px synthetic frames with ~1–2px bullets. Disqualified precisely on our weak axes.
+- **Regime 2 — small co-trained CNN for control (size-matched).** **PLDM** (Sobal et al., LeCun group, arXiv:2502.14819) trains a JEPA latent objective on a small **Impala-CNN @64px** ("Impala Small Encoder, 1.43M params" — *our trunk family*) with VICReg anti-collapse + inverse dynamics; **TD-MPC2** uses a tiny 4-conv CNN @64px (SimNorm latent). Both **co-trained, not frozen, label-free.**
+- **Verdict:** frozen ViTs are wrong-scale/domain; the size-matched JEPA option is co-trained + collapse-prone — and since **we have ground-truth labels, JEPA's no-labels advantage is moot** → lower-VOI than finishing the supervised decode + transfer probe.
+
+### 11.3 Takeaways & recommendation
+1. **Our direction is field-standard, not a compromise** — TD-MPC2 and DreamerV3 both use small CNNs at 64–96px for control. Validates `impala × flatten` + the #12 small-input axis.
+2. **Our actual target — a small *frozen* encoder feeding a *model-free* policy — has no published precedent.** Everyone co-trains the encoder (PLDM, TD-MPC2) or freezes a *large foundation* encoder for a *world-model/planner* (V-JEPA2-AC, DINO-WM). So **Exp #5's result is primary evidence**, not a foregone conclusion.
+- **Do not** spike DreamerV3 or a frozen ViT (incl. a DINOv2/I-JEPA ViT-S probe) as sweep cells — low VOI, doesn't attack aim/bullet-pos.
+- **Highest-VOI next step = Exp #5** (frozen-encoder → PPO transfer probe): validate the frozen-embedding premise itself, with the encoder we trust, *before* spending compute on exotic encoders.
+- If/when a JEPA track opens (§8 P1), the evidence points to **CNN, PLDM-style** (small Impala @64–96px + VICReg), **not** ViT — sequence it *after* the transfer probe.
+
+*Open items:* DreamerV3 encoder-only param counts not found (published numbers are whole-world-model totals); PLDM's 1.43M Impala-small config is paper-verified only (repo not independently confirmed).
+
+### 11.4 Sources
+- **DreamerV3** — arXiv:2301.04104 · github.com/danijar/dreamerv3 (`dreamerv3/rssm.py`, `agent.py`, `configs.yaml`) · port github.com/NM512/dreamerv3-torch (`networks.py`)
+- **I-JEPA** — arXiv:2301.08243 · github.com/facebookresearch/ijepa (archived 2024-08)
+- **V-JEPA** — arXiv:2404.08471 · github.com/facebookresearch/jepa
+- **V-JEPA 2 / 2-AC** — arXiv:2506.09985 · github.com/facebookresearch/vjepa2
+- **DINO-WM** — arXiv:2411.04983 · github.com/gaoyuezhou/dino_wm
+- **PLDM** — arXiv:2502.14819 · latent-planning.github.io
+- **TD-MPC2** — github.com/nicklashansen/tdmpc2 (`tdmpc2/common/layers.py`)
+
+---
+
 ## References
 - **Code:** [`docs/components/pretraining.md`](../components/pretraining.md) · PR #11 (harness) · PR #4 (plan)
 - **Research briefings:** RL-from-pixels resolutions; supervised dataset sizes *(produced this session)*
