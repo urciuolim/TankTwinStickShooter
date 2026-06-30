@@ -5,6 +5,9 @@ Operational guide for agents on the Tank Twin Stick Shooter revival. Load-bearin
 ## What this is
 Unity 6.5 (2D twin-stick tank game) as the simulator + a Python 3.12 reinforcement-learning driver (Stable-Baselines3 PPO, population-based self-play) over a TCP-JSON protocol. Milestones: M0 playable game (two humans, Xbox pads + shared keyboard) → M1 single-agent PPO → M2 population training. Cluster target: GCP.
 
+## Communication (YOU MUST)
+Write plainly and professionally. Do NOT use Bay Area / startup-tech colloquialisms or jargon — e.g. "footgun," "table stakes," "boil the ocean," "happy path," "low-hanging fruit." Say what you mean in direct, literal terms ("an easy default mistake," not "footgun"). Applies to ALL agent output: chat, PR descriptions, docs, and commit messages.
+
 ## Environment (YOU MUST)
 - Always use an isolated venv (managed by `uv`); NEVER the system Python. Python 3.12.
 - Cross-platform: no `fork`/`forkserver` (use `spawn` on Windows); no `os.system("zip"/"rm"/"cp"/"mv")` (use stdlib `zipfile`/`shutil`/`pathlib`); build commands with `subprocess` arg-lists, not shell strings.
