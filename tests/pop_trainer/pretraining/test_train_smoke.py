@@ -91,7 +91,7 @@ def test_main_parses_group_and_pos_weight_args(monkeypatch):
 
 def test_combined_loss_decreases_over_steps():
     torch.manual_seed(0)
-    model = StateDecoder(build_encoder(EncoderConfig("nature", "gap")), SMALL_HW, hidden=32)
+    model = StateDecoder(build_encoder(EncoderConfig("cnn", "gap")), SMALL_HW, hidden=32)
     opt = torch.optim.Adam(model.spatial_parameters(), lr=1e-2)
     # one fixed batch the model should overfit: a constant frame -> constant targets.
     x = torch.rand(4, 3, *SMALL_HW)
@@ -126,9 +126,9 @@ def test_run_end_to_end_writes_strict_json(tmp_path):
     cfg = TrainConfig(
         data_dir=str(data_dir),
         out_dir=str(out_dir),
-        trunk="nature",
+        trunk="cnn",
         pooling="gap",
-        resolution=180,  # nature underflows a 90-row frame; 180 is the smallest nature-valid res
+        resolution=180,  # cnn underflows a 90-row frame; 180 is the smallest cnn-valid res
         epochs=2,
         batch_size=8,
         lr=1e-3,

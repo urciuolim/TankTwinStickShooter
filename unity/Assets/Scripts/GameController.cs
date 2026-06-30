@@ -1,0 +1,386 @@
+﻿using System;
+using System.Collections;
+using System.Collections.Generic;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+using UnityEngine.UI;
+using UnityEngine.Tilemaps;
+using Newtonsoft.Json.Linq;
+
+public class GameController : MonoBehaviour
+{
+    public static GameController instance;
+    bool gamePlaying = false;
+
+    private PlayerController[][] tanks;
+    private GameObject hudContainer;
+
+    private Text timeLeftDisplay, countdown;
+    private int countdownStart = 5;
+    private float startTime, elapsedTime;
+    private float maxTime = 60f;
+    private TimeSpan timeLeft;
+    private int stepsLeft = 0;
+
+    private GameObject redHealthBar, blueHealthBar;
+    private float healthBarMaxWidth = 200f;
+    private GameObject redReloading, blueReloading;
+
+    private bool checkWinner = false;
+    private bool humanPlayer;
+
+    // Set true by EndGame to FREEZE the round once it has been decided. While set, FixedUpdate
+    // early-returns so UpdateState() no longer overwrites the done/winner-stamped
+    // DriverController.instance.state -- this guarantees the done step is delivered to Python
+    // exactly once. EndGame no longer reloads the scene (Python's restart -> the deferred start
+    // reload does that), so without this freeze the still-loaded GameController would clobber the
+    // done state on its next tick. A fresh GameController (after the next Arena load) starts with
+    // roundOver=false.
+    private bool roundOver = false;
+
+    public TileBase[] tiles;
+
+    // OBSERVABILITY (verbose-gated; no behavior/wire impact). MONOTONIC stopwatch started when the
+    // Arena scene's GameController.Awake runs, used to measure scene-RELOAD duration: Awake ->
+    // first UpdateState after load. NEVER Time.time (frozen by Time.timeScale=0 in FixedUpdate).
+    private System.Diagnostics.Stopwatch awakeClock;
+    // One-shot latch so ONLY the first UpdateState after each Arena load logs the reload duration.
+    private bool firstStateLogged = false;
+
+    private void Awake()
+    {
+        instance = this;
+        gamePlaying = false;
+        checkWinner = false;
+        if (DriverController.instance != null && DriverController.instance.verbose)
+        {
+            awakeClock = System.Diagnostics.Stopwatch.StartNew();
+            Debug.Log(DriverLog.Format("arena_awake", System.DateTime.UtcNow));
+        }
+        JObject config = DriverController.instance.config;
+        if (config["game_countdownStart"] != null)
+            countdownStart = config["game_countdownStart"].Value<int>();
+        if (config["game_maxTime"] != null)
+            maxTime = config["game_maxTime"].Value<float>();
+        if (config["game_healthBarMaxWidth"] != null)
+            healthBarMaxWidth = config["game_healthBarMaxWidth"].Value<float>();
+        
+        if (DriverController.instance.verbose)
+        {
+            Debug.Log("Countdown timer set for " + countdownStart + " seconds");
+            Debug.Log("Max time set to " + maxTime + " seconds");
+            Debug.Log("Health bar (UI) max width set to " + healthBarMaxWidth);
+        }
+
+        Tilemap floor = GameObject.Find("Floor").GetComponent<Tilemap>();
+        Tilemap walls = GameObject.Find("Walls").GetComponent<Tilemap>();
+        JObject arena = DriverController.instance.arena;
+        if (arena != null)
+        {
+            floor.ClearAllTiles();
+            walls.ClearAllTiles();
+            PlaceTiles(floor, arena["Floor"]);
+            PlaceTiles(walls, arena["Walls"]);
+        }
+    }
+
+    private void PlaceTiles(Tilemap grid, JToken layout)
+    {
+        int minX = layout["dims"]["minX"].Value<int>();
+        int maxX = layout["dims"]["maxX"].Value<int>();
+        int minY = layout["dims"]["minY"].Value<int>();
+        int maxY = layout["dims"]["maxY"].Value<int>();
+        int tileID = layout["tileID"].Value<int>();
+        JArray yaxis;
+
+        for (int x = minX; x <= maxX; x++)
+        {
+            yaxis = (JArray)layout[x.ToString()];
+            foreach (JToken y in yaxis)
+            {
+                grid.SetTile(new Vector3Int(x, y.Value<int>(), 0), tiles[tileID]);
+            }
+        }
+        grid.RefreshAllTiles();
+    }
+
+    // Start is called before the first frame update
+    private void Start()
+    {
+        Transform teams = GameObject.Find("Teams").transform;
+        tanks = new PlayerController[teams.childCount][];
+        for (int i = 0; i < tanks.Length; i++)
+        {
+            Transform team = teams.GetChild(i);
+            tanks[i] = new PlayerController[team.childCount];
+            for (int j = 0; j < team.childCount; j++)
+            {
+                tanks[i][j] = team.GetChild(j).gameObject.GetComponent<PlayerController>();
+            }
+        }
+        hudContainer = GameObject.Find("HUDContainer");
+        humanPlayer = !(tanks[0][0].AI && tanks[1][0].AI);
+        if (humanPlayer)
+        {
+            redHealthBar = GameObject.Find("RedHealthBar");
+            blueHealthBar = GameObject.Find("BlueHealthBar");
+            redReloading = GameObject.Find("RedReloading");
+            redReloading.SetActive(false);
+            blueReloading = GameObject.Find("BlueReloading");
+            blueReloading.SetActive(false);
+            countdown = GameObject.Find("Countdown").GetComponent<Text>();
+            timeLeftDisplay = GameObject.Find("TimeRemainingText").GetComponent<Text>();
+            StartCoroutine(Countdown());
+        } else
+        {
+            hudContainer.SetActive(false);
+            stepsLeft = (int)Math.Ceiling(maxTime / DriverController.instance.fixedDeltaTime);
+
+            if (DriverController.instance.running)
+            {
+                startGame();
+            }
+            else
+            {
+                SceneManager.LoadScene("Driver");
+            }
+        }
+    }
+
+    private void updatePlaying(bool val)
+    {
+        for (int i = 0; i < tanks.Length; i++)
+        {
+            for (int j = 0; j < tanks[i].Length; j++)
+            {
+                tanks[i][j].playing = val;
+            }
+        }
+    }
+
+    private void startGame()
+    {
+        updatePlaying(true);
+        startTime = Time.time;
+        gamePlaying = true;
+    }
+
+    private IEnumerator Countdown()
+    {
+        //updatePlaying(false);
+        for (int i = countdownStart; i > 0; i--)
+        {
+            countdown.text = i.ToString();
+            yield return new WaitForSeconds(1);
+        }
+        countdown.text = "START";
+        yield return new WaitForSeconds(1);
+        countdown.gameObject.SetActive(false);
+        startGame();
+    }
+
+    private void FixedUpdate()
+    {
+        // Once the round is decided, FREEZE: stop updating state/timer so the done/winner-stamped
+        // state is not overwritten before DriverController delivers the done step to Python. The
+        // round stays frozen until the next Arena load (Python restart -> deferred start reload)
+        // brings up a fresh GameController.
+        if (roundOver)
+            return;
+        UpdateState();
+        stepsLeft--;
+        UpdateGameTimer();
+    }
+
+    private void UpdateState()
+    {
+        if (tanks[0][0] == null || tanks[1][0] == null) return;
+        JObject state = new JObject();
+        float[] s = new float[52];
+        for (int i = 0; i < s.Length; i++)
+            s[i] = -100;
+
+        s[0] = tanks[0][0].transform.position.x;
+        s[1] = tanks[0][0].transform.position.y;
+        s[2] = tanks[0][0].velocity.x;
+        s[3] = tanks[0][0].velocity.y;
+        s[4] = tanks[0][0].aim.x;
+        s[5] = tanks[0][0].aim.y;
+
+        int c = 6;
+        foreach (GameObject b in tanks[0][0].bullets)
+        {
+            var bc = b.GetComponent<BulletController>();
+            s[c] = b.transform.position.x;
+            s[c + 1] = b.transform.position.y;
+            s[c + 2] = bc.velocity.x * bc.speed;
+            s[c + 3] = bc.velocity.y * bc.speed;
+            c += 4;
+        }
+
+        s[26] = tanks[1][0].transform.position.x;
+        s[27] = tanks[1][0].transform.position.y;
+        s[28] = tanks[1][0].velocity.x;
+        s[29] = tanks[1][0].velocity.y;
+        s[30] = tanks[1][0].aim.x;
+        s[31] = tanks[1][0].aim.y;
+        c = 32;
+        foreach (GameObject b in tanks[1][0].bullets)
+        {
+            var bc = b.GetComponent<BulletController>();
+            s[c] = b.transform.position.x;
+            s[c + 1] = b.transform.position.y;
+            s[c + 2] = bc.velocity.x * bc.speed;
+            s[c + 3] = bc.velocity.y * bc.speed;
+            c += 4;
+        }
+
+        state.Add("state", new JArray(s));
+        DriverController.instance.state = state;
+
+        // OBSERVE-ONLY (verbose-gated): the FIRST populated UpdateState after this Arena load.
+        // Elapsed since Awake = the scene-RELOAD duration. One-shot so only the first tick logs
+        // (not every FixedUpdate). The 52-float `s` layout above is untouched.
+        if (!firstStateLogged && DriverController.instance.verbose)
+        {
+            firstStateLogged = true;
+            double reloadMs = awakeClock != null ? awakeClock.Elapsed.TotalMilliseconds : 0d;
+            Debug.Log(DriverLog.Format("first_state_after_load", System.DateTime.UtcNow,
+                "reload_ms", DriverLog.Ms(reloadMs)));
+        }
+    }
+
+    private void UpdateGameTimer()
+    {
+        if (gamePlaying)
+        {
+            if (humanPlayer)
+            {
+                //Debug.Log("UpdateGameTimer: humanPlayer");
+                elapsedTime = Time.time - startTime;
+                timeLeft = TimeSpan.FromSeconds(maxTime - elapsedTime);
+                timeLeftDisplay.text = "Time Remaining\n" + timeLeft.ToString("mm':'ss'.'ff");
+                if (elapsedTime >= maxTime)
+                {
+                    gamePlaying = false;
+                    updatePlaying(false);
+                    checkWinner = true;
+                }
+            }
+            else if (stepsLeft <= 0)
+            {
+                Debug.Log("UpdateGameTimer: stepsLeft");
+                gamePlaying = false;
+                updatePlaying(false);
+                checkWinner = true;
+            }
+        }
+        if (checkWinner)
+        {
+            Debug.Log("UpdateGameTimer: checkWinner");
+            checkWinner = false;
+            CheckWinner();
+        }
+    }
+
+    private void CheckWinner()
+    {
+        Transform teams = GameObject.Find("Teams").transform;
+        int teamsAlive = 0;
+        int lastAlive = -1;
+        for (int i = 0; i < tanks.Length; i++)
+        {
+            if (teams.GetChild(i).childCount > 0)
+            {
+                teamsAlive++;
+                lastAlive = i;
+            }
+        }
+        if (teamsAlive >= 2)
+        {
+            if (!gamePlaying)
+            {
+                EndGame(-1);
+            }
+            return;
+        } 
+        if (gamePlaying)
+        {
+            gamePlaying = false;
+            updatePlaying(false);
+        }
+        if (teamsAlive == 1)
+        {
+            EndGame(lastAlive);
+        } else
+        {
+            EndGame(-1);
+        }
+    }
+
+    public void EndGame(int winningTeam)
+    {
+        tanks[0][0].DeactivateBullets();
+        tanks[1][0].DeactivateBullets();
+        try
+        {
+            DriverController.instance.state.Add("done", new JValue(true));
+        } catch (ArgumentException)
+        {
+            Debug.Log("ArgumentException raised while trying to add done to state in EndGame, continuing...");
+        }
+        try
+        {
+            DriverController.instance.state.Add("winner", new JValue(winningTeam));
+        } catch (ArgumentException)
+        {
+            Debug.Log("ArgumentException raised while trying to add winner to state in EndGame, continuing...");
+        }
+        // DEFERRED scene reload: we do NOT LoadScene here. Unity finishes the round on its OWN
+        // clock and stamps done/winner above; DriverController delivers that done step (state +
+        // frame) and enters the waiting state servicing the socket. The next round's Arena load is
+        // DEFERRED until Python sends restart -> start (the start handler reloads). roundOver
+        // FREEZES this GameController so its next FixedUpdate cannot overwrite the done-stamped
+        // state before it is sent. This removes the synchronous-LoadScene-in-the-read collapse AND
+        // the dead-zone (Unity stays responsive between rounds).
+        gamePlaying = false;
+        roundOver = true;
+    }
+
+    public void UpdateHealth(int playerID)
+    {
+        if (!humanPlayer) return;
+        PlayerController pc;
+        GameObject hb;
+        float tmp;
+        if (playerID == 1)
+        {
+            pc = tanks[0][0];
+            hb = redHealthBar;
+        } else
+        {
+            pc = tanks[1][0];
+            hb = blueHealthBar;
+        }
+        tmp = pc.health / pc.maxHealth;
+        hb.transform.localScale = new Vector3(tmp, 1, 1);
+    }
+
+    public void UpdateReloading(int playerID, bool canShoot)
+    {
+        if (!humanPlayer) 
+            return;
+        if (playerID == 1)
+        {
+            redReloading.SetActive(!canShoot);
+        } else
+        {
+            blueReloading.SetActive(!canShoot);
+        }
+    }
+
+    public void CheckGameEnd()
+    {
+        checkWinner = true;
+    }
+}

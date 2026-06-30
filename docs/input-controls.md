@@ -8,7 +8,7 @@ transition. The AI / socket path is unchanged.
 ## What drives a tank
 
 Each human tank (`playerID` 1 or 2, set in `Arena.unity`) reads input from its own clone of
-`Assets/Input/TankControls.inputactions` (action map `Tank`, actions `Move` / `Aim` / `Fire`).
+`unity/Assets/Input/TankControls.inputactions` (action map `Tank`, actions `Move` / `Aim` / `Fire`).
 The action vector applied locally is still `[velX, velY, aimX, aimY, trigger]` — only the source
 of the values changed (`PlayerController.GetInput`, human branch).
 
@@ -43,23 +43,16 @@ cross-assign. Both keyboard players share ONE physical keyboard; they are kept d
 All keyboard clusters are disjoint (WASD, TFGH, LeftShift vs Arrows, IJKL, RightShift). Aim is
 key-based, not mouse-based, so the keyboard is genuinely shareable by two players.
 
-## Config presets (`Assets/StreamingAssets/`)
+## Config presets (`unity/Assets/StreamingAssets/`)
 - `config_2p.json` — two humans, **both on pads** (default; most ergonomic for twin-stick).
 - `config_2p_keyboard.json` — two humans, **shared keyboard** (P1 left cluster, P2 right cluster).
 - To mix (pad + keyboard), copy a preset and set one player's `player{ID}_keyboard` to the opposite value.
 
 ## Two-human play-test (owed to a human + verification-lead)
 
-Real device input cannot be verified headlessly. Run the standalone build via the Python
-local-play host (keeps Python clocking the sim; humans control locally in Unity):
-
-```
-# Two Xbox pads (plug in BOTH pads first):
-python PythonScripts/play_local.py --config Assets/StreamingAssets/config_2p.json
-
-# Shared keyboard (two players, one keyboard):
-python PythonScripts/play_local.py --config Assets/StreamingAssets/config_2p_keyboard.json
-```
-
-`play_local.py` launches `Builds/Windows/TankTwinStickShooter.exe` by default and forwards
-`--config`. Pass `--game-path` to point at a different build.
+Real device input cannot be verified headlessly. The game is a Python-clocked simulator, so a
+local-play host must clock the sim while humans control locally in Unity (point it at one of the
+two-human config presets above — `config_2p.json` / `config_2p_keyboard.json` — and at the
+standalone build). The 2021 `play_local.py` host that did this was retired (it lives in git
+history); a `pop_trainer` local-play entrypoint that supersedes it is not yet wired, so this
+play-test is still owed.

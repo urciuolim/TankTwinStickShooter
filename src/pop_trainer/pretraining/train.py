@@ -71,7 +71,7 @@ class TrainConfig:
 
     data_dir: str
     out_dir: str
-    trunk: str = "nature"
+    trunk: str = "cnn"
     pooling: str = "gap"
     resolution: int = 180
     epochs: int = 1
@@ -670,7 +670,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Single-frame decoder pretraining.")
     parser.add_argument("--data", default="datasets/decode-v1")
     parser.add_argument("--out", default="runs/decode-smoke")
-    parser.add_argument("--trunk", choices=("nature", "impala"), default="nature")
+    parser.add_argument("--trunk", choices=("cnn", "resnet", "gn-cnn"), default="cnn")
     parser.add_argument("--pooling", choices=("gap", "flatten"), default="gap")
     parser.add_argument("--resolution", type=int, choices=(360, 180, 90), default=180)
     parser.add_argument("--epochs", type=int, default=1)

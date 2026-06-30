@@ -23,9 +23,15 @@ THE COVERAGE FAMILY. The data-collection surface is ONE map-aware policy family,
 * ``CoverageAgent.opponent_shadower`` — the same coverage movement, but the aim layer aims at the
   opponent and fires (subsuming the old aim-at-player2 rule).
 
-:class:`RandomAgent` is the map-agnostic baseline. :mod:`pop_trainer.agents.coverage_metrics`
+:class:`RandomAgent` is the map-agnostic baseline; :class:`NoOpAgent` is the stationary
+curriculum floor (the env's zero action every step). :mod:`pop_trainer.agents.coverage_metrics`
 provides the kinematic-rollout coverage-measurement harness (coverage-fraction +
 occupancy-entropy + an ESS guardrail) that validates the family against ``RandomAgent``.
+
+THE SELECTOR REGISTRY. :mod:`pop_trainer.agents.registry` owns the canonical ``string -> agent``
+map (:data:`AGENT_SELECTORS` + :func:`make_agent`) — the SINGLE source of truth re-exported here
+that :mod:`pop_trainer.data.collect_runner` and :mod:`pop_trainer.play` import (rather than
+duplicating). The roster is the coverage family's three presets, ``random``, and ``noop``.
 
 :class:`HumanAgent` (:mod:`pop_trainer.agents.human_agent`) is a KEYBOARD-driven agent for live
 human-vs-human play: two players share one keyboard via a single :class:`KeyboardListener` /
@@ -64,7 +70,9 @@ from pop_trainer.agents.human_agent import (
     player1_mapping,
     player2_mapping,
 )
+from pop_trainer.agents.noop_agent import NoOpAgent
 from pop_trainer.agents.random_agent import RandomAgent
+from pop_trainer.agents.registry import AGENT_SELECTORS, make_agent
 
 __all__ = [
     # action contract
@@ -80,6 +88,10 @@ __all__ = [
     "CoverageAgent",
     "AimFireSchedule",
     "RandomAgent",
+    "NoOpAgent",
+    # the canonical agent-selector registry (string -> agent)
+    "AGENT_SELECTORS",
+    "make_agent",
     # coverage-measurement harness
     "measure_coverage",
     "build_grid",

@@ -15,16 +15,41 @@ Modules:
   length-prefixed REAL pixel-frame channel (the actual observation input path).
 * :mod:`pop_trainer.core.config` — frozen, strict-JSON config dataclasses
   (``RunConfig`` / ``EnvConfig`` / ``RewardConfig``).
+* :mod:`pop_trainer.core.obs` — DERIVE the channels-last pixel ``frame_shape`` (``(H, W, 3)``) from
+  the RAW game-config JSON's ``obs_pixels_*`` (the one source of truth the Unity build also reads) +
+  the anti-desync validation guard (``frame_shape_from_config`` / ``validate_frame_shape``).
 * :mod:`pop_trainer.core.maps` — the map-rotation resolution contract.
 * :mod:`pop_trainer.core.agent` — the Agent Protocol (``act(obs) -> action``), the
   type-only decision-maker interface ``agents`` implements and ``env`` consumes (keeping
   ``env`` torch-free).
 * :mod:`pop_trainer.core.launch` — stdlib-only live-build launch + socket-connect helpers
-  (the windowed ``Popen`` arg-list + a bounded connect retry/backoff) shared by the demo and
+  (the windowed ``Popen`` arg-list + a bounded connect retry/backoff) shared by the play app and
   the collection runner.
+* :mod:`pop_trainer.core.logging_setup` — stdlib-``logging``-only per-process structured-JSONL
+  observability setup (per-process file routing + a strict-JSON line formatter) every layer
+  routes to.
 """
 
-from pop_trainer.core import agent, config, launch, maps, protocol, state
+from pop_trainer.core import agent, config, launch, logging_setup, maps, obs, protocol, state
 from pop_trainer.core.agent import Agent, StatefulAgent
+from pop_trainer.core.obs import (
+    DEFAULT_FRAME_SHAPE,
+    frame_shape_from_config,
+    validate_frame_shape,
+)
 
-__all__ = ["state", "protocol", "config", "maps", "agent", "launch", "Agent", "StatefulAgent"]
+__all__ = [
+    "state",
+    "protocol",
+    "config",
+    "obs",
+    "maps",
+    "agent",
+    "launch",
+    "logging_setup",
+    "Agent",
+    "StatefulAgent",
+    "DEFAULT_FRAME_SHAPE",
+    "frame_shape_from_config",
+    "validate_frame_shape",
+]

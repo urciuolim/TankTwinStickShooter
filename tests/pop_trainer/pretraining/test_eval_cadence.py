@@ -103,7 +103,7 @@ def _run_fixture(
     cfg = TrainConfig(
         data_dir=str(data_dir),
         out_dir=str(out_dir),
-        trunk="nature",
+        trunk="cnn",
         pooling="gap",
         resolution=180,
         epochs=epochs,
@@ -170,7 +170,7 @@ def test_val_trajectory_written_to_json(tmp_path):
     cfg = TrainConfig(
         data_dir=str(data_dir),
         out_dir=str(out_dir),
-        trunk="nature",
+        trunk="cnn",
         pooling="gap",
         resolution=180,
         epochs=2,
@@ -230,7 +230,7 @@ def test_eval_every_zero_json_has_empty_val_trajectory(tmp_path):
     cfg = TrainConfig(
         data_dir=str(data_dir),
         out_dir=str(out_dir),
-        trunk="nature",
+        trunk="cnn",
         pooling="gap",
         resolution=180,
         epochs=2,

@@ -95,7 +95,7 @@ def _sync(device: torch.device) -> None:
 def main(argv: list[str] | None = None) -> int:
     """CLI: ``python -m pop_trainer.pretraining.profile`` — print the profile as strict JSON."""
     parser = argparse.ArgumentParser(description="Encoder compute profile (params + latency).")
-    parser.add_argument("--trunk", choices=("nature", "impala"), default="nature")
+    parser.add_argument("--trunk", choices=("cnn", "resnet", "gn-cnn"), default="cnn")
     parser.add_argument("--pooling", choices=("gap", "flatten"), default="gap")
     parser.add_argument("--resolution", type=int, choices=(360, 180, 90), default=180)
     parser.add_argument("--device", default="auto")

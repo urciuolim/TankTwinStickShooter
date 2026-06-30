@@ -23,10 +23,10 @@ from pop_trainer.pretraining.decoder import (  # noqa: E402
     soft_argmax,
 )
 
-SMALL_HW = (180, 320)  # survives the NatureCNN stem+trio
+SMALL_HW = (180, 320)  # survives the CnnTrunk stem+trio
 
 
-def _decoder(trunk="nature", pooling="gap"):
+def _decoder(trunk="cnn", pooling="gap"):
     enc = build_encoder(EncoderConfig(trunk=trunk, pooling=pooling))
     return StateDecoder(enc, SMALL_HW, hidden=32)
 
@@ -77,7 +77,7 @@ def test_spatial_heads_use_per_keypoint_affines():
     assert model.spatial_heads.bullet_affine.scale.shape == (_N_BULLET_KEYPOINTS, 2)
 
 
-@pytest.mark.parametrize("trunk", ["nature", "impala"])
+@pytest.mark.parametrize("trunk", ["cnn", "resnet"])
 @pytest.mark.parametrize("pooling", ["gap", "flatten"])
 def test_head_output_shapes_both_families(trunk, pooling):
     model = _decoder(trunk=trunk, pooling=pooling)

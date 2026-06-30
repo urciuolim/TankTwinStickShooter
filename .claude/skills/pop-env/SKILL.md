@@ -16,4 +16,4 @@ description: Contract + boundaries for the env/ component of src/pop_trainer. Lo
 
 **Boundaries:** imports `core` only. Imports nothing from `models / data / pretraining / rl`. The Unity game is the implementation *behind* this interface (bridged only by `core.protocol`); never reach into Unity specifics elsewhere.
 
-**Inspiration (do NOT copy):** 2021 `PythonScripts/tank_env.py`.
+**Inspiration (do NOT copy):** the 2021 `tank_env` gym wrapper (retired to git history).

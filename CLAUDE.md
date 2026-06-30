@@ -20,7 +20,7 @@ Unity 6.5 (2D twin-stick tank game) as the simulator + a Python 3.12 reinforceme
 - The socket protocol is unframed today (`recv(1024)` assumes one JSON object per read) — don't rely on that; framing is planned.
 - No runtime `UnityEditor` imports in shipping C# (breaks standalone builds).
 - **DO NOT** change the RL seam without explicit sign-off: `DriverController`'s socket/`actions` path and `GameController.UpdateState()`'s 52-float state layout — M1 depends on them being stable.
-- Observations are PIXELS: a synthetic RGB grid drawn from state by `tank_env.draw_state` (CnnPolicy), NOT a Unity render. (Future: frozen vision-encoder embedding — deferred to M1.)
+- Observations are PIXELS: the REAL rendered Unity frame (CnnPolicy), captured from the live game render; the old synthetic RGB grid (`tank_env.draw_state`) is DROPPED. (Future: frozen vision-encoder embedding over that frame.)
 - The game is a **Python-clocked simulator**: it blocks on `AcceptTcpClient` and Python drives the clock/opponent — there is NO standalone human-play mode yet. Human *input* is read locally by Unity; AI opponents are Python. Opening `Arena.unity` alone throws NREs (it needs the Driver scene). See `docs/game-architecture.md`.
 
 ## Standards — apply your phase's section of `@docs/engineering-standards.md`
@@ -31,6 +31,16 @@ Unity 6.5 (2D twin-stick tank game) as the simulator + a Python 3.12 reinforceme
 - One concern per change; branch-per-task (`unity/…`, `python/…`, `fix/…`, `protocol/…`); keep it reversible.
 - Verify every new dependency exists on PyPI and pin it (lockfile). Never commit secrets / GCP keys.
 - Definition of Done: `@docs/definition-of-done.md`. "Done" = a check passed, not "looks done."
+
+## The gate is NOT optional (YOU MUST)
+The platform/infra team is the checks-and-balances, and it must NEVER be bypassed — not for time pressure, not for "technical difficulties" (agent deaths, app restarts, flaky tooling). The flow is always `build → gate → docs → commit`:
+- Every deliverable goes through the infra-manager GATE: the independent read-only reviewers (code-reviewer / repo-steward / evaluation) emit GO/NO-GO, and at GO the documentarian updates `./docs/`. Only then does the Director commit.
+- The Director's inline `ruff`/`pytest`/smoke checks SUPPLEMENT the gate — they NEVER replace the independent review or the docs step, and never license a self-certified commit.
+- If ANY team/agent is ERRORING (research, engineering, or platform/infra — it may be a Claude Code app issue): STOP and FLAG it to the user. Do NOT bypass it, do NOT blindly re-run or grind, do NOT self-certify. The user decides how to proceed.
+- The user MAY explicitly authorize a deviation (a bypass, or a specific way to use a team) — then follow the user's instruction. But NEVER suggest or propose deviating from the established path yourself.
+- Seam changes additionally require a LIVE gated run + explicit CTO sign-off (see Don't touch).
+
+A process abandoned under pressure is not a process. The whole point of the checks-and-balances is that they are not skippable.
 
 ## Don't touch
 - Generated `Library/`, and the `runs/ models/ logs/ datasets/` artifacts (git-ignored).

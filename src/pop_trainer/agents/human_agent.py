@@ -215,8 +215,8 @@ class KeyboardState:
 class HumanAgent:
     """A keyboard-driven :class:`pop_trainer.core.agent.Agent`; ``act`` ignores the observation.
 
-    Holds ONE player's :class:`KeyMapping` and a SHARED :class:`KeyboardState` (the demo builds one
-    state + listener and hands the state to both players). Does NOT construct or touch the
+    Holds ONE player's :class:`KeyMapping` and a SHARED :class:`KeyboardState` (the play app builds
+    one state + listener and hands the state to both players). Does NOT construct or touch the
     listener — and never imports ``pynput`` — so it is pure and unit-testable from an injected
     state.
     """
@@ -262,7 +262,7 @@ class KeyboardListener:
 
     def __post_init__(self) -> None:
         # Fail fast with the actionable message if the optional extra is not installed, rather than
-        # deferring the ImportError to start() after the demo has already launched the build.
+        # deferring the ImportError to start() after play has already launched the build.
         self._require_pynput()
 
     @staticmethod

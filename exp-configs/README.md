@@ -1,18 +1,18 @@
-# exp-configs — ready-made maps & rewards for experiments
+# exp-configs — symmetric arena geometry for experiments
 
-Point the trainer at one map config and one reward config to run an experiment.
-See `docs/experiments.md` for the full format reference; this dir is the curated
-set to grab from.
+This dir generates the curated set of symmetric **arena geometry** files. See
+`docs/experiments.md` for the full arena-format reference.
 
 ```
 exp-configs/
-  maps/
-    <name>.json          # game config (references its arena)
-    Arenas/<name>.json   # the arena geometry (walls)
-  rewards/
-    <name>.json          # a RewardConfig preset
-  _generate_maps.py      # regenerates the maps (symmetry guaranteed by construction)
+  _generate_maps.py      # (re)generates the arena geometry (symmetry guaranteed by construction)
 ```
+
+`_generate_maps.py` writes the arena **geometry** (walls/floor) to
+`unity/Assets/StreamingAssets/Arenas/`, the single source of truth for that geometry. The curated
+10-map **training rotation** — which of those arenas the trainer rotates over, and in what order —
+lives in `src/pop_trainer/core/maps.py` (the `CURATED_ROTATION` constant). There are no game-config
+wrappers in this dir.
 
 ## Maps (10)
 
@@ -38,37 +38,17 @@ Symmetry, obs-shape, and floor-connectivity are pinned by `tests/test_exp_config
 Regenerate / add more: edit the seed lists in `_generate_maps.py` and run
 `uv run python exp-configs/_generate_maps.py` — it auto-mirrors every wall you place,
 so new maps stay symmetric by construction. (Keep the Walls dims fixed to keep the
-(36, 60, 3) obs and cross-map model compatibility.)
+(36, 60, 3) obs and cross-map model compatibility.) If you add a new arena to the
+training rotation, also add its `Arenas/<name>.json` target to `CURATED_ROTATION` in
+`src/pop_trainer/core/maps.py`.
 
-## Rewards (3)
+## Rewards
 
-Budget-based (full-episode totals, spread per step over `max_episode_length = 300`):
+The reward shaping lives in code, not here — see `src/pop_trainer/env/rewards.py`
+(budget-based: full-episode totals spread per step). There are no reward-preset JSONs in this dir.
 
-| reward | meaning |
-|---|---|
-| `sparse` | just **+1 win / −1 loss**, no shaping |
-| `classic_2021` | the **2021 reward**: +1/−1 plus a `−0.003`/step time penalty (budget `−0.9`), no action cost |
-| `shaped_default` | the **current default**: +1/−1, time budget `−1.0`, action-cost budget `−0.1` |
+## Run an experiment
 
-## Run an experiment (PowerShell, one line each)
-
-> **RETIRED AT M1:** the `tank_twin.train` commands below no longer run — the `tank_twin`
-> package was removed; its M1 sources are kept inert under `reference/tank_twin_m1/`, and a
-> `pop_trainer` training entrypoint supersedes them (not yet wired). Kept here as historical
-> reference only.
-
-The 2021 map with the 2021 reward:
-
-```powershell
-uv run python -m tank_twin.train --game-path "C:\src\TankTwinStickShooter\build\TankTwinStickShooter.exe" --config "C:\src\TankTwinStickShooter\exp-configs\maps\custom1_2021.json" --reward-config "C:\src\TankTwinStickShooter\exp-configs\rewards\classic_2021.json" --run-name exp-2021 --device cuda
-```
-
-A chokepoint map with the current shaped reward:
-
-```powershell
-uv run python -m tank_twin.train --game-path "C:\src\TankTwinStickShooter\build\TankTwinStickShooter.exe" --config "C:\src\TankTwinStickShooter\exp-configs\maps\chokepoint.json" --reward-config "C:\src\TankTwinStickShooter\exp-configs\rewards\shaped_default.json" --run-name exp-chokepoint --device cuda
-```
-
-Per-knob reward flags (`--time-penalty-total`, `--action-cost-total`, …) still override
-a `--reward-config` file if you add them. Every run records its resolved map + reward in
-`runs/<run-name>/manifest.json`.
+The previous `tank_twin.train` experiment commands were retired at M1 (the `tank_twin` package
+was removed; see git history). A `pop_trainer` training entrypoint that consumes the curated
+rotation supersedes them and is not yet wired.

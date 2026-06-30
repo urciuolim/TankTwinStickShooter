@@ -14,9 +14,9 @@ description: Contract + boundaries for the pretraining/ component of src/pop_tra
 
 **Boundaries:** imports `core`, `data` (dataset readers), `models` (encoder + heads). Imports nothing from `env / rl`. Decoupled from `env` BY the dataset (offline training).
 
-**Inspiration (do NOT copy):** `reference/tank_twin_m1/pretrain_pixels.py` + `reference/tank_twin_m1/_pretrain_pixels_train.py`. NOTE: that is the legacy 53%-of-src, cycle-bearing, 2,112-line mass — build this CLEAN and SPLIT: small cohesive modules, **no import cycle**, no 2,000-line files. Draw on it ONLY for field-grouping / per-head ideas; current-only comments (no "ported from", no legacy cross-refs).
+**Inspiration (do NOT copy):** the M1 `tank_twin` pixel-pretraining reference (`pretrain_pixels` + its train module), retired to git history. NOTE: that was a 53%-of-src, cycle-bearing, 2,112-line mass — this is built CLEAN and SPLIT: small cohesive modules, **no import cycle**, no 2,000-line files. Draw on it ONLY for field-grouping / per-head ideas; current-only comments (no "ported from", no legacy cross-refs).
 
-## First content: the single-frame decoder harness (issues #3 / #6, Phase 1)
+## The single-frame decoder harness (issues #3 / #6, Phase 1) — BUILT
 
 A supervised **inverse-renderer** that decodes the 52-float wire state from ONE pixel frame. Locked by CTO/Brian (PR #4). The ENCODER is the artifact; every head is disposable.
 
@@ -28,17 +28,17 @@ A supervised **inverse-renderer** that decodes the 52-float wire state from ONE 
 - **bullet position** (present slots only) → MASKED regression (absent slots zeroed + masked out of the loss); metric = position error over present slots.
 
 **Two head families, BOTH reported:**
-- **spatial heads** read `Encoder.features` (the `(B,C,h,w)` map) — per-group FC heads (heatmap deferred; "good not best"). These train the encoder.
+- **spatial heads** read `Encoder.features` (the `(B,C,h,w)` map). Locatable groups (player / bullet position) localize via a heatmap + soft-argmax head; aim / velocity (directions / derivatives, not locations) use a flatten-then-FC head; presence reads off the same score maps. These train the encoder.
 - **embed-probe** reads `Encoder.embed.detach()` (the pooled `(B,D)` vector). LOAD-BEARING: it measures how much state survives pooling (GAP vs Flatten), so pooling shows a real accuracy delta. The `.detach()` is mandatory — the probe must NOT backprop into the encoder. Report its per-group metrics ALONGSIDE the spatial heads. Train the probe with its OWN loss/optimizer step (separate from the encoder+spatial loss).
 
-**Loader** — shard-streaming `Dataset` over `data.readers` (`build_index` + `DatasetIndex.split` → map-aware 80/10/10, group key = map_id, no leak) and `data.shards` (lazy per-row frame fetch). `uint8 → [0,1]` NCHW; **load-time resolution downsample** (360→180→90 as a loader param); per-group target extraction from the 52-float state + sensible per-field target normalization (fit on TRAIN only — no val/test leak). NOTE: decode-v1 shards live in `worker_*/` SUBDIRS, so index recursively (`**/shard_*.npz`) or per-worker-dir; do not assume flat layout.
+**Loader** — shard-streaming `Dataset` over `data.readers` (`build_index` + `DatasetIndex.split` → map-aware split, group key = map_id, no leak) and `data.shards` (lazy per-row frame fetch). `uint8 → [0,1]` NCHW; **load-time resolution downsample** (360→180→90 as a loader param); per-group target extraction from the 52-float state + sensible per-field target normalization (fit on TRAIN only — no val/test leak). NOTE: decode-v1 shards live in `worker_*/` SUBDIRS, so index recursively (`**/shard_*.npz`) or per-worker-dir; do not assume flat layout.
 
-**Sweep axes** (config/CLI; the 12-cell grid runs on a 4090 later, NOT here): trunk {nature, impala} x pooling {gap, flatten} x resolution {360,180,90}. Build them as knobs; here only smoke-verify.
+**Sweep axes** (config/CLI; the grid runs on a 4090 later, NOT here): trunk × pooling {gap, flatten} × resolution {360,180,90}. The trunk keys are the repo-standard `cnn` / `resnet` / `gn-cnn` (model lineage: Nature-DQN / ResNet / DreamerV3-GroupNorm respectively). Build them as knobs; here only smoke-verify.
 
-**Train CLI** (`python -m pop_trainer.pretraining.train`): **device-agnostic** `--device cuda|mps|cpu` (auto-detect default; must run on the 4090 unchanged — no hardcoded device), `--data` (default `datasets/decode-v1`), `--trunk`, `--pooling`, `--resolution`, epochs/batch/lr defaults, `--seed` (deterministic where reasonable). Trains, evals on val + test, logs per-group metrics for spatial heads + embed-probe, saves a checkpoint + a STRICT-JSON results record.
+**Train CLI** (`python -m pop_trainer.pretraining.train`): **device-agnostic** `--device cuda|mps|cpu` (auto-detect default; must run on the 4090 unchanged — no hardcoded device), `--data` (default `datasets/decode-v1`), `--trunk {cnn,resnet,gn-cnn}`, `--pooling {gap,flatten}`, `--resolution {360,180,90}`, epochs/batch/lr defaults, `--seed` (deterministic where reasonable). Trains, evals on val + test, logs per-group metrics for spatial heads + embed-probe, saves a checkpoint + a STRICT-JSON results record.
 
 **Compute profile** — a fn/CLI reporting parameter count + forward-pass latency for a config+device (the Phase-3 numbers).
 
-**Build scope for the first cut:** harness CODE + tests + a SMOKE-TRAIN only. Smoke = a few steps on a tiny subset of decode-v1 (cpu/mps), proving the loop runs end-to-end and the loss decreases. Do NOT run the 12-cell sweep. Do NOT require decode-v2.
+**Build scope for the first cut:** harness CODE + tests + a SMOKE-TRAIN only. Smoke = a few steps on a tiny subset of decode-v1 (cpu/mps), proving the loop runs end-to-end and the loss decreases. Do NOT run the full sweep. Do NOT require decode-v2.
 
 **Tests (pure + one smoke):** head output shapes; each per-group loss; each metric fn; the loader's split + target extraction + downsample; plus a fast smoke-train test (tiny tensors / tiny fixture) asserting the train step runs and loss decreases over a few steps. Strict JSON for any on-disk record.

@@ -39,12 +39,14 @@ release and THEN terminates the build process (terminate -> wait(10) -> kill on 
 
 PIXELS. Collection MUST receive pixel frames (the env reads a length-prefixed frame after every
 state; a build without ``obs_pixels`` would leave the env blocking on bytes that never arrive). The
-no-rotation default ``--map`` resolves to ``Assets/StreamingAssets/demo_config.json`` — the SAME
-obs_pixels-enabled config the demo launches with (640x360, arena ``Arenas/custom1.json`` resolved
-against the config dir) — so the captured ``(frame, state)`` rows are byte-for-byte the demo's /
-RL's observation pipeline, with no drift. For a rotation run the boot config is the FIRST rotation
-map config (it must likewise enable ``obs_pixels``). The env is built with the matching
-``frame_shape`` either way.
+no-rotation default ``--map`` resolves to ``unity/Assets/StreamingAssets/demo_config.json`` — the
+SAME obs_pixels-enabled config the play app launches with (arena ``Arenas/custom1.json`` resolved
+against the config dir) — so the captured ``(frame, state)`` rows are byte-for-byte the play / RL
+observation pipeline, with no drift. A rotation run boots on the SAME obs_pixels ``--map`` config
+and only the arena rotates via ``switch_arena`` (the curated rotation is arena switch TARGETS, not
+boot
+configs). The env's ``frame_shape`` is DERIVED from the boot config's ``obs_pixels_*`` either way
+(:func:`core.obs.frame_shape_from_config`), so it always matches the build's rendered frame.
 """
 
 from __future__ import annotations
@@ -57,7 +59,7 @@ import platform
 import socket
 import subprocess
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -65,11 +67,12 @@ from pathlib import Path
 import numpy as np
 import psutil
 
-from pop_trainer import agents
+from pop_trainer.agents import AGENT_SELECTORS, make_agent
 from pop_trainer.core import agent as core_agent
 from pop_trainer.core import launch
 from pop_trainer.core import maps as core_maps
 from pop_trainer.core.config import EnvConfig
+from pop_trainer.core.obs import DEFAULT_FRAME_SHAPE, frame_shape_from_config
 from pop_trainer.core.protocol import Connection
 from pop_trainer.data import collect, schema
 from pop_trainer.data.collect import CollectionSpec, EpisodePlan, collect_parallel
@@ -86,9 +89,10 @@ __all__ = [
     "MAP_CONFIGS",
     "MAPS_SIDECAR_NAME",
     "FRAME_SHAPE",
+    "FRAME_HEIGHT",
+    "FRAME_WIDTH",
     "frame_nbytes",
     "make_agent",
-    "arena_path_for_config",
     "build_rotation",
     "build_map_index",
     "round_robin_plan",
@@ -107,13 +111,14 @@ __all__ = [
 # The repo root is three parents up from this file (src/pop_trainer/data/collect_runner.py).
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 # OS-aware default to the launchable build binary (.exe / .app inner / bare); --exe overrides it.
-DEFAULT_EXE = launch.default_build_path(_REPO_ROOT)
+DEFAULT_EXE = launch.default_build_path(_REPO_ROOT / "unity")
 
-# Rendered pixel-frame dimensions (W x H) — MUST match the launched config's obs_pixels_*.
-FRAME_WIDTH = 640
-FRAME_HEIGHT = 360
-# TankEnv frame_shape is (H, W, 3).
-FRAME_SHAPE = (FRAME_HEIGHT, FRAME_WIDTH, 3)
+# The pixel frame_shape (H, W, 3) is DERIVED from the launched boot config's obs_pixels_*
+# (frame_shape_from_config) so the env byte-read matches the build's rendered frame (one source of
+# truth). FRAME_SHAPE is only the FALLBACK default (640x360, the DriverController default) for a
+# config that declares no obs_pixels_* keys; FRAME_HEIGHT / FRAME_WIDTH expose its dimensions.
+FRAME_SHAPE = DEFAULT_FRAME_SHAPE
+FRAME_HEIGHT, FRAME_WIDTH, _ = FRAME_SHAPE
 
 
 def frame_nbytes(frame_shape: Sequence[int]) -> int:
@@ -126,9 +131,10 @@ def frame_nbytes(frame_shape: Sequence[int]) -> int:
 
 
 # Map name -> the obs_pixels-enabled build config it launches with (the single-map / no-rotation
-# default). Reusing the demo config keeps collection's frames byte-identical to the demo's / RL's
-# pipeline (640x360 pixels on, arena Arenas/custom1.json resolved against the config dir).
-_STREAMING_ASSETS = _REPO_ROOT / "Assets" / "StreamingAssets"
+# default). Reusing the demo_config.json config keeps collection's frames byte-identical to the
+# play / RL pipeline (pixels on, arena Arenas/custom1.json resolved against the config dir); the
+# env frame_shape is derived from that config's obs_pixels_*.
+_STREAMING_ASSETS = _REPO_ROOT / "unity" / "Assets" / "StreamingAssets"
 MAP_CONFIGS: dict[str, Path] = {
     "custom1": _STREAMING_ASSETS / "demo_config.json",
 }
@@ -151,16 +157,11 @@ MAX_WORKERS = 8
 _SEED_STRIDE = 10_000
 
 
-# --- agent selectors (the coverage/random presets; mirrors demo, built from agents directly) ---
-# Built straight from ``pop_trainer.agents`` — NOT imported from ``demo`` (demo is an env-app;
-# data reaching into it would be a cross-app boundary smell). The surface is intentionally the
-# same coverage family + random baseline the demo exposes.
-AGENT_SELECTORS: dict[str, Callable[[int | None], core_agent.Agent]] = {
-    "aggressive-coverage": lambda seed: agents.CoverageAgent.aggressive(seed=seed),
-    "wall-hugger": lambda seed: agents.CoverageAgent.wall_hugger(seed=seed),
-    "opponent-shadower": lambda seed: agents.CoverageAgent.opponent_shadower(seed=seed),
-    "random": lambda seed: agents.RandomAgent(seed=seed),
-}
+# --- agent selectors ---
+# The string -> agent registry (``AGENT_SELECTORS`` + ``make_agent``) is owned by
+# ``pop_trainer.agents`` (the single source of truth) and imported above; collection re-exports
+# the imported names in ``__all__`` so downstream callers are unaffected by the move. Only the
+# collection-POLICY defaults below (the players / pairing mix) live here.
 
 DEFAULT_PLAYER1 = "aggressive-coverage"
 DEFAULT_PLAYER2 = "opponent-shadower"
@@ -179,60 +180,28 @@ DEFAULT_PAIRINGS: list[tuple[str, str]] = [
 ]
 
 
-def make_agent(selector: str, *, seed: int | None = None) -> core_agent.Agent:
-    """Build the agent named by ``selector`` (see :data:`AGENT_SELECTORS`).
-
-    Raises ``ValueError`` on an unknown selector, listing the valid names.
-    """
-    factory = AGENT_SELECTORS.get(selector)
-    if factory is None:
-        valid = ", ".join(sorted(AGENT_SELECTORS))
-        raise ValueError(f"unknown agent selector {selector!r}; choose one of: {valid}")
-    return factory(seed)
-
-
-# --- map rotation: config path -> (build config, switch_arena path) + the int index ----------
+# --- map rotation: --maps value -> the ordered arena-target set + the int index ---------------
 #
-# A rotation entry is a map-CONFIG path (e.g. exp-configs/maps/center_block.json). Two distinct
-# things come off it:
-#   * the BUILD CONFIG to launch a worker on (the config path itself — it carries obs_pixels + the
-#     boot arena);
-#   * the SWITCH_ARENA path the env hands to ``env.reset(options={"switch_arena": ...})`` between
-#     episodes, which Unity resolves and ECHOES back as ``WallLayout.map_id``. That echoed string
-#     is the F5 tag source, so the int index is keyed on the SAME arena-path string.
-# The arena path is the config's ``arena_path`` field. Unity echoes that verbatim resolved string,
-# so keying the index on ``arena_path`` makes the echo decode to the right int.
-
-
-def arena_path_for_config(config_path: str | Path) -> str:
-    """Read a map-config JSON and return its ``arena_path`` (the switch_arena / echo string).
-
-    The ``arena_path`` field is the arena the build resolves AND the verbatim string Unity echoes
-    back as ``WallLayout.map_id`` after a switch. Strict ``json`` (Python-parsed). Raises
-    ``ValueError`` if the field is missing or not a string.
-    """
-    with open(config_path, encoding="utf-8") as fh:
-        config = json.load(fh)
-    arena = config.get("arena_path")
-    if not isinstance(arena, str):
-        raise ValueError(f"map config {config_path} has no string 'arena_path' (got {arena!r})")
-    return arena
+# A rotation entry is an ARENA TARGET (e.g. ``Arenas/center_block.json``): the path the env hands
+# to ``env.reset(options={"switch_arena": ...})`` between episodes, which Unity resolves and ECHOES
+# back as ``WallLayout.map_id``. That echoed string is the F5 tag source, so the int index is keyed
+# on the SAME arena-target string. The rotation set is produced directly by
+# :func:`core.maps.resolve_map_rotation`; the build always boots on the obs_pixels-enabled ``--map``
+# config and only the arena rotates via ``switch_arena``.
 
 
 def build_rotation(map_values: list[str] | None) -> list[str]:
-    """Resolve the ``--maps`` flag value into the ROTATION SET of arena-path strings.
+    """Resolve the ``--maps`` flag value into the ROTATION SET of arena-target strings.
 
     Delegates to :func:`core.maps.resolve_map_rotation` (the shared rotation contract: ``None`` ->
-    single-map, ``[]`` / sentinel -> all 10 shipped exp-configs/maps sorted, a dir -> its *.json
-    sorted, a list -> given order) and then maps each resolved map-config path to its
-    ``arena_path`` (:func:`arena_path_for_config`). The returned list is the ordered rotation set;
-    its INDEX in this list is the on-disk int for that arena (the dataset ``maps`` list). A ``None``
-    flag value (single-map mode) yields ``[]`` — the caller uses the no-rotation path.
+    single-map, ``[]`` / sentinel -> the curated 10-map rotation, a dir -> its ``*.json`` configs'
+    arena targets sorted, a list -> the given arena targets in order). The returned list is the
+    ordered rotation set; its INDEX in this list is the on-disk int for that arena (the dataset
+    ``maps`` list). A ``None`` flag value (single-map mode) yields ``[]`` — the caller uses the
+    no-rotation path.
     """
-    configs = core_maps.resolve_map_rotation(map_values)
-    if configs is None:
-        return []
-    return [arena_path_for_config(p) for p in configs]
+    rotation = core_maps.resolve_map_rotation(map_values)
+    return rotation if rotation is not None else []
 
 
 def build_map_index(rotation: Sequence[str]) -> dict[str, int]:
@@ -489,7 +458,7 @@ def build_specs(
     workers: int,
     base_port: int,
     seed: int,
-    frame_shape: tuple[int, int, int] = FRAME_SHAPE,
+    frame_shape: tuple[int, int, int] | None = None,
     shard_size: int | None = None,
 ) -> list[CollectionSpec]:
     """Turn collection params into a list of N :class:`CollectionSpec` (one per worker).
@@ -505,11 +474,17 @@ def build_specs(
 
     BOOT CONFIG (the obs_pixels gotcha): the build is launched ONCE per worker on the ``--map``
     config (``config``) in BOTH modes, then rotates via ``switch_arena``. ``obs_pixels`` is a
-    LAUNCH-time config flag (the env blocks on a frame that never arrives without it), and the
-    shipped ``exp-configs/maps`` rotation configs do NOT enable it — so they are used ONLY to
-    extract each arena's ``arena_path`` (the switch targets), never as the boot config. The
-    ``--map`` config (the demo config) enables obs_pixels, so the build boots correctly and the
-    runtime ``switch_arena`` changes only the arena, not the pixel channel.
+    LAUNCH-time config flag (the env blocks on a frame that never arrives without it), so the build
+    must boot on an obs_pixels-enabled config. The curated rotation is just arena switch TARGETS
+    (the ``switch_arena`` paths), never a boot config. The ``--map`` config (demo_config.json)
+    enables obs_pixels, so the build boots correctly and the runtime ``switch_arena`` changes only
+    the arena, not the pixel channel.
+
+    FRAME SHAPE: ``frame_shape`` is DERIVED from the boot ``config``'s ``obs_pixels_*`` (the SAME
+    keys the Unity build reads) via :func:`core.obs.frame_shape_from_config` when the caller passes
+    ``None`` (the default) — so a 64x64 boot config auto-yields a ``(64, 64, 3)`` env with no
+    manual sync. An explicit ``frame_shape`` overrides the derivation (the test seam). The
+    derived/overridden shape is carried in each spec's ``extra["frame_shape"]`` to the worker.
 
     ``workers`` is CLAMPED to ``[1, MAX_WORKERS]``. Each worker gets a distinct ``worker_id``
     (0..N-1), its own ``out_dir`` subdir (so shard files never clash), its slice of the round-robin
@@ -525,6 +500,10 @@ def build_specs(
         raise ValueError(f"episodes must be >= 1, got {episodes}")
     if not pairings:
         raise ValueError("at least one pairing is required")
+    # DERIVE the frame_shape from the boot config's obs_pixels_* unless the caller overrode it, so
+    # the env byte-read matches the build's rendered frame with no hand-synced constant.
+    if frame_shape is None:
+        frame_shape = frame_shape_from_config(config)
     # Validate every selector named by any pairing eagerly so a bad CLI fails before launch.
     for p1, p2 in pairings:
         make_agent(p1, seed=seed)
@@ -543,10 +522,10 @@ def build_specs(
         map_index = build_map_index(rotation)
         sidecar_maps = rotation
     else:
-        # Single-map mode: one arena, int 0, no switch. The sole pairing is pairings[0].
-        single_arena = arena_path_for_config(boot_config)
+        # Single-map mode: one arena, int 0, no switch. The sole pairing is pairings[0]. The
+        # demo_config.json --map arena is the documented constant (no JSON read needed here).
         map_index = {}  # no echo lookup -> the intended int 0 is used (tag_source "intended")
-        sidecar_maps = [single_arena]
+        sidecar_maps = [_DEFAULT_MAP_ARENA]
         pairings = [pairings[0]]
 
     n_workers = max(1, min(int(workers), MAX_WORKERS))
@@ -721,9 +700,10 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         default=None,
         metavar="MAP_CONFIG",
         help=(
-            "Rotate over a set of map configs (round-robin map x pairing, via switch_arena). "
-            "No value -> the shipped 10 exp-configs/maps; a directory -> its *.json configs "
-            "(sorted); a list of paths -> that order. Absent -> no rotation (single --map)."
+            "Rotate over a set of arenas (round-robin map x pairing, via switch_arena). "
+            "No value -> the curated 10-map rotation; a directory -> its *.json configs' arena "
+            "targets (sorted); a list of arena targets -> that order. Absent -> no rotation "
+            "(single --map)."
         ),
     )
     parser.add_argument(
@@ -840,8 +820,9 @@ def main(argv: list[str] | None = None) -> int:
     # the on-disk shard — is the OOM surface. Resolve the EFFECTIVE shard_size (auto -> the byte
     # budget for this frame, so the printed estimate matches what the workers will actually buffer),
     # estimate the peak across all workers, ALWAYS print the estimate, then abort BEFORE launching
-    # any build if it blows the budget (unless --allow-oversized).
-    fb = frame_nbytes(FRAME_SHAPE)
+    # any build if it blows the budget (unless --allow-oversized). The frame size is the DERIVED
+    # boot-config shape the specs carry — so the estimate matches what the workers actually buffer.
+    fb = frame_nbytes(specs[0].extra["frame_shape"])
     effective_shard_size = (
         args.shard_size if args.shard_size is not None else collect.default_shard_size(fb)
     )

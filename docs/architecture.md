@@ -8,21 +8,30 @@ The cross-component class-to-class interaction map for the built + GO'd slice of
 `models` imports nothing internal (a leaf alongside `core`). The full direction:
 
 ```
-core  ←  { models, env, agents, data }  ←  { demo, pretraining }
+core  ←  { models, env, agents, data }  ←  { play, rl, pretraining }
 ```
 
-- [core](components/core.md) — stdlib + numpy only; imports nothing internal.
+- [core](components/core.md) — stdlib + numpy only; imports nothing internal (now incl. the
+  `obs` observation-resolution contract).
 - [models](components/models.md) — torch only; imports nothing internal.
 - [env](components/env.md) — imports `core` (+ gymnasium, numpy).
 - [agents](components/agents.md) — imports `core` (+ numpy).
 - [data](components/data.md) — imports `core`, `env`, `agents`.
-- [demo](components/demo.md) — imports `core`, `env`, `agents`.
+- [play](components/play.md) — imports `core`, `env`, `agents`; and `stable_baselines3`
+  **directly + lazily** (a composition-root app — the only relaxation; sb3/torch import only inside
+  its RL-player factory, never `pop_trainer.rl`).
+- [rl](components/rl.md) — imports `core`, `env`, `models`, `agents` (+ torch / gymnasium / numpy /
+  stable-baselines3).
 - [pretraining](components/pretraining.md) — imports `core`, `models`, `data` (+ torch, numpy);
-  nothing from `env` / `rl`.
+  nothing from `env` / `rl` (the on-disk dataset decouples it from the live engine).
+- [utils](components/utils.md) — a **leaf SINK**: it MAY import `core` / `models` / `rl` (+ sb3 /
+  torch), but **nothing in `pop_trainer` imports it**, so it can never create a cycle.
 
-No import cycles: `data` / `demo` / `pretraining` sit at the top, `core` at the bottom, `models`
-off to the side. (`rl` / `eval` / `population` / `deployment` / `imitation` are not built yet and
-are omitted.)
+No import cycles: `data` / `play` / `rl` / `pretraining` sit at the top, `core` at the bottom,
+`models` off to the side, `utils` off to the side as a one-way sink. `play` is a LEAF (imported by
+nothing); its only relaxation is the lazy **direct `stable_baselines3` import** inside its RL-player
+factory (no edge to `pop_trainer.rl` at all), so it adds no cycle. (`eval` / `population` /
+`deployment` / `imitation` are not built yet and are omitted.)
 
 ## Class-to-class interaction map
 
@@ -30,15 +39,25 @@ are omitted.)
 graph TD
     subgraph core["core (contract layer — dep-free root)"]
         State["state.py<br/>52-float schema +<br/>split_state_for_opponent /<br/>flip_frame_perspective"]
-        Protocol["protocol.py<br/>Connection, encode/decode,<br/>receive_frame, WallLayout,<br/>parse_walls_message"]
+        Protocol["protocol.py<br/>Connection (send=length-prefixed),<br/>encode/decode, receive_frame,<br/>WallLayout, parse_walls_message"]
         Config["config.py<br/>RunConfig / EnvConfig /<br/>RewardConfig"]
+        Obs["obs.py<br/>frame_shape_from_config /<br/>validate_frame_shape"]
         Maps["maps.py<br/>resolve_map_rotation"]
         AgentProto["agent.py<br/>Agent / StatefulAgent<br/>(Protocol)"]
         Launch["launch.py<br/>build_launch_cmd / connect<br/>(stdlib leaf)"]
     end
 
     subgraph models["models (torch; no internal deps)"]
-        Encoder["Encoder = Trunk × Pooling<br/>build_encoder / export_onnx"]
+        Encoder["Encoder = Trunk × Pooling<br/>TRUNKS: cnn / resnet / gn-cnn<br/>build_encoder / export_onnx"]
+    end
+
+    subgraph utils["utils (leaf CLI sink)"]
+        ModelInfo["model_info.py<br/>inspect SB3 ckpt:<br/>spaces / trunk / param counts"]
+    end
+
+    subgraph rl["rl (online RL; SB3)"]
+        EncoderExtractor["EncoderExtractor<br/>(SB3 BaseFeaturesExtractor)"]
+        SelfPlay["SelfPlayWrapper (gym.Wrapper) /<br/>OpponentProvider / ScriptedOpponent"]
     end
 
     subgraph agents["agents (model-free policies)"]
@@ -64,9 +83,11 @@ graph TD
         TrainCLI["train.py / profile.py (CLI)"]
     end
 
-    Demo["demo.py<br/>run_demo_episode / main"]
+    Play["play.py<br/>run_play_episode / main<br/>(human / rule-based / rl:&lt;ckpt&gt;)"]
 
     Unity["Unity sim<br/>(GameController, DriverController,<br/>WallMessage, FrameCapture)"]
+
+    SB3ext["stable_baselines3 (external)<br/>PPO.load"]
 
     %% env wiring
     TankEnv --> Protocol
@@ -84,10 +105,16 @@ graph TD
 
     %% map hook: WallLayout reaches a map-aware agent via the optional set_map hook (driver-side)
     Collect -.->|set_map player1 + player2| AgentImpls
-    Demo -.->|set_map player1 + player2| AgentImpls
+    Play -.->|set_map player1 + player2| AgentImpls
 
     %% models wiring
     Encoder -.->|leaf, no internal import| core
+
+    %% rl wiring: the encoder seam wraps models; the self-play seam wraps env + reuses core/agents
+    EncoderExtractor -.->|"wraps build_encoder(trunk by size or --trunk, flatten)"| Encoder
+    SelfPlay -.->|"wraps env; step(a1,a2)"| TankEnv
+    SelfPlay -.->|"from_roster → make_agent"| AgentImpls
+    SelfPlay -.->|split_state_for_opponent| State
 
     %% data wiring
     Runner --> Collect
@@ -102,16 +129,27 @@ graph TD
     Collect --> Shards
     Readers --> Shards
 
-    %% demo wiring
-    Demo --> TankEnv
-    Demo --> AgentImpls
-    Demo --> Protocol
-    Demo --> Launch
+    %% play wiring
+    Play --> TankEnv
+    Play --> AgentImpls
+    Play --> Protocol
+    Play --> Launch
+    Play -.->|"rl:&lt;ckpt&gt; only — lazy DIRECT sb3 PPO.load(ckpt); no edge to pop_trainer.rl"| SB3ext
+
+    %% obs-resolution wiring: every live entry derives frame_shape from its launched config
+    %% (the derived resolution also drives the rl extractor's trunk auto-selection)
+    Play -.->|frame_shape_from_config| Obs
+    Runner -.->|frame_shape_from_config| Obs
+    rl -.->|"frame_shape_from_config + validate_frame_shape"| Obs
+
+    %% utils: a one-way sink — loads an SB3 ckpt + reads the models trunk by attribute
+    ModelInfo -.->|"PPO.load + .encoder.trunk (by attr)"| rl
+    ModelInfo -.->|names the active trunk class| Encoder
 
     %% pretraining wiring (offline; decoupled from env by the dataset)
     TrainCLI --> Decoder
     TrainCLI --> DecodeDS
-    Decoder -->|"features (GAP) +<br/>embed.detach"| Encoder
+    Decoder -->|"features (spatial heads) +<br/>embed.detach (probe)"| Encoder
     Decoder --> Targets
     DecodeDS -->|"reuses DatasetIndex.split<br/>(map-aware)"| Readers
     DecodeDS --> Targets
@@ -126,20 +164,24 @@ graph TD
 - **`TankEnv` is the hub.** It pulls every `core` module it needs (`protocol`, `state`,
   `config`, `agent`, plus its own `rewards`) and is the only thing that talks to Unity over the
   socket. It is a **pure symmetric transport** that owns neither player — `step(a1, a2)` takes both
-  actions from the caller. Both `data.collect` and `demo` run their episodes through it.
+  actions from the caller. Both `data.collect` and `play` run their episodes through it.
 - **The self-play seam** lives in `core.state` (`split_state_for_opponent` /
-  `flip_frame_perspective`) and is owned **driver-side**: `data.collect` / `demo` flip player2's
+  `flip_frame_perspective`) and is owned **driver-side**: `data.collect` / `play` flip player2's
   perspective to compute its action `a2`, then pass it to `env.step(a1, a2)`. Agents read `PLAYER_1`
   out of whatever (possibly flipped) view they're handed. `TankEnv` exposes `player2_frame()` /
-  `player2_state()` helpers but does not call them during `step`.
+  `player2_state()` helpers but does not call them during `step`. [`rl`](components/rl.md) now
+  packages this SAME driver path as a `gymnasium.Wrapper` — `SelfPlayWrapper` samples a scripted
+  opponent per episode (via `OpponentProvider` over the `agents` roster), caches player2's flipped
+  view from `info["state"]`, and drives `env.step(a1, a2)` so SB3 supplies only `a1`. Self-play stays
+  a WRAPPER over the trainer, never woven into the env or PPO core.
 - **The wall-message seam** flows `WallMessage` (Unity) → `protocol.parse_walls_message` →
   `WallLayout` → `TankEnv.current_map` → `info["map"]`, and from there into a map-aware agent via
   the OPTIONAL `set_map` hook — called **driver-side** on **both** players: `data.collect` /
-  `demo` call `set_map` on player1 and player2 (all `getattr`-probed; the env notifies no agent). A
+  `play` call `set_map` on player1 and player2 (all `getattr`-probed; the env notifies no agent). A
   [`CoverageAgent`](components/agents.md) rebuilds its coverage grid from the layout; `RandomAgent`
   does not implement the hook. See
-  [core](components/core.md#the-wall-message--protocol-seam-walllayout--infomap).
-- **`core.launch` is the shared live seam.** Both the `demo` and `data.collect_runner` launch the
+  [core](components/core.md#the-wall-message-seam-walllayout--infomap).
+- **`core.launch` is the shared live seam.** Both `play` and `data.collect_runner` launch the
   build + open the socket through `build_launch_cmd` / `connect`; it is stdlib-only so `core` stays
   the leaf. `collect_runner.env_factory` calls it once per worker (`port = base_port + worker_id`).
 - **`data.collect_runner` is the collection CLI** (`python -m pop_trainer.data.collect_runner`):
@@ -152,18 +194,56 @@ graph TD
   core.Connection.switch_arena` (the additive outbound seam), and `collect.resolve_map_tag` tags
   each sample's `map_id` from the arena Unity **echoed** (the F5 tag-from-echo), decoded through the
   `maps.json` sidecar / `map_index`. See
-  [data](components/data.md#the-rotation-scheduler--map-tagging).
-- **`models` is detached** from the live loop — it's the shared vision backbone
-  [`pretraining`](components/pretraining.md) trains (and the future `rl` will consume), and the
-  deployable ONNX artifact.
+  [data](components/data.md#the-rotation-scheduler--tag-from-echo).
+- **`models` is detached** from the live loop — it's the shared vision backbone consumed on BOTH
+  arms, and the deployable ONNX artifact. Its trunks are named by architecture
+  (`cnn` / `resnet` / `gn-cnn`); the small-frame `gn-cnn` (DreamerV3-style GroupNorm CNN) survives
+  ≤128px frames where the `cnn` stride-4 stem collapses. Online: [`rl`](components/rl.md)'s
+  `EncoderExtractor` wraps the `Encoder` and reads its `embed` flat embedding as the SB3 policy /
+  value feature extractor, **auto-selecting the trunk by obs resolution** (or honoring an explicit
+  `--trunk` override). Offline: [`pretraining`](components/pretraining.md)'s `StateDecoder` reads
+  `Encoder.features` for the spatial heads that train the encoder.
 - **`pretraining` is the offline arm.** `StateDecoder` wraps a `build_encoder` [`Encoder`](components/models.md)
   and decodes the 52-float state from one frame: the **spatial heads** read `Encoder.features`
-  (GAP'd, grad flows to the encoder — the artifact trains here) while the **detached embed-probe**
+  (grad flows to the encoder — the artifact trains here) while the **detached embed-probe**
   reads `Encoder.embed.detach()` (encoder-frozen, measuring how much state survives pooling).
   `DecodeDataset` streams [`data`](components/data.md)'s decode-v1 shards and **reuses**
   `DatasetIndex.split` (map-aware, no reimplementation); targets are carved via the
   [`core.state`](components/core.md) named accessors. It imports nothing from `env` / `rl` — the
   dataset decouples it from the live engine. See [pretraining](components/pretraining.md).
+- **The observation-resolution seam (`core.obs`).** The env's pixel `frame_shape` is the ONE
+  source of truth derived from the launched config's `obs_pixels_width/height` via
+  `core.obs.frame_shape_from_config` — every live entry (`play` / `rl.train` / the collection
+  runner) derives it, so the env byte-read always matches the build's rendered W/H, and the derived
+  resolution is what drives the `models` trunk auto-selection above. `rl.train` also
+  `validate_frame_shape`s its configured shape against the launched config before any build starts.
+  See [core](components/core.md#the-observation-resolution-contract-coreobs).
+- **The transport handshake (Python-driven round boundary + length-prefix framing).** The episode
+  boundary is now driven off **Unity's own clock** — Unity ends the round (winner OR timer), freezes
+  it (`roundOver`), delivers the `done` step+frame once, and KEEPS servicing the socket while waiting;
+  Python's `done → terminated → reset()` sends `restart` into the clean waiting state (never
+  mid-round). Python → Unity control/step writes are now **length-prefixed** (4-byte big-endian +
+  JSON, the new `DriverProtocol.cs` read-exactly side); inbound JSON + the pixel-frame header are
+  unchanged. The wire DATA contract is byte-identical. See
+  [Unity/protocol](game-architecture.md#the-python-driven-round-boundary--length-prefix-framing).
+- **`utils` is a one-way sink** off the graph: `utils.model_info` (`python -m
+  pop_trainer.utils.model_info <ckpt>`) loads an SB3 checkpoint on CPU and reports its obs/action
+  spaces, the active [`models`](components/models.md) trunk, and id-deduped per-section param counts.
+  Nothing imports it, so it can reach across components without a cycle. See
+  [utils](components/utils.md).
+- **`rl` now spans four internal deps**, not just `models`: the self-play seam adds `env` (the
+  `TankEnv` `SelfPlayWrapper` wraps), `agents` (`make_agent` for the opponent roster), and `core`
+  (`split_state_for_opponent` for the perspective flip, plus `core.launch` for the re-derived live
+  build launch). It still imports NOTHING from `data` / `pretraining` — the opponent-driving
+  primitives are reused directly, not the `data` module. The M1 PPO trainer is **built**:
+  `train_local` composes the vec-env stack + `CnnPolicy`/`EncoderExtractor` policy, the
+  `EvalWinRateCallback` (a same-width `M == N` eval instance set on a disjoint port block,
+  time-multiplexed with training so the two sets never coexist), checkpoint + resumable `state.json`
+  sidecar, and the light from-eval ELO wiring — plus the `n_envs > 1` `SubprocVecEnv` fan-out (one
+  Unity build per training port `game_port + i`, `start_method="spawn"`), now implemented + unit-tested
+  (live multi-instance launch pending). The Unity-instance lifecycle is `TankEnv`-owned (lazy launch /
+  `release` / kill-old-first reconnect) so a lost connection is survivable. Still future: the
+  population / M2 frozen-self ELO ladder and the distributed/GCP cluster.
 
 ---
 [← back to index](README.md)

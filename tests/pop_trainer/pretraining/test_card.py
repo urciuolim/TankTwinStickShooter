@@ -12,11 +12,11 @@ from pop_trainer.pretraining import card
 
 def _architecture(**overrides) -> dict:
     base = {
-        "trunk": "nature",
+        "trunk": "cnn",
         "pooling": "gap",
         "resolution": 180,
         "input_hw": [180, 320],
-        "trunk_class": "NatureCNN",
+        "trunk_class": "CnnTrunk",
         "pooling_class": "GlobalAveragePool",
         "decoder_class": "StateDecoder",
         "encoder_params": 123456,

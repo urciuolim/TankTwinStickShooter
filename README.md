@@ -1,6 +1,6 @@
 # Tank Twin Stick Shooter
 
-A 2021 Unity 2D twin-stick tank game, revived in 2026 as a **reinforcement-learning research environment**. Unity 6.5 is the simulator; a Python driver (`pop_trainer`) drives it over a TCP-JSON socket, with agents observing the **real rendered pixel frame**.
+A 2021 Unity 2D twin-stick tank game **reinforcement-learning research environment** revived in 2026. Unity 6.5 is the simulator; a Python driver (`pop_trainer`) drives it over a TCP-JSON socket, with agents observing the **real rendered pixel frame**.
 
 <p align="center">
   <img src="docs/assets/gameplay.gif" width="480" alt="A map-aware coverage agent (blue) and a random opponent (red) playing the custom1 arena"><br>
@@ -20,7 +20,8 @@ The training stack (`src/pop_trainer/`) is rebuilt component-by-component, each 
 | `agents` | map-aware coverage policies (+ a random baseline) that drive data collection |
 | `models` | composable, ablation-ready vision encoders (ONNX / Unity-Sentis-clean) |
 | `data` | a multi-worker collection runner — parallel builds, **map + pairing rotation**, echo-tagged shards |
-| `demo` | launch the live build and watch two policies play |
+| `rl` | **end-to-end PPO on pixels** — `EncoderExtractor`, a self-play opponent seam, eval + ELO, multi-env (`SubprocVecEnv`), checkpoint/resume |
+| `play` | launch the live build and play one episode — any pairing of human, rule-based, or a trained `rl:<ckpt>` agent |
 
 ### Multi-map data collection
 
@@ -35,9 +36,11 @@ The collector rotates arenas *and* policy pairings between episodes — one long
 
 ```bash
 uv sync                                          # Python 3.12 env (managed by uv)
-# build the Unity game -> build/TankTwinStickShooter.exe  (see docs/runbook.md)
-uv run python -m pop_trainer.demo                # watch two policies play one episode
+# build the Unity game -> unity/build/TankTwinStickShooter.exe  (see docs/runbook.md)
+uv run python -m pop_trainer.play                # watch / play one episode (human, rule-based, or rl:<ckpt>)
 uv run python -m pop_trainer.data.collect_runner --out-dir runs/demo --maps   # collect a rotating dataset
+uv run python -m pop_trainer.rl.train \
+  --config unity/Assets/StreamingAssets/train_config.json --run-dir runs/train   # train a PPO agent on pixels
 ```
 
 Full setup, the component map, and the class-to-class architecture live in **[`docs/`](docs/README.md)**.
@@ -48,4 +51,4 @@ This revival is developed by a team of AI coding subagents — research, enginee
 
 ## Status
 
-**M0** — playable two-human game ✅ · **M1** — single-agent PPO on real pixels (in progress) · **M2** — population-based self-play (next). Target training cluster: GCP.
+**M0** — playable two-human game ✅ · **M1** — single-agent PPO on real pixels: **end-to-end training stack landed + running** (hyperparameter tuning + a pretrained encoder next) · **M2** — population-based self-play (next). Target training cluster: GCP.
