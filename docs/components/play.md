@@ -23,14 +23,14 @@ uv run python -m pop_trainer.play --player1 human --player2 rl:runs/train/model.
 ```
 
 **Boundary (an intentional, CTO-approved relaxation):** `play` is a **composition-root app**, like
-[`rl/train.py`](rl.md). It MAY import [`env`](env.md), [`agents`](agents.md), [`core`](core.md), and
-[`rl`](rl.md). It is a **leaf** entry point — imported by nothing — so the `play → rl` edge adds NO
-cycle. This is a deliberate relaxation of the former `demo`'s "never import `rl`" rule. Still
-FORBIDDEN: `models` (reached only transitively through `rl`), `data`, `pretraining`, anything from
-`tank_twin`. Crucially, **`rl` / `stable_baselines3` / `torch` are imported LAZILY** — only inside
-the RL-player factory `make_rl_player` — so human / rule-based play stays torch-free and fast. The
-module-top imports are `env` + `agents` + `core` only; a unit test asserts none of
-`stable_baselines3` / `torch` / `pop_trainer.rl` appears at module level.
+[`rl/train.py`](rl.md). At module top it imports [`env`](env.md), [`agents`](agents.md), and
+[`core`](core.md) **only**. It is a **leaf** entry point — imported by nothing. To load a trained PPO
+checkpoint it reaches `stable_baselines3` **directly** (it does NOT import [`rl`](rl.md) at all);
+that **direct sb3 dependency** is the deliberate relaxation of the former `demo`'s "torch-free" rule.
+Still FORBIDDEN: `rl`, `models`, `data`, `pretraining`, anything from `tank_twin`. Crucially,
+**`stable_baselines3` / `torch` are imported LAZILY** — only inside the RL-player factory
+`make_rl_player` (`play.py:265`) — so human / rule-based play stays torch-free and fast. A unit test
+asserts none of `stable_baselines3` / `torch` / `pop_trainer.rl` appears at module level.
 
 ## Key entry points
 
@@ -117,8 +117,9 @@ an actionable message naming the extra.
 - [agents](agents.md) — the rule-based selectors for both players, plus
   `HumanAgent` / `KeyboardListener` / `KeyboardState` / `player{1,2}_mapping` for the `human` form
   (lazy `pynput`, the `human` extra).
-- [rl](rl.md) — **lazily, inside `make_rl_player` only**: `stable_baselines3.PPO` to load an `rl:`
-  checkpoint predict-only. Never imported at module level.
+- `stable_baselines3` (`PPO`) — **directly and lazily, inside `make_rl_player` only**
+  (`play.py:265`): to load an `rl:` checkpoint predict-only. NOT imported at module level, and
+  `pop_trainer.rl` is never imported at all.
 
 ## Pushes to (downstream)
 

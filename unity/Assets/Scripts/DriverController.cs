@@ -353,7 +353,11 @@ public class DriverController : MonoBehaviour
 
         if (message != null)
         {
-            if (message["start"] != null && message["start"].Value<bool>())
+            // Single tested dispatch (DriverProtocol.Classify) replaces the inline key-probing.
+            // Waiting-state semantics: Action and Unknown are NO-OPS here (the original chain had
+            // no else, so any non-control message was silently ignored).
+            DriverProtocol.MessageKind kind = DriverProtocol.Classify(message);
+            if (kind == DriverProtocol.MessageKind.Start)
             {
                 if (verbose)
                     Debug.Log(DriverLog.Format("start_received", System.DateTime.UtcNow, "port", connectionPort.ToString()));
@@ -378,7 +382,7 @@ public class DriverController : MonoBehaviour
                         new[] { "from", "to", "cause", "port" },
                         new[] { "false", "true", "start", connectionPort.ToString() }));
                 ingame = true;
-            } else if (message["end"] != null && message["end"].Value<bool>())
+            } else if (kind == DriverProtocol.MessageKind.End)
             {
                 if (verbose)
                     Debug.Log(DriverLog.Format("end_received", System.DateTime.UtcNow, "port", connectionPort.ToString()));
@@ -388,7 +392,7 @@ public class DriverController : MonoBehaviour
                 byte[] writeBuffer = Encoding.ASCII.GetBytes(confirmation.ToString());
                 nwStream.Write(writeBuffer, 0, writeBuffer.Length);
                 instance.running = false;
-            } else if (message["restart"] != null && message["restart"].Value<bool>())
+            } else if (kind == DriverProtocol.MessageKind.Restart)
             {
                 if (verbose)
                     Debug.Log(DriverLog.Format("restart_received", System.DateTime.UtcNow,
@@ -403,7 +407,7 @@ public class DriverController : MonoBehaviour
                 // next round's Arena load is DEFERRED to the {"start": true} handler (so an optional
                 // switch_arena between restart and start takes effect for the round it is requested
                 // in). We remain !ingame; the round-over state stays frozen until start reloads.
-            } else if (message["switch_arena"] != null)
+            } else if (kind == DriverProtocol.MessageKind.SwitchArena)
             {
                 // Optional, additive handshake message in the !ingame window (after restart, before
                 // start). Swaps the cached arena so the deferred LoadScene("Arena") in the start
@@ -529,7 +533,12 @@ public class DriverController : MonoBehaviour
 
         if (message != null)
         {
-            if (message["restart"] != null && message["restart"].Value<bool>())
+            // Single tested dispatch (DriverProtocol.Classify) replaces the inline restart probe.
+            // Mid-round semantics: Restart hits the safety-cap neutralize branch; EVERY other kind
+            // (Start / End / SwitchArena / Action / Unknown) takes the original else (actions =
+            // message), so the fallthrough is unchanged. The null message stays a no-op via the guard.
+            DriverProtocol.MessageKind kind = DriverProtocol.Classify(message);
+            if (kind == DriverProtocol.MessageKind.Restart)
             {
                 // SAFETY-CAP corner case ONLY: in the normal flow Python NEVER sends restart mid-
                 // round (it drives the boundary off Unity's done). If a restart still lands here --

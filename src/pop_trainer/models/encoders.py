@@ -82,8 +82,8 @@ __all__ = [
     "POOLINGS",
 ]
 
-# Canonical synthetic-frame size as (H, W): 360 rows x 640 cols (the Unity RGB grid the env
-# draws). Used as the default export spatial axes; encoders are size-agnostic at build time.
+# Canonical rendered-frame size as (H, W): 360 rows x 640 cols (the real Unity render the env
+# captures). Used as the default export spatial axes; encoders are size-agnostic at build time.
 CANONICAL_HW = (360, 640)
 
 TrunkName = Literal["cnn", "resnet", "gn-cnn"]

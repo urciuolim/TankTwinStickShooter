@@ -15,7 +15,7 @@ Unity 6.5 (2D twin-stick tank game) as the simulator + a Python 3.12 reinforceme
 - The socket protocol is unframed today (`recv(1024)` assumes one JSON object per read) — don't rely on that; framing is planned.
 - No runtime `UnityEditor` imports in shipping C# (breaks standalone builds).
 - **DO NOT** change the RL seam without explicit sign-off: `DriverController`'s socket/`actions` path and `GameController.UpdateState()`'s 52-float state layout — M1 depends on them being stable.
-- Observations are PIXELS: a synthetic RGB grid drawn from state by `tank_env.draw_state` (CnnPolicy), NOT a Unity render. (Future: frozen vision-encoder embedding — deferred to M1.)
+- Observations are PIXELS: the REAL rendered Unity frame (CnnPolicy), captured from the live game render; the old synthetic RGB grid (`tank_env.draw_state`) is DROPPED. (Future: frozen vision-encoder embedding over that frame.)
 - The game is a **Python-clocked simulator**: it blocks on `AcceptTcpClient` and Python drives the clock/opponent — there is NO standalone human-play mode yet. Human *input* is read locally by Unity; AI opponents are Python. Opening `Arena.unity` alone throws NREs (it needs the Driver scene). See `docs/game-architecture.md`.
 
 ## Standards — apply your phase's section of `@docs/engineering-standards.md`

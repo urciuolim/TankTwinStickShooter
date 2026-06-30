@@ -17,17 +17,19 @@ core  ←  { models, env, agents, data }  ←  play
 - [env](components/env.md) — imports `core` (+ gymnasium, numpy).
 - [agents](components/agents.md) — imports `core` (+ numpy).
 - [data](components/data.md) — imports `core`, `env`, `agents`.
-- [play](components/play.md) — imports `core`, `env`, `agents`; and `rl` **lazily** (a
-  composition-root app — the only relaxation; sb3/torch import only inside its RL-player factory).
+- [play](components/play.md) — imports `core`, `env`, `agents`; and `stable_baselines3`
+  **directly + lazily** (a composition-root app — the only relaxation; sb3/torch import only inside
+  its RL-player factory, never `pop_trainer.rl`).
 - [rl](components/rl.md) — imports `core`, `env`, `models`, `agents` (+ torch / gymnasium / numpy /
   stable-baselines3).
 - [utils](components/utils.md) — a **leaf SINK**: it MAY import `core` / `models` / `rl` (+ sb3 /
   torch), but **nothing in `pop_trainer` imports it**, so it can never create a cycle.
 
 No import cycles: `data` and `play` sit at the top, `core` at the bottom, `models` off to the
-side, `utils` off to the side as a one-way sink. `play` is a LEAF (imported by nothing), so its lazy
-`play → rl` edge adds no cycle. (`pretraining` / `eval` / `population` / `deployment` / `imitation`
-are not built yet and are omitted.)
+side, `utils` off to the side as a one-way sink. `play` is a LEAF (imported by nothing); its only
+relaxation is the lazy **direct `stable_baselines3` import** inside its RL-player factory (no edge to
+`pop_trainer.rl` at all), so it adds no cycle. (`pretraining` / `eval` / `population` / `deployment` /
+`imitation` are not built yet and are omitted.)
 
 ## Class-to-class interaction map
 
@@ -76,6 +78,8 @@ graph TD
 
     Unity["Unity sim<br/>(GameController, DriverController,<br/>WallMessage, FrameCapture)"]
 
+    SB3ext["stable_baselines3 (external)<br/>PPO.load"]
+
     %% env wiring
     TankEnv --> Protocol
     TankEnv -->|"reset(switch_arena)<br/>→ Connection.switch_arena"| Protocol
@@ -121,7 +125,7 @@ graph TD
     Play --> AgentImpls
     Play --> Protocol
     Play --> Launch
-    Play -.->|"rl:&lt;ckpt&gt; only — lazy sb3 PPO.load(ckpt)"| rl
+    Play -.->|"rl:&lt;ckpt&gt; only — lazy DIRECT sb3 PPO.load(ckpt); no edge to pop_trainer.rl"| SB3ext
 
     %% obs-resolution wiring: every live entry derives frame_shape from its launched config
     %% (the derived resolution also drives the rl extractor's trunk auto-selection)

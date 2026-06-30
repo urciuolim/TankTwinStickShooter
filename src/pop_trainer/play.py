@@ -24,13 +24,14 @@ Three player FORMS on each slot:
   ``*.zip`` path is also accepted). Any matchup works: rl-vs-human, rl-vs-rulebased, rl-vs-rl, etc.
 
 BOUNDARY (INTENTIONAL, CTO-APPROVED RELAXATION): ``play`` is a COMPOSITION-ROOT APP, like
-``rl/train.py``. It MAY import ``env`` + ``agents`` + ``rl`` + ``core``. It is a LEAF entry point —
-imported by NOTHING — so the ``play -> rl`` import introduces NO cycle. This is a deliberate
-relaxation of demo's old "never import ``rl``" rule; the repo-steward must NOT treat it as a
-violation. Still FORBIDDEN: ``models`` (reached only transitively through ``rl``), ``data``,
-``pretraining``, anything from ``tank_twin``. ``rl`` / ``stable_baselines3`` / ``torch`` are
-imported LAZILY — ONLY inside :func:`make_rl_player` — so human / rule-based play stays torch-free
-and fast; the module-top imports are ``env`` + ``agents`` + ``core`` only (a unit test enforces it).
+``rl/train.py``. At module top it imports ``env`` + ``agents`` + ``core`` only. It is a LEAF entry
+point — imported by NOTHING. To load a trained PPO checkpoint it reaches ``stable_baselines3``
+DIRECTLY (it does NOT import ``pop_trainer.rl`` at all); that direct sb3 dependency is the
+deliberate relaxation of demo's old "torch-free" rule, and the repo-steward must NOT treat it as a
+violation. Still FORBIDDEN: ``rl``, ``models``, ``data``, ``pretraining``, anything from
+``tank_twin``. ``stable_baselines3`` / ``torch`` are imported LAZILY — ONLY inside
+:func:`make_rl_player` — so human / rule-based play stays torch-free and fast; the module-top
+imports are ``env`` + ``agents`` + ``core`` only (a unit test enforces it).
 
 The episode-driving logic is the pure :func:`run_play_episode` (an already-built env + two player
 adapters in, a :class:`PlayResult` out); the subprocess launch and socket connect live in
@@ -241,10 +242,12 @@ class PixelsAdapter:
 
 
 def make_rl_player(checkpoint: str | Path, *, slot: int, model=None) -> PixelsAdapter:
-    """Build a :class:`PixelsAdapter` over a trained SB3 PPO checkpoint (the ONLY ``rl`` seam).
+    """Build a :class:`PixelsAdapter` over a trained SB3 PPO checkpoint (the ONLY trained-model
+    seam).
 
-    This is the SOLE place ``rl`` / ``stable_baselines3`` / ``torch`` are imported, and the import
-    is LAZY (inside the function) — invoked only when an ``rl:`` player is requested, so human /
+    This is the SOLE place ``stable_baselines3`` / ``torch`` are imported (via
+    ``from stable_baselines3 import PPO``; ``pop_trainer.rl`` is NOT imported), and the import is
+    LAZY (inside the function) — invoked only when an ``rl:`` player is requested, so human /
     rule-based play stays torch-free. ``PPO.load(checkpoint)`` is predict-only (no env needed for
     ``.predict``). The ``checkpoint`` path must exist (an actionable error otherwise).
 
@@ -279,7 +282,8 @@ def build_players(
     * ``human`` -> a :class:`~pop_trainer.agents.HumanAgent` over the player's keymap + the shared
       ``state``, wrapped in a :class:`StateAdapter`.
     * a rule-based selector -> :func:`make_agent`, wrapped in a :class:`StateAdapter`.
-    * ``rl:<path>`` -> :func:`make_rl_player` (the lazy ``rl`` import; the checkpoint loads here).
+    * ``rl:<path>`` -> :func:`make_rl_player` (the lazy ``stable_baselines3`` import; the checkpoint
+      loads here).
 
     Pure with respect to the keyboard: it takes an already-built ``state`` and never constructs a
     listener / touches ``pynput``. RL loading is NOT injectable here — the RL-adapter unit tests
@@ -496,7 +500,7 @@ def main(argv: list[str] | None = None) -> int:
     listener = agents.KeyboardListener() if human_play else None
     state = listener.state if listener is not None else agents.KeyboardState()
     # Build the adapters before launching the build: an RL player loads its checkpoint here (the
-    # lazy rl import), so a missing '*.zip' errors BEFORE any subprocess is spawned.
+    # lazy stable_baselines3 import), so a missing '*.zip' errors BEFORE any subprocess is spawned.
     try:
         player1, player2 = build_players(spec1, spec2, state, seed=args.seed)
     except FileNotFoundError as exc:
