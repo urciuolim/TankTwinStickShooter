@@ -6,9 +6,9 @@ top-level ``importorskip`` (the repo gates its torch tests this way). They cover
 1. forward-pass SHAPES for every {trunk} x {pooling}: ``features`` is 4-D ``(B, C, h, w)``,
    ``embed`` is 2-D ``(B, D)`` — at a small representative size for speed AND once at the real
    640x360 (batch 1) to prove the stem crushes the canonical frame;
-2. composability: the named ablation configs (NatureCNN, IMPALA-residual, IMPALA-plain) build
+2. composability: the named ablation configs (cnn, resnet-residual, resnet-plain) build
    + run end-to-end via the factory;
-3. the IMPALA residual ablation: IMPALA-plain and IMPALA-residual share channel widths and
+3. the resnet residual ablation: resnet-plain and resnet-residual share channel widths and
    conv-layer count, differing only by the skip add, so their outputs diverge; and the
    ``blocks_per_stage`` depth knob adds conv params while keeping the output channels;
 4. ONNX-export cleanliness: each encoder (residual AND plain) exports to a tmp file and the
@@ -16,7 +16,9 @@ top-level ``importorskip`` (the repo gates its torch tests this way). They cover
    positive allow-list). The op-scan is REAL — it iterates the exported graph's node op_types
    via the ``onnx`` package (a pinned hard dependency), and the assertion is not a no-op (see
    ``_assert_sentis_clean``);
-5. determinism: ``embed`` in ``eval()`` is deterministic for the same input.
+5. the registry contract: ``TRUNKS`` carries exactly the architecture-descriptive keys mapped
+   to the right classes;
+6. determinism: ``embed`` in ``eval()`` is deterministic for the same input.
 """
 
 from __future__ import annotations
@@ -29,39 +31,45 @@ from pop_trainer.models import (  # noqa: E402  (after importorskip, by design)
     CANONICAL_HW,
     POOLINGS,
     TRUNKS,
+    CnnTrunk,
     EncoderConfig,
+    GroupNormCNN,
+    ResNetTrunk,
     build_encoder,
     export_onnx,
 )
 
-# A small input that still survives the NatureCNN stem+trio (90x160 underflows the conv
+# A small input that still survives the cnn-trunk stem+trio (90x160 underflows the conv
 # stack; half-canonical 180x320 runs the SAME code path and is fast).
 SMALL_HW = (180, 320)
 
-# Every {trunk} x {pooling} cell of the ablation grid.
-ALL_CELLS = [(t, p) for t in TRUNKS for p in POOLINGS]
+# Every {trunk} x {pooling} cell of the canonical-frame, Sentis-deployable ablation grid. The
+# gn-cnn trunk is a SMALL-frame RL trunk (GroupNorm, not a Sentis-clean deploy target) and is
+# covered by its own tests below, so it is excluded from the deployable-grid sweep here.
+DEPLOY_TRUNKS = [t for t in TRUNKS if t != "gn-cnn"]
+ALL_CELLS = [(t, p) for t in DEPLOY_TRUNKS for p in POOLINGS]
 
-# The named ablation configs the contract calls out, including the IMPALA-plain (residual off)
+# The named ablation configs the contract calls out, including the resnet-plain (residual off)
 # variant that isolates whether the skip connections earn their keep.
 ABLATION_CONFIGS = [
-    EncoderConfig(trunk="nature", pooling="flatten"),  # "just NatureCNN"
-    EncoderConfig(trunk="nature", pooling="gap"),
-    EncoderConfig(trunk="impala", pooling="gap"),  # IMPALA-residual
-    EncoderConfig(trunk="impala", pooling="gap", residual=False),  # IMPALA-plain
-    EncoderConfig(trunk="impala", pooling="flatten", residual=False),  # IMPALA-plain + flatten
+    EncoderConfig(trunk="cnn", pooling="flatten"),  # "just the cnn trunk"
+    EncoderConfig(trunk="cnn", pooling="gap"),
+    EncoderConfig(trunk="resnet", pooling="gap"),  # resnet-residual
+    EncoderConfig(trunk="resnet", pooling="gap", residual=False),  # resnet-plain
+    EncoderConfig(trunk="resnet", pooling="flatten", residual=False),  # resnet-plain + flatten
 ]
 
-# IMPALA configs that must export Sentis-clean: residual AND plain, both poolings. Parametrized
+# resnet configs that must export Sentis-clean: residual AND plain, both poolings. Parametrized
 # into the ONNX test so the op-scan fires for plain configs too.
-IMPALA_ONNX_CONFIGS = [
-    EncoderConfig(trunk="impala", pooling="gap"),  # IMPALA-residual
-    EncoderConfig(trunk="impala", pooling="gap", residual=False),  # IMPALA-plain
-    EncoderConfig(trunk="impala", pooling="flatten", residual=False),  # IMPALA-plain + flatten
+RESNET_ONNX_CONFIGS = [
+    EncoderConfig(trunk="resnet", pooling="gap"),  # resnet-residual
+    EncoderConfig(trunk="resnet", pooling="gap", residual=False),  # resnet-plain
+    EncoderConfig(trunk="resnet", pooling="flatten", residual=False),  # resnet-plain + flatten
 ]
 
 
-def _impala_id(cfg) -> str:
-    """A readable parametrize id naming the IMPALA variant under test."""
+def _resnet_id(cfg) -> str:
+    """A readable parametrize id naming the resnet variant under test."""
     return f"{'residual' if cfg.residual else 'plain'}+{cfg.pooling}"
 
 
@@ -187,6 +195,51 @@ def _assert_sentis_clean(op_types: list[str]) -> None:
     )
 
 
+# --- 0. the registry contract (architecture-descriptive keys -> classes) ----------------
+
+
+def test_trunk_registry_keys_and_classes():
+    """TRUNKS carries exactly the architecture-descriptive keys mapped to the right classes."""
+    assert set(TRUNKS) == {"cnn", "resnet", "gn-cnn"}
+    assert TRUNKS["cnn"] is CnnTrunk
+    assert TRUNKS["resnet"] is ResNetTrunk
+    assert TRUNKS["gn-cnn"] is GroupNormCNN
+
+
+@pytest.mark.parametrize("trunk", ["cnn", "resnet", "gn-cnn"])
+def test_build_encoder_works_for_each_registry_key(trunk):
+    """build_encoder assembles + runs every registry trunk, honoring its trunk-specific knobs.
+
+    cnn / resnet take the canonical-frame path; gn-cnn takes a small frame. resnet exercises the
+    residual / blocks_per_stage knobs and gn-cnn exercises cnn_depth, so the per-trunk fields are
+    proven to flow through the factory.
+    """
+    if trunk == "gn-cnn":
+        cfg = EncoderConfig(trunk=trunk, pooling="flatten", cnn_depth=16)
+        hw = (64, 64)
+    elif trunk == "resnet":
+        cfg = EncoderConfig(trunk=trunk, pooling="gap", residual=False, blocks_per_stage=3)
+        hw = SMALL_HW
+    else:
+        cfg = EncoderConfig(trunk=trunk, pooling="flatten")
+        hw = SMALL_HW
+    enc = build_encoder(cfg).eval()
+    x = torch.zeros(1, 3, *hw)
+    with torch.no_grad():
+        feats = enc.features(x)
+        emb = enc.embed(x)
+    assert feats.ndim == 4
+    assert emb.ndim == 2
+    assert isinstance(TRUNKS[trunk], type)
+    assert isinstance(enc.trunk, TRUNKS[trunk])
+
+
+def test_encoder_config_rejects_unknown_trunk():
+    """An unknown trunk key fails loudly at EncoderConfig construction (registry-driven)."""
+    with pytest.raises(ValueError, match="unknown trunk"):
+        EncoderConfig(trunk="bogus-trunk", pooling="gap")  # type: ignore[arg-type]
+
+
 # --- 1. instantiation + forward-pass SHAPES --------------------------------------------
 
 
@@ -243,7 +296,7 @@ def _cfg_id(c) -> str:
 
 @pytest.mark.parametrize("cfg", ABLATION_CONFIGS, ids=_cfg_id)
 def test_ablation_configs_build_and_run(cfg):
-    """Each named ablation (incl. IMPALA-plain) assembles via build_encoder and runs."""
+    """Each named ablation (incl. resnet-plain) assembles via build_encoder and runs."""
     enc = build_encoder(cfg).eval()
     h, w = SMALL_HW
     x = torch.zeros(1, 3, h, w)
@@ -263,18 +316,18 @@ def test_bad_config_rejected():
     with pytest.raises(ValueError, match="unknown trunk"):
         EncoderConfig(trunk="mamba", pooling="gap")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="unknown pooling"):
-        EncoderConfig(trunk="nature", pooling="attention")  # type: ignore[arg-type]
+        EncoderConfig(trunk="cnn", pooling="attention")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="in_channels"):
-        EncoderConfig(trunk="nature", pooling="gap", in_channels=0)
+        EncoderConfig(trunk="cnn", pooling="gap", in_channels=0)
     with pytest.raises(ValueError, match="blocks_per_stage"):
-        EncoderConfig(trunk="impala", pooling="gap", blocks_per_stage=0)
+        EncoderConfig(trunk="resnet", pooling="gap", blocks_per_stage=0)
 
 
-# --- the IMPALA residual ablation: same shape, the skip is the only difference ----------
+# --- the resnet residual ablation: same shape, the skip is the only difference ----------
 
 
-def test_impala_plain_vs_residual_same_shape_differ_only_by_skip():
-    """IMPALA-plain and IMPALA-residual: identical conv structure, outputs diverge.
+def test_resnet_plain_vs_residual_same_shape_differ_only_by_skip():
+    """resnet-plain and resnet-residual: identical conv structure, outputs diverge.
 
     With the SAME seed (so both build identical conv weights), the plain and residual trunks
     produce the same output channel count, the same spatial shape, and the SAME number of conv
@@ -285,9 +338,9 @@ def test_impala_plain_vs_residual_same_shape_differ_only_by_skip():
     x = torch.randn(1, 3, h, w)
 
     torch.manual_seed(0)
-    res = build_encoder(EncoderConfig(trunk="impala", pooling="gap", residual=True)).eval()
+    res = build_encoder(EncoderConfig(trunk="resnet", pooling="gap", residual=True)).eval()
     torch.manual_seed(0)
-    plain = build_encoder(EncoderConfig(trunk="impala", pooling="gap", residual=False)).eval()
+    plain = build_encoder(EncoderConfig(trunk="resnet", pooling="gap", residual=False)).eval()
 
     with torch.no_grad():
         f_res = res.features(x)
@@ -302,7 +355,7 @@ def test_impala_plain_vs_residual_same_shape_differ_only_by_skip():
     assert not torch.allclose(f_res, f_plain)
 
 
-def test_impala_depth_knob_adds_conv_params_keeps_channels():
+def test_resnet_depth_knob_adds_conv_params_keeps_channels():
     """blocks_per_stage: deeper builds + runs, adds conv params, keeps output channels at 32.
 
     Each extra block per stage adds two 3x3 convs at that stage's width, so the total conv
@@ -312,8 +365,8 @@ def test_impala_depth_knob_adds_conv_params_keeps_channels():
     h, w = SMALL_HW
     x = torch.zeros(1, 3, h, w)
 
-    shallow = build_encoder(EncoderConfig(trunk="impala", pooling="gap", blocks_per_stage=1)).eval()
-    deep = build_encoder(EncoderConfig(trunk="impala", pooling="gap", blocks_per_stage=3)).eval()
+    shallow = build_encoder(EncoderConfig(trunk="resnet", pooling="gap", blocks_per_stage=1)).eval()
+    deep = build_encoder(EncoderConfig(trunk="resnet", pooling="gap", blocks_per_stage=3)).eval()
 
     assert shallow.out_channels == deep.out_channels == 32
     assert _conv_param_count(deep.trunk) > _conv_param_count(shallow.trunk)
@@ -327,11 +380,11 @@ def test_embedding_dim_static_vs_probed():
     Covers the flatten 'D unknown without a spatial size' early-return and the probe path
     that restores train() afterward.
     """
-    gap = build_encoder(EncoderConfig(trunk="nature", pooling="gap"))
+    gap = build_encoder(EncoderConfig(trunk="cnn", pooling="gap"))
     # GAP D is knowable with no input_hw at all.
     assert gap.embedding_dim() == gap.out_channels
 
-    flat = build_encoder(EncoderConfig(trunk="impala", pooling="flatten"))
+    flat = build_encoder(EncoderConfig(trunk="resnet", pooling="flatten"))
     # flatten D is not statically knowable without a spatial size.
     assert flat.embedding_dim() is None
     # probing in train() mode must derive a concrete D and leave the module in train().
@@ -360,17 +413,17 @@ def test_onnx_export_sentis_clean(trunk, pooling, tmp_path):
     _assert_sentis_clean(op_types)
 
 
-@pytest.mark.parametrize("cfg", IMPALA_ONNX_CONFIGS, ids=lambda c: _impala_id(c))
-def test_onnx_export_impala_residual_and_plain_clean(cfg, tmp_path):
-    """IMPALA-residual AND IMPALA-plain export Sentis-clean; plain emits no Add (no skip).
+@pytest.mark.parametrize("cfg", RESNET_ONNX_CONFIGS, ids=lambda c: _resnet_id(c))
+def test_onnx_export_resnet_residual_and_plain_clean(cfg, tmp_path):
+    """resnet-residual AND resnet-plain export Sentis-clean; plain emits no Add (no skip).
 
     The op-scan runs for both residual and plain configs. Beyond the forbidden-op check, this
-    asserts every recovered op is in the positive allow-list and that an IMPALA-plain graph
+    asserts every recovered op is in the positive allow-list and that a resnet-plain graph
     contains NO ``Add`` node (the skip is the only structural difference), while the residual
     graph does.
     """
     enc = build_encoder(cfg)
-    out = tmp_path / f"impala_{cfg.pooling}_{'res' if cfg.residual else 'plain'}.onnx"
+    out = tmp_path / f"resnet_{cfg.pooling}_{'res' if cfg.residual else 'plain'}.onnx"
     export_onnx(enc, out, input_hw=SMALL_HW)
 
     assert out.exists() and out.stat().st_size > 0
@@ -381,9 +434,9 @@ def test_onnx_export_impala_residual_and_plain_clean(cfg, tmp_path):
     assert not unexpected, f"unexpected ops in exported graph: {sorted(unexpected)}"
     # the residual skip add is the ONLY structural difference between the two graphs
     if cfg.residual:
-        assert "Add" in op_types, "IMPALA-residual graph should contain the skip Add"
+        assert "Add" in op_types, "resnet-residual graph should contain the skip Add"
     else:
-        assert "Add" not in op_types, "IMPALA-plain graph must contain no skip Add"
+        assert "Add" not in op_types, "resnet-plain graph must contain no skip Add"
 
 
 def test_forbidden_op_assertion_actually_fires():
@@ -418,6 +471,90 @@ def test_proto_scanner_recovers_known_ops():
 
     ops = _scan_proto_op_types(_FakePath())
     assert ops == ["Conv", "Relu", "ReduceMean"]
+
+
+# --- the gn-cnn trunk: survives small frames where the cnn stem collapses -----------------
+
+# The gn-cnn trunk's canonical input is a 64x64 RGB frame; the four stride-2 blocks take it 64 -> 4.
+SMALL_FRAME_HW = (64, 64)
+
+
+def test_gn_cnn_trunk_spatial_map_default_depth():
+    """gn-cnn trunk at 64x64, cnn_depth=32: feature map is (B, 256, 4, 4); embedding finite.
+
+    Four stride-2 blocks halve the spatial dims each (64 -> 32 -> 16 -> 8 -> 4) while channels
+    double from cnn_depth (32 -> 64 -> 128 -> 256 = 8*cnn_depth), so the map is (B, 256, 4, 4)
+    and the flatten embedding is 256*4*4 = 4096.
+    """
+    enc = build_encoder(EncoderConfig(trunk="gn-cnn", pooling="flatten")).eval()
+    x = torch.zeros(2, 3, *SMALL_FRAME_HW)
+    with torch.no_grad():
+        feats = enc.features(x)
+        emb = enc.embed(x)
+
+    assert feats.shape == (2, 256, 4, 4)
+    assert enc.out_channels == 256
+    assert emb.shape == (2, 256 * 4 * 4)  # 4096
+    assert emb.shape[1] == 4096
+    assert torch.isfinite(emb).all()
+    # the statically-derived flatten D agrees with the realized embedding
+    assert enc.embedding_dim(SMALL_FRAME_HW) == 4096
+
+
+def test_gn_cnn_trunk_scales_with_cnn_depth():
+    """cnn_depth flows ONLY to the gn-cnn trunk: depth 16 -> (B, 128, 4, 4), out_channels 128.
+
+    Output channels are 8*cnn_depth, so halving the depth halves every channel width while the
+    64 -> 4 spatial schedule is unchanged.
+    """
+    enc = build_encoder(EncoderConfig(trunk="gn-cnn", pooling="flatten", cnn_depth=16)).eval()
+    x = torch.zeros(1, 3, *SMALL_FRAME_HW)
+    with torch.no_grad():
+        feats = enc.features(x)
+        emb = enc.embed(x)
+
+    assert feats.shape == (1, 128, 4, 4)
+    assert enc.out_channels == 128
+    assert emb.shape == (1, 128 * 4 * 4)  # 2048
+    assert torch.isfinite(emb).all()
+
+
+def test_gn_cnn_no_batchnorm():
+    """The gn-cnn trunk uses no BatchNorm (an on-policy-RL footgun) — norm is GroupNorm."""
+    enc = build_encoder(EncoderConfig(trunk="gn-cnn", pooling="flatten"))
+    norms = [m for m in enc.trunk.modules() if isinstance(m, torch.nn.modules.batchnorm._BatchNorm)]
+    assert not norms, "gn-cnn trunk must not contain BatchNorm"
+    assert any(isinstance(m, torch.nn.GroupNorm) for m in enc.trunk.modules())
+
+
+def test_gn_cnn_bad_cnn_depth_rejected():
+    """cnn_depth < 1 fails loudly at construction (the gn-cnn-only depth knob is validated)."""
+    with pytest.raises(ValueError, match="cnn_depth"):
+        EncoderConfig(trunk="gn-cnn", pooling="flatten", cnn_depth=0)
+
+
+# --- regression: the cnn-trunk path at the canonical 360x640 is unchanged ----------------
+
+
+def test_cnn_canonical_regression_unchanged():
+    """The cnn trunk at the canonical 360x640 still produces the expected (B, 64, h, w) map.
+
+    Locks the byte-for-byte 360x640 cnn-trunk path against the gn-cnn addition: out_channels is
+    the conv trio's last width (64), the stem+trio crush the frame well below an eighth of
+    the input, and the flatten embedding D is the expected positive int.
+    """
+    enc = build_encoder(EncoderConfig(trunk="cnn", pooling="flatten")).eval()
+    h, w = CANONICAL_HW  # (360, 640)
+    x = torch.zeros(1, 3, h, w)
+    with torch.no_grad():
+        feats = enc.features(x)
+        emb = enc.embed(x)
+
+    assert enc.out_channels == 64
+    assert feats.shape[:2] == (1, 64)
+    assert feats.shape[2] < h // 8 and feats.shape[3] < w // 8
+    assert emb.shape == (1, 64 * feats.shape[2] * feats.shape[3])
+    assert enc.embedding_dim(CANONICAL_HW) == emb.shape[1]
 
 
 # --- 4. determinism nicety -------------------------------------------------------------

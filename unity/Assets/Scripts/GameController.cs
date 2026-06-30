@@ -29,6 +29,15 @@ public class GameController : MonoBehaviour
     private bool checkWinner = false;
     private bool humanPlayer;
 
+    // Set true by EndGame to FREEZE the round once it has been decided. While set, FixedUpdate
+    // early-returns so UpdateState() no longer overwrites the done/winner-stamped
+    // DriverController.instance.state -- this guarantees the done step is delivered to Python
+    // exactly once. EndGame no longer reloads the scene (Python's restart -> the deferred start
+    // reload does that), so without this freeze the still-loaded GameController would clobber the
+    // done state on its next tick. A fresh GameController (after the next Arena load) starts with
+    // roundOver=false.
+    private bool roundOver = false;
+
     public TileBase[] tiles;
 
     // OBSERVABILITY (verbose-gated; no behavior/wire impact). MONOTONIC stopwatch started when the
@@ -172,6 +181,12 @@ public class GameController : MonoBehaviour
 
     private void FixedUpdate()
     {
+        // Once the round is decided, FREEZE: stop updating state/timer so the done/winner-stamped
+        // state is not overwritten before DriverController delivers the done step to Python. The
+        // round stays frozen until the next Arena load (Python restart -> deferred start reload)
+        // brings up a fresh GameController.
+        if (roundOver)
+            return;
         UpdateState();
         stepsLeft--;
         UpdateGameTimer();
@@ -321,7 +336,15 @@ public class GameController : MonoBehaviour
         {
             Debug.Log("ArgumentException raised while trying to add winner to state in EndGame, continuing...");
         }
-        SceneManager.LoadScene("Driver");
+        // DEFERRED scene reload: we do NOT LoadScene here. Unity finishes the round on its OWN
+        // clock and stamps done/winner above; DriverController delivers that done step (state +
+        // frame) and enters the waiting state servicing the socket. The next round's Arena load is
+        // DEFERRED until Python sends restart -> start (the start handler reloads). roundOver
+        // FREEZES this GameController so its next FixedUpdate cannot overwrite the done-stamped
+        // state before it is sent. This removes the synchronous-LoadScene-in-the-read collapse AND
+        // the dead-zone (Unity stays responsive between rounds).
+        gamePlaying = false;
+        roundOver = true;
     }
 
     public void UpdateHealth(int playerID)

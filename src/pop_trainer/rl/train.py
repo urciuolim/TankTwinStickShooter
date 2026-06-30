@@ -60,6 +60,11 @@ from pop_trainer.core.logging_setup import (
     setup_system_logger,
     unity_log_path,
 )
+from pop_trainer.core.obs import (
+    DEFAULT_FRAME_SHAPE,
+    frame_shape_from_config,
+    validate_frame_shape,
+)
 from pop_trainer.core.protocol import Connection
 from pop_trainer.env.tank_env import TankEnv
 from pop_trainer.rl.elo import elo_change
@@ -93,12 +98,15 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 # timeScale<=5). Lives next to the other StreamingAssets configs.
 DEFAULT_TRAIN_CONFIG = _REPO_ROOT / "unity" / "Assets" / "StreamingAssets" / "train_config.json"
 
-# The 640x360 RGB pixel frame Unity renders, channels-LAST (H, W, 3). SB3 auto-applies
-# VecTransposeImage so the extractor sees (N, 3, 360, 640).
-DEFAULT_FRAME_SHAPE = (360, 640, 3)
+# The channels-LAST (H, W, 3) pixel frame is DERIVED from the launched game config's obs_pixels_*
+# (the one source of truth the Unity build also reads); core.DEFAULT_FRAME_SHAPE (640x360, the
+# DriverController default) is only the fallback when a config declares no obs_pixels_* keys. SB3
+# auto-applies VecTransposeImage so the extractor sees (N, 3, H, W).
 
-# Phase-1 round cap (1-min / 300-step rounds — intentional, see the milestone notes).
-DEFAULT_MAX_STEPS = 300
+# Python-side SAFETY cap only. Since the episode-boundary handshake, Unity's own ~300-step round
+# timer drives the boundary (it stamps `done`); this is set generously ABOVE it so Unity's `done`,
+# not this cap, ends every normal round. The intentional 300-step round is enforced Unity-side.
+DEFAULT_MAX_STEPS = 600
 
 # Every roster opponent starts at this rating; Phase-1 persists the ELO structure so resume can
 # restore it (a simple from-eval update is wired below but optional).
@@ -106,6 +114,18 @@ BASE_ELO = 1000.0
 
 # The sidecar file written alongside each model_<steps>.zip checkpoint.
 SIDECAR_NAME = "state.json"
+
+# Valid PPO learning-rate schedules: "constant" passes the float lr unchanged; "linear" decays it
+# to 0 over training via SB3's progress_remaining callable. Default "constant" == today's behavior.
+LR_SCHEDULES = ("constant", "linear")
+
+# Valid encoder-trunk overrides threaded to EncoderExtractor: "auto" keeps the size-based selection
+# (today's behavior); the rest are explicit registry trunks. Kept in sync with models.TRUNKS.
+TRUNK_CHOICES = ("auto", "cnn", "resnet", "gn-cnn")
+
+# The explicit policy/value MLP-head default. SB3 silently uses [64, 64] when net_arch is unset;
+# making it explicit keeps today's behavior while letting the CLI override it.
+DEFAULT_NET_ARCH = [64, 64]
 
 # --- multi-env rollout-buffer memory guard ---------------------------------------------------
 # At n_envs > 1 the SB3 PPO RolloutBuffer is the OOM surface: it allocates
@@ -158,8 +178,19 @@ class TrainConfig:
         checkpoint_freq: env-steps between checkpoints (``> 0``; the sidecar rides this cadence).
         resume: a prior ``run_dir`` to resume from (load the latest ``model_*.zip`` + sidecar).
         seed: the master seed (threaded into SB3, the env, and the opponent provider).
-        learning_rate / n_steps / batch_size / n_epochs / gamma / gae_lambda / clip_range:
-            PPO hyperparameters (pixel-PPO defaults).
+        learning_rate / n_steps / batch_size / n_epochs / gamma / gae_lambda / clip_range /
+        ent_coef / vf_coef / max_grad_norm:
+            PPO hyperparameters (the defaults keep SB3's own defaults exact, so an existing run
+            reproduces bit-for-bit).
+        lr_schedule: ``"constant"`` (pass ``learning_rate`` as a float, the default) or
+            ``"linear"`` (decay ``learning_rate`` to 0 over training via SB3's
+            ``progress_remaining`` schedule callable).
+        net_arch: the policy/value MLP-head architecture passed through ``policy_kwargs``. ``None``
+            (the default) becomes SB3's implicit ``[64, 64]`` made EXPLICIT; an SB3 ``net_arch``
+            value (e.g. ``dict(pi=[64, 64], vf=[64, 64])``) overrides it.
+        trunk: the encoder trunk override threaded to the :class:`EncoderExtractor`. ``"auto"``
+            (the default) keeps the extractor's size-based selection; an explicit ``"cnn"`` /
+            ``"resnet"`` / ``"gn-cnn"`` forces that trunk.
         frame_shape: the ``(H, W, 3)`` pixel-frame shape (channels-last; SB3 transposes it).
         game_port: the BASE TCP port. Training env ``i`` listens on ``game_port + i`` for
             ``i in 0..n_envs-1`` (``args[1]`` of each build's launch arg-list). The training BLOCK
@@ -201,7 +232,8 @@ class TrainConfig:
     seed: int = 0
     log_dir: Path | None = None
     debug_logging: bool = False
-    # PPO hyperparameters (pixel-PPO defaults).
+    # PPO hyperparameters. Every default keeps SB3's own default exact, so a TrainConfig built
+    # with no new flags reproduces today's run bit-for-bit.
     learning_rate: float = 3e-4
     n_steps: int = 2048
     batch_size: int = 64
@@ -209,6 +241,16 @@ class TrainConfig:
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_range: float = 0.2
+    ent_coef: float = 0.0
+    vf_coef: float = 0.5
+    max_grad_norm: float = 0.5
+    lr_schedule: str = "constant"
+    # The policy/value MLP-head architecture. None at construction -> SB3's implicit [64, 64]
+    # made EXPLICIT in __post_init__; otherwise an SB3 net_arch value (e.g.
+    # dict(pi=[64, 64], vf=[64, 64])).
+    net_arch: dict | list | None = None
+    # The encoder trunk override threaded to EncoderExtractor ("auto" = the size rule).
+    trunk: str = "auto"
     frame_shape: tuple[int, int, int] = DEFAULT_FRAME_SHAPE
     game_port: int = 50000
     eval_port: int | None = None
@@ -253,6 +295,15 @@ class TrainConfig:
                     "with a training build — choose an eval_port whose block is disjoint (e.g. "
                     f">= {train_hi + 1})"
                 )
+        if self.lr_schedule not in LR_SCHEDULES:
+            valid = ", ".join(LR_SCHEDULES)
+            raise ValueError(f"unknown lr_schedule {self.lr_schedule!r}; choose one of: {valid}")
+        if self.trunk not in TRUNK_CHOICES:
+            valid = ", ".join(TRUNK_CHOICES)
+            raise ValueError(f"unknown trunk {self.trunk!r}; choose one of: {valid}")
+        # Make SB3's silent [64, 64] head EXPLICIT when net_arch is unset (frozen -> setattr).
+        if self.net_arch is None:
+            object.__setattr__(self, "net_arch", list(DEFAULT_NET_ARCH))
 
     @property
     def effective_eval_port(self) -> int:
@@ -302,6 +353,12 @@ class TrainConfig:
             "gamma": self.gamma,
             "gae_lambda": self.gae_lambda,
             "clip_range": self.clip_range,
+            "ent_coef": self.ent_coef,
+            "vf_coef": self.vf_coef,
+            "max_grad_norm": self.max_grad_norm,
+            "lr_schedule": self.lr_schedule,
+            "net_arch": self.net_arch,
+            "trunk": self.trunk,
             "frame_shape": list(self.frame_shape),
             "game_port": self.game_port,
             "eval_port": self.eval_port,
@@ -728,18 +785,35 @@ def build_vec_env(
 
 
 def _build_policy_kwargs(cfg: TrainConfig) -> dict:
-    """The ``policy_kwargs`` handed to PPO: wire the :class:`EncoderExtractor` + its load/freeze.
+    """The ``policy_kwargs`` handed to PPO: wire the :class:`EncoderExtractor` + the head arch.
 
-    Pure (builds no encoder / no PPO) so the test can assert the extractor class and the
-    checkpoint/freeze kwargs without touching torch.
+    Threads the extractor's ``checkpoint`` / ``freeze`` / ``trunk`` kwargs and the policy/value
+    ``net_arch`` (the explicit ``[64, 64]`` default unless overridden). Pure (builds no encoder /
+    no PPO) so the test can assert the extractor class and the kwargs without touching torch.
     """
     return {
         "features_extractor_class": EncoderExtractor,
         "features_extractor_kwargs": {
             "checkpoint": cfg.encoder_checkpoint,
             "freeze": cfg.freeze_encoder,
+            "trunk": cfg.trunk,
         },
+        "net_arch": cfg.net_arch,
     }
+
+
+def _resolve_learning_rate(cfg: TrainConfig):
+    """The PPO ``learning_rate`` arg: a float for ``"constant"`` or a schedule for ``"linear"``.
+
+    ``"constant"`` (the default) returns ``cfg.learning_rate`` unchanged — bit-for-bit today's
+    behavior. ``"linear"`` returns SB3's ``progress_remaining`` callable
+    ``lambda progress_remaining: progress_remaining * lr`` so the rate decays from ``lr`` to 0
+    across training (``progress_remaining`` runs 1 -> 0). Pure (no PPO / torch).
+    """
+    if cfg.lr_schedule == "linear":
+        lr = cfg.learning_rate
+        return lambda progress_remaining: progress_remaining * lr
+    return cfg.learning_rate
 
 
 def _find_selfplay_wrapper(vec_env: VecEnv) -> SelfPlayWrapper:
@@ -1035,6 +1109,15 @@ def train_local(cfg: TrainConfig) -> Path:
     set_random_seed(cfg.seed)
     cfg.run_dir.mkdir(parents=True, exist_ok=True)
 
+    # FAIL FAST on a frame_shape <-> game_config desync BEFORE any build launches: the env reads
+    # exactly prod(frame_shape) bytes per frame, so a mismatch with the build's actual obs_pixels
+    # W/H would corrupt every frame. This guards a directly-constructed TrainConfig too (main()
+    # already derives the shape, but this is the anti-silent-desync invariant for any caller). Only
+    # when the config file is actually present — an absent path is the launch's own failure surface
+    # (and the test seam constructs fabricated config paths it never reads).
+    if Path(cfg.game_config).exists():
+        validate_frame_shape(cfg.frame_shape, cfg.game_config)
+
     # Set up the training-system logger (the main process) at the chosen level. INFO by default;
     # DEBUG when the single switch is set. This is purely observational.
     sys_logger = setup_system_logger(cfg.effective_log_dir, level=cfg.log_level)
@@ -1127,13 +1210,16 @@ def train_local(cfg: TrainConfig) -> Path:
                     policy_kwargs=_build_policy_kwargs(cfg),
                     seed=cfg.seed,
                     tensorboard_log=str(cfg.run_dir),
-                    learning_rate=cfg.learning_rate,
+                    learning_rate=_resolve_learning_rate(cfg),
                     n_steps=cfg.n_steps,
                     batch_size=cfg.batch_size,
                     n_epochs=cfg.n_epochs,
                     gamma=cfg.gamma,
                     gae_lambda=cfg.gae_lambda,
                     clip_range=cfg.clip_range,
+                    ent_coef=cfg.ent_coef,
+                    vf_coef=cfg.vf_coef,
+                    max_grad_norm=cfg.max_grad_norm,
                     verbose=1,
                 )
 
@@ -1262,6 +1348,27 @@ def _parse_opponents(spec: str) -> tuple[str, ...]:
     return tuple(s.strip() for s in spec.split(","))
 
 
+def _parse_net_arch(spec: str) -> dict[str, list[int]]:
+    """Parse a ``--net-arch`` spec ``"pi=64,64:vf=64,64"`` into SB3's ``dict(pi=..., vf=...)``.
+
+    The spec is colon-separated ``head=widths`` groups, each a comma-separated int width list, so
+    ``"pi=64,64:vf=64,64"`` -> ``{"pi": [64, 64], "vf": [64, 64]}`` (the per-head SB3 net_arch
+    form). Pure; raises :class:`ValueError` on a malformed group / non-int width (argparse turns it
+    into a clean exit-code-2 message).
+    """
+    arch: dict[str, list[int]] = {}
+    for group in spec.split(":"):
+        head, _, widths = group.partition("=")
+        head = head.strip()
+        if not head or not widths.strip():
+            raise ValueError(f"malformed net_arch group {group!r}; expected 'head=w1,w2,...'")
+        try:
+            arch[head] = [int(w) for w in widths.split(",")]
+        except ValueError as exc:
+            raise ValueError(f"net_arch widths must be ints in {group!r}") from exc
+    return arch
+
+
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     """Parse the train CLI (PURE: no side effects, returns the namespace)."""
     parser = argparse.ArgumentParser(
@@ -1314,6 +1421,72 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         type=int,
         default=TrainConfig.batch_size,
         help="PPO batch size",
+    )
+    parser.add_argument(
+        "--learning-rate",
+        type=float,
+        default=TrainConfig.learning_rate,
+        help="PPO learning rate.",
+    )
+    parser.add_argument(
+        "--lr-schedule",
+        choices=LR_SCHEDULES,
+        default=TrainConfig.lr_schedule,
+        help="learning-rate schedule: constant (default) or linear decay to 0.",
+    )
+    parser.add_argument(
+        "--n-epochs",
+        type=int,
+        default=TrainConfig.n_epochs,
+        help="PPO epochs per rollout.",
+    )
+    parser.add_argument(
+        "--gamma",
+        type=float,
+        default=TrainConfig.gamma,
+        help="discount factor.",
+    )
+    parser.add_argument(
+        "--gae-lambda",
+        type=float,
+        default=TrainConfig.gae_lambda,
+        help="GAE lambda.",
+    )
+    parser.add_argument(
+        "--clip-range",
+        type=float,
+        default=TrainConfig.clip_range,
+        help="PPO clip range.",
+    )
+    parser.add_argument(
+        "--ent-coef",
+        type=float,
+        default=TrainConfig.ent_coef,
+        help="entropy coefficient.",
+    )
+    parser.add_argument(
+        "--vf-coef",
+        type=float,
+        default=TrainConfig.vf_coef,
+        help="value-function loss coefficient.",
+    )
+    parser.add_argument(
+        "--max-grad-norm",
+        type=float,
+        default=TrainConfig.max_grad_norm,
+        help="gradient-clipping max norm.",
+    )
+    parser.add_argument(
+        "--net-arch",
+        type=_parse_net_arch,
+        default=None,
+        help="policy/value MLP head, e.g. 'pi=64,64:vf=64,64' (default: [64, 64]).",
+    )
+    parser.add_argument(
+        "--trunk",
+        choices=TRUNK_CHOICES,
+        default=TrainConfig.trunk,
+        help="encoder trunk override: auto (size rule) or cnn/resnet/gn-cnn.",
     )
     parser.add_argument(
         "--allow-oversized",
@@ -1388,10 +1561,15 @@ def main(argv: list[str] | None = None) -> Path:
         level_from_env(debug=args.debug, env_value=os.environ.get(LOG_LEVEL_ENV_VAR))
         == logging.DEBUG
     )
+    # DERIVE the pixel frame_shape from the LAUNCHED config's obs_pixels_* so the env byte-read
+    # matches the build's rendered frame (one source of truth) — no hand-synced constant. Missing
+    # keys fall back to core.DEFAULT_FRAME_SHAPE; a malformed value fails here.
+    frame_shape = frame_shape_from_config(args.config)
     cfg = TrainConfig(
         total_timesteps=args.total_timesteps,
         game_config=args.config,
         run_dir=args.run_dir,
+        frame_shape=frame_shape,
         n_envs=args.n_envs,
         frame_stack=args.frame_stack,
         encoder_checkpoint=args.encoder_checkpoint,
@@ -1404,6 +1582,17 @@ def main(argv: list[str] | None = None) -> Path:
         checkpoint_freq=args.checkpoint_freq,
         n_steps=args.n_steps,
         batch_size=args.batch_size,
+        learning_rate=args.learning_rate,
+        lr_schedule=args.lr_schedule,
+        n_epochs=args.n_epochs,
+        gamma=args.gamma,
+        gae_lambda=args.gae_lambda,
+        clip_range=args.clip_range,
+        ent_coef=args.ent_coef,
+        vf_coef=args.vf_coef,
+        max_grad_norm=args.max_grad_norm,
+        net_arch=args.net_arch,
+        trunk=args.trunk,
         allow_oversized=args.allow_oversized,
         game_port=args.port,
         eval_port=args.eval_port,

@@ -31,6 +31,7 @@ from pop_trainer.rl.extractor import EncoderExtractor
 from pop_trainer.rl.selfplay import DEFAULT_ROSTER, OpponentProvider, SelfPlayWrapper
 from pop_trainer.rl.train import (
     BASE_ELO,
+    DEFAULT_NET_ARCH,
     MEMORY_MARGIN,
     UNITY_INSTANCE_BYTES,
     TrainConfig,
@@ -45,6 +46,8 @@ from pop_trainer.rl.train import (
     _make_self_play_env,
     _make_sidecar_callback,
     _parse_args,
+    _parse_net_arch,
+    _resolve_learning_rate,
     _restore_provider_position,
     _terminate,
     _training_env_factories,
@@ -125,6 +128,34 @@ def test_trainconfig_defaults(tmp_path):
     # eval_port defaults to None -> the effective eval port is game_port + 1 (a separate socket).
     assert cfg.eval_port is None
     assert cfg.effective_eval_port == cfg.game_port + 1
+
+
+def test_trainconfig_hyperparameter_defaults_unchanged(tmp_path):
+    """REGRESSION GUARD: a TrainConfig built with NO new flags reproduces today's behavior.
+
+    Every PPO hyperparameter default — including the NEW fields (ent_coef / vf_coef /
+    max_grad_norm / lr_schedule / net_arch / trunk) — must match the value the run used before
+    they were exposed, so an existing run is bit-for-bit reproducible. ent_coef=0.0, vf_coef=0.5,
+    max_grad_norm=0.5 are SB3's own silent defaults; lr_schedule="constant" passes the float lr
+    unchanged; net_arch=[64, 64] is SB3's implicit head made explicit; trunk="auto" keeps the
+    size-based selection.
+    """
+    cfg = _cfg(tmp_path)
+    # the existing hyperparameters keep their values
+    assert cfg.learning_rate == 3e-4
+    assert cfg.n_steps == 2048
+    assert cfg.batch_size == 64
+    assert cfg.n_epochs == 10
+    assert cfg.gamma == 0.99
+    assert cfg.gae_lambda == 0.95
+    assert cfg.clip_range == 0.2
+    # the NEW fields default to SB3's silent defaults / the no-op selection
+    assert cfg.ent_coef == 0.0
+    assert cfg.vf_coef == 0.5
+    assert cfg.max_grad_norm == 0.5
+    assert cfg.lr_schedule == "constant"
+    assert cfg.net_arch == [64, 64] == DEFAULT_NET_ARCH
+    assert cfg.trunk == "auto"
 
 
 def test_eval_port_default_is_after_training_range_at_multi_env(tmp_path):
@@ -561,6 +592,22 @@ def test_policy_kwargs_carry_extractor_and_checkpoint(tmp_path):
     assert pk["features_extractor_class"] is EncoderExtractor
     assert pk["features_extractor_kwargs"]["checkpoint"] == ckpt
     assert pk["features_extractor_kwargs"]["freeze"] is True
+
+
+def test_policy_kwargs_carry_net_arch_and_trunk_override(tmp_path):
+    # net_arch + the trunk override thread through policy_kwargs / features_extractor_kwargs.
+    cfg = _cfg(tmp_path, net_arch={"pi": [128], "vf": [128]}, trunk="resnet")
+    pk = _build_policy_kwargs(cfg)
+    assert pk["net_arch"] == {"pi": [128], "vf": [128]}
+    assert pk["features_extractor_kwargs"]["trunk"] == "resnet"
+
+
+def test_policy_kwargs_default_net_arch_is_explicit_64_64(tmp_path):
+    # The default (no --net-arch) carries SB3's implicit [64, 64] made EXPLICIT; trunk is "auto".
+    cfg = _cfg(tmp_path)
+    pk = _build_policy_kwargs(cfg)
+    assert pk["net_arch"] == [64, 64]
+    assert pk["features_extractor_kwargs"]["trunk"] == "auto"
 
 
 # --- 2b. rollout-buffer memory guard (pure; available_bytes INJECTED) ------------------------
@@ -1031,6 +1078,18 @@ def test_main_defaults_preserved_when_flags_omitted(tmp_path, monkeypatch):
     assert cfg.allow_oversized is False
     assert cfg.game_port == 50000
     assert cfg.eval_port is None
+    # the NEW PPO-hyperparameter flags, omitted -> the TrainConfig defaults (unchanged behavior).
+    assert cfg.learning_rate == 3e-4
+    assert cfg.lr_schedule == "constant"
+    assert cfg.n_epochs == 10
+    assert cfg.gamma == 0.99
+    assert cfg.gae_lambda == 0.95
+    assert cfg.clip_range == 0.2
+    assert cfg.ent_coef == 0.0
+    assert cfg.vf_coef == 0.5
+    assert cfg.max_grad_norm == 0.5
+    assert cfg.net_arch == [64, 64]
+    assert cfg.trunk == "auto"
 
 
 def test_main_equal_ports_rejected_through_cli(tmp_path, monkeypatch):
@@ -1050,3 +1109,184 @@ def test_main_equal_ports_rejected_through_cli(tmp_path, monkeypatch):
                 "50000",
             ]
         )
+
+
+# --- 6. parameterization: new hyperparameter flags + helpers ---------------------------------
+
+
+def test_trainconfig_rejects_unknown_lr_schedule(tmp_path):
+    with pytest.raises(ValueError, match="unknown lr_schedule"):
+        _cfg(tmp_path, lr_schedule="cosine")
+
+
+def test_trainconfig_rejects_unknown_trunk(tmp_path):
+    with pytest.raises(ValueError, match="unknown trunk"):
+        _cfg(tmp_path, trunk="bogus-trunk")
+
+
+def test_trainconfig_net_arch_override_kept(tmp_path):
+    # An explicit net_arch is kept verbatim (not normalized to the [64, 64] default).
+    cfg = _cfg(tmp_path, net_arch={"pi": [256, 256], "vf": [128]})
+    assert cfg.net_arch == {"pi": [256, 256], "vf": [128]}
+
+
+def test_resolve_learning_rate_constant_is_the_float(tmp_path):
+    # "constant" passes cfg.learning_rate through unchanged (bit-for-bit today's behavior).
+    cfg = _cfg(tmp_path, learning_rate=2.5e-4, lr_schedule="constant")
+    lr = _resolve_learning_rate(cfg)
+    assert lr == 2.5e-4
+    assert isinstance(lr, float)
+
+
+def test_resolve_learning_rate_linear_is_a_callable(tmp_path):
+    # "linear" returns SB3's progress_remaining schedule callable decaying lr -> 0.
+    cfg = _cfg(tmp_path, learning_rate=1e-3, lr_schedule="linear")
+    sched = _resolve_learning_rate(cfg)
+    assert callable(sched)
+    assert sched(1.0) == 1e-3  # full budget remaining -> the base lr
+    assert sched(0.5) == 5e-4  # half remaining -> half the lr
+    assert sched(0.0) == 0.0  # none remaining -> 0
+
+
+def test_parse_net_arch_per_head_form():
+    # "pi=64,64:vf=64,64" -> the SB3 dict(pi=[64, 64], vf=[64, 64]) form.
+    assert _parse_net_arch("pi=64,64:vf=64,64") == {"pi": [64, 64], "vf": [64, 64]}
+    # asymmetric heads parse too.
+    assert _parse_net_arch("pi=256,256:vf=128") == {"pi": [256, 256], "vf": [128]}
+
+
+def test_parse_net_arch_rejects_malformed():
+    with pytest.raises(ValueError):
+        _parse_net_arch("pi=")  # empty widths
+    with pytest.raises(ValueError):
+        _parse_net_arch("pi=64,abc")  # non-int width
+
+
+def test_parse_args_carries_new_hyperparameter_flags():
+    args = _parse_args(
+        [
+            "--total-timesteps",
+            "1000",
+            "--run-dir",
+            "out",
+            "--learning-rate",
+            "1e-3",
+            "--lr-schedule",
+            "linear",
+            "--n-epochs",
+            "5",
+            "--gamma",
+            "0.97",
+            "--gae-lambda",
+            "0.9",
+            "--clip-range",
+            "0.1",
+            "--ent-coef",
+            "0.01",
+            "--vf-coef",
+            "0.25",
+            "--max-grad-norm",
+            "1.0",
+            "--net-arch",
+            "pi=128,128:vf=128,128",
+            "--trunk",
+            "resnet",
+        ]
+    )
+    assert args.learning_rate == 1e-3
+    assert args.lr_schedule == "linear"
+    assert args.n_epochs == 5
+    assert args.gamma == 0.97
+    assert args.gae_lambda == 0.9
+    assert args.clip_range == 0.1
+    assert args.ent_coef == 0.01
+    assert args.vf_coef == 0.25
+    assert args.max_grad_norm == 1.0
+    assert args.net_arch == {"pi": [128, 128], "vf": [128, 128]}
+    assert args.trunk == "resnet"
+
+
+def test_parse_args_net_arch_defaults_none():
+    # Omitting --net-arch leaves args.net_arch None (TrainConfig normalizes it to [64, 64]).
+    args = _parse_args(["--total-timesteps", "1000", "--run-dir", "out"])
+    assert args.net_arch is None
+    assert args.trunk == "auto"
+    assert args.lr_schedule == "constant"
+
+
+def test_parse_args_bad_trunk_choice_exits():
+    # An out-of-registry trunk name is not a valid choice -> argparse exits 2.
+    with pytest.raises(SystemExit) as exc:
+        _parse_args(["--total-timesteps", "1000", "--run-dir", "out", "--trunk", "bogus-trunk"])
+    assert exc.value.code == 2
+
+
+def test_main_threads_new_hyperparameters_into_config(tmp_path, monkeypatch):
+    captured = _capture_cfg(monkeypatch)
+    main(
+        [
+            "--total-timesteps",
+            "1000",
+            "--run-dir",
+            str(tmp_path),
+            "--learning-rate",
+            "1e-3",
+            "--lr-schedule",
+            "linear",
+            "--n-epochs",
+            "5",
+            "--gamma",
+            "0.97",
+            "--gae-lambda",
+            "0.9",
+            "--clip-range",
+            "0.1",
+            "--ent-coef",
+            "0.01",
+            "--vf-coef",
+            "0.25",
+            "--max-grad-norm",
+            "1.0",
+            "--net-arch",
+            "pi=128,128:vf=128,128",
+            "--trunk",
+            "resnet",
+        ]
+    )
+    cfg = captured["cfg"]
+    assert cfg.learning_rate == 1e-3
+    assert cfg.lr_schedule == "linear"
+    assert cfg.n_epochs == 5
+    assert cfg.gamma == 0.97
+    assert cfg.gae_lambda == 0.9
+    assert cfg.clip_range == 0.1
+    assert cfg.ent_coef == 0.01
+    assert cfg.vf_coef == 0.25
+    assert cfg.max_grad_norm == 1.0
+    assert cfg.net_arch == {"pi": [128, 128], "vf": [128, 128]}
+    assert cfg.trunk == "resnet"
+    # the dict still round-trips through to_dict() (the sidecar persists the new fields).
+    d = cfg.to_dict()
+    assert d["lr_schedule"] == "linear"
+    assert d["ent_coef"] == 0.01
+    assert d["vf_coef"] == 0.25
+    assert d["max_grad_norm"] == 1.0
+    assert d["net_arch"] == {"pi": [128, 128], "vf": [128, 128]}
+    assert d["trunk"] == "resnet"
+    import json
+
+    json.dumps(d)  # JSON-serializable (no Path / tuple leaks)
+
+
+def test_to_dict_roundtrips_new_fields_at_defaults(tmp_path):
+    # The default sidecar view carries the new fields at their unchanged defaults.
+    d = _cfg(tmp_path).to_dict()
+    assert d["ent_coef"] == 0.0
+    assert d["vf_coef"] == 0.5
+    assert d["max_grad_norm"] == 0.5
+    assert d["lr_schedule"] == "constant"
+    assert d["net_arch"] == [64, 64]
+    assert d["trunk"] == "auto"
+    import json
+
+    json.dumps(d)

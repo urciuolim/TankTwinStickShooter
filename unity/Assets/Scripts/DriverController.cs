@@ -218,7 +218,10 @@ public class DriverController : MonoBehaviour
         {
             EstablishPythonConnection();
         }
-        Reset();
+        // Python is the SOLE driver of the round boundary: we do NOT load the Arena here. We stay
+        // in the Driver scene servicing the socket (ingame=false) until Python's first
+        // {"restart": true} arrives, which loads the Arena for the first round -- the SAME path
+        // every subsequent round takes. No special-case initial LoadScene.
     }
 
     private void FixedUpdate()
@@ -307,26 +310,66 @@ public class DriverController : MonoBehaviour
         Debug.Log("Closed listener on port " + connectionPort);
     }
 
+    // Read EXACTLY n bytes from the socket, looping because NetworkStream.Read may return fewer
+    // bytes than requested (TCP is a stream, not framed). Returns null if the peer closes mid-read
+    // (Read returns 0). The Python side write-exactly contract guarantees the n bytes arrive.
+    private byte[] ReadExactly(int n)
+    {
+        byte[] buffer = new byte[n];
+        int offset = 0;
+        while (offset < n)
+        {
+            int read = nwStream.Read(buffer, offset, n - offset);
+            if (read <= 0)
+                return null; // peer closed mid-read
+            offset += read;
+        }
+        return buffer;
+    }
+
+    // Read ONE length-prefixed JSON message: 4 bytes BIG-ENDIAN payload length, then EXACTLY that
+    // many UTF-8 JSON bytes, then JObject.Parse (see DriverProtocol / pop_trainer.core.protocol).
+    // Replaces the old single nwStream.Read(ReceiveBufferSize) that assumed one JSON per recv --
+    // the read-exactly frame removes the dormant desync when TCP coalesces or splits writes.
+    // Returns null on a peer close mid-read.
+    private JObject ReadFramedMessage()
+    {
+        byte[] prefix = ReadExactly(DriverProtocol.LengthPrefixBytes);
+        if (prefix == null)
+            return null;
+        int payloadLen = DriverProtocol.DecodeLengthPrefix(prefix);
+        if (payloadLen <= 0)
+            return null;
+        byte[] payload = ReadExactly(payloadLen);
+        if (payload == null)
+            return null;
+        string dataReceived = Encoding.UTF8.GetString(payload, 0, payloadLen);
+        return JObject.Parse(dataReceived);
+    }
+
     private void ReceiveAndSendData()
     {
-        byte[] readBuffer = new byte[client.ReceiveBufferSize];
-        int bytesRead = nwStream.Read(readBuffer, 0, client.ReceiveBufferSize);
-        JObject message = null;
-
-        if (bytesRead > 0)
-        {
-            string dataReceived = Encoding.UTF8.GetString(readBuffer, 0, bytesRead);
-            message = JObject.Parse(dataReceived);
-        }
+        JObject message = ReadFramedMessage();
 
         if (message != null)
-        { 
-            if (message["start"] != null && message["start"].Value<bool>())
+        {
+            // Single tested dispatch (DriverProtocol.Classify) replaces the inline key-probing.
+            // Waiting-state semantics: Action and Unknown are NO-OPS here (the original chain had
+            // no else, so any non-control message was silently ignored).
+            DriverProtocol.MessageKind kind = DriverProtocol.Classify(message);
+            if (kind == DriverProtocol.MessageKind.Start)
             {
                 if (verbose)
                     Debug.Log(DriverLog.Format("start_received", System.DateTime.UtcNow, "port", connectionPort.ToString()));
                 else
                     Debug.Log("Start received");
+                // DEFERRED scene reload: start is the SOLE place the next round's Arena loads.
+                // EndGame no longer reloads the scene (it only stamps done/winner and freezes the
+                // round), and restart only acks -- so loading here, AFTER any switch_arena swapped
+                // the cached arena, guarantees the switch takes effect for THIS round. LoadScene
+                // takes effect next frame; the GameController then comes up and produces the first
+                // state, which flows on the next SendAndReceiveData tick.
+                Reset();
                 JObject confirmation = JObject.Parse("{starting:true}");
                 byte[] writeBuffer = Encoding.ASCII.GetBytes(confirmation.ToString());
                 nwStream.Write(writeBuffer, 0, writeBuffer.Length);
@@ -339,7 +382,7 @@ public class DriverController : MonoBehaviour
                         new[] { "from", "to", "cause", "port" },
                         new[] { "false", "true", "start", connectionPort.ToString() }));
                 ingame = true;
-            } else if (message["end"] != null && message["end"].Value<bool>())
+            } else if (kind == DriverProtocol.MessageKind.End)
             {
                 if (verbose)
                     Debug.Log(DriverLog.Format("end_received", System.DateTime.UtcNow, "port", connectionPort.ToString()));
@@ -349,24 +392,28 @@ public class DriverController : MonoBehaviour
                 byte[] writeBuffer = Encoding.ASCII.GetBytes(confirmation.ToString());
                 nwStream.Write(writeBuffer, 0, writeBuffer.Length);
                 instance.running = false;
-            } else if (message["restart"] != null && message["restart"].Value<bool>())
+            } else if (kind == DriverProtocol.MessageKind.Restart)
             {
                 if (verbose)
                     Debug.Log(DriverLog.Format("restart_received", System.DateTime.UtcNow,
                         new[] { "phase", "port" },
-                        new[] { "pregame", connectionPort.ToString() }));
+                        new[] { "waiting", connectionPort.ToString() }));
                 else
                     Debug.Log("Restart received");
                 JObject confirmation = JObject.Parse("{restarting:true}");
                 byte[] writeBuffer = Encoding.ASCII.GetBytes(confirmation.ToString());
                 nwStream.Write(writeBuffer, 0, writeBuffer.Length);
-            } else if (message["switch_arena"] != null)
+                // A restart from the waiting state only ACKS -- it does NOT reload the scene. The
+                // next round's Arena load is DEFERRED to the {"start": true} handler (so an optional
+                // switch_arena between restart and start takes effect for the round it is requested
+                // in). We remain !ingame; the round-over state stays frozen until start reloads.
+            } else if (kind == DriverProtocol.MessageKind.SwitchArena)
             {
-                // Optional, additive handshake message. Swaps the cached arena so the NEXT
-                // LoadScene("Arena") (which fires at the start of every episode via Reset())
-                // re-places walls from the new arena in GameController.Awake(). We do NOT reload
-                // the scene here: during the pre-start handshake the active scene may be "Driver",
-                // and the start/restart handshake already triggers an Arena load momentarily.
+                // Optional, additive handshake message in the !ingame window (after restart, before
+                // start). Swaps the cached arena so the deferred LoadScene("Arena") in the start
+                // handler re-places walls from the new arena in GameController.Awake(). We do NOT
+                // reload here -- the start handler is the single reload point, so the swap is in
+                // place before that load fires (the switch takes effect for THIS round).
                 string switchArenaPath = message["switch_arena"].Value<string>();
                 if (verbose)
                     Debug.Log(DriverLog.Format("switch_arena_received", System.DateTime.UtcNow,
@@ -482,36 +529,40 @@ public class DriverController : MonoBehaviour
             return;
         }
 
-        byte[] readBuffer = new byte[client.ReceiveBufferSize];
-        int bytesRead = nwStream.Read(readBuffer, 0, client.ReceiveBufferSize);
-
-        JObject message = null;
-
-        if (bytesRead > 0)
-        {
-            string dataReceived = Encoding.UTF8.GetString(readBuffer, 0, bytesRead);
-            message = JObject.Parse(dataReceived);
-            //Debug.Log("Received: " + actions.ToString());
-        }
+        JObject message = ReadFramedMessage();
 
         if (message != null)
         {
-            if (message["restart"] != null && message["restart"].Value<bool>())
+            // Single tested dispatch (DriverProtocol.Classify) replaces the inline restart probe.
+            // Mid-round semantics: Restart hits the safety-cap neutralize branch; EVERY other kind
+            // (Start / End / SwitchArena / Action / Unknown) takes the original else (actions =
+            // message), so the fallthrough is unchanged. The null message stays a no-op via the guard.
+            DriverProtocol.MessageKind kind = DriverProtocol.Classify(message);
+            if (kind == DriverProtocol.MessageKind.Restart)
             {
+                // SAFETY-CAP corner case ONLY: in the normal flow Python NEVER sends restart mid-
+                // round (it drives the boundary off Unity's done). If a restart still lands here --
+                // e.g. the env's max_steps safety cap tripped on a round Unity never decided -- we
+                // NEUTRALIZE the old synchronous EndGame(-1)+LoadScene-in-the-read collapse that
+                // silenced the instance. We just ack and abandon the round: clear state/actions and
+                // go !ingame. The reload is DEFERRED to the following start handler (the single
+                // reload point), so the handshake stays clean and the socket stays responsive.
                 if (verbose)
                     Debug.Log(DriverLog.Format("restart_received", System.DateTime.UtcNow,
                         new[] { "phase", "port" },
-                        new[] { "midgame", connectionPort.ToString() }));
+                        new[] { "midgame_safety", connectionPort.ToString() }));
                 else
                     Debug.Log("Restart received");
                 JObject confirmation = JObject.Parse("{restarting:true}");
                 writeBuffer = Encoding.ASCII.GetBytes(confirmation.ToString());
                 nwStream.Write(writeBuffer, 0, writeBuffer.Length);
-                GameController.instance.EndGame(-1);
+                state = null;
+                actions = null;
+                stateWasPopulated = false;
                 if (verbose)
                     Debug.Log(DriverLog.Format("ingame_flip", System.DateTime.UtcNow,
                         new[] { "from", "to", "cause", "port" },
-                        new[] { "true", "false", "restart_midgame", connectionPort.ToString() }));
+                        new[] { "true", "false", "restart_midgame_safety", connectionPort.ToString() }));
                 ingame = false;
             } else
             {

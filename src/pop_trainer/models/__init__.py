@@ -14,22 +14,24 @@ encoders). Imports nothing from ``env`` / ``data`` / ``pretraining`` / ``rl``. N
 
 Modules:
 
-* :mod:`pop_trainer.models.encoders` — the trunks (:class:`NatureCNN`, :class:`ImpalaResNet`),
-  the poolings (:class:`GlobalAveragePool`, :class:`Flatten`), the composed :class:`Encoder`,
-  the :class:`EncoderConfig` + :func:`build_encoder` factory, and :func:`export_onnx`.
+* :mod:`pop_trainer.models.encoders` — the trunks (:class:`CnnTrunk`, :class:`ResNetTrunk`,
+  :class:`GroupNormCNN`), the poolings (:class:`GlobalAveragePool`, :class:`Flatten`), the composed
+  :class:`Encoder`, the :class:`EncoderConfig` + :func:`build_encoder` factory, and
+  :func:`export_onnx`.
 """
 
 from pop_trainer.models.encoders import (
     CANONICAL_HW,
     POOLINGS,
     TRUNKS,
+    CnnTrunk,
     Encoder,
     EncoderConfig,
     Flatten,
     GlobalAveragePool,
-    ImpalaResNet,
-    NatureCNN,
+    GroupNormCNN,
     Pooling,
+    ResNetTrunk,
     Trunk,
     build_encoder,
     export_onnx,
@@ -37,8 +39,9 @@ from pop_trainer.models.encoders import (
 
 __all__ = [
     "Trunk",
-    "NatureCNN",
-    "ImpalaResNet",
+    "CnnTrunk",
+    "ResNetTrunk",
+    "GroupNormCNN",
     "Pooling",
     "GlobalAveragePool",
     "Flatten",

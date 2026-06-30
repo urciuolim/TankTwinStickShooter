@@ -24,13 +24,14 @@ Three player FORMS on each slot:
   ``*.zip`` path is also accepted). Any matchup works: rl-vs-human, rl-vs-rulebased, rl-vs-rl, etc.
 
 BOUNDARY (INTENTIONAL, CTO-APPROVED RELAXATION): ``play`` is a COMPOSITION-ROOT APP, like
-``rl/train.py``. It MAY import ``env`` + ``agents`` + ``rl`` + ``core``. It is a LEAF entry point —
-imported by NOTHING — so the ``play -> rl`` import introduces NO cycle. This is a deliberate
-relaxation of demo's old "never import ``rl``" rule; the repo-steward must NOT treat it as a
-violation. Still FORBIDDEN: ``models`` (reached only transitively through ``rl``), ``data``,
-``pretraining``, anything from ``tank_twin``. ``rl`` / ``stable_baselines3`` / ``torch`` are
-imported LAZILY — ONLY inside :func:`make_rl_player` — so human / rule-based play stays torch-free
-and fast; the module-top imports are ``env`` + ``agents`` + ``core`` only (a unit test enforces it).
+``rl/train.py``. At module top it imports ``env`` + ``agents`` + ``core`` only. It is a LEAF entry
+point — imported by NOTHING. To load a trained PPO checkpoint it reaches ``stable_baselines3``
+DIRECTLY (it does NOT import ``pop_trainer.rl`` at all); that direct sb3 dependency is the
+deliberate relaxation of demo's old "torch-free" rule, and the repo-steward must NOT treat it as a
+violation. Still FORBIDDEN: ``rl``, ``models``, ``data``, ``pretraining``, anything from
+``tank_twin``. ``stable_baselines3`` / ``torch`` are imported LAZILY — ONLY inside
+:func:`make_rl_player` — so human / rule-based play stays torch-free and fast; the module-top
+imports are ``env`` + ``agents`` + ``core`` only (a unit test enforces it).
 
 The episode-driving logic is the pure :func:`run_play_episode` (an already-built env + two player
 adapters in, a :class:`PlayResult` out); the subprocess launch and socket connect live in
@@ -41,9 +42,10 @@ state JSON, but the shipped ``unity/Assets/StreamingAssets/config.json`` has no 
 so the build defaults ``obsPixels=false`` and sends NO frame — the env would block waiting for
 bytes that never arrive. Play therefore launches the build with
 ``unity/Assets/StreamingAssets/demo_config.json``, which sets ``"obs_pixels": true`` plus
-``obs_pixels_width``/``obs_pixels_height`` (640x360, the DriverController defaults and 16:9), and
-constructs the env with ``frame_shape=(360, 640, 3)`` to MATCH. That config lives inside
-StreamingAssets next to the ``Arenas/`` directory so its relative ``arena_path``
+``obs_pixels_width``/``obs_pixels_height``, and DERIVES the env's ``frame_shape`` (H, W, 3) from
+those SAME keys via :func:`core.obs.frame_shape_from_config` — so the env always MATCHES whatever
+resolution the launched config declares (one source of truth, no hand-synced constant). That
+config lives inside StreamingAssets next to the ``Arenas/`` directory so its relative ``arena_path``
 (``Arenas/custom1.json``) resolves against the config directory — exactly how
 ``DriverController.ResolveArenaPath`` resolves it. It also drops ``timeScale`` from the shipped 20
 to a human-watchable 2.
@@ -73,6 +75,7 @@ from pop_trainer.core import agent as core_agent
 from pop_trainer.core import state as S
 from pop_trainer.core.config import EnvConfig
 from pop_trainer.core.launch import build_launch_cmd, connect, default_build_path
+from pop_trainer.core.obs import frame_shape_from_config
 from pop_trainer.core.protocol import Connection, WallLayout
 from pop_trainer.env.tank_env import TankEnv
 
@@ -91,11 +94,9 @@ DEFAULT_CONFIG = _REPO_ROOT / "unity" / "Assets" / "StreamingAssets" / "demo_con
 HUMAN_CONFIG = _REPO_ROOT / "unity" / "Assets" / "StreamingAssets" / "human_config.json"
 DEFAULT_PORT = 50000
 
-# Rendered pixel-frame dimensions (W x H) — MUST match demo_config.json's obs_pixels_*.
-FRAME_WIDTH = 640
-FRAME_HEIGHT = 360
-# TankEnv frame_shape is (H, W, 3).
-FRAME_SHAPE = (FRAME_HEIGHT, FRAME_WIDTH, 3)
+# The pixel frame_shape (H, W, 3) is DERIVED from the launched config's obs_pixels_* at runtime
+# (frame_shape_from_config), so setting obs_pixels_width/height in a config auto-matches the env
+# with no manual sync. There is no hardcoded resolution constant here anymore.
 
 DEFAULT_MAX_STEPS = 600
 DEFAULT_SEED = 0
@@ -241,10 +242,12 @@ class PixelsAdapter:
 
 
 def make_rl_player(checkpoint: str | Path, *, slot: int, model=None) -> PixelsAdapter:
-    """Build a :class:`PixelsAdapter` over a trained SB3 PPO checkpoint (the ONLY ``rl`` seam).
+    """Build a :class:`PixelsAdapter` over a trained SB3 PPO checkpoint (the ONLY trained-model
+    seam).
 
-    This is the SOLE place ``rl`` / ``stable_baselines3`` / ``torch`` are imported, and the import
-    is LAZY (inside the function) — invoked only when an ``rl:`` player is requested, so human /
+    This is the SOLE place ``stable_baselines3`` / ``torch`` are imported (via
+    ``from stable_baselines3 import PPO``; ``pop_trainer.rl`` is NOT imported), and the import is
+    LAZY (inside the function) — invoked only when an ``rl:`` player is requested, so human /
     rule-based play stays torch-free. ``PPO.load(checkpoint)`` is predict-only (no env needed for
     ``.predict``). The ``checkpoint`` path must exist (an actionable error otherwise).
 
@@ -279,7 +282,8 @@ def build_players(
     * ``human`` -> a :class:`~pop_trainer.agents.HumanAgent` over the player's keymap + the shared
       ``state``, wrapped in a :class:`StateAdapter`.
     * a rule-based selector -> :func:`make_agent`, wrapped in a :class:`StateAdapter`.
-    * ``rl:<path>`` -> :func:`make_rl_player` (the lazy ``rl`` import; the checkpoint loads here).
+    * ``rl:<path>`` -> :func:`make_rl_player` (the lazy ``stable_baselines3`` import; the checkpoint
+      loads here).
 
     Pure with respect to the keyboard: it takes an already-built ``state`` and never constructs a
     listener / touches ``pynput``. RL loading is NOT injectable here — the RL-adapter unit tests
@@ -422,8 +426,9 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         type=Path,
         default=None,
         help=(
-            "config JSON for the build (MUST enable obs_pixels at 640x360); defaults to "
-            "human_config.json when a player is 'human', else demo_config.json"
+            "config JSON for the build (MUST enable obs_pixels; the env frame_shape is derived "
+            "from its obs_pixels_width/height); defaults to human_config.json when a player is "
+            "'human', else demo_config.json"
         ),
     )
     _player_help = (
@@ -485,13 +490,17 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: config not found at {config}", file=sys.stderr)
         return 2
 
+    # DERIVE the env's pixel frame_shape from the config we actually launch with (its obs_pixels_*),
+    # so a 64x64 config auto-yields a (64, 64, 3) env with no hardcoded constant to drift.
+    frame_shape = frame_shape_from_config(config)
+
     # For human play, ONE listener owns ONE shared KeyboardState that both HumanAgents read; the
     # listener is started before the episode and stopped in the teardown. pynput is imported lazily
     # by KeyboardListener, so a missing 'human' extra fails here with an actionable message.
     listener = agents.KeyboardListener() if human_play else None
     state = listener.state if listener is not None else agents.KeyboardState()
     # Build the adapters before launching the build: an RL player loads its checkpoint here (the
-    # lazy rl import), so a missing '*.zip' errors BEFORE any subprocess is spawned.
+    # lazy stable_baselines3 import), so a missing '*.zip' errors BEFORE any subprocess is spawned.
     try:
         player1, player2 = build_players(spec1, spec2, state, seed=args.seed)
     except FileNotFoundError as exc:
@@ -509,7 +518,7 @@ def main(argv: list[str] | None = None) -> int:
         connection = Connection(connect(args.port))
         env = TankEnv(
             connection=connection,
-            frame_shape=FRAME_SHAPE,
+            frame_shape=frame_shape,
             env_config=EnvConfig(max_steps=args.max_steps),
             seed=args.seed,
         )

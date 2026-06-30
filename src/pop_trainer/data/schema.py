@@ -18,7 +18,7 @@ array name      dtype      shape                     meaning
 ``step_idxs``   int32      ``(N,)``                  step index within the episode
 ==============  =========  ========================  =====================================
 
-* ``frames`` are stored RAW (the synthetic flat-color renders deflate hard, so npz is fine).
+* ``frames`` are stored RAW — the real rendered Unity frames; npz deflate keeps the corpus fine.
 * ``actions`` is OPTIONAL on write (omitted when an inverse-render dataset only needs
   ``(frame, state)``); :data:`ARRAY_ACTIONS` is absent from such a shard and readers tolerate
   that. ``H`` / ``W`` are NOT fixed by this schema (the collector records the native frame
