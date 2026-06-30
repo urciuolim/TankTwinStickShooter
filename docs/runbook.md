@@ -173,6 +173,7 @@ Flags (defaults shown, [`_parse_args`](../src/pop_trainer/data/collect_runner.py
 | `--out-dir` | *(required)* | root output dir; worker `w` writes to `worker_<w>/` under it |
 | `--maps` / `--map-rotation` | *(absent)* | **no value** → the curated 10-map rotation; **a directory** → its sorted `*.json` arena targets; **a list** → that order; **absent** → single `--map` |
 | `--map` | `custom1` | single-map config + the **boot** arena when `--maps` is absent |
+| `--config` | *(absent → `--map` default)* | override the **boot** config (obs resolution + initial arena); the env `frame_shape` derives from its `obs_pixels_*` (a 64×64 config → a `(64, 64, 3)` env). Absent → `MAP_CONFIGS[--map]` (`demo_config.json`, 640×360). **Composes with `--maps`**: `switch_arena` arena rotation is unchanged. See [64×64 collect](#collecting-a-6464-square-dataset) |
 | `--pairing P1:P2` | `DEFAULT_PAIRINGS` mix | a `(player1:player2)` selector pairing; **repeatable**. Omitted → the default coverage-family mix |
 | `--episodes` | `1` | episodes **per worker** |
 | `--max-steps` | `800` | per-episode step cap (see [episode budget](#episode-budget--obs_pixels)) |
@@ -187,6 +188,26 @@ Flags (defaults shown, [`_parse_args`](../src/pop_trainer/data/collect_runner.py
 
 Selectors for `--pairing` (and `--map`'s default boot): `aggressive-coverage`, `wall-hugger`,
 `opponent-shadower`, `random`.
+
+### Collecting a 64×64 square dataset
+
+`--config` overrides the boot config the build launches on; the env `frame_shape` is **derived from
+its `obs_pixels_*`** (the same `core.obs.frame_shape_from_config` source of truth play/train use), so
+pointing it at a 64×64-native config yields a `(64, 64, 3)` env and writes 64×64 frames. Absent, the
+runner falls back to the `--map` default (`config = args.config if args.config is not None else
+MAP_CONFIGS[args.map]`, [`collect_runner.py:804`](../src/pop_trainer/data/collect_runner.py)), i.e.
+`demo_config.json` at 640×360. It **composes with `--maps`** — the override changes only the boot
+resolution/arena; `switch_arena` arena rotation is unchanged.
+
+```bash
+# 64x64-native square corpus, arena-rotated over the curated set
+uv run python -m pop_trainer.data.collect_runner \
+  --config unity/Assets/StreamingAssets/train_config_64.json \
+  --out-dir datasets/collect-64 --maps
+```
+
+This feeds the gn-cnn @ 64×64 pretrain cell — see
+[pretraining → resolution 64](components/pretraining.md#resolution-64-and-0-native-the-shape-follows-the-dataset).
 
 ### Memory safety (the pre-flight guard)
 

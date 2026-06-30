@@ -38,7 +38,7 @@ from torch.utils.data import DataLoader, Dataset
 from pop_trainer.data.manifest import MANIFEST_NAME, manifest_id
 from pop_trainer.models import EncoderConfig, build_encoder
 from pop_trainer.pretraining import card, losses, metrics
-from pop_trainer.pretraining.dataset import build_splits
+from pop_trainer.pretraining.dataset import RESOLUTIONS, build_splits
 from pop_trainer.pretraining.decoder import StateDecoder
 from pop_trainer.pretraining.device import resolve_device
 from pop_trainer.pretraining.progress import ProgressReporter
@@ -60,9 +60,6 @@ __all__ = [
     "run",
     "main",
 ]
-
-_NATIVE_HEIGHT = 360
-_NATIVE_WIDTH = 640
 
 
 @dataclass(frozen=True)
@@ -139,12 +136,6 @@ def seed_everything(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-
-
-def input_hw(resolution: int) -> tuple[int, int]:
-    """``(H, W)`` for a target height ``resolution`` keeping the native 360x640 aspect."""
-    factor = _NATIVE_HEIGHT // resolution
-    return resolution, _NATIVE_WIDTH // factor
 
 
 def _to_device(batch_targets: dict[str, torch.Tensor], device: torch.device) -> dict:
@@ -312,7 +303,6 @@ def run(cfg: TrainConfig) -> dict:
     """
     seed_everything(cfg.seed)
     device = torch.device(resolve_device(cfg.device))
-    h, w = input_hw(cfg.resolution)
 
     splits = build_splits(
         cfg.data_dir,
@@ -322,6 +312,9 @@ def run(cfg: TrainConfig) -> dict:
         test_frac=cfg.test_frac,
         limit=cfg.subset,
     )
+    # The training (H, W) is derived from the DATASET's native frame_hw at cfg.resolution, so a
+    # 64x64-native dataset trains square (64, 64) and a 360x640 native @ 180 trains (180, 320).
+    h, w = splits.input_hw
     encoder = build_encoder(EncoderConfig(trunk=cfg.trunk, pooling=cfg.pooling))
     model = StateDecoder(encoder, (h, w)).to(device)
 
@@ -672,7 +665,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", default="runs/decode-smoke")
     parser.add_argument("--trunk", choices=("cnn", "resnet", "gn-cnn"), default="cnn")
     parser.add_argument("--pooling", choices=("gap", "flatten"), default="gap")
-    parser.add_argument("--resolution", type=int, choices=(360, 180, 90), default=180)
+    parser.add_argument(
+        "--resolution",
+        type=int,
+        choices=RESOLUTIONS,
+        default=180,
+        help=(
+            "target frame HEIGHT; must EVENLY divide the dataset's native height (width scales by "
+            "the same factor, preserving aspect). 360/180/90 target the 16:9 render; 64 targets a "
+            "64x64-native square dataset; 0 = native (no downsample, adapts to frame_hw)."
+        ),
+    )
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=3e-4)

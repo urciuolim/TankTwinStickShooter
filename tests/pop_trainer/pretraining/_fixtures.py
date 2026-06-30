@@ -2,7 +2,9 @@
 
 Writes a worker_*/shard_*.npz layout with a handful of frames across a few maps, so the
 map-aware split, recursive index, and end-to-end train step can run on a few-second CPU fixture
-without the real dataset.
+without the real dataset. ``make_fixture`` defaults to the 360x640 (16:9) native render;
+``make_square_fixture`` is the 64x64 SQUARE variant for the gn-cnn-at-64x64 path (same shard
+layout / signal, only ``hw`` differs) — NO live Unity in either.
 """
 
 from __future__ import annotations
@@ -72,3 +74,14 @@ def make_fixture(
             shards.write_shard(root / f"worker_{w}" / f"shard_w{w}_{sidx:04d}.npz", shard)
             map_id += 1
     return root
+
+
+def make_square_fixture(root: Path, *, hw: tuple[int, int] = (64, 64), **kwargs) -> Path:
+    """Write a 64x64 SQUARE decode-v1-style fixture (the gn-cnn-at-64x64 path); returns ``root``.
+
+    A thin wrapper over :func:`make_fixture` that pins a square ``hw`` (64x64 by default, matching
+    the 64x64 RL obs). Every other knob (maps / workers / rows) passes through unchanged, so the
+    shard layout + weak per-frame signal are identical to the 16:9 fixture — only the frame is
+    square, so resolution 64 (or 0) downsamples to a square training shape.
+    """
+    return make_fixture(root, hw=hw, **kwargs)

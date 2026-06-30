@@ -165,11 +165,14 @@ group key = `map_id`, so no map leaks across train/val/test,
   works too ([`dataset.py:223,239`](../../src/pop_trainer/pretraining/dataset.py)). Index basenames
   are mapped back to full subdir paths by `_resolve_shard_paths`
   ([`dataset.py:70-81`](../../src/pop_trainer/pretraining/dataset.py)).
-- **Load-time downsample:** `resolution` is the target **HEIGHT** (one of `360 / 180 / 90`); the
-  width scales by the **same integer factor** so the native 360×640 aspect is preserved, via
-  deterministic **area** interpolation
-  ([`dataset.py:51-67`](../../src/pop_trainer/pretraining/dataset.py)). Frames are `uint8 (H,W,3)` →
-  float32 `[0,1]` NCHW.
+- **Load-time downsample:** `resolution` is the target **HEIGHT** (one of `360 / 180 / 90 / 64`, or
+  `0` = native); the width scales by the **same integer factor**, so the training shape **follows the
+  dataset's native `frame_hw`** — NOT a hardcoded 16:9. A 360×640 native @ `180` → factor 2 →
+  (180, 320); a 64×64 native @ `64` (or `0`) → factor 1 → (64, 64). The single source of truth is
+  [`downsampled_hw(native_hw, resolution)`](../../src/pop_trainer/pretraining/dataset.py)
+  ([`dataset.py:82`](../../src/pop_trainer/pretraining/dataset.py)), applied to BOTH dims; resize is
+  deterministic **area** interpolation. Frames are `uint8 (H,W,3)` → float32 `[0,1]` NCHW. See
+  [resolution 64 / 0](#resolution-64-and-0-native-the-shape-follows-the-dataset).
 - [`build_splits`](../../src/pop_trainer/pretraining/dataset.py) wires the index + split +
   **TRAIN-only** `NormStats` AND `GridExtent` consistently across the three views
   ([`dataset.py:215-256`](../../src/pop_trainer/pretraining/dataset.py)); `limit` caps the total
@@ -191,6 +194,32 @@ group key = `map_id`, so no map leaks across train/val/test,
   it ([`dataset.py:139-145`](../../src/pop_trainer/pretraining/dataset.py)) — the windowed train
   loader sizes it to `window + 1` (below); val/test keep the capacity-1 default (sequential
   streaming).
+
+### Resolution 64 and 0 (native): the shape follows the dataset
+
+`--resolution` accepts `360 / 180 / 90` (the 16:9 render) **plus `64` and `0`**
+(`RESOLUTIONS = (NATIVE_RESOLUTION, 360, 180, 90, 64)`,
+[`dataset.py:60-61`](../../src/pop_trainer/pretraining/dataset.py)):
+
+- **`64`** targets a **64×64-native square** dataset → factor 1 → a (64, 64) cell. The constraint is
+  **divisibility**, not 16:9: `64` raises a `ValueError` on a non-64-divisible native height
+  ([`_downsample_factor`, `dataset.py:64-79`](../../src/pop_trainer/pretraining/dataset.py)), so a
+  640×360 16:9 set **cannot** go square — it would still downsample to 16:9, not a square.
+- **`0` is the "native / no-downsample" sentinel** (`NATIVE_RESOLUTION`): factor 1, whatever
+  `frame_hw` the dataset carries. It adapts to ANY native shape — 64×64 → (64, 64), 360×640 → (360, 640).
+
+So the training shape is **derived from the dataset's native `frame_hw`** via `downsampled_hw`, never a
+fixed aspect: a 16:9 dataset still downsamples to 16:9, a square dataset stays square. Pair the
+[64×64 collect](../runbook.md#collecting-a-6464-square-dataset) with the `gn-cnn @ 64` pretrain cell:
+
+```bash
+uv run python -m pop_trainer.pretraining.train \
+  --data datasets/collect-64 --trunk gn-cnn --resolution 64 --device cuda
+```
+
+(`cnn` cannot take a 64-row frame — its stride-4 stem underflows; see
+[the sweep-planning note](#sweep-planning-note--cnn--resolution-90-is-infeasible). `gn-cnn` is the
+small-frame trunk.)
 
 ### Windowed TRAIN sampler (cross-shard diversity, cache-friendly)
 
@@ -245,7 +274,10 @@ calibrates the presence threshold on val and applies it to test
 [artifacts](#the-artifacts). Device-agnostic via `--device` (auto → cuda > mps > cpu).
 
 Key flags ([`train.py:670-762`](../../src/pop_trainer/pretraining/train.py)):
-`--trunk {cnn,resnet,gn-cnn}`, `--pooling {gap,flatten}`, `--resolution {360,180,90}`, `--epochs`,
+`--trunk {cnn,resnet,gn-cnn}`, `--pooling {gap,flatten}`,
+`--resolution {0,360,180,90,64}` (target HEIGHT; the shape follows the dataset's native `frame_hw`,
+so `64` → a 64×64 square cell and `0` = native/no-downsample — see
+[resolution 64 / 0](#resolution-64-and-0-native-the-shape-follows-the-dataset)), `--epochs`,
 `--batch-size`, `--lr`, `--subset` / `--limit` (alias, caps total indexed samples), `--val-frac` /
 `--test-frac` (map-aware split fractions **by map COUNT**, both default **0.2** for a 60/20/20 split
 that seats ≥2 maps at G=10), `--seed`, `--device`, `--num-workers`, `--shard-window` (the windowed
@@ -258,9 +290,12 @@ sampler's `W`, default 32), `--heatmap-weight` / `--heatmap-sigma` (the heatmap 
 Reports the Phase-3 compute numbers for one `(EncoderConfig, resolution, device)` cell:
 **parameter counts** (total + encoder-only) and **mean forward-pass latency** over a few timed
 iterations after warmup ([`profile_forward`, `profile.py:39-86`](../../src/pop_trainer/pretraining/profile.py)).
-Output is a strict-JSON dict (`allow_nan=False`). Same `--trunk {cnn,resnet,gn-cnn}` / `--pooling` /
-`--resolution` / `--device` knobs, plus `--batch-size` / `--warmup` / `--iters`
-([`profile.py:95-117`](../../src/pop_trainer/pretraining/profile.py)).
+The profiled input is `downsampled_hw(native_hw, resolution)`, so the cell follows the same
+dataset-derived shape as training. Output is a strict-JSON dict (`allow_nan=False`). Same
+`--trunk {cnn,resnet,gn-cnn}` / `--pooling` / `--resolution {0,360,180,90,64}` / `--device` knobs,
+plus **`--native-hw H W`** (the native frame to downsample from; default `360 640` — pass `64 64` for
+the square gn-cnn cell, [`profile.py:106-113`](../../src/pop_trainer/pretraining/profile.py)) and
+`--batch-size` / `--warmup` / `--iters` ([`profile.py:95-117`](../../src/pop_trainer/pretraining/profile.py)).
 
 ## The artifacts
 

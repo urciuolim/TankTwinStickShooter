@@ -11,9 +11,12 @@ decode-v1 shards live in ``worker_*/`` SUBDIRS, so the index is built with a REC
 (``**/shard_*.npz``); a flat-layout dir works too. Frames are ``uint8 (H, W, 3)`` -> float32
 ``[0, 1]`` NCHW ``(3, h, w)``.
 
-LOAD-TIME downsample: ``resolution`` is the target HEIGHT (one of 360 / 180 / 90); the WIDTH
-scales by the SAME integer factor as the height (native 360 -> factor 1/2/4 -> 360/180/90), so
-the native frame aspect is preserved. Resize is deterministic area-interpolation.
+LOAD-TIME downsample: ``resolution`` is the target HEIGHT, which must EVENLY divide the dataset's
+native height; the WIDTH scales by the SAME integer factor as the height, so the native frame
+aspect is preserved (a 360x640 native @ resolution 180 -> factor 2 -> (180, 320); a 64x64 native @
+resolution 64 -> factor 1 -> (64, 64), square). ``resolution=0`` is the "native" sentinel: factor
+1, no downsample, whatever ``frame_hw`` the dataset carries. The training shape is thus derived
+from the DATASET, not a fixed aspect. Resize is deterministic area-interpolation.
 
 Targets are extracted per-row from the 52-float state via
 :mod:`pop_trainer.pretraining.targets`, normalized by a :class:`~...targets.NormStats` and placed
@@ -39,22 +42,54 @@ from torch.utils.data import Dataset
 from pop_trainer.data import readers, schema, shards
 from pop_trainer.pretraining import targets as T
 
-__all__ = ["RESOLUTIONS", "DecodeDataset", "SplitDatasets", "build_splits"]
+__all__ = [
+    "NATIVE_RESOLUTION",
+    "RESOLUTIONS",
+    "downsampled_hw",
+    "DecodeDataset",
+    "SplitDatasets",
+    "build_splits",
+]
 
 logger = logging.getLogger(__name__)
 
-# Allowed target heights for the load-time downsample (native frame height is 360).
-RESOLUTIONS: tuple[int, ...] = (360, 180, 90)
-_NATIVE_HEIGHT = 360
+# Target heights the CLI exposes for the load-time downsample. The 16:9 trio (360 / 180 / 90)
+# targets the native-360 render; 64 targets a 64x64-native (square) dataset; 0 is the "native, no
+# downsample" sentinel that adapts to whatever height the dataset carries. The actual constraint is
+# divisibility (enforced in _downsample_factor), not membership here -- this only drives the CLI.
+NATIVE_RESOLUTION = 0
+RESOLUTIONS: tuple[int, ...] = (NATIVE_RESOLUTION, 360, 180, 90, 64)
 
 
 def _downsample_factor(native_h: int, resolution: int) -> int:
-    """Integer downsample factor mapping ``native_h`` to ``resolution`` (must divide evenly)."""
-    if resolution not in RESOLUTIONS:
-        raise ValueError(f"resolution must be one of {RESOLUTIONS}, got {resolution}")
+    """Integer downsample factor mapping ``native_h`` to target height ``resolution``.
+
+    ``resolution=NATIVE_RESOLUTION`` (0) means "no downsample" -> factor 1. Otherwise ``resolution``
+    is the target height and must EVENLY divide ``native_h`` (the same factor scales the width, so
+    the aspect is preserved). Raises ``ValueError`` when it does not divide evenly.
+    """
+    if resolution == NATIVE_RESOLUTION:
+        return 1
+    if resolution <= 0:
+        raise ValueError(
+            f"resolution must be {NATIVE_RESOLUTION} (native) or > 0, got {resolution}"
+        )
     if native_h % resolution != 0:
         raise ValueError(f"native height {native_h} is not divisible by resolution {resolution}")
     return native_h // resolution
+
+
+def downsampled_hw(native_hw: tuple[int, int], resolution: int) -> tuple[int, int]:
+    """Training ``(H, W)`` for ``native_hw`` at target height ``resolution`` (same integer factor).
+
+    The single source of truth for the training shape: it derives the factor from the dataset's
+    native height (:func:`_downsample_factor`) and applies it to BOTH dims, so a 360x640 native @
+    180 -> (180, 320) and a 64x64 native @ 64 (or 0) -> (64, 64). The training shape thus follows
+    the dataset's aspect, square or 16:9.
+    """
+    native_h, native_w = native_hw
+    factor = _downsample_factor(native_h, resolution)
+    return native_h // factor, native_w // factor
 
 
 def _frame_to_chw(frame: np.ndarray, factor: int) -> torch.Tensor:
@@ -180,7 +215,12 @@ class DecodeDataset(Dataset):
 
 
 class SplitDatasets:
-    """The three map-aware split views (``train`` / ``val`` / ``test``) + the shared TRAIN-fits."""
+    """The three map-aware split views (``train`` / ``val`` / ``test``) + the shared TRAIN-fits.
+
+    Also carries the dataset's native ``frame_hw`` and the derived training ``input_hw`` (the
+    downsampled ``(H, W)`` every view serves) so a trainer sizes its model from the DATASET instead
+    of a hardcoded aspect.
+    """
 
     def __init__(
         self,
@@ -189,12 +229,16 @@ class SplitDatasets:
         test: DecodeDataset,
         stats: T.NormStats,
         extent: T.GridExtent,
+        frame_hw: tuple[int, int],
+        input_hw: tuple[int, int],
     ) -> None:
         self.train = train
         self.val = val
         self.test = test
         self.stats = stats
         self.extent = extent
+        self.frame_hw = frame_hw
+        self.input_hw = input_hw
 
 
 def _collect_train_states(
@@ -253,7 +297,15 @@ def build_splits(
     def view(idxs: np.ndarray) -> DecodeDataset:
         return DecodeDataset(shard_paths, index, idxs, stats, extent, resolution)
 
-    return SplitDatasets(view(split.train), view(split.val), view(split.test), stats, extent)
+    return SplitDatasets(
+        view(split.train),
+        view(split.val),
+        view(split.test),
+        stats,
+        extent,
+        frame_hw=index.frame_hw,
+        input_hw=downsampled_hw(index.frame_hw, resolution),
+    )
 
 
 _MIN_MAPS_PER_SPLIT = 2

@@ -16,13 +16,15 @@ import time
 import torch
 
 from pop_trainer.models import EncoderConfig, build_encoder
+from pop_trainer.pretraining.dataset import RESOLUTIONS, downsampled_hw
 from pop_trainer.pretraining.decoder import StateDecoder
 from pop_trainer.pretraining.device import resolve_device
 
 __all__ = ["count_parameters", "profile_forward", "main"]
 
-_NATIVE_HEIGHT = 360
-_NATIVE_WIDTH = 640
+# Default native frame the 16:9 resolutions downsample from; --native-hw overrides it (e.g. 64x64
+# for the square gn-cnn cell).
+_DEFAULT_NATIVE_HW = (360, 640)
 
 
 def count_parameters(module: torch.nn.Module) -> int:
@@ -30,16 +32,11 @@ def count_parameters(module: torch.nn.Module) -> int:
     return int(sum(p.numel() for p in module.parameters()))
 
 
-def _input_hw(resolution: int) -> tuple[int, int]:
-    """``(H, W)`` for a target height ``resolution`` keeping the native 360x640 aspect."""
-    factor = _NATIVE_HEIGHT // resolution
-    return resolution, _NATIVE_WIDTH // factor
-
-
 def profile_forward(
     cfg: EncoderConfig,
     *,
     resolution: int = 180,
+    native_hw: tuple[int, int] = _DEFAULT_NATIVE_HW,
     device: str = "cpu",
     batch_size: int = 8,
     warmup: int = 3,
@@ -47,12 +44,14 @@ def profile_forward(
 ) -> dict:
     """Profile the decoder's forward pass for ``cfg`` at ``resolution`` on ``device``.
 
-    Builds the encoder + decoder, runs ``warmup`` untimed forward passes then ``iters`` timed
-    ones, and returns a strict-JSON-safe summary: parameter counts (total + encoder-only) and
-    mean / per-sample forward latency in milliseconds.
+    The profiled input ``(H, W)`` is :func:`...dataset.downsampled_hw` of ``native_hw`` at
+    ``resolution`` (so a 64x64 ``native_hw`` @ resolution 64 or 0 profiles the square gn-cnn cell).
+    Builds the encoder + decoder, runs ``warmup`` untimed forward passes then ``iters`` timed ones,
+    and returns a strict-JSON-safe summary: parameter counts (total + encoder-only) and mean /
+    per-sample forward latency in milliseconds.
     """
     dev = torch.device(resolve_device(device))
-    h, w = _input_hw(resolution)
+    h, w = downsampled_hw(native_hw, resolution)
     encoder = build_encoder(cfg)
     model = StateDecoder(encoder, (h, w)).to(dev).eval()
 
@@ -97,7 +96,21 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Encoder compute profile (params + latency).")
     parser.add_argument("--trunk", choices=("cnn", "resnet", "gn-cnn"), default="cnn")
     parser.add_argument("--pooling", choices=("gap", "flatten"), default="gap")
-    parser.add_argument("--resolution", type=int, choices=(360, 180, 90), default=180)
+    parser.add_argument(
+        "--resolution",
+        type=int,
+        choices=RESOLUTIONS,
+        default=180,
+        help="target frame HEIGHT (must divide --native-hw's height); 0 = native (no downsample).",
+    )
+    parser.add_argument(
+        "--native-hw",
+        type=int,
+        nargs=2,
+        metavar=("H", "W"),
+        default=list(_DEFAULT_NATIVE_HW),
+        help="native frame (H, W) to downsample from; default 360 640. Pass 64 64 for square.",
+    )
     parser.add_argument("--device", default="auto")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--warmup", type=int, default=3)
@@ -108,6 +121,7 @@ def main(argv: list[str] | None = None) -> int:
     summary = profile_forward(
         cfg,
         resolution=args.resolution,
+        native_hw=(args.native_hw[0], args.native_hw[1]),
         device=args.device,
         batch_size=args.batch_size,
         warmup=args.warmup,

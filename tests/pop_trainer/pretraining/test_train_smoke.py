@@ -19,9 +19,10 @@ from pop_trainer.pretraining import train as train_mod  # noqa: E402
 from pop_trainer.pretraining.decoder import StateDecoder  # noqa: E402
 from pop_trainer.pretraining.train import TrainConfig, run  # noqa: E402
 
-from ._fixtures import make_fixture  # noqa: E402
+from ._fixtures import make_fixture, make_square_fixture  # noqa: E402
 
 SMALL_HW = (180, 320)
+SQUARE_HW = (64, 64)
 
 
 def test_train_config_split_frac_defaults():
@@ -115,6 +116,65 @@ def test_combined_loss_decreases_over_steps():
             first = float(total.detach())
         last = float(total.detach())
     assert last < first  # the encoder + spatial heads learned the fixed batch
+
+
+def test_gn_cnn_64x64_loss_decreases_over_steps():
+    # the 64x64 SQUARE path: gn-cnn decoder builds at (64, 64) and the spatial loss steps down.
+    torch.manual_seed(0)
+    model = StateDecoder(build_encoder(EncoderConfig("gn-cnn", "gap")), SQUARE_HW, hidden=32)
+    opt = torch.optim.Adam(model.spatial_parameters(), lr=1e-2)
+    x = torch.rand(4, 3, *SQUARE_HW)
+    targets = {
+        "player_position": torch.randn(4, 4),
+        "player_velocity": torch.randn(4, 4),
+        "player_aim": torch.nn.functional.normalize(torch.randn(4, 2, 2), dim=2).reshape(4, 4),
+        "bullet_presence": (torch.rand(4, 10) < 0.3).float(),
+        "bullet_position": torch.randn(4, 20),
+        "bullet_slot_mask": torch.ones(4, 20),
+    }
+    first = last = None
+    model.train()
+    for step in range(20):
+        out = model(x)
+        total, _ = losses.combined_loss(out["spatial"], targets, presence_pos_weight=2.0)
+        opt.zero_grad(set_to_none=True)
+        total.backward()
+        opt.step()
+        if step == 0:
+            first = float(total.detach())
+        last = float(total.detach())
+    assert last < first  # the gn-cnn encoder + spatial heads learned the fixed 64x64 batch
+
+
+def test_run_end_to_end_gn_cnn_64x64(tmp_path):
+    # full run on a 64x64 SQUARE fixture with --trunk gn-cnn at resolution 64: trains square.
+    data_dir = tmp_path / "data"
+    make_square_fixture(
+        data_dir, n_maps=4, workers=2, shards_per_worker=2, rows_per_shard=10
+    )
+    out_dir = tmp_path / "out"
+    cfg = TrainConfig(
+        data_dir=str(data_dir),
+        out_dir=str(out_dir),
+        trunk="gn-cnn",
+        pooling="gap",
+        resolution=64,  # 64x64-native -> factor 1 -> square (64, 64)
+        epochs=2,
+        batch_size=8,
+        lr=1e-3,
+        seed=0,
+        device="cpu",
+    )
+    record = run(cfg)
+    assert (out_dir / "checkpoint.pt").exists()
+    assert (out_dir / "results.json").exists()
+    # the recorded training shape is the square (64, 64), and the card agrees.
+    assert record["input_hw"] == [64, 64]
+    card_json = json.loads((out_dir / "model_card.json").read_text())
+    assert card_json["architecture"]["input_hw"] == [64, 64]
+    assert card_json["architecture"]["resolution"] == 64
+    assert card_json["architecture"]["trunk"] == "gn-cnn"
+    assert len(record["loss_trajectory"]) == 2
 
 
 def test_run_end_to_end_writes_strict_json(tmp_path):
