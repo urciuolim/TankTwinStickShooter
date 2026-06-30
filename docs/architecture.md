@@ -162,7 +162,7 @@ graph TD
   `play` call `set_map` on player1 and player2 (all `getattr`-probed; the env notifies no agent). A
   [`CoverageAgent`](components/agents.md) rebuilds its coverage grid from the layout; `RandomAgent`
   does not implement the hook. See
-  [core](components/core.md#the-wall-message--protocol-seam-walllayout--infomap).
+  [core](components/core.md#the-wall-message-seam-walllayout--infomap).
 - **`core.launch` is the shared live seam.** Both `play` and `data.collect_runner` launch the
   build + open the socket through `build_launch_cmd` / `connect`; it is stdlib-only so `core` stays
   the leaf. `collect_runner.env_factory` calls it once per worker (`port = base_port + worker_id`).
@@ -176,7 +176,7 @@ graph TD
   core.Connection.switch_arena` (the additive outbound seam), and `collect.resolve_map_tag` tags
   each sample's `map_id` from the arena Unity **echoed** (the F5 tag-from-echo), decoded through the
   `maps.json` sidecar / `map_index`. See
-  [data](components/data.md#the-rotation-scheduler--map-tagging).
+  [data](components/data.md#the-rotation-scheduler--tag-from-echo).
 - **`models` is detached** from the live loop today — it's the shared vision backbone, and the
   deployable ONNX artifact. Its trunks are named by architecture (`cnn` / `resnet` / `gn-cnn`); the
   small-frame `gn-cnn` (DreamerV3-style GroupNorm CNN) survives ≤128px frames where the `cnn`
