@@ -4,7 +4,7 @@ The **datasets pipeline**: collect time-aligned `(frame, state, action)` samples
 pretraining, organize them into on-disk `.npz` shards, and split them map-aware. Collection drives
 the game through [`TankEnv`](env.md) — the **same** gymnasium observation pipeline RL trains on — so
 the captured rows are byte-for-byte the RL observations, and `data` communicates downstream only via
-dataset artifacts on disk. Six ideas hold the whole component together:
+dataset artifacts on disk. Seven ideas hold the whole component together:
 
 1. **The on-disk schema** is the single source of truth for the parallel-array names / dtypes /
    shapes a shard holds (`frames` / `states` / optional `actions` + provenance).
@@ -18,6 +18,8 @@ dataset artifacts on disk. Six ideas hold the whole component together:
    budget, not a sample count — and aborts pre-flight if a run would blow the RAM budget.
 6. **The split readers** group samples by map so a whole arena's frames never leak across the
    train/val/test boundary.
+7. **The run-root manifest** fingerprints each run (provenance / machine / collection counts +
+   human/agent **descriptions**) — the dataset's identity card, not a reproduce-this recipe.
 
 **Boundary:** `data` imports [`core`](core.md) (state schema, launch, wire, config, map-rotation),
 [`env`](env.md) (`TankEnv`), and [`agents`](agents.md) (the policies that drive collection), plus
@@ -35,6 +37,7 @@ graph LR
     cli["collect_runner.main (CLI)"] -->|"build_specs"| specs["CollectionSpec[] (one per worker)"]
     cli -->|"check_memory_budget (pre-flight)"| guard["abort if over RAM budget"]
     cli -->|"write_maps_sidecar"| sidecar["maps.json (int → arena path)"]
+    cli -->|"build_manifest (provenance)"| man["manifest.json (run fingerprint)"]
     specs -->|"collect_parallel (spawn)"| par["spawn Pool"]
     par -->|"env_factory @worker"| ef["build_launch_cmd + connect → bare TankEnv"]
     par -->|"agent_pool_factory @worker"| pool["selector → agent pool"]
@@ -132,26 +135,47 @@ orchestration. Multi-worker; runs a single map OR a map × pairing rotation (`--
   rotates arenas at runtime via `switch_arena`. The env's `frame_shape` is **derived from the boot
   config's `obs_pixels_*`** via [`core.obs.frame_shape_from_config`](core.md#the-observation-resolution-contract-coreobs),
   so the env byte-read matches the build's rendered frame
-  ([`collect_runner.py:346-388,500-501,563`](../../src/pop_trainer/data/collect_runner.py)).
+  ([`collect_runner.py:351-393,505-506,568`](../../src/pop_trainer/data/collect_runner.py)).
 - [`agent_pool_factory`](../../src/pop_trainer/data/collect_runner.py) is the module-level (spawn-safe)
   factory that builds the worker's `{selector → agent}` pool once up front, so each selector's RNG
   stream is continuous across the episodes it plays; both factories are wired onto every spec and
-  required by `run_worker` ([`collect_runner.py:391-401`](../../src/pop_trainer/data/collect_runner.py)).
+  required by `run_worker` ([`collect_runner.py:396-406`](../../src/pop_trainer/data/collect_runner.py)).
 - [`build_specs`](../../src/pop_trainer/data/collect_runner.py) is the pure CLI-args→`list[CollectionSpec]`
   builder (one per worker, `--workers` clamped to `[1, MAX_WORKERS=8]`, each an own `worker_<id>/`
   out-dir + a distinct seed, and either a single-map no-switch plan or its slice of the round-robin)
-  ([`collect_runner.py:443-570`](../../src/pop_trainer/data/collect_runner.py)).
+  ([`collect_runner.py:448-575`](../../src/pop_trainer/data/collect_runner.py)).
 - [`main`](../../src/pop_trainer/data/collect_runner.py) parses the flags, resolves the boot config
   (the obs_pixels-enabled `demo_config.json`), runs the **pre-flight memory guard**, writes the
-  `maps.json` sidecar, drives `collect_parallel`, and prints a concise end-of-run summary
-  (`--max-steps` defaults to `DEFAULT_MAX_STEPS = 800` — the live coverage finding)
-  ([`collect_runner.py:144,760-857`](../../src/pop_trainer/data/collect_runner.py)). The pure
+  `maps.json` sidecar, drives `collect_parallel`, prints a concise end-of-run summary
+  (`--max-steps` defaults to `DEFAULT_MAX_STEPS = 800` — the live coverage finding), and writes the
+  run-root [`manifest.json`](#the-run-root-manifestjson-dataset-fingerprint)
+  ([`collect_runner.py:149,776-937`](../../src/pop_trainer/data/collect_runner.py)). The pure
   end-of-run counter is [`summarize_collection`](../../src/pop_trainer/data/collect_runner.py) /
   [`CollectionSummary`](../../src/pop_trainer/data/collect_runner.py), fed each worker's per-sample
   `map_ids` read back by `_read_worker_map_ids` (which globs `shard_*.npz` in sorted order and reads
   ONLY the tiny `map_ids` member — never inflating the big `frames` array)
-  ([`collect_runner.py:576-628,631-646`](../../src/pop_trainer/data/collect_runner.py)). See the
+  ([`collect_runner.py:598-633,636-651`](../../src/pop_trainer/data/collect_runner.py)). See the
   [runbook §4](../runbook.md#4-collect-a-dataset) for the flags + printout.
+
+### `data.manifest` — the pure run-fingerprint assembler
+[`manifest.py`](../../src/pop_trainer/data/manifest.py). Stdlib-only.
+[`build_manifest`](../../src/pop_trainer/data/manifest.py) shapes **and** validates the run-root
+`manifest.json` from injected provenance / machine / collection values — no I/O, no clock
+(`created_utc` is passed in) — and seeds the `descriptions` list; `collect_runner.main` is the live
+glue that gathers the values ([`manifest.py:70-139`](../../src/pop_trainer/data/manifest.py)).
+[`add_description`](../../src/pop_trainer/data/manifest.py) appends one human/agent annotation,
+returning an updated **copy** (never mutates its input) so a manifest loaded off disk is safe to
+annotate ([`manifest.py:142-153`](../../src/pop_trainer/data/manifest.py)). See
+[the run-root manifest](#the-run-root-manifestjson-dataset-fingerprint) and
+[descriptions](#descriptions-human--agent-annotations).
+
+### `data.describe` — the annotate-a-manifest CLI
+[`describe.py`](../../src/pop_trainer/data/describe.py)
+(`python -m pop_trainer.data.describe <dataset-dir> --text … [--author …]` to add, `--list` to
+print). Stdlib-only glue: it loads a run's `manifest.json`, appends one description via the pure
+`add_description`, and rewrites the file **atomically** (sibling `*.tmp` → `Path.replace`)
+([`describe.py:36-47,92-125`](../../src/pop_trainer/data/describe.py)). See
+[descriptions](#descriptions-human--agent-annotations).
 
 ## The rotation scheduler + tag-from-echo
 
@@ -164,7 +188,7 @@ is `--pairing` (default `DEFAULT_PAIRINGS`, the coverage family vs each other + 
   worker `w` episode `i` picks cell `(worker_id + i*n_workers) % G`. Across all workers the chosen
   indices form a **bijection** onto `[0, n_workers*episodes)`, so the union covers the grid evenly and
   no two workers run identical episodes at the same step
-  ([`collect_runner.py:234-280`](../../src/pop_trainer/data/collect_runner.py)).
+  ([`collect_runner.py:239-285`](../../src/pop_trainer/data/collect_runner.py)).
 - [`EpisodePlan`](../../src/pop_trainer/data/collect.py) is one scheduled episode as **plain,
   spawn-safe data** (`switch_arena` arena-path string / `player1` / `player2` selector names /
   `intended_map_id` int); `switch_arena=None` is a no-switch reset (single-map mode)
@@ -199,7 +223,70 @@ Constants: `SHARD_BYTES_BUDGET ≈ 384 MB`, `SPIKE_FACTOR = 2` (the flush transi
 **injected** argument — `psutil` is read ONLY in [`collect_runner.main`](../../src/pop_trainer/data/collect_runner.py),
 which resolves the effective `shard_size`, reads `psutil.virtual_memory().available`, and on
 `MemoryError` aborts with exit code `2` BEFORE launching any build
-([`collect_runner.py:803-825`](../../src/pop_trainer/data/collect_runner.py)).
+([`collect_runner.py:819-841`](../../src/pop_trainer/data/collect_runner.py)).
+
+## The run-root `manifest.json` (dataset fingerprint)
+
+Each run writes one **`manifest.json`** at the run root (next to the root `maps.json`) that
+**identifies** the dataset. Datasets are **NOT byte-reproducible** run-to-run (Unity physics + GPU
+rendering vary across machines), so the manifest is not a reproduce-this recipe — it records WHAT was
+collected, WHICH commit/build produced it, and on WHAT machine, to make cross-machine discrepancies
+explicable.
+
+The shape is the dict [`build_manifest`](../../src/pop_trainer/data/manifest.py) returns; constants
+`MANIFEST_NAME = "manifest.json"` and `MANIFEST_SCHEMA_VERSION = 2`
+([`manifest.py:31-32,70-139`](../../src/pop_trainer/data/manifest.py)). Top-level keys:
+
+- `schema_version` (int) + `created_utc` (ISO-8601 UTC) + `dataset` (the run-dir name).
+- `descriptions` — the human/agent annotation list (see
+  [descriptions](#descriptions-human--agent-annotations)); empty when none was seeded.
+- `collection` — the run params: `seed`, `command` (`sys.argv`), `workers`, `episodes`, `max_steps`,
+  `maps` (the arena list, aligned to `maps.json`), `pairings` (each a 2-element `[p1, p2]` list),
+  `total_shards`, `total_samples`, `per_map_samples` (`arena-path → count`). The counts +
+  `per_map_samples` are reused from the same `CollectionSummary` as the end-of-run printout.
+- `provenance` — `git_commit`, `git_dirty` (bool, or `None` when git is absent), and `build`
+  (`{path, mtime_utc, size_bytes}` — the build-binary fingerprint).
+- `machine` — `hostname`, `platform`, `system`, `release`, `arch`, `processor`, `cpu_count`,
+  `ram_total_gb`, `python`.
+
+**Pure builder / injected glue split** (the same split as the rest of `data`):
+
+- [`build_manifest`](../../src/pop_trainer/data/manifest.py) is **pure + unit-tested**: it assembles
+  and validates the dict from injected values — no I/O, no clock — normalizing the
+  JSON-unrepresentable pieces (pairing tuples → 2-element lists, `per_map_samples` keys → strings)
+  and seeding `descriptions` (`None` → `[]`, copied to a fresh list), and fails **loudly**
+  (`ValueError`) if a required sub-key is missing / mistyped
+  ([`manifest.py:99-100,106`, `_require_keys` `manifest.py:61-67`](../../src/pop_trainer/data/manifest.py)).
+- The **live gathering** is untested CLI glue in
+  [`collect_runner.main`](../../src/pop_trainer/data/collect_runner.py): `git_commit` /
+  `git_dirty` via arg-list `git rev-parse HEAD` / `git status --porcelain` (`None` if git is
+  absent / errors), `build` from `args.exe.stat()`, `machine` from `socket` / `platform` / `os` /
+  `psutil`, and `created_utc` from `datetime.now(UTC)`. The file is written **atomically**
+  (`json.dump` to `manifest.json.tmp`, then `Path.replace`) — the same tmp→replace discipline as the
+  shards and the sidecar ([`collect_runner.py:874-936`](../../src/pop_trainer/data/collect_runner.py)).
+
+## Descriptions (human / agent annotations)
+
+The manifest carries a `descriptions` list of free-form annotations so a human or an agent can record
+WHAT a dataset is / why it was collected. Each entry is exactly
+`{"author": str, "text": str, "added_utc": str}` (`added_utc` ISO-8601 UTC). `author` is **content
+provenance** — who WROTE the note (`"human"`, `"claude"`, any string) — NOT git/PR attribution.
+
+`MANIFEST_SCHEMA_VERSION` bumped **1 → 2** for this list; a v1 manifest lacking the key is treated as
+an **empty list**, so older datasets stay readable AND annotatable
+([`manifest.py:32`](../../src/pop_trainer/data/manifest.py)). Two ways to add one:
+
+- **At collection time** — `collect_runner`'s `--description "TEXT" [--description-author NAME]`
+  seeds exactly ONE entry as the manifest is written (`--description-author` defaults to `"human"`);
+  the seed entry's `added_utc` shares the manifest's `created_utc` (one clock read)
+  ([`collect_runner.py:896-902`](../../src/pop_trainer/data/collect_runner.py)). See the
+  [runbook](../runbook.md#descriptions-annotating-a-dataset).
+- **Post-hoc** — [`python -m pop_trainer.data.describe`](../../src/pop_trainer/data/describe.py)
+  appends one annotation (`--author` defaults to `"human"`) via the pure `add_description` and
+  rewrites the manifest atomically, or `--list` prints the existing ones. `added_utc` is the CLI's
+  own `datetime.now(UTC)` read; it returns rc `0` on success, rc `2` on a missing `manifest.json` OR
+  a missing `--text` (when not `--list`)
+  ([`describe.py:92-125`](../../src/pop_trainer/data/describe.py)).
 
 ## Pulls from (upstream)
 
@@ -214,9 +301,11 @@ which resolves the effective `shard_size`, reads `psutil.virtual_memory().availa
 
 ## Pushes to (downstream)
 
-On-disk `.npz` shard artifacts + the `maps.json` sidecar — **not** via imports. Nothing in
-`src/pop_trainer` imports `data` today; the future `pretraining` streams the shards via the
-[`schema`](#dataschema--the-on-disk-record-contract) for the supervised-decode training.
+On-disk `.npz` shard artifacts + the `maps.json` sidecar + the run-root
+[`manifest.json`](#the-run-root-manifestjson-dataset-fingerprint) fingerprint — **not** via imports.
+Nothing in `src/pop_trainer` imports `data` today; the future `pretraining` streams the shards via the
+[`schema`](#dataschema--the-on-disk-record-contract) for the supervised-decode training, and the
+manifest is the dataset's identity card for whoever later consumes / compares the corpus.
 
 ## Where it sits in the run
 

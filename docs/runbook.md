@@ -176,11 +176,13 @@ Flags (defaults shown, [`_parse_args`](../src/pop_trainer/data/collect_runner.py
 | `--pairing P1:P2` | `DEFAULT_PAIRINGS` mix | a `(player1:player2)` selector pairing; **repeatable**. Omitted → the default coverage-family mix |
 | `--episodes` | `1` | episodes **per worker** |
 | `--max-steps` | `800` | per-episode step cap (see [episode budget](#episode-budget--obs_pixels)) |
-| `--workers` | `2` | parallel workers, one build each (**clamped to `[1, MAX_WORKERS=8]`**, `collect_runner.py:149`) |
+| `--workers` | `2` | parallel workers, one build each (**clamped to `[1, MAX_WORKERS=8]`**, `collect_runner.py:154,531`) |
 | `--exe` | `unity/build/TankTwinStickShooter.exe` | path to the Unity build |
 | `--base-port` | `50000` | base TCP port; worker `w` connects on `base_port + w` |
 | `--seed` | `0` | base seed; worker `w` uses `base + w*10000` |
 | `--shard-size` | *(auto)* | in-RAM **buffer** bound (samples/worker before a flush), **not** a file-size knob. Auto → the OOM-safe byte budget. See [memory safety](#memory-safety-the-pre-flight-guard) |
+| `--description TEXT` | *(none)* | seed ONE free-form description into the manifest at collection time. See [descriptions](#descriptions-annotating-a-dataset) |
+| `--description-author` | `human` | author for `--description` (free string, e.g. `claude`) — content provenance (who wrote the note), not git/PR attribution |
 | `--allow-oversized` | *(off)* | skip the pre-flight memory **abort** (estimate still printed) |
 
 Selectors for `--pairing` (and `--map`'s default boot): `aggressive-coverage`, `wall-hugger`,
@@ -197,7 +199,7 @@ compress ~140×) — is the OOM surface. A smaller bound just yields **more, sma
 peak-buffer estimate, **always prints it**, and **aborts with exit `2`** when the estimate exceeds
 **60%** of available RAM — unless `--allow-oversized`
 ([`check_memory_budget`, `collect.py:136-170`](../src/pop_trainer/data/collect.py); call site
-[`collect_runner.py:803-825`](../src/pop_trainer/data/collect_runner.py)). The peak is:
+[`collect_runner.py:819-841`](../src/pop_trainer/data/collect_runner.py)). The peak is:
 
 ```
 peak buffer ~= frame_bytes × shard_size × workers × 2   (the SPIKE_FACTOR=2 compress transient)
@@ -233,12 +235,62 @@ model).
 - **End-of-run summary** — counts only, no filename dumps: an aggregate line, one terse per-worker
   line, and a per-map sample-count table aligned to the `maps.json` sidecar (including zero-sample
   arenas). Counts come from a **pure** counter
-  ([`summarize_collection`, `collect_runner.py:593-628`](../src/pop_trainer/data/collect_runner.py))
+  ([`summarize_collection`, `collect_runner.py:598-633`](../src/pop_trainer/data/collect_runner.py))
   that reads back **only** each shard's tiny `map_ids` member — the big `frames` array is never
-  decompressed ([`_read_worker_map_ids`, `collect_runner.py:631-646`](../src/pop_trainer/data/collect_runner.py)).
+  decompressed ([`_read_worker_map_ids`, `collect_runner.py:636-651`](../src/pop_trainer/data/collect_runner.py)).
 - **`maps.json` sidecar** — `{"schema_version": 1, "maps": ["Arenas/...json", ...]}`, written per
   worker-dir AND at the run root, so each on-disk `int32` `map_id` is reversible to the arena Unity
   actually loaded (the echo-tagged id; see [data](components/data.md#the-rotation-scheduler--tag-from-echo)).
+- **`manifest.json` fingerprint** — written once at the run root (next to the root `maps.json`). See
+  [the manifest below](#the-manifestjson-fingerprint).
+
+### The `manifest.json` fingerprint
+
+Each run also writes a single **`manifest.json`** at the run root recording, under
+`schema_version: 2`: the collection params (`seed`, the full `command`, `workers`, `episodes`,
+`max_steps`, the `maps` list, the `pairings`, and the `total_shards` / `total_samples` /
+`per_map_samples` counts — reused from the same summary as the printout), provenance (`git_commit`,
+`git_dirty`, and a `build` `{path, mtime_utc, size_bytes}` fingerprint), the `machine` (hostname,
+platform, CPU, RAM, python), and the `descriptions` list (see
+[descriptions below](#descriptions-annotating-a-dataset)). It is written **atomically** (tmp →
+`Path.replace`) ([`collect_runner.py:874-936`](../src/pop_trainer/data/collect_runner.py)).
+
+> **Not a reproduce-this recipe — it is the dataset's IDENTITY.** Datasets are **NOT
+> byte-reproducible** run-to-run (Unity physics + GPU rendering vary across machines), so the
+> manifest exists to **identify** a dataset and make cross-machine discrepancies explicable (which
+> commit, which build, which machine) — not to regenerate a corpus byte-for-byte. See
+> [data → the run-root manifest](components/data.md#the-run-root-manifestjson-dataset-fingerprint).
+
+### Descriptions (annotating a dataset)
+
+The manifest carries a `descriptions` list of free-form human/agent annotations so you can record
+WHAT a dataset is. Each entry is exactly `{"author", "text", "added_utc"}` (`added_utc` ISO-8601
+UTC); `author` is **content provenance** (who wrote the note — `human`, `claude`, …), NOT git/PR
+attribution. A pre-existing v1 manifest with no `descriptions` key is tolerated (treated as empty),
+so older datasets stay annotatable. Two ways to add one:
+
+**At collection time** — seed one description as the manifest is written (the seed entry's
+`added_utc` shares the manifest's `created_utc`):
+
+```bash
+uv run python -m pop_trainer.data.collect_runner --out-dir runs/collect-demo \
+  --description "first center-block sweep" --description-author claude
+```
+
+**Post-hoc** — append (or list) descriptions on an already-collected run with
+[`python -m pop_trainer.data.describe`](../src/pop_trainer/data/describe.py):
+
+```bash
+# append one annotation (rewrites manifest.json atomically; --author defaults to 'human')
+uv run python -m pop_trainer.data.describe runs/collect-demo --text "looks clean" --author claude
+# list the existing descriptions instead of adding one
+uv run python -m pop_trainer.data.describe runs/collect-demo --list
+```
+
+`describe` takes the run **directory** holding `manifest.json`. It returns **0** on success and **2**
+on a missing `manifest.json` or a missing `--text` (when not using `--list`)
+([`describe.py:92-125`](../src/pop_trainer/data/describe.py)). See
+[data → descriptions](components/data.md#descriptions-human--agent-annotations).
 
 ## 5. Run RL training
 
