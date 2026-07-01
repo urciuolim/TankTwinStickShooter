@@ -60,6 +60,7 @@ from pop_trainer.core.logging_setup import (
     setup_system_logger,
     unity_log_path,
 )
+from pop_trainer.core.maps import resolve_map_rotation
 from pop_trainer.core.obs import (
     DEFAULT_FRAME_SHAPE,
     frame_shape_from_config,
@@ -69,7 +70,13 @@ from pop_trainer.core.protocol import Connection
 from pop_trainer.env.tank_env import TankEnv
 from pop_trainer.rl.elo import elo_change
 from pop_trainer.rl.extractor import EncoderExtractor
-from pop_trainer.rl.selfplay import _STRATEGIES, DEFAULT_ROSTER, OpponentProvider, SelfPlayWrapper
+from pop_trainer.rl.selfplay import (
+    _STRATEGIES,
+    DEFAULT_ROSTER,
+    MapProvider,
+    OpponentProvider,
+    SelfPlayWrapper,
+)
 
 if TYPE_CHECKING:  # type-only: keep the pure helpers / config import-light at module load
     from collections.abc import Callable, Sequence
@@ -173,6 +180,14 @@ class TrainConfig:
         freeze_encoder: freeze the encoder weights during RL.
         opponents: the self-play roster (``agents`` selector strings; non-empty).
         opponent_strategy: ``"round_robin"`` (resumable) or ``"uniform"`` (seed-only resume).
+        maps: the per-episode arena rotation (resolved arena-target strings). ``None`` (the default)
+            = single-arena = TODAY's behavior (no ``switch_arena`` ever sent; the build stays
+            on the ``game_config`` arena). A non-empty tuple rotates the TRAINING envs over those
+            arenas per-episode at reset (the same per-subproc-provider seam as the opponent
+            rotation); EVAL never rotates. Resolve a ``--maps`` flag value through
+            :func:`pop_trainer.core.maps.resolve_map_rotation` before constructing the config.
+        map_strategy: ``"round_robin"`` (resumable) or ``"uniform"`` (seed-only resume) — the map
+            sibling of ``opponent_strategy``.
         eval_freq: env-steps between periodic win-rate evals (``>= 0``; ``0`` disables).
         eval_episodes: greedy episodes per opponent per eval.
         checkpoint_freq: env-steps between checkpoints (``> 0``; the sidecar rides this cadence).
@@ -225,6 +240,10 @@ class TrainConfig:
     freeze_encoder: bool = False
     opponents: tuple[str, ...] = DEFAULT_ROSTER
     opponent_strategy: str = "round_robin"
+    # The per-episode arena rotation (resolved arena targets). None = single-arena = today's
+    # behavior (no switch_arena ever sent). map_strategy mirrors opponent_strategy.
+    maps: tuple[str, ...] | None = None
+    map_strategy: str = "round_robin"
     eval_freq: int = 10_000
     eval_episodes: int = 10
     checkpoint_freq: int = 10_000
@@ -271,6 +290,9 @@ class TrainConfig:
             )
         if not self.opponents:
             raise ValueError("opponents must be non-empty")
+        if self.map_strategy not in _STRATEGIES:
+            valid = ", ".join(_STRATEGIES)
+            raise ValueError(f"unknown map_strategy {self.map_strategy!r}; choose one of: {valid}")
         if self.eval_freq < 0:
             raise ValueError(f"eval_freq must be >= 0, got {self.eval_freq}")
         if self.checkpoint_freq <= 0:
@@ -341,6 +363,8 @@ class TrainConfig:
             "freeze_encoder": self.freeze_encoder,
             "opponents": list(self.opponents),
             "opponent_strategy": self.opponent_strategy,
+            "maps": None if self.maps is None else list(self.maps),
+            "map_strategy": self.map_strategy,
             "eval_freq": self.eval_freq,
             "eval_episodes": self.eval_episodes,
             "checkpoint_freq": self.checkpoint_freq,
@@ -596,6 +620,12 @@ def _make_self_play_env(
     closure that wraps this spawn-safe: nothing live is captured, the provider is built INSIDE the
     subprocess. Returns the wrapper.
 
+    Map rotation: a :class:`MapProvider` (seeded ``cfg.seed + seed_offset`` — the SAME per-subproc
+    scheme as the opponent provider, so each subproc rotates deterministically and differently) is
+    attached ONLY for ``role == ROLE_TRAIN`` AND only when ``cfg.maps is not None``; otherwise the
+    wrapper gets ``maps=None``. So the EVAL wrappers (``role == ROLE_EVAL``) NEVER rotate, and a run
+    with no ``cfg.maps`` is byte-identical to single-arena (no ``switch_arena`` ever sent).
+
     Observability: on the LIVE path (no injected ``connection_factory``) this sets up the
     per-process env logger for ``(role, port)`` HERE — which, for a ``SubprocVecEnv`` worker, runs
     INSIDE the spawned subprocess, so the worker opens its OWN ``env-<role>-<port>.log`` handle —
@@ -613,7 +643,16 @@ def _make_self_play_env(
     provider = OpponentProvider.from_roster(
         cfg.opponents, cfg.opponent_strategy, seed=cfg.seed + seed_offset
     )
-    return SelfPlayWrapper(base, provider)
+    # Map rotation is TRAINING-only: eval must NOT rotate (a mid-eval switch_arena desyncs the
+    # build), so only the role==ROLE_TRAIN wrapper gets a MapProvider, and only when cfg.maps is set
+    # (None = single-arena = today's behavior). Seeded with the SAME per-subproc offset as the
+    # opponent provider so each subproc rotates deterministically + differently.
+    maps = (
+        MapProvider(cfg.maps, cfg.map_strategy, seed=cfg.seed + seed_offset)
+        if (cfg.maps is not None and role == ROLE_TRAIN)
+        else None
+    )
+    return SelfPlayWrapper(base, provider, maps=maps)
 
 
 def training_ports(cfg: TrainConfig) -> list[int]:
@@ -845,18 +884,26 @@ def save_sidecar(
     elo: dict[str, float],
     cfg: TrainConfig,
     num_timesteps: int,
+    map_provider: MapProvider | None = None,
 ) -> None:
     """Write the resumable run state to ``path`` as STRICT JSON (PURE; no model touched).
 
-    Captures the opponent-provider position, the per-selector ELO dict, ``cfg.to_dict()``, and the
-    current ``num_timesteps``. The provider position is replayable ONLY for ``round_robin`` (the
-    ``_index``); for ``uniform`` there is no replayable position, so only ``strategy`` is recorded
-    (resume continues the seeded RNG fresh — documented as the non-replayable strategy).
+    Captures the opponent-provider position, the MAP-provider position, the per-selector ELO dict,
+    ``cfg.to_dict()``, and the current ``num_timesteps``. A provider position is replayable ONLY for
+    ``round_robin`` (the ``_index``); for ``uniform`` there is no replayable position, so only
+    ``strategy`` is recorded (resume continues the seeded RNG fresh — the non-replayable strategy).
 
     ``provider is None`` is the n_envs>1 case: the providers live PER-SUBPROC (unreachable in this
     process), so only the strategy + seed (from ``cfg``) are recorded — resume RESEEDS the per-
     subproc rotation (approximate phase, like ``uniform``). The config carries ``opponent_strategy``
     and ``seed`` either way, so the sidecar still fully describes the run.
+
+    The MAP provider rides the SAME contract in a SEPARATE ``map_provider`` block (the opponent
+    ``provider`` block is unchanged): at n_envs==1 the in-process training wrapper's
+    :class:`MapProvider` is passed and its ``_index`` round-trips (position-exact ``round_robin``);
+    at n_envs>1 (or no rotation) ``map_provider is None`` and the block records the strategy + seed
+    so resume reseeds. When ``cfg.maps is None`` (single-arena) the block records
+    ``{"maps": null}`` — there is no rotation to resume.
     """
     if provider is None:
         provider_state: dict = {"strategy": cfg.opponent_strategy, "seed": cfg.seed}
@@ -864,13 +911,34 @@ def save_sidecar(
         provider_state = {"strategy": provider.strategy}
         if provider.strategy == "round_robin":
             provider_state["index"] = int(provider._index)
+    map_state = _map_provider_state(map_provider, cfg)
     payload = {
         "num_timesteps": int(num_timesteps),
         "provider": provider_state,
+        "map_provider": map_state,
         "elo": {str(k): float(v) for k, v in elo.items()},
         "config": cfg.to_dict(),
     }
     Path(path).write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _map_provider_state(map_provider: MapProvider | None, cfg: TrainConfig) -> dict:
+    """The persisted ``map_provider`` block — the MAP sibling of the opponent ``provider`` block.
+
+    With ``cfg.maps is None`` (single-arena, no rotation) there is nothing to resume, so the block
+    records ``{"maps": None}``. Otherwise it mirrors the opponent provider exactly: a live
+    in-process :class:`MapProvider` (n_envs==1) records ``strategy`` + the ``round_robin`` index
+    for a position-exact resume; ``map_provider is None`` (n_envs>1 — per-subproc providers
+    unreachable) records ``strategy`` + ``seed`` so resume reseeds the rotation (approximate phase).
+    """
+    if cfg.maps is None:
+        return {"maps": None}
+    if map_provider is None:
+        return {"strategy": cfg.map_strategy, "seed": cfg.seed}
+    state = {"strategy": map_provider.strategy}
+    if map_provider.strategy == "round_robin":
+        state["index"] = int(map_provider._index)
+    return state
 
 
 def load_sidecar(path: str | Path) -> dict:
@@ -896,6 +964,21 @@ def _restore_provider_position(provider: OpponentProvider | None, sidecar: dict)
     provider_state = sidecar.get("provider", {})
     if provider.strategy == "round_robin" and "index" in provider_state:
         provider._index = int(provider_state["index"])
+
+
+def _restore_map_provider_position(map_provider: MapProvider | None, sidecar: dict) -> None:
+    """Restore the MAP-provider position from a loaded sidecar (round_robin only) — the map sibling.
+
+    Mirrors :func:`_restore_provider_position` exactly: for ``round_robin`` the ``_index`` from the
+    sidecar's ``map_provider`` block is restored so the rotation continues where it left off; for
+    ``uniform`` (or a single-arena ``{"maps": null}`` block) there is nothing replayable. A ``None``
+    provider (n_envs>1, or single-arena) is a no-op — resume RESEEDS the per-subproc rotation.
+    """
+    if map_provider is None:
+        return
+    map_state = sidecar.get("map_provider", {})
+    if map_provider.strategy == "round_robin" and "index" in map_state:
+        map_provider._index = int(map_state["index"])
 
 
 def _update_elo_from_eval(
@@ -938,16 +1021,22 @@ def _checkpoint_save_freq(cfg: TrainConfig) -> int:
 
 
 def _make_sidecar_callback(
-    cfg: TrainConfig, provider: OpponentProvider | None, elo: dict[str, float], *, save_freq: int
+    cfg: TrainConfig,
+    provider: OpponentProvider | None,
+    elo: dict[str, float],
+    *,
+    save_freq: int,
+    map_provider: MapProvider | None = None,
 ):
     """Build the SB3 callback that writes ``state.json`` in lockstep with each checkpoint.
 
     The callback is created lazily (SB3 imported here, not at module top) so the pure sidecar
     helpers above stay import-light. It rides the SAME transformed ``save_freq`` as the
     ``CheckpointCallback`` (see :func:`_checkpoint_save_freq`) so ``run_dir/state.json`` lands
-    alongside each ``model_<steps>.zip`` at ANY ``n_envs``, capturing the provider position + ELO +
-    cfg + ``num_timesteps``. ``provider`` is ``None`` for ``n_envs > 1`` (the per-subproc providers
-    are unreachable; the sidecar records strategy + seed from ``cfg`` instead).
+    alongside each ``model_<steps>.zip`` at ANY ``n_envs``, capturing the opponent + map provider
+    positions + ELO + cfg + ``num_timesteps``. Both providers are ``None`` for ``n_envs > 1`` (the
+    per-subproc providers are unreachable; the sidecar records strategy + seed from ``cfg``
+    instead), and ``map_provider`` is also ``None`` when ``cfg.maps is None`` (no rotation).
     """
     from stable_baselines3.common.callbacks import BaseCallback
 
@@ -959,6 +1048,7 @@ def _make_sidecar_callback(
             self.save_freq = save_freq
             self.sidecar_path = sidecar_path
             self._provider = provider
+            self._map_provider = map_provider
             self._elo = elo
 
         def _on_step(self) -> bool:
@@ -971,6 +1061,7 @@ def _make_sidecar_callback(
                     elo=self._elo,
                     cfg=cfg,
                     num_timesteps=self.num_timesteps,
+                    map_provider=self._map_provider,
                 )
             return True
 
@@ -1136,6 +1227,8 @@ def train_local(cfg: TrainConfig) -> Path:
                 "frame_stack": cfg.frame_stack,
                 "opponents": list(cfg.opponents),
                 "opponent_strategy": cfg.opponent_strategy,
+                "maps": None if cfg.maps is None else list(cfg.maps),
+                "map_strategy": cfg.map_strategy,
                 "seed": cfg.seed,
                 "log_dir": str(cfg.effective_log_dir),
                 "level": logging.getLevelName(cfg.log_level),
@@ -1179,9 +1272,17 @@ def train_local(cfg: TrainConfig) -> Path:
             cfg, port=cfg.effective_eval_port, ports=eval_ports(cfg), monitor=False, role=ROLE_EVAL
         )
         try:
-            # n_envs=1: reach the in-process provider for position-exact round_robin resume.
+            # n_envs=1: reach the in-process providers for position-exact round_robin resume.
             # n_envs>1: providers live per-subproc (unreachable here) -> None -> reseed-on-resume.
-            provider = _find_selfplay_wrapper(vec_env).opponents if cfg.n_envs == 1 else None
+            # The map provider is None at n_envs==1 too when cfg.maps is None (single-arena: the
+            # training wrapper carries maps=None).
+            if cfg.n_envs == 1:
+                train_wrapper = _find_selfplay_wrapper(vec_env)
+                provider = train_wrapper.opponents
+                map_provider = train_wrapper.maps
+            else:
+                provider = None
+                map_provider = None
 
             elo = _initial_elo(cfg.opponents)
             reset_num_timesteps = cfg.resume is None
@@ -1199,6 +1300,7 @@ def train_local(cfg: TrainConfig) -> Path:
                 if sidecar_path.exists():
                     sidecar = load_sidecar(sidecar_path)
                     _restore_provider_position(provider, sidecar)
+                    _restore_map_provider_position(map_provider, sidecar)
                     elo = {**elo, **{k: float(v) for k, v in sidecar.get("elo", {}).items()}}
             else:
                 # FRESH: build PPO with the CnnPolicy + EncoderExtractor (it owns the checkpoint
@@ -1245,7 +1347,9 @@ def train_local(cfg: TrainConfig) -> Path:
                         save_path=str(cfg.run_dir),
                         name_prefix="model",
                     ),
-                    _make_sidecar_callback(cfg, provider, elo, save_freq=ckpt_save_freq),
+                    _make_sidecar_callback(
+                        cfg, provider, elo, save_freq=ckpt_save_freq, map_provider=map_provider
+                    ),
                     _make_observability_callback(sys_logger, checkpoint_save_freq=ckpt_save_freq),
                 ]
             )
@@ -1315,6 +1419,7 @@ def train_local(cfg: TrainConfig) -> Path:
                 elo=elo,
                 cfg=cfg,
                 num_timesteps=model.num_timesteps,
+                map_provider=map_provider,
             )
         finally:
             # ALWAYS reap any live eval Unity instances. release() HARD-KILLS each live build via
@@ -1507,6 +1612,24 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="opponent rotation: round_robin (resumable) or uniform (seed-only resume).",
     )
     parser.add_argument(
+        "--maps",
+        nargs="*",
+        default=None,
+        metavar="MAP",
+        help=(
+            "per-episode arena rotation for TRAINING (via switch_arena; eval never rotates). "
+            "No value -> the curated 10-map rotation; a directory -> its *.json configs' arena "
+            "targets (sorted); a list of arena targets -> that order. Absent -> no rotation "
+            "(single arena from --config)."
+        ),
+    )
+    parser.add_argument(
+        "--map-strategy",
+        choices=("round_robin", "uniform"),
+        default="round_robin",
+        help="map rotation: round_robin (resumable) or uniform (seed-only resume).",
+    )
+    parser.add_argument(
         "--eval-freq", type=int, default=10_000, help="env-steps between win-rate evals (0=off)."
     )
     parser.add_argument(
@@ -1556,6 +1679,11 @@ def main(argv: list[str] | None = None) -> Path:
     args = _parse_args(argv)
     # --opponents omitted (None) -> let TrainConfig's DEFAULT_ROSTER default apply.
     opponents_kwarg = {} if args.opponents is None else {"opponents": args.opponents}
+    # --maps ABSENT (None) -> resolve_map_rotation -> None -> single-arena (today's behavior; no
+    # switch_arena ever sent). --maps with NO value -> the curated rotation; a dir / list resolves
+    # per the shared contract. The resolved arena-target list (or None) -> TrainConfig.maps.
+    resolved_maps = resolve_map_rotation(args.maps)
+    maps_tuple = None if resolved_maps is None else tuple(resolved_maps)
     # The single DEBUG switch: --debug flag OR the POP_LOG_LEVEL env var (resolved purely).
     debug_logging = (
         level_from_env(debug=args.debug, env_value=os.environ.get(LOG_LEVEL_ENV_VAR))
@@ -1577,6 +1705,8 @@ def main(argv: list[str] | None = None) -> Path:
         resume=args.resume,
         seed=args.seed,
         opponent_strategy=args.opponent_strategy,
+        maps=maps_tuple,
+        map_strategy=args.map_strategy,
         eval_freq=args.eval_freq,
         eval_episodes=args.eval_episodes,
         checkpoint_freq=args.checkpoint_freq,

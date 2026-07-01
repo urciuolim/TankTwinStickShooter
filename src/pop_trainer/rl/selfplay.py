@@ -37,9 +37,16 @@ import gymnasium
 import numpy as np
 
 from pop_trainer.agents import make_agent
+from pop_trainer.core.maps import resolve_map_rotation
 from pop_trainer.core.state import split_state_for_opponent
 
-__all__ = ["Opponent", "ScriptedOpponent", "OpponentProvider", "SelfPlayWrapper"]
+__all__ = [
+    "Opponent",
+    "ScriptedOpponent",
+    "OpponentProvider",
+    "MapProvider",
+    "SelfPlayWrapper",
+]
 
 # The default Phase-1 roster: the stationary floor, the map-agnostic baseline, and the three
 # map-aware coverage presets. These are the canonical ``agents`` selectors (see the registry).
@@ -174,6 +181,79 @@ class OpponentProvider:
         return self.opponents[int(self._rng.integers(len(self.opponents)))]
 
 
+class MapProvider:
+    """A rotation of ARENA TARGETS plus a per-episode sampling strategy — the map sibling of
+    :class:`OpponentProvider`.
+
+    Each entry is an arena-target string (``Arenas/<name>.json`` — what Unity loads via
+    ``switch_arena`` and echoes back as ``WallLayout.map_id``). :meth:`sample` is called at EACH
+    episode reset to pick the arena for that episode, with the SAME two strategies the opponent
+    rotation uses:
+
+    * ``"round_robin"`` cycles through the rotation in order (wrapping with a modulo index);
+    * ``"uniform"`` draws one uniformly at random from a SEEDED ``numpy.random.Generator`` so a
+      fixed ``seed`` reproduces the sequence of picks.
+
+    The provider takes an EXPLICIT, non-empty list of arena targets (not a flag value), so it stays
+    pure + picklable — spawn-safe for a ``SubprocVecEnv`` worker exactly like
+    :class:`OpponentProvider`. The flag-value resolution is :meth:`from_curated` (or the caller's
+    own :func:`pop_trainer.core.maps.resolve_map_rotation`).
+
+    Args:
+        maps: a non-empty sequence of arena-target strings (held as a list).
+        strategy: ``"round_robin"`` or ``"uniform"``; any other value raises ``ValueError``.
+        seed: seeds the uniform-sampling RNG (ignored by round-robin). ``None`` is a
+            nondeterministic draw.
+    """
+
+    def __init__(
+        self,
+        maps: Sequence[str],
+        strategy: str = "round_robin",
+        *,
+        seed: int | None = None,
+    ) -> None:
+        if strategy not in _STRATEGIES:
+            valid = ", ".join(_STRATEGIES)
+            raise ValueError(f"unknown strategy {strategy!r}; choose one of: {valid}")
+        self.maps = list(maps)
+        if not self.maps:
+            raise ValueError("MapProvider needs at least one map")
+        self.strategy = strategy
+        self._rng = np.random.default_rng(seed)
+        self._index = 0
+
+    @classmethod
+    def from_curated(
+        cls,
+        values: list[str] | None = None,
+        strategy: str = "round_robin",
+        *,
+        seed: int | None = None,
+    ) -> MapProvider:
+        """Build a provider by resolving a ``--maps`` flag value through the rotation contract.
+
+        Delegates to :func:`pop_trainer.core.maps.resolve_map_rotation` (the SINGLE source of how a
+        rotation request maps to arena targets). ``values is None`` (the flag ABSENT) resolves to
+        ``None`` — single-arena mode, with NO rotation — and is rejected here with the empty
+        guard, because a :class:`MapProvider` only exists when there IS a rotation to play; the
+        single-arena path passes ``maps=None`` to :class:`SelfPlayWrapper` instead of building one.
+        """
+        rotation = resolve_map_rotation(values)
+        if not rotation:
+            raise ValueError("MapProvider needs at least one map")
+        return cls(rotation, strategy, seed=seed)
+
+    def sample(self) -> str:
+        """Return the arena target for the NEXT episode per the configured strategy."""
+        if self.strategy == "round_robin":
+            target = self.maps[self._index % len(self.maps)]
+            self._index += 1
+            return target
+        # uniform: a seeded draw from the rotation.
+        return self.maps[int(self._rng.integers(len(self.maps)))]
+
+
 class SelfPlayWrapper(gymnasium.Wrapper):
     """Present a symmetric :class:`~pop_trainer.env.tank_env.TankEnv` as a 1-action gym env.
 
@@ -188,11 +268,22 @@ class SelfPlayWrapper(gymnasium.Wrapper):
     flipped view is cached at reset (the PRE-step view a simultaneous-move opponent sees) and
     RE-cached after every step from the new ``info["state"]``. A NEW opponent is sampled ONLY at
     reset, never mid-episode.
+
+    Map rotation (OPTIONAL): when a :class:`MapProvider` is supplied, the wrapper samples ONE arena
+    target per episode at reset (alongside the opponent sample, never mid-episode) and merges it
+    into the reset options as ``{"switch_arena": <target>}``, which :class:`TankEnv.reset` forwards
+    to Unity. A caller-supplied ``switch_arena`` in ``options`` WINS (the provider only fills it in
+    when absent). When ``maps is None`` (the default — the EVAL + backward-compat path) reset is
+    BYTE-IDENTICAL to the no-rotation handshake: no options are injected and no ``switch_arena`` is
+    ever sent.
     """
 
-    def __init__(self, env, opponents: OpponentProvider) -> None:
+    def __init__(
+        self, env, opponents: OpponentProvider, *, maps: MapProvider | None = None
+    ) -> None:
         super().__init__(env)
         self.opponents = opponents
+        self.maps = maps
         self._opp: Opponent | None = None
         self._p2_obs = None
 
@@ -203,7 +294,19 @@ class SelfPlayWrapper(gymnasium.Wrapper):
         the opponent (both no-ops unless the wrapped agent exposes the hook). The PRE-step player2
         view is cached from ``info["state"]`` through the perspective flip. Returns player1's
         ``(obs, info)`` unchanged.
+
+        When a :class:`MapProvider` is held, an arena target is sampled here (per-episode, at reset)
+        and merged into ``options`` as ``{"switch_arena": <target>}`` BEFORE the env reset — a
+        caller-supplied ``switch_arena`` is preserved (caller wins). With ``maps is None`` the
+        options pass through untouched, so no ``switch_arena`` is sent (the eval / single-arena
+        path).
         """
+        if self.maps is not None:
+            # Copy so we never mutate the caller's dict; fill switch_arena only if the caller did
+            # not already pin one (caller wins). maps is None -> options pass through untouched, so
+            # the no-rotation reset is byte-identical to before.
+            options = dict(options or {})
+            options.setdefault("switch_arena", self.maps.sample())
         obs_p1, info = self.env.reset(seed=seed, options=options)
         self._opp = self.opponents.sample()
         # Forward map then seed to the opponent (OPTIONAL hooks; no-op when absent / None map).

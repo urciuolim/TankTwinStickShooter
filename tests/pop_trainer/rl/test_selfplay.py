@@ -27,9 +27,11 @@ import gymnasium
 import numpy as np
 import pytest
 
+from pop_trainer.core.maps import CURATED_ROTATION
 from pop_trainer.core.state import STATE_LEN, split_state_for_opponent
 from pop_trainer.rl.selfplay import (
     DEFAULT_ROSTER,
+    MapProvider,
     Opponent,
     OpponentProvider,
     ScriptedOpponent,
@@ -396,3 +398,154 @@ def test_scripted_opponent_forwards_reset_and_set_map_only_when_present():
     pure = ScriptedOpponent(_Pure())
     pure.reset(7)  # no-op, no AttributeError
     pure.set_map("layoutY")  # no-op, no AttributeError
+
+
+# --- map rotation: MapProvider (the per-episode arena sibling of OpponentProvider) ------------
+
+_ARENAS = ("Arenas/a.json", "Arenas/b.json", "Arenas/c.json")
+
+
+def test_map_provider_round_robin_cycles_in_order_and_wraps():
+    provider = MapProvider(_ARENAS, strategy="round_robin")
+    picks = [provider.sample() for _ in range(7)]
+    assert picks == [
+        "Arenas/a.json",
+        "Arenas/b.json",
+        "Arenas/c.json",
+        "Arenas/a.json",
+        "Arenas/b.json",
+        "Arenas/c.json",
+        "Arenas/a.json",
+    ]
+
+
+def test_map_provider_uniform_is_reproducible_under_a_fixed_seed():
+    p1 = MapProvider(_ARENAS, strategy="uniform", seed=123)
+    p2 = MapProvider(_ARENAS, strategy="uniform", seed=123)
+    seq1 = [p1.sample() for _ in range(20)]
+    seq2 = [p2.sample() for _ in range(20)]
+    assert seq1 == seq2
+    # not vacuous: a uniform draw over 3 arenas across 20 picks touches more than one.
+    assert len(set(seq1)) > 1
+
+
+def test_map_provider_unknown_strategy_raises():
+    with pytest.raises(ValueError, match="unknown strategy"):
+        MapProvider(_ARENAS, strategy="bogus")
+
+
+def test_map_provider_empty_maps_raises():
+    with pytest.raises(ValueError, match="at least one map"):
+        MapProvider([], strategy="round_robin")
+
+
+def test_map_provider_per_subproc_seeding_determinism():
+    # Two providers with the SAME seed produce the SAME uniform sequence; with DIFFERENT seeds the
+    # sequences differ (the per-subproc cfg.seed + i scheme -> each subproc rotates differently).
+    same_a = MapProvider(_ARENAS, strategy="uniform", seed=7)
+    same_b = MapProvider(_ARENAS, strategy="uniform", seed=7)
+    diff = MapProvider(_ARENAS, strategy="uniform", seed=8)
+    seq_a = [same_a.sample() for _ in range(30)]
+    seq_b = [same_b.sample() for _ in range(30)]
+    seq_diff = [diff.sample() for _ in range(30)]
+    assert seq_a == seq_b  # same seed -> identical
+    assert seq_a != seq_diff  # different seed -> not identical over a reasonable draw
+
+
+def test_map_provider_from_curated_no_value_resolves_curated_rotation():
+    # The flag passed with no value ([]) resolves to the curated rotation.
+    provider = MapProvider.from_curated([])
+    assert provider.maps == list(CURATED_ROTATION)
+
+
+def test_map_provider_from_curated_absent_flag_raises():
+    # A None value (flag ABSENT) resolves to None (single-arena) -> no rotation to build.
+    with pytest.raises(ValueError, match="at least one map"):
+        MapProvider.from_curated(None)
+
+
+# --- map rotation: SelfPlayWrapper injects switch_arena (training) / never (eval) -------------
+
+
+def test_selfplay_wrapper_with_map_provider_injects_switch_arena():
+    env = StubEnv([_state(0.0), _state(100.0)])
+    opp = RecordingOpponent(map_aware=False)
+    maps = MapProvider(_ARENAS, strategy="round_robin")
+    wrapper = SelfPlayWrapper(env, OpponentProvider([opp]), maps=maps)
+    wrapper.reset()
+
+    # the env.reset saw options carrying the first round-robin arena target.
+    assert env.reset_calls[-1]["options"] == {"switch_arena": "Arenas/a.json"}
+
+
+def test_selfplay_wrapper_map_target_advances_per_episode_across_resets():
+    env = StubEnv([_state(0.0), _state(100.0)])
+    maps = MapProvider(_ARENAS, strategy="round_robin")
+    wrapper = SelfPlayWrapper(
+        env, OpponentProvider([RecordingOpponent(map_aware=False)]), maps=maps
+    )
+
+    targets = []
+    for _ in range(4):
+        wrapper.reset()
+        targets.append(env.reset_calls[-1]["options"]["switch_arena"])
+    # round-robin advances per EPISODE (per reset), wrapping after the 3-arena rotation.
+    assert targets == ["Arenas/a.json", "Arenas/b.json", "Arenas/c.json", "Arenas/a.json"]
+
+
+def test_selfplay_wrapper_map_sampled_once_per_episode_not_mid_step():
+    # The map is sampled at reset only (one switch_arena per episode); steps within the episode send
+    # NO further switch_arena. Mirrors the one-opponent-per-episode contract.
+    env = StubEnv([_state(float(i) * 100.0) for i in range(6)])
+    maps = MapProvider(_ARENAS, strategy="round_robin")
+    sample_count = {"n": 0}
+    real_sample = maps.sample
+
+    def counting_sample():
+        sample_count["n"] += 1
+        return real_sample()
+
+    maps.sample = counting_sample  # type: ignore[method-assign]
+    wrapper = SelfPlayWrapper(
+        env, OpponentProvider([RecordingOpponent(map_aware=False)]), maps=maps
+    )
+
+    wrapper.reset()
+    assert sample_count["n"] == 1
+    for _ in range(4):
+        wrapper.step([0.0] * 5)
+    # still ONE map sample across all the steps within the episode (step never resamples).
+    assert sample_count["n"] == 1
+    # a second reset samples the next arena.
+    wrapper.reset()
+    assert sample_count["n"] == 2
+
+
+def test_selfplay_wrapper_map_provider_preserves_caller_switch_arena():
+    # A caller-supplied switch_arena WINS over the provider's sampled target (caller-wins).
+    env = StubEnv([_state(0.0), _state(100.0)])
+    maps = MapProvider(_ARENAS, strategy="round_robin")
+    wrapper = SelfPlayWrapper(
+        env, OpponentProvider([RecordingOpponent(map_aware=False)]), maps=maps
+    )
+    wrapper.reset(options={"switch_arena": "Arenas/explicit.json"})
+    assert env.reset_calls[-1]["options"]["switch_arena"] == "Arenas/explicit.json"
+
+
+def test_selfplay_wrapper_without_map_provider_sends_no_switch_arena():
+    # BACKWARD-COMPAT / EVAL: maps=None (the default) injects NO switch_arena — reset options are
+    # byte-identical to before (None passes through untouched).
+    env = StubEnv([_state(0.0), _state(100.0)])
+    wrapper = SelfPlayWrapper(env, OpponentProvider([RecordingOpponent(map_aware=False)]))
+    assert wrapper.maps is None
+    wrapper.reset()
+    # plain reset() -> options is None (no dict injected, no switch_arena key).
+    assert env.reset_calls[-1]["options"] is None
+
+
+def test_selfplay_wrapper_no_map_provider_preserves_caller_options():
+    # maps=None must NOT swallow caller-supplied options (it passes them through verbatim).
+    env = StubEnv([_state(0.0), _state(100.0)])
+    wrapper = SelfPlayWrapper(env, OpponentProvider([RecordingOpponent(map_aware=False)]))
+    wrapper.reset(options={"switch_arena": "Arenas/caller.json"})
+    assert env.reset_calls[-1]["options"] == {"switch_arena": "Arenas/caller.json"}

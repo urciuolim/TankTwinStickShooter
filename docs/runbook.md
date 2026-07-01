@@ -371,6 +371,8 @@ bit-for-bit ([`TrainConfig`, `train.py:235-247`](../src/pop_trainer/rl/train.py)
 | `--seed` | `0` | master seed — threaded into SB3, the env, and the opponent provider |
 | `--opponents` | *(full roster)* | comma-separated roster selectors, validated against [`AGENT_SELECTORS`](../src/pop_trainer/agents/registry.py); unknown → exit 2 before launch |
 | `--opponent-strategy` | `round_robin` | `round_robin` (resumable) or `uniform` (seed-only resume) |
+| `--maps` | *(absent)* | per-episode arena rotation for **TRAINING** (via `switch_arena`; **eval never rotates** — see [Map rotation](#map-rotation)). **Absent** → single arena from `--config` (today's default). **No value** → the curated 10-map rotation (`core.maps.CURATED_ROTATION`). **A directory** → its sorted `*.json` configs' arena targets. **A list of arena targets** → that order, verbatim. Resolved via `resolve_map_rotation` (`train.py:1685`) |
+| `--map-strategy` | `round_robin` | map rotation: `round_robin` (resumable at `--n-envs 1`) or `uniform` (seed-only resume) |
 | `--eval-freq` | `10000` | env-steps between win-rate evals (`0` = off) |
 | `--eval-episodes` | `10` | greedy episodes per opponent per eval |
 | `--checkpoint-freq` | `10000` | env-steps between checkpoints (the sidecar rides this cadence) |
@@ -499,6 +501,35 @@ position-exact `round_robin`; at `--n-envs 1` resume stays position-exact. See
 > the next `unity-<role>-<port>-<attempt>.log`, so the stalled instance's C# log survives. A
 > `worker_death` / `step_lost_connection` record mid-run is the recovery path, not a crash. See
 > [env → instance lifecycle](components/env.md#instance-lifecycle-lazy-launch--release--kill-old-first-reconnect).
+
+### Map rotation
+
+By default training runs on the **single arena** in `--config` (`train_config.json`'s
+`arena_path`) — no rotation. `--maps` opts into per-episode arena rotation: each TRAINING episode
+samples one arena (`--map-strategy round_robin` cycles in order, `uniform` is a seeded draw) and the
+`SelfPlayWrapper` sends it to Unity via `switch_arena` at reset. The flag resolves like collection's
+(`core.maps.resolve_map_rotation`): **no value** → the curated 10-arena set
+(`core.maps.CURATED_ROTATION`); **a directory** → its sorted `*.json` arena targets; **a list** →
+verbatim.
+
+```bash
+# rotate every TRAINING episode over the curated 10-arena set (uniform draw)
+uv run python -m pop_trainer.rl.train --total-timesteps 200000 --run-dir runs/train-rot \
+  --maps --map-strategy uniform
+# rotate over an explicit ordered list (round_robin, the default strategy)
+uv run python -m pop_trainer.rl.train --total-timesteps 200000 --run-dir runs/train-rot2 \
+  --maps Arenas/empty.json Arenas/chokepoint.json Arenas/scattered.json
+```
+
+> **EVAL IS ALWAYS FIXED to the config's arena — `--maps` does NOT rotate eval.** The map provider
+> attaches to the **training role only**; the eval vec is built `role=ROLE_EVAL` (`maps=None`), and
+> `evaluate_winrate` sends plain `reset()` / `step()` — never `switch_arena`. So win-rate is scored
+> on a stable arena across the whole run, comparable eval-to-eval, while training rotates. Internals:
+> [rl → map rotation invariant](components/rl.md#the-train_local-integrator).
+>
+> **Resume:** the rotation is persisted in a separate `map_provider` sidecar block. `round_robin`
+> resume is **position-exact only at `--n-envs 1`**; at `--n-envs > 1` (per-subproc providers) or
+> `uniform`, resume **RESEEDS** the rotation — exactly like the opponent rotation.
 
 ### The training topology
 

@@ -25,10 +25,17 @@ import pytest
 from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack, VecMonitor
 
 from pop_trainer.agents import AGENT_SELECTORS
+from pop_trainer.core.logging_setup import ROLE_EVAL, ROLE_TRAIN
+from pop_trainer.core.maps import CURATED_ROTATION
 from pop_trainer.core.protocol import Connection
 from pop_trainer.env.tank_env import TankEnv
 from pop_trainer.rl.extractor import EncoderExtractor
-from pop_trainer.rl.selfplay import DEFAULT_ROSTER, OpponentProvider, SelfPlayWrapper
+from pop_trainer.rl.selfplay import (
+    DEFAULT_ROSTER,
+    MapProvider,
+    OpponentProvider,
+    SelfPlayWrapper,
+)
 from pop_trainer.rl.train import (
     BASE_ELO,
     DEFAULT_NET_ARCH,
@@ -48,6 +55,7 @@ from pop_trainer.rl.train import (
     _parse_args,
     _parse_net_arch,
     _resolve_learning_rate,
+    _restore_map_provider_position,
     _restore_provider_position,
     _terminate,
     _training_env_factories,
@@ -949,10 +957,17 @@ def test_resume_restores_provider_and_elo_with_mocked_ppo_load(tmp_path, monkeyp
     real_save = train_mod.save_sidecar
     final_elo: dict = {}
 
-    def _capture_save(path, *, provider, elo, cfg, num_timesteps):
+    def _capture_save(path, *, provider, elo, cfg, num_timesteps, map_provider=None):
         final_elo.clear()
         final_elo.update(elo)
-        real_save(path, provider=provider, elo=elo, cfg=cfg, num_timesteps=num_timesteps)
+        real_save(
+            path,
+            provider=provider,
+            elo=elo,
+            cfg=cfg,
+            num_timesteps=num_timesteps,
+            map_provider=map_provider,
+        )
 
     monkeypatch.setattr(train_mod, "save_sidecar", _capture_save)
 
@@ -1290,3 +1305,254 @@ def test_to_dict_roundtrips_new_fields_at_defaults(tmp_path):
     import json
 
     json.dumps(d)
+
+
+# --- 7. map rotation: config, CLI, wiring, eval-never-rotates, sidecar ------------------------
+
+_ARENAS = ("Arenas/a.json", "Arenas/b.json", "Arenas/c.json")
+
+
+def test_trainconfig_maps_default_is_none(tmp_path):
+    # BACKWARD-COMPAT: the default config carries no rotation (single-arena = today's behavior).
+    cfg = _cfg(tmp_path)
+    assert cfg.maps is None
+    assert cfg.map_strategy == "round_robin"
+    d = cfg.to_dict()
+    assert d["maps"] is None
+    assert d["map_strategy"] == "round_robin"
+    import json
+
+    json.dumps(d)
+
+
+def test_trainconfig_maps_to_dict_roundtrips_tuple(tmp_path):
+    cfg = _cfg(tmp_path, maps=_ARENAS, map_strategy="uniform")
+    d = cfg.to_dict()
+    assert d["maps"] == list(_ARENAS)
+    assert d["map_strategy"] == "uniform"
+    import json
+
+    json.dumps(d)
+
+
+def test_trainconfig_rejects_unknown_map_strategy(tmp_path):
+    with pytest.raises(ValueError, match="unknown map_strategy"):
+        _cfg(tmp_path, map_strategy="bogus")
+
+
+def test_make_self_play_env_attaches_map_provider_only_for_training_role(tmp_path):
+    # TRAINING role with cfg.maps set -> the wrapper carries a seeded MapProvider; EVAL role -> None
+    # (eval must NOT rotate). This is the single rule guaranteeing eval sends no switch_arena.
+    cfg = _cfg(tmp_path, maps=_ARENAS)
+    train_wrapper = _make_self_play_env(
+        cfg, cfg.game_port, connection_factory=_stub_factory, role=ROLE_TRAIN
+    )
+    eval_wrapper = _make_self_play_env(
+        cfg, cfg.effective_eval_port, connection_factory=_stub_factory, role=ROLE_EVAL
+    )
+    assert isinstance(train_wrapper.maps, MapProvider)
+    assert train_wrapper.maps.maps == list(_ARENAS)
+    assert eval_wrapper.maps is None  # eval NEVER rotates
+
+
+def test_make_self_play_env_no_map_provider_when_maps_none(tmp_path):
+    # cfg.maps None (default) -> even the TRAINING wrapper carries maps=None (single-arena).
+    cfg = _cfg(tmp_path)
+    wrapper = _make_self_play_env(
+        cfg, cfg.game_port, connection_factory=_stub_factory, role=ROLE_TRAIN
+    )
+    assert wrapper.maps is None
+
+
+def test_build_vec_env_training_carries_map_provider_eval_does_not(tmp_path):
+    # The TRAINING vec (role=train) wrapper holds a MapProvider; the EVAL vec (role=eval) wrapper
+    # holds None. This is the seam guaranteeing eval does not rotate at the vec level.
+    cfg = _cfg(tmp_path, maps=_ARENAS, game_port=55000)
+    train_vec = build_vec_env(
+        cfg, port=cfg.game_port, role=ROLE_TRAIN, connection_factory=_stub_factory
+    )
+    eval_vec = build_vec_env(
+        cfg, port=cfg.effective_eval_port, role=ROLE_EVAL, connection_factory=_stub_factory
+    )
+    try:
+        train_wrapper = _find_selfplay_wrapper(train_vec)
+        eval_wrapper = _find_selfplay_wrapper(eval_vec)
+        assert isinstance(train_wrapper.maps, MapProvider)
+        assert eval_wrapper.maps is None
+    finally:
+        train_vec.close()
+        eval_vec.close()
+
+
+def test_build_vec_env_multi_env_training_carries_per_subproc_map_providers(tmp_path):
+    # At n_envs>1 each TRAINING subproc gets its OWN seeded MapProvider (the per-subproc seam,
+    # mirroring the opponent provider). Asserted on the DummyVecEnv-of-stubs path (no subprocs).
+    cfg = _cfg(tmp_path, maps=_ARENAS, game_port=56000, n_envs=3)
+    vec = build_vec_env(cfg, port=cfg.game_port, connection_factory_for_port=_stub_factory_for_port)
+    try:
+        inner = vec.venv
+        for w in inner.envs:
+            assert isinstance(w.maps, MapProvider)
+            assert w.maps.maps == list(_ARENAS)
+    finally:
+        vec.close()
+
+
+def test_build_vec_env_no_map_provider_when_maps_absent(tmp_path):
+    # No cfg.maps -> the TRAINING wrapper carries maps=None (byte-identical to today: no rotation).
+    cfg = _cfg(tmp_path, game_port=57000)
+    vec = build_vec_env(cfg, port=cfg.game_port, role=ROLE_TRAIN, connection_factory=_stub_factory)
+    try:
+        assert _find_selfplay_wrapper(vec).maps is None
+    finally:
+        vec.close()
+
+
+def test_parse_args_maps_absent_is_none():
+    # --maps ABSENT -> args.maps None (resolve_map_rotation -> None -> single-arena).
+    args = _parse_args(["--total-timesteps", "1000", "--run-dir", "out"])
+    assert args.maps is None
+    assert args.map_strategy == "round_robin"
+
+
+def test_parse_args_maps_no_value_is_empty_list():
+    # --maps with NO value -> [] (nargs="*"), which resolve_map_rotation maps to the curated set.
+    args = _parse_args(["--total-timesteps", "1000", "--run-dir", "out", "--maps"])
+    assert args.maps == []
+
+
+def test_parse_args_maps_explicit_list_in_order():
+    args = _parse_args(
+        [
+            "--total-timesteps",
+            "1000",
+            "--run-dir",
+            "out",
+            "--maps",
+            "Arenas/x.json",
+            "Arenas/y.json",
+        ]
+    )
+    assert args.maps == ["Arenas/x.json", "Arenas/y.json"]
+
+
+def test_parse_args_bad_map_strategy_exits():
+    with pytest.raises(SystemExit) as exc:
+        _parse_args(["--total-timesteps", "1000", "--run-dir", "out", "--map-strategy", "bogus"])
+    assert exc.value.code == 2
+
+
+def test_main_maps_absent_leaves_cfg_maps_none(tmp_path, monkeypatch):
+    # BACKWARD-COMPAT: no --maps -> cfg.maps None (single-arena; no switch_arena ever sent).
+    captured = _capture_cfg(monkeypatch)
+    main(["--total-timesteps", "1000", "--run-dir", str(tmp_path)])
+    cfg = captured["cfg"]
+    assert cfg.maps is None
+    assert cfg.map_strategy == "round_robin"
+
+
+def test_main_maps_no_value_resolves_curated_rotation(tmp_path, monkeypatch):
+    # --maps with no value -> the curated 10-map rotation, as a tuple on cfg.maps.
+    captured = _capture_cfg(monkeypatch)
+    main(["--total-timesteps", "1000", "--run-dir", str(tmp_path), "--maps"])
+    cfg = captured["cfg"]
+    assert cfg.maps == CURATED_ROTATION
+
+
+def test_main_maps_explicit_list_threads_in_order(tmp_path, monkeypatch):
+    captured = _capture_cfg(monkeypatch)
+    main(
+        [
+            "--total-timesteps",
+            "1000",
+            "--run-dir",
+            str(tmp_path),
+            "--maps",
+            "Arenas/x.json",
+            "Arenas/y.json",
+            "--map-strategy",
+            "uniform",
+        ]
+    )
+    cfg = captured["cfg"]
+    assert cfg.maps == ("Arenas/x.json", "Arenas/y.json")
+    assert cfg.map_strategy == "uniform"
+
+
+def test_sidecar_map_provider_round_robin_roundtrips(tmp_path):
+    # n_envs==1 position-exact resume: the live MapProvider's _index round-trips through the
+    # separate map_provider block (the opponent provider block is untouched).
+    cfg = _cfg(tmp_path, maps=_ARENAS)
+    provider = OpponentProvider.from_roster(cfg.opponents, "round_robin", seed=cfg.seed)
+    map_provider = MapProvider(cfg.maps, "round_robin", seed=cfg.seed)
+    map_provider.sample()
+    map_provider.sample()
+    assert map_provider._index == 2
+
+    path = tmp_path / "state.json"
+    save_sidecar(
+        path,
+        provider=provider,
+        elo=_initial_elo(cfg.opponents),
+        cfg=cfg,
+        num_timesteps=4096,
+        map_provider=map_provider,
+    )
+    loaded = load_sidecar(path)
+    assert loaded["map_provider"]["strategy"] == "round_robin"
+    assert loaded["map_provider"]["index"] == 2
+    # the opponent provider block is independent (not overloaded).
+    assert "index" in loaded["provider"]
+
+
+def test_sidecar_map_provider_none_at_multi_env_records_strategy_and_seed(tmp_path):
+    # n_envs>1: the per-subproc map providers are unreachable -> map_provider=None records the
+    # strategy + seed from cfg so resume reseeds (approximate phase, like uniform).
+    cfg = _cfg(tmp_path, maps=_ARENAS, map_strategy="uniform", seed=21)
+    path = tmp_path / "state.json"
+    save_sidecar(
+        path,
+        provider=None,
+        elo=_initial_elo(cfg.opponents),
+        cfg=cfg,
+        num_timesteps=512,
+        map_provider=None,
+    )
+    loaded = load_sidecar(path)
+    assert loaded["map_provider"]["strategy"] == "uniform"
+    assert loaded["map_provider"]["seed"] == 21
+    assert "index" not in loaded["map_provider"]
+
+
+def test_sidecar_map_provider_block_is_null_when_no_rotation(tmp_path):
+    # cfg.maps None (single-arena) -> the map_provider block is {"maps": null} (nothing to resume).
+    cfg = _cfg(tmp_path)
+    path = tmp_path / "state.json"
+    save_sidecar(
+        path,
+        provider=None,
+        elo=_initial_elo(cfg.opponents),
+        cfg=cfg,
+        num_timesteps=8,
+        map_provider=None,
+    )
+    loaded = load_sidecar(path)
+    assert loaded["map_provider"] == {"maps": None}
+
+
+def test_restore_map_provider_position_round_robin(tmp_path):
+    cfg = _cfg(tmp_path, maps=_ARENAS)
+    map_provider = MapProvider(cfg.maps, "round_robin", seed=cfg.seed)
+    assert map_provider._index == 0
+    sidecar = {"map_provider": {"strategy": "round_robin", "index": 5}}
+    _restore_map_provider_position(map_provider, sidecar)
+    assert map_provider._index == 5
+
+
+def test_restore_map_provider_position_uniform_and_none_noop(tmp_path):
+    cfg = _cfg(tmp_path, maps=_ARENAS, map_strategy="uniform")
+    map_provider = MapProvider(cfg.maps, "uniform", seed=cfg.seed)
+    _restore_map_provider_position(map_provider, {"map_provider": {"strategy": "uniform"}})
+    assert map_provider._index == 0
+    # a None provider (n_envs>1 / single-arena) restore is a no-op (no crash).
+    _restore_map_provider_position(None, {"map_provider": {"strategy": "round_robin", "index": 9}})
