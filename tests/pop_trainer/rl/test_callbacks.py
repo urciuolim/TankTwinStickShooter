@@ -19,6 +19,10 @@ Coverage:
    reset to all-True.
 3. THE INVARIANT: no eval instance coexists with a training instance (shared ledger).
 4. per-opponent ``eval/win_rate/<sel>`` keys (and overall ``eval/win_rate``) are logged + dumped.
+5. rotation eval (``maps=...``): one ``eval/win_rate/map/<short>`` scalar per MAP (never per
+   cell); phase resets carry the pinned ``switch_arena``; without ``maps`` NO map scalar exists
+   and no ``switch_arena`` is ever sent (byte-identical fallback).
+6. matchup-EMA isolation: an eval-style untagged terminal info leaves the aggregator untouched.
 """
 
 from __future__ import annotations
@@ -160,7 +164,7 @@ class FakeModel:
         return np.zeros((batch, 5), dtype=np.float32), None
 
 
-def _make(eval_freq, eval_episodes, opponents, m=1):
+def _make(eval_freq, eval_episodes, opponents, m=1, maps=None):
     """Build a wired callback + model + logger + shared ledger/trace over an M-wide eval vec."""
     ledger: set = set()
     trace: list = []
@@ -172,6 +176,7 @@ def _make(eval_freq, eval_episodes, opponents, m=1):
         eval_freq=eval_freq,
         eval_episodes=eval_episodes,
         opponents=opponents,
+        maps=maps,
         eval_env=eval_vec,
         training_vec=training_vec,
     )
@@ -294,16 +299,78 @@ def test_logs_per_opponent_and_overall_win_rate_keys():
 
 
 def test_eval_resets_pass_no_switch_arena_option():
-    # rotation suppression: NEVER send switch_arena on any eval reset.
+    # the no-rotation fallback: NEVER send switch_arena on any eval reset when maps is None.
     cb, model, logger, training_vec, eval_vec, _ledger, trace = _make(100, 2, ("noop",))
     model.num_timesteps = cb.num_timesteps = 100
 
     cb._on_rollout_end()
 
-    # every raw eval-env reset during eval passed options=None (no switch_arena -> no desync).
+    # every raw eval-env reset during eval passed options=None (plain handshake, byte-identical).
     raw_envs = [w.env for w in eval_vec.envs]
     assert any(e.reset_options for e in raw_envs)  # eval did reset the eval envs
     assert all(opt is None for e in raw_envs for opt in e.reset_options)
+    # and the eval wrappers' maps attr was never pinned.
+    assert all(w.maps is None for w in eval_vec.envs)
+
+
+def test_no_rotation_records_no_map_scalars():
+    cb, model, logger, training_vec, eval_vec, _ledger, trace = _make(100, 2, ("noop", "random"))
+    model.num_timesteps = cb.num_timesteps = 100
+
+    cb._on_rollout_end()
+
+    assert not any(key.startswith("eval/win_rate/map/") for key in logger.records)
+
+
+# --- 5. rotation eval: per-map scalars + pinned switch_arena ------------------------------
+
+_EVAL_MAPS = ("Arenas/a.json", "Arenas/b.json")
+
+
+def test_rotation_eval_logs_one_scalar_per_map_with_short_names():
+    cb, model, logger, training_vec, eval_vec, _ledger, trace = _make(
+        100, 2, ("noop", "random"), maps=_EVAL_MAPS
+    )
+    model.num_timesteps = cb.num_timesteps = 100
+
+    cb._on_rollout_end()
+
+    # exactly one scalar per MAP (short tag names), never one per (opponent x map) cell.
+    map_keys = sorted(k for k in logger.records if k.startswith("eval/win_rate/map/"))
+    assert map_keys == ["eval/win_rate/map/a", "eval/win_rate/map/b"]
+    # always-win eval stubs -> every marginal is 1.0 and they all reconcile.
+    assert logger.records["eval/win_rate/map/a"] == 1.0
+    assert logger.records["eval/win_rate/map/b"] == 1.0
+    assert logger.records["eval/win_rate/noop"] == 1.0
+    assert logger.records["eval/win_rate/random"] == 1.0
+    assert logger.records["eval/win_rate"] == 1.0
+    assert logger.dumps == [100]
+
+
+def test_rotation_eval_resets_carry_the_pinned_switch_arena():
+    cb, model, logger, training_vec, eval_vec, _ledger, trace = _make(
+        100, 2, ("noop",), maps=_EVAL_MAPS
+    )
+    model.num_timesteps = cb.num_timesteps = 100
+
+    cb._on_rollout_end()
+
+    # every eval reset carried a pinned rotation arena, and both arenas were visited.
+    raw_envs = [w.env for w in eval_vec.envs]
+    opts = [opt for e in raw_envs for opt in e.reset_options]
+    assert opts and all(opt is not None and opt.get("switch_arena") in _EVAL_MAPS for opt in opts)
+    assert {opt["switch_arena"] for opt in opts} == set(_EVAL_MAPS)
+
+
+def test_rotation_eval_preserves_the_no_coexist_invariant():
+    # The teardown -> eval -> respawn cycle is unchanged by the map phases (the ledger would
+    # raise if a pinned-arena reset ever overlapped a live training instance).
+    cb, model, logger, training_vec, eval_vec, ledger, trace = _make(
+        100, 4, ("noop", "random"), m=2, maps=_EVAL_MAPS
+    )
+    model.num_timesteps = cb.num_timesteps = 100
+    cb._on_rollout_end()
+    assert ledger == {"train"}
 
 
 # --- MatchupSamplingCallback: accumulate -> fold at rollout end -> broadcast ---------------
@@ -387,6 +454,22 @@ def test_matchup_on_step_without_locals_is_a_noop():
     cb.locals = {}
     assert cb._on_step() is True
     assert cb._pending == []
+
+
+def test_eval_style_untagged_terminal_info_leaves_the_ema_untouched():
+    # Eval episodes cannot feed the EMA: eval wrappers carry NO MatchupProvider (even during
+    # rotation eval, where only a single-map MapProvider is pinned), so their terminal infos
+    # have no "matchup" tag — and an untagged done is ignored by the aggregator.
+    cb = _matchup_cb()
+    cb.locals = {
+        "dones": np.array([True]),
+        "infos": [{"outcome": WIN, "state": _state(1.0)}],  # a typical eval terminal info
+    }
+    assert cb._on_step() is True
+    assert cb._pending == []
+    cb._on_rollout_end()
+    assert cb.win_rates == [0.5, 0.5]
+    assert cb.counts == [0, 0]
 
 
 def test_matchup_rollout_end_folds_ema_counts_and_records_scalars():

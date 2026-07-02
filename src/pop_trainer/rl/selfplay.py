@@ -365,9 +365,11 @@ class SelfPlayWrapper(gymnasium.Wrapper):
     target per episode at reset (alongside the opponent sample, never mid-episode) and merges it
     into the reset options as ``{"switch_arena": <target>}``, which :class:`TankEnv.reset` forwards
     to Unity. A caller-supplied ``switch_arena`` in ``options`` WINS (the provider only fills it in
-    when absent). When ``maps is None`` (the default — the EVAL + backward-compat path) reset is
-    BYTE-IDENTICAL to the no-rotation handshake: no options are injected and no ``switch_arena`` is
-    ever sent.
+    when absent). When ``maps is None`` (the default — the single-arena / backward-compat path)
+    reset is BYTE-IDENTICAL to the no-rotation handshake: no options are injected and no
+    ``switch_arena`` is ever sent. Eval wrappers are CONSTRUCTED with ``maps=None``; during a
+    rotation eval, ``rl.evaluate`` pins a single-map provider on this attribute per (opponent, map)
+    phase via ``set_attr``, so the same reset-time injection covers the eval maps deliberately.
 
     Matchup sampling (OPTIONAL): when a :class:`MatchupProvider` is supplied it is the SINGLE
     source of the episode's (opponent, arena) pair — one joint draw at reset overrides both
@@ -427,8 +429,7 @@ class SelfPlayWrapper(gymnasium.Wrapper):
         When a :class:`MapProvider` is held, an arena target is sampled here (per-episode, at reset)
         and merged into ``options`` as ``{"switch_arena": <target>}`` BEFORE the env reset — a
         caller-supplied ``switch_arena`` is preserved (caller wins). With ``maps is None`` the
-        options pass through untouched, so no ``switch_arena`` is sent (the eval / single-arena
-        path).
+        options pass through untouched, so no ``switch_arena`` is sent (the single-arena path).
 
         When a :class:`MatchupProvider` is held it OVERRIDES both samplers: one joint draw yields
         the episode's opponent AND arena. A ``None`` boot-arena cell injects nothing (options pass

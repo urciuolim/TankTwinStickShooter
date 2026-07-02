@@ -791,6 +791,21 @@ def test_wrapper_without_matchups_never_tags_terminal_info():
     assert env.reset_calls[-1]["options"] is None
 
 
+def test_wrapper_with_pinned_single_map_provider_emits_no_matchup_tag():
+    # The rotation-EVAL pin: ``rl.evaluate`` sets a single-map MapProvider on an eval wrapper per
+    # phase (``matchups`` stays None). The pin injects switch_arena at every reset but must NOT
+    # produce an ``info["matchup"]`` tag — eval episodes can never feed the matchup-sampling EMA
+    # (the tag is emitted only from a MatchupProvider's joint draw).
+    env = TerminalStubEnv([_state(0.0), _state(100.0)], outcome="win")
+    wrapper = SelfPlayWrapper(env, OpponentProvider([RecordingOpponent(map_aware=False)]))
+    wrapper.maps = MapProvider(["Arenas/b.json"], strategy="round_robin")  # the eval-phase pin
+    wrapper.reset()
+    assert env.reset_calls[-1]["options"] == {"switch_arena": "Arenas/b.json"}
+    _obs, _r, terminated, _tr, info = wrapper.step([0.0] * 5)
+    assert terminated is True
+    assert "matchup" not in info
+
+
 def test_matchup_distribution_property_reads_and_broadcast_assigns_in_place():
     env = StubEnv([_state(0.0), _state(100.0)])
     wrapper, _pairs, matchups = _wired_matchup_wrapper(env)

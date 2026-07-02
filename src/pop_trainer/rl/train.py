@@ -11,7 +11,8 @@ Nothing here re-implements those seams — it WIRES them:
 * :class:`~pop_trainer.rl.callbacks.EvalWinRateCallback` logs periodic per-opponent win-rate
   against a DEDICATED eval env (a second build/socket) — the training env is never touched;
 * :func:`~pop_trainer.rl.evaluate.evaluate_winrate` +
-  :func:`~pop_trainer.rl.evaluate.format_per_map_table` produce a final per-opponent summary line;
+  :func:`~pop_trainer.rl.evaluate.format_per_opponent_line` (and, with map rotation,
+  :func:`~pop_trainer.rl.evaluate.format_per_map_line`) produce the final summary lines;
 * :mod:`~pop_trainer.rl.elo` holds the ELO math the sidecar persists.
 
 The env LAUNCH seam (the crux): :class:`~pop_trainer.env.tank_env.TankEnv` does NOT launch Unity —
@@ -189,8 +190,11 @@ class TrainConfig:
             = single-arena = TODAY's behavior (no ``switch_arena`` ever sent; the build stays
             on the ``game_config`` arena). A non-empty tuple rotates the TRAINING envs over those
             arenas per-episode at reset (the same per-subproc-provider seam as the opponent
-            rotation); EVAL never rotates. Resolve a ``--maps`` flag value through
-            :func:`pop_trainer.core.maps.resolve_map_rotation` before constructing the config.
+            rotation), and EVAL covers the same arenas: ``evaluate_winrate`` spreads each
+            opponent's ``eval_episodes`` budget across the rotation and pins one arena per
+            (opponent, map) phase (per-map win-rate marginals land in TensorBoard). Resolve a
+            ``--maps`` flag value through :func:`pop_trainer.core.maps.resolve_map_rotation`
+            before constructing the config.
         map_strategy: ``"round_robin"`` (resumable) or ``"uniform"`` (seed-only resume) — the map
             sibling of ``opponent_strategy``.
         matchup_sampling: ``"off"`` (the default — the independent opponent/map samplers pick
@@ -653,8 +657,11 @@ def _make_self_play_env(
     Map rotation: a :class:`MapProvider` (seeded ``cfg.seed + seed_offset`` — the SAME per-subproc
     scheme as the opponent provider, so each subproc rotates deterministically and differently) is
     attached ONLY for ``role == ROLE_TRAIN`` AND only when ``cfg.maps is not None``; otherwise the
-    wrapper gets ``maps=None``. So the EVAL wrappers (``role == ROLE_EVAL``) NEVER rotate, and a run
-    with no ``cfg.maps`` is byte-identical to single-arena (no ``switch_arena`` ever sent).
+    wrapper gets ``maps=None``. The EVAL wrappers (``role == ROLE_EVAL``) are ALWAYS constructed
+    with ``maps=None``: the eval map schedule is owned entirely by ``evaluate_winrate``, which pins
+    a single-map provider per (opponent, map) phase via ``set_attr`` — never by a free-running
+    construction-time provider. A run with no ``cfg.maps`` is byte-identical to single-arena (no
+    ``switch_arena`` ever sent, in training or eval).
 
     Matchup sampling: a :class:`MatchupProvider` over ``cfg.opponents x (cfg.maps or the boot
     arena)`` (seeded with the SAME per-subproc scheme) is attached ONLY when
@@ -679,10 +686,12 @@ def _make_self_play_env(
     provider = OpponentProvider.from_roster(
         cfg.opponents, cfg.opponent_strategy, seed=cfg.seed + seed_offset
     )
-    # Map rotation is TRAINING-only: eval must NOT rotate (a mid-eval switch_arena desyncs the
-    # build), so only the role==ROLE_TRAIN wrapper gets a MapProvider, and only when cfg.maps is set
-    # (None = single-arena = today's behavior). Seeded with the SAME per-subproc offset as the
-    # opponent provider so each subproc rotates deterministically + differently.
+    # The free-running rotation provider is TRAINING-only: only the role==ROLE_TRAIN wrapper gets
+    # a MapProvider here, and only when cfg.maps is set (None = single-arena = today's behavior).
+    # Eval wrappers start with maps=None; evaluate_winrate pins a single-map provider per
+    # (opponent, map) phase via set_attr, so the eval arena schedule stays deliberate and
+    # phase-scoped. Seeded with the SAME per-subproc offset as the opponent provider so each
+    # subproc rotates deterministically + differently.
     maps = (
         MapProvider(cfg.maps, cfg.map_strategy, seed=cfg.seed + seed_offset)
         if (cfg.maps is not None and role == ROLE_TRAIN)
@@ -1289,7 +1298,13 @@ def train_local(cfg: TrainConfig) -> Path:
     from stable_baselines3.common.utils import set_random_seed
 
     from pop_trainer.rl.callbacks import EvalWinRateCallback, MatchupSamplingCallback
-    from pop_trainer.rl.evaluate import evaluate_winrate, format_per_map_table
+    from pop_trainer.rl.evaluate import (
+        evaluate_winrate,
+        format_per_map_line,
+        format_per_opponent_line,
+        pool_by_map,
+        pool_by_opponent,
+    )
 
     set_random_seed(cfg.seed)
     cfg.run_dir.mkdir(parents=True, exist_ok=True)
@@ -1456,6 +1471,9 @@ def train_local(cfg: TrainConfig) -> Path:
                         cfg.eval_freq,
                         cfg.eval_episodes,
                         opponents=cfg.opponents,
+                        # Eval covers the TRAINING rotation (per-map marginals in TensorBoard);
+                        # None = single-arena eval, byte-identical to the no-rotation behavior.
+                        maps=cfg.maps,
                         seed=cfg.seed,
                         # The eval vec (M == n_envs) and the TRAINING vec handle SB3 reads
                         # _last_obs from (model.env, post-VecTransposeImage). The callback
@@ -1513,31 +1531,51 @@ def train_local(cfg: TrainConfig) -> Path:
                 raise
             sys_logger.info("learn_end", extra={"detail": {"num_timesteps": model.num_timesteps}})
 
-            # Final per-opponent win-rate summary line (wires format_per_map_table -> the Director's
-            # smoke gets one final per-opponent line). OBEY THE INVARIANT: tear the TRAINING
-            # instances down FIRST (free their RAM/ports) so the M eval instances never coexist with
-            # them; then run the PARALLEL eval over the eval vec. This is end-of-run, so no respawn
-            # is needed afterward — everything is closed in the finally blocks below.
+            # Final win-rate summary (the Director's smoke gets one per-opponent line, plus a
+            # per-map line when the rotation is active). OBEY THE INVARIANT: tear the TRAINING
+            # instances down FIRST (free their RAM/ports) so the M eval instances never coexist
+            # with them; then run the PARALLEL eval over the eval vec. This is end-of-run, so no
+            # respawn is needed afterward — everything is closed in the finally blocks below.
             sys_logger.info(
                 "final_eval_begin",
                 extra={"detail": {"episodes": cfg.eval_episodes, "opponents": list(cfg.opponents)}},
             )
             vec_env.env_method("release")
-            per_opponent = evaluate_winrate(
+            eval_result = evaluate_winrate(
                 model,
                 eval_vec_env,
                 opponents=cfg.opponents,
                 n_episodes=cfg.eval_episodes,
                 seed=cfg.seed,
+                maps=cfg.maps,
             )
+            if cfg.maps is None:
+                per_opponent = eval_result
+                per_map = None
+            else:
+                # Rotation eval returns per-cell counts; pool BOTH marginals from the same counts
+                # so the printed breakdowns reconcile with each other and with TensorBoard.
+                per_opponent = pool_by_opponent(eval_result)
+                per_map = pool_by_map(eval_result)
             elo = _update_elo_from_eval(elo, per_opponent)
             sys_logger.info(
                 "final_eval_end",
                 extra={
-                    "detail": {"win_rates": {str(k): float(v) for k, v in per_opponent.items()}}
+                    "detail": {
+                        "win_rates": {str(k): float(v) for k, v in per_opponent.items()},
+                        **(
+                            {}
+                            if per_map is None
+                            else {
+                                "win_rates_per_map": {str(k): float(v) for k, v in per_map.items()}
+                            }
+                        ),
+                    }
                 },
             )
-            print(format_per_map_table(per_opponent, episodes=cfg.eval_episodes))  # noqa: T201
+            print(format_per_opponent_line(per_opponent, episodes=cfg.eval_episodes))  # noqa: T201
+            if per_map is not None:
+                print(format_per_map_line(per_map))  # noqa: T201
 
             # Persist the final sidecar (post-learn position + the eval-updated ELO). The matchup
             # kwarg is passed ONLY when the feature is on, so the flag-off call is unchanged.
@@ -1747,7 +1785,8 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         default=None,
         metavar="MAP",
         help=(
-            "per-episode arena rotation for TRAINING (via switch_arena; eval never rotates). "
+            "per-episode arena rotation for TRAINING (via switch_arena); eval covers the same "
+            "rotation (episodes spread across the maps; per-map win-rates in TensorBoard). "
             "No value -> the curated 10-map rotation; a directory -> its *.json configs' arena "
             "targets (sorted); a list of arena targets -> that order. Absent -> no rotation "
             "(single arena from --config)."
@@ -1784,7 +1823,10 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--eval-freq", type=int, default=10_000, help="env-steps between win-rate evals (0=off)."
     )
     parser.add_argument(
-        "--eval-episodes", type=int, default=10, help="greedy episodes per opponent per eval."
+        "--eval-episodes",
+        type=int,
+        default=10,
+        help="greedy episodes per opponent per eval (spread across the maps when --maps is set).",
     )
     parser.add_argument(
         "--checkpoint-freq", type=int, default=10_000, help="env-steps between checkpoints."

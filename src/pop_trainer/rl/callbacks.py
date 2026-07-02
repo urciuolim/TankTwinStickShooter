@@ -5,6 +5,12 @@ Ships :class:`EvalWinRateCallback`: a ``BaseCallback`` that periodically evaluat
 policy's GREEDY (``deterministic=True``) win-rate against each opponent in a roster (via the
 self-play seam) and logs ``eval/win_rate/<selector>`` plus an overall ``eval/win_rate`` into the
 model's existing SB3 logger, so they land in both ``progress.csv`` and TensorBoard ``tfevents``.
+When the training map rotation is active (``maps`` given), each eval additionally covers EVERY
+rotation arena — the per-opponent episode budget is spread deterministically across the maps
+(:func:`~pop_trainer.rl.evaluate.episode_spread`; the eval cost is unchanged) — and the callback
+also logs a per-map marginal ``eval/win_rate/map/<short-map-name>`` per arena. The per-opponent
+scalars and the overall become marginals over maps, all POOLED from the same per-cell counts so
+they reconcile; no per-(opponent x map) cell scalar is ever emitted.
 
 Also ships :class:`MatchupSamplingCallback` (the ``--matchup-sampling winrate`` main-process
 half): it accumulates the ``info["matchup"]`` cell/outcome tags the training
@@ -24,7 +30,8 @@ so they must be time-multiplexed. At each eval boundary the callback runs this s
    hook and frees its port — the worker PROCESSES stay alive, only the Unity children die.
 2. EVAL: lazy-launch the M eval instances (``eval_vec.reset`` / the parallel eval's first step) and
    run ``eval_episodes`` per opponent DISTRIBUTED across them in parallel
-   (:func:`pop_trainer.rl.evaluate.evaluate_winrate`), aggregating per opponent.
+   (:func:`pop_trainer.rl.evaluate.evaluate_winrate`), aggregating per opponent (and per map when
+   the rotation is active).
 3. TEAR DOWN the eval instances: ``eval_vec.env_method("release")``.
 4. RESPAWN training: ``training_vec.reset()`` (lazily re-launches each training instance via its
    factory) and OVERWRITE the model's rollout sentinels with the fresh obs
@@ -35,9 +42,9 @@ So at any instant the run holds EITHER the training set OR the eval set, never b
 handed BOTH vec env handles (and reaches the model via ``self.model``) at construction.
 
 Eval runs at a ROLLOUT BOUNDARY (``_on_rollout_end``), gated by ``eval_freq`` timesteps, NEVER
-mid-rollout. ``_on_step`` only returns ``True``. :func:`evaluate_winrate` re-wraps each raw eval
-``TankEnv`` in its own per-opponent ``SelfPlayWrapper`` and plays greedy episodes via
-``model.predict``.
+mid-rollout. ``_on_step`` only returns ``True``. :func:`evaluate_winrate` pins each eval env's
+``SelfPlayWrapper`` per phase — the opponent always, plus a single-map provider when the map
+rotation is active — and plays greedy episodes via ``model.predict``.
 
 Imports sb3 (a trainer-side module, not in the pure-logic import path); the eval logic is reused
 from :func:`pop_trainer.rl.evaluate.evaluate_winrate` (NOT sb3 ``evaluate_policy``).
@@ -49,7 +56,14 @@ from typing import TYPE_CHECKING
 
 from stable_baselines3.common.callbacks import BaseCallback
 
-from pop_trainer.rl.evaluate import evaluate_winrate, overall_win_rate
+from pop_trainer.rl.evaluate import (
+    evaluate_winrate,
+    map_short_name,
+    overall_win_rate,
+    pool_by_map,
+    pool_by_opponent,
+    pooled_win_rate,
+)
 from pop_trainer.rl.matchup import (
     INITIAL_WIN_RATE,
     deficit_distribution,
@@ -79,18 +93,24 @@ class EvalWinRateCallback(BaseCallback):
     (:func:`pop_trainer.rl.evaluate.evaluate_winrate`), tears the eval instances down, then respawns
     training and re-syncs the model's rollout sentinels to the post-respawn obs. It logs
     ``eval/win_rate/<selector>`` for each opponent plus an overall ``eval/win_rate``, then dumps the
-    row.
+    row. With ``maps`` given, the eval spreads each opponent's budget across those arenas (per-cell
+    pinned phases) and additionally logs ``eval/win_rate/map/<short-map-name>`` per arena; all
+    scalars are pooled from the same per-cell counts, so the marginals reconcile.
 
     Args:
         eval_freq: minimum env-steps between evaluations (gated against the last eval's timestep at
             each rollout boundary). ``<= 0`` disables eval.
         eval_episodes: number of greedy episodes per opponent per evaluation (distributed across the
-            M eval envs).
+            M eval envs, and — with ``maps`` — spread deterministically across the eval maps).
         opponents: the roster of ``agents`` selector strings to evaluate against (default
             :data:`~pop_trainer.rl.selfplay.DEFAULT_ROSTER`).
+        maps: the eval map rotation (arena-target strings) — normally the TRAINING rotation, so
+            eval covers the same arenas training plays. ``None`` (default) = single-arena eval:
+            no ``switch_arena`` is ever sent, no per-map scalar is emitted, and the eval envs'
+            ``maps`` attribute is never touched (byte-identical to the no-rotation behavior).
         seed: optional seed passed to ``evaluate_winrate`` (opponent reproducibility across evals).
         eval_env: the eval vec env (``M`` envs; ``DummyVecEnv`` at M=1, ``SubprocVecEnv`` at M>1).
-            ``evaluate_winrate`` peels it to the raw ``TankEnv``s and re-wraps each per-opponent.
+            ``evaluate_winrate`` re-pins each wrapper's providers per phase via ``set_attr``.
             Its instances are spawned for eval and torn down (``env_method("release")``) afterward.
         training_vec: the TRAINING vec env handle — the SAME vec env SB3 reads ``_last_obs`` from
             (the integrator passes ``model.env``, i.e. SB3's ``VecTransposeImage``-wrapped training
@@ -106,6 +126,7 @@ class EvalWinRateCallback(BaseCallback):
         eval_freq: int,
         eval_episodes: int = 10,
         opponents=DEFAULT_ROSTER,
+        maps: Sequence[str] | None = None,
         seed: int | None = None,
         eval_env: VecEnv | None = None,
         training_vec: VecEnv | None = None,
@@ -115,6 +136,7 @@ class EvalWinRateCallback(BaseCallback):
         self.eval_freq = eval_freq
         self.eval_episodes = eval_episodes
         self.opponents = tuple(opponents)
+        self.maps = None if maps is None else tuple(maps)
         self.seed = seed
         self.eval_env = eval_env
         self.training_vec = training_vec
@@ -133,38 +155,59 @@ class EvalWinRateCallback(BaseCallback):
             return
         self._last_eval_timestep = self.num_timesteps
 
-        per_opponent = self._run_eval_cycle()
+        result = self._run_eval_cycle()
+        if self.maps is None:
+            # Single-arena eval: result is the per-selector win-rate dict, logged exactly as
+            # before (no per-map scalar exists to emit).
+            per_opponent = result
+            overall = overall_win_rate(per_opponent)
+        else:
+            # Rotation eval: result is per-(opponent x map) cell counts. Pool the marginals from
+            # the SAME counts (never a mean of means) so per-opponent, per-map, and overall
+            # reconcile; emit one scalar per MAP, never one per cell.
+            per_opponent = pool_by_opponent(result)
+            overall = pooled_win_rate(result)
+            for target, rate in pool_by_map(result).items():
+                self.logger.record(f"eval/win_rate/map/{map_short_name(target)}", rate)
 
         # Log per-opponent and overall into the model's existing logger (-> progress.csv AND
         # tfevents). Then dump so the row lands at this timestep.
         for selector, rate in per_opponent.items():
             self.logger.record(f"eval/win_rate/{selector}", rate)
-        self.logger.record("eval/win_rate", overall_win_rate(per_opponent))
+        self.logger.record("eval/win_rate", overall)
         self.logger.dump(self.num_timesteps)
 
-    def _run_eval_cycle(self) -> dict[str, float]:
+    def _run_eval_cycle(self):
         """Teardown training -> parallel eval -> teardown eval -> respawn training (the INVARIANT).
 
-        Returns the per-opponent win-rate. The order is load-bearing: the eval instances are spawned
-        ONLY after every training instance is reaped, and the training instances are respawned ONLY
-        after every eval instance is reaped, so the two sets never coexist.
+        Returns ``evaluate_winrate``'s result: the per-opponent win-rate dict (``maps is None``)
+        or the per-(opponent x map) cell counts. The order is load-bearing: the eval instances are
+        spawned ONLY after every training instance is reaped, and the training instances are
+        respawned ONLY after every eval instance is reaped, so the two sets never coexist.
 
-        NOTE (eval-rotation suppression): a mid-eval reset that sent ``switch_arena`` would desync
-        a build (it handles ``switch_arena`` only while ``!ingame``). ``TankEnv`` rotates ONLY when
-        the CALLER passes ``reset(options={"switch_arena": ...})``; ``evaluate_winrate`` calls plain
-        ``reset()``s, so no ``switch_arena`` is ever sent during eval and that desync cannot occur.
+        NOTE (eval arena switching): the build handles ``switch_arena`` only while ``!ingame``, so
+        the ONLY safe channel is the reset handshake — ``TankEnv`` sends ``switch_arena`` solely
+        when the caller passes ``reset(options={"switch_arena": ...})``. Rotation eval uses exactly
+        that channel, DELIBERATELY: ``evaluate_winrate`` pins ONE arena per (opponent, map) phase
+        (a single-map provider set on each eval wrapper), so every reset in the phase injects the
+        same known target at reset time, while ``!ingame``. That is safe where the historical
+        uncontrolled rotation was not: eval envs once carrying a free-running rotation switched to
+        an arbitrary arena at every auto-reset, unaccounted by the eval math, desyncing the run at
+        the rollout boundary. With ``maps is None`` no ``switch_arena`` is ever sent (plain
+        ``reset()``s, byte-identical to before).
         """
         # 1. Tear down ALL training Unity instances (frees their ports; workers stay alive).
         self.training_vec.env_method("release")
 
         try:
             # 2. Parallel eval across the M eval instances (lazy-launched on first reset/step).
-            per_opponent = evaluate_winrate(
+            result = evaluate_winrate(
                 self.model,
                 self.eval_env,
                 opponents=self.opponents,
                 n_episodes=self.eval_episodes,
                 seed=self.seed,
+                maps=self.maps,
             )
         finally:
             # 3. Tear down the eval instances regardless of eval outcome (invariant before respawn).
@@ -178,7 +221,7 @@ class EvalWinRateCallback(BaseCallback):
         if getattr(self.model, "_last_episode_starts", None) is not None:
             self.model._last_episode_starts[:] = True
 
-        return per_opponent
+        return result
 
 
 class MatchupSamplingCallback(BaseCallback):
