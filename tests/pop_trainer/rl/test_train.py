@@ -33,6 +33,7 @@ from pop_trainer.rl.extractor import EncoderExtractor
 from pop_trainer.rl.selfplay import (
     DEFAULT_ROSTER,
     MapProvider,
+    MatchupProvider,
     OpponentProvider,
     SelfPlayWrapper,
 )
@@ -52,10 +53,12 @@ from pop_trainer.rl.train import (
     _live_connection_factory_for_port,
     _make_self_play_env,
     _make_sidecar_callback,
+    _matchup_state_block,
     _parse_args,
     _parse_net_arch,
     _resolve_learning_rate,
     _restore_map_provider_position,
+    _restore_matchup_state,
     _restore_provider_position,
     _terminate,
     _training_env_factories,
@@ -1556,3 +1559,268 @@ def test_restore_map_provider_position_uniform_and_none_noop(tmp_path):
     assert map_provider._index == 0
     # a None provider (n_envs>1 / single-arena) restore is a no-op (no crash).
     _restore_map_provider_position(None, {"map_provider": {"strategy": "round_robin", "index": 9}})
+
+
+# --- 8. matchup sampling: config, wiring, sidecar, CLI -----------------------------------------
+
+
+def test_trainconfig_matchup_defaults_off(tmp_path):
+    # BACKWARD-COMPAT: the default config keeps matchup sampling OFF with the CTO-set knobs.
+    cfg = _cfg(tmp_path)
+    assert cfg.matchup_sampling == "off"
+    assert cfg.matchup_floor == 0.25
+    assert cfg.matchup_ema_alpha == 0.05
+    d = cfg.to_dict()
+    assert d["matchup_sampling"] == "off"
+    assert d["matchup_floor"] == 0.25
+    assert d["matchup_ema_alpha"] == 0.05
+    import json
+
+    json.dumps(d)
+
+
+@pytest.mark.parametrize(
+    ("field", "bad"),
+    [
+        ("matchup_sampling", "bogus"),
+        ("matchup_floor", -0.1),
+        ("matchup_floor", 1.1),
+        ("matchup_ema_alpha", 0.0),
+        ("matchup_ema_alpha", 1.5),
+        ("matchup_ema_alpha", -0.5),
+    ],
+)
+def test_trainconfig_matchup_validation_rejects(tmp_path, field, bad):
+    with pytest.raises(ValueError):
+        _cfg(tmp_path, **{field: bad})
+
+
+def test_trainconfig_with_matchup_fields_pickles(tmp_path):
+    # Spawn safety: the frozen cfg (captured by the SubprocVecEnv factory closures) must pickle
+    # with the new fields present.
+    import pickle
+
+    cfg = _cfg(tmp_path, matchup_sampling="winrate", matchup_floor=0.1, matchup_ema_alpha=0.2)
+    clone = pickle.loads(pickle.dumps(cfg))
+    assert clone == cfg
+    assert clone.matchup_sampling == "winrate"
+
+
+def test_make_self_play_env_attaches_matchup_provider_only_for_training_role(tmp_path):
+    # winrate + TRAIN role -> a seeded MatchupProvider over opponents x maps; EVAL role -> None
+    # (eval keeps plain resets + round_robin pinning); flag off -> None (byte-identical wiring).
+    cfg = _cfg(tmp_path, maps=_ARENAS, matchup_sampling="winrate", opponents=("noop", "random"))
+    train_wrapper = _make_self_play_env(
+        cfg, cfg.game_port, connection_factory=_stub_factory, role=ROLE_TRAIN
+    )
+    eval_wrapper = _make_self_play_env(
+        cfg, cfg.effective_eval_port, connection_factory=_stub_factory, role=ROLE_EVAL
+    )
+    assert isinstance(train_wrapper.matchups, MatchupProvider)
+    assert train_wrapper.matchups.cells == [
+        (sel, arena) for sel in ("noop", "random") for arena in _ARENAS
+    ]
+    assert eval_wrapper.matchups is None  # eval NEVER gets the joint sampler
+
+
+def test_make_self_play_env_no_matchup_provider_when_flag_off(tmp_path):
+    cfg = _cfg(tmp_path, maps=_ARENAS)  # matchup_sampling defaults to "off"
+    wrapper = _make_self_play_env(
+        cfg, cfg.game_port, connection_factory=_stub_factory, role=ROLE_TRAIN
+    )
+    assert wrapper.matchups is None
+
+
+def test_make_self_play_env_matchup_cells_boot_arena_when_maps_absent(tmp_path):
+    # No map rotation -> cells span opponents x {boot arena} (None) — opponent-only priority,
+    # no switch_arena ever injected.
+    cfg = _cfg(tmp_path, matchup_sampling="winrate", opponents=("noop", "random"))
+    wrapper = _make_self_play_env(
+        cfg, cfg.game_port, connection_factory=_stub_factory, role=ROLE_TRAIN
+    )
+    assert wrapper.matchups.cells == [("noop", None), ("random", None)]
+
+
+def test_build_vec_env_multi_env_carries_per_subproc_matchup_providers(tmp_path):
+    # Each per-env factory builds its OWN seeded provider inside the (would-be) subprocess.
+    cfg = _cfg(tmp_path, maps=_ARENAS, matchup_sampling="winrate", game_port=58000, n_envs=3)
+    vec = build_vec_env(cfg, port=cfg.game_port, connection_factory_for_port=_stub_factory_for_port)
+    try:
+        providers = [w.matchups for w in vec.venv.envs]
+        assert all(isinstance(p, MatchupProvider) for p in providers)
+        assert len({id(p) for p in providers}) == 3  # one provider per env, not shared
+    finally:
+        vec.close()
+
+
+def test_sidecar_matchup_block_off_by_default(tmp_path):
+    # Flag off -> the block records the off state (mirroring {"maps": null}).
+    cfg = _cfg(tmp_path)
+    path = tmp_path / "state.json"
+    save_sidecar(path, provider=None, elo=_initial_elo(cfg.opponents), cfg=cfg, num_timesteps=8)
+    loaded = load_sidecar(path)
+    assert loaded["matchup"] == {"sampling": "off"}
+
+
+def test_sidecar_matchup_state_roundtrips(tmp_path):
+    cfg = _cfg(tmp_path, matchup_sampling="winrate", opponents=("noop", "random"))
+    state = {
+        "sampling": "winrate",
+        "floor": 0.25,
+        "ema_alpha": 0.05,
+        "cells": [["noop", None], ["random", None]],
+        "win_rates": [0.75, 0.5],
+        "counts": [3, 1],
+    }
+    path = tmp_path / "state.json"
+    save_sidecar(
+        path,
+        provider=None,
+        elo=_initial_elo(cfg.opponents),
+        cfg=cfg,
+        num_timesteps=512,
+        matchup_state=state,
+    )
+    loaded = load_sidecar(path)
+    assert loaded["matchup"] == state
+
+
+def test_matchup_state_block_config_fallback_when_state_missing(tmp_path):
+    # Flag on but no callback state at the save site -> the config-only view (still describes
+    # the run; nothing position-exact to persist).
+    cfg = _cfg(tmp_path, matchup_sampling="winrate", matchup_floor=0.3, matchup_ema_alpha=0.1)
+    block = _matchup_state_block(None, cfg)
+    assert block == {"sampling": "winrate", "floor": 0.3, "ema_alpha": 0.1}
+
+
+def test_restore_matchup_state_continues_the_ema(tmp_path):
+    from pop_trainer.rl.callbacks import MatchupSamplingCallback
+
+    cb = MatchupSamplingCallback(("noop", "random"), None, floor=0.25, ema_alpha=0.05)
+    sidecar = {
+        "matchup": {
+            "sampling": "winrate",
+            "cells": [["noop", None], ["random", None]],
+            "win_rates": [0.9, 0.1],
+            "counts": [4, 6],
+        }
+    }
+    _restore_matchup_state(cb, sidecar)
+    assert cb.win_rates == [0.9, 0.1]
+    assert cb.counts == [4, 6]
+
+
+def test_restore_matchup_state_noop_cases(tmp_path):
+    from pop_trainer.rl.callbacks import MatchupSamplingCallback
+
+    # None callback (feature off) -> no crash.
+    _restore_matchup_state(None, {"matchup": {"sampling": "winrate"}})
+    # an "off" block / a missing block leaves the fresh prior untouched.
+    cb = MatchupSamplingCallback(("noop",), None)
+    _restore_matchup_state(cb, {"matchup": {"sampling": "off"}})
+    _restore_matchup_state(cb, {})
+    assert cb.win_rates == [0.5]
+    assert cb.counts == [0]
+
+
+def test_sidecar_callback_includes_live_matchup_state(tmp_path):
+    # The per-checkpoint sidecar rides the callback's LIVE curriculum state.
+    from pop_trainer.rl.callbacks import MatchupSamplingCallback
+
+    cfg = _cfg(tmp_path, matchup_sampling="winrate", opponents=("noop", "random"))
+    cfg.run_dir.mkdir(parents=True)
+    matchup_cb = MatchupSamplingCallback(("noop", "random"), None, floor=0.25, ema_alpha=0.5)
+    matchup_cb.win_rates = [0.75, 0.5]
+    matchup_cb.counts = [1, 0]
+    sidecar_cb = _make_sidecar_callback(
+        cfg, None, _initial_elo(cfg.opponents), save_freq=1, matchup_cb=matchup_cb
+    )
+    sidecar_cb.n_calls = 1
+    sidecar_cb.num_timesteps = 1
+    sidecar_cb._on_step()
+    loaded = load_sidecar(cfg.run_dir / "state.json")
+    assert loaded["matchup"]["sampling"] == "winrate"
+    assert loaded["matchup"]["win_rates"] == [0.75, 0.5]
+    assert loaded["matchup"]["counts"] == [1, 0]
+
+
+def test_parse_args_matchup_defaults_off():
+    args = _parse_args(["--total-timesteps", "1000", "--run-dir", "out"])
+    assert args.matchup_sampling == "off"
+    assert args.matchup_floor == 0.25
+    assert args.matchup_ema_alpha == 0.05
+
+
+def test_parse_args_matchup_winrate_with_knobs():
+    args = _parse_args(
+        [
+            "--total-timesteps",
+            "1000",
+            "--run-dir",
+            "out",
+            "--matchup-sampling",
+            "winrate",
+            "--matchup-floor",
+            "0.1",
+            "--matchup-ema-alpha",
+            "0.2",
+        ]
+    )
+    assert args.matchup_sampling == "winrate"
+    assert args.matchup_floor == 0.1
+    assert args.matchup_ema_alpha == 0.2
+
+
+def test_parse_args_bad_matchup_choice_exits():
+    with pytest.raises(SystemExit) as exc:
+        _parse_args(
+            ["--total-timesteps", "1000", "--run-dir", "out", "--matchup-sampling", "bogus"]
+        )
+    assert exc.value.code == 2
+
+
+def test_main_threads_matchup_flags_into_config(tmp_path, monkeypatch):
+    captured = _capture_cfg(monkeypatch)
+    main(
+        [
+            "--total-timesteps",
+            "1000",
+            "--run-dir",
+            str(tmp_path),
+            "--matchup-sampling",
+            "winrate",
+            "--matchup-floor",
+            "0.5",
+            "--matchup-ema-alpha",
+            "0.1",
+        ]
+    )
+    cfg = captured["cfg"]
+    assert cfg.matchup_sampling == "winrate"
+    assert cfg.matchup_floor == 0.5
+    assert cfg.matchup_ema_alpha == 0.1
+
+
+def test_main_matchup_omitted_stays_off(tmp_path, monkeypatch):
+    captured = _capture_cfg(monkeypatch)
+    main(["--total-timesteps", "1000", "--run-dir", str(tmp_path)])
+    cfg = captured["cfg"]
+    assert cfg.matchup_sampling == "off"
+    assert cfg.matchup_floor == 0.25
+    assert cfg.matchup_ema_alpha == 0.05
+
+
+@pytest.mark.parametrize(
+    ("flag", "value", "message"),
+    [
+        ("--matchup-floor", "1.5", "matchup_floor"),
+        ("--matchup-floor", "-0.1", "matchup_floor"),
+        ("--matchup-ema-alpha", "0", "matchup_ema_alpha"),
+        ("--matchup-ema-alpha", "2", "matchup_ema_alpha"),
+    ],
+)
+def test_main_matchup_out_of_range_knobs_rejected(tmp_path, monkeypatch, flag, value, message):
+    # Range validation lives in TrainConfig.__post_init__; the CLI surfaces it before training.
+    _capture_cfg(monkeypatch)
+    with pytest.raises(ValueError, match=message):
+        main(["--total-timesteps", "1000", "--run-dir", str(tmp_path), flag, value])

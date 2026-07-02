@@ -74,6 +74,7 @@ from pop_trainer.rl.selfplay import (
     _STRATEGIES,
     DEFAULT_ROSTER,
     MapProvider,
+    MatchupProvider,
     OpponentProvider,
     SelfPlayWrapper,
 )
@@ -129,6 +130,10 @@ LR_SCHEDULES = ("constant", "linear")
 # Valid encoder-trunk overrides threaded to EncoderExtractor: "auto" keeps the size-based selection
 # (today's behavior); the rest are explicit registry trunks. Kept in sync with models.TRUNKS.
 TRUNK_CHOICES = ("auto", "cnn", "resnet", "gn-cnn")
+
+# Valid matchup-sampling modes: "off" (the default — the independent opponent/map samplers,
+# byte-identical to today) or "winrate" (the joint deficit-weighted (opponent x map) sampler).
+MATCHUP_SAMPLING_CHOICES = ("off", "winrate")
 
 # The explicit policy/value MLP-head default. SB3 silently uses [64, 64] when net_arch is unset;
 # making it explicit keeps today's behavior while letting the CLI override it.
@@ -188,6 +193,14 @@ class TrainConfig:
             :func:`pop_trainer.core.maps.resolve_map_rotation` before constructing the config.
         map_strategy: ``"round_robin"`` (resumable) or ``"uniform"`` (seed-only resume) — the map
             sibling of ``opponent_strategy``.
+        matchup_sampling: ``"off"`` (the default — the independent opponent/map samplers pick
+            each episode's matchup, byte-identical to today) or ``"winrate"`` (a JOINT sampler
+            over cells = opponents x (maps or the boot arena) picks it, weighted by the per-cell
+            win-rate deficit the :class:`~pop_trainer.rl.callbacks.MatchupSamplingCallback`
+            aggregates from TRAINING episodes). Training-only; eval never uses it.
+        matchup_floor: the exploration floor ``eps`` of the winrate sampler, in ``[0, 1]``
+            (every cell keeps probability >= ``eps / n_cells``).
+        matchup_ema_alpha: the per-cell win-rate EMA weight of the newest episode, in ``(0, 1]``.
         eval_freq: env-steps between periodic win-rate evals (``>= 0``; ``0`` disables).
         eval_episodes: greedy episodes per opponent per eval.
         checkpoint_freq: env-steps between checkpoints (``> 0``; the sidecar rides this cadence).
@@ -244,6 +257,11 @@ class TrainConfig:
     # behavior (no switch_arena ever sent). map_strategy mirrors opponent_strategy.
     maps: tuple[str, ...] | None = None
     map_strategy: str = "round_robin"
+    # Win-rate matchup sampling: "off" keeps the independent samplers (today's behavior exactly);
+    # "winrate" activates the joint (opponent x map) deficit sampler + its aggregation callback.
+    matchup_sampling: str = "off"
+    matchup_floor: float = 0.25
+    matchup_ema_alpha: float = 0.05
     eval_freq: int = 10_000
     eval_episodes: int = 10
     checkpoint_freq: int = 10_000
@@ -293,6 +311,15 @@ class TrainConfig:
         if self.map_strategy not in _STRATEGIES:
             valid = ", ".join(_STRATEGIES)
             raise ValueError(f"unknown map_strategy {self.map_strategy!r}; choose one of: {valid}")
+        if self.matchup_sampling not in MATCHUP_SAMPLING_CHOICES:
+            valid = ", ".join(MATCHUP_SAMPLING_CHOICES)
+            raise ValueError(
+                f"unknown matchup_sampling {self.matchup_sampling!r}; choose one of: {valid}"
+            )
+        if not 0.0 <= self.matchup_floor <= 1.0:
+            raise ValueError(f"matchup_floor must be in [0, 1], got {self.matchup_floor}")
+        if not 0.0 < self.matchup_ema_alpha <= 1.0:
+            raise ValueError(f"matchup_ema_alpha must be in (0, 1], got {self.matchup_ema_alpha}")
         if self.eval_freq < 0:
             raise ValueError(f"eval_freq must be >= 0, got {self.eval_freq}")
         if self.checkpoint_freq <= 0:
@@ -365,6 +392,9 @@ class TrainConfig:
             "opponent_strategy": self.opponent_strategy,
             "maps": None if self.maps is None else list(self.maps),
             "map_strategy": self.map_strategy,
+            "matchup_sampling": self.matchup_sampling,
+            "matchup_floor": self.matchup_floor,
+            "matchup_ema_alpha": self.matchup_ema_alpha,
             "eval_freq": self.eval_freq,
             "eval_episodes": self.eval_episodes,
             "checkpoint_freq": self.checkpoint_freq,
@@ -626,6 +656,12 @@ def _make_self_play_env(
     wrapper gets ``maps=None``. So the EVAL wrappers (``role == ROLE_EVAL``) NEVER rotate, and a run
     with no ``cfg.maps`` is byte-identical to single-arena (no ``switch_arena`` ever sent).
 
+    Matchup sampling: a :class:`MatchupProvider` over ``cfg.opponents x (cfg.maps or the boot
+    arena)`` (seeded with the SAME per-subproc scheme) is attached ONLY when
+    ``cfg.matchup_sampling == "winrate"`` AND ``role == ROLE_TRAIN`` — the EVAL wrappers NEVER
+    get one, and the default ``"off"`` leaves the wrapper byte-identical to today. Built INSIDE
+    the factory from ``cfg`` fields only, so the closure that wraps this stays spawn-safe.
+
     Observability: on the LIVE path (no injected ``connection_factory``) this sets up the
     per-process env logger for ``(role, port)`` HERE — which, for a ``SubprocVecEnv`` worker, runs
     INSIDE the spawned subprocess, so the worker opens its OWN ``env-<role>-<port>.log`` handle —
@@ -652,7 +688,14 @@ def _make_self_play_env(
         if (cfg.maps is not None and role == ROLE_TRAIN)
         else None
     )
-    return SelfPlayWrapper(base, provider, maps=maps)
+    # The joint winrate sampler is TRAINING-only too: eval keeps its plain resets + round_robin
+    # opponent pinning untouched. When attached it overrides the sibling providers per episode.
+    matchups = (
+        MatchupProvider.from_roster(cfg.opponents, cfg.maps, seed=cfg.seed + seed_offset)
+        if (cfg.matchup_sampling == "winrate" and role == ROLE_TRAIN)
+        else None
+    )
+    return SelfPlayWrapper(base, provider, maps=maps, matchups=matchups)
 
 
 def training_ports(cfg: TrainConfig) -> list[int]:
@@ -885,6 +928,7 @@ def save_sidecar(
     cfg: TrainConfig,
     num_timesteps: int,
     map_provider: MapProvider | None = None,
+    matchup_state: dict | None = None,
 ) -> None:
     """Write the resumable run state to ``path`` as STRICT JSON (PURE; no model touched).
 
@@ -904,6 +948,11 @@ def save_sidecar(
     at n_envs>1 (or no rotation) ``map_provider is None`` and the block records the strategy + seed
     so resume reseeds. When ``cfg.maps is None`` (single-arena) the block records
     ``{"maps": null}`` — there is no rotation to resume.
+
+    The MATCHUP curriculum rides a third block (``matchup``): ``matchup_state`` is the
+    :meth:`~pop_trainer.rl.callbacks.MatchupSamplingCallback.state` plain dict (cells + win-rate
+    EMA + counts — position-exact at ANY n_envs, because the EMA lives in the main process).
+    With the feature off the block records ``{"sampling": "off"}`` (mirroring ``{"maps": null}``).
     """
     if provider is None:
         provider_state: dict = {"strategy": cfg.opponent_strategy, "seed": cfg.seed}
@@ -916,6 +965,7 @@ def save_sidecar(
         "num_timesteps": int(num_timesteps),
         "provider": provider_state,
         "map_provider": map_state,
+        "matchup": _matchup_state_block(matchup_state, cfg),
         "elo": {str(k): float(v) for k, v in elo.items()},
         "config": cfg.to_dict(),
     }
@@ -939,6 +989,26 @@ def _map_provider_state(map_provider: MapProvider | None, cfg: TrainConfig) -> d
     if map_provider.strategy == "round_robin":
         state["index"] = int(map_provider._index)
     return state
+
+
+def _matchup_state_block(matchup_state: dict | None, cfg: TrainConfig) -> dict:
+    """The persisted ``matchup`` block — the curriculum sibling of the provider blocks.
+
+    With ``cfg.matchup_sampling == "off"`` there is no curriculum to resume, so the block records
+    ``{"sampling": "off"}`` (mirroring the map block's ``{"maps": None}``). With the feature on
+    the callback's :meth:`~pop_trainer.rl.callbacks.MatchupSamplingCallback.state` dict is
+    persisted verbatim; a missing state (no callback handle at the save site) degrades to the
+    config-only view so the sidecar still fully describes the run.
+    """
+    if cfg.matchup_sampling == "off":
+        return {"sampling": "off"}
+    if matchup_state is None:
+        return {
+            "sampling": cfg.matchup_sampling,
+            "floor": cfg.matchup_floor,
+            "ema_alpha": cfg.matchup_ema_alpha,
+        }
+    return matchup_state
 
 
 def load_sidecar(path: str | Path) -> dict:
@@ -979,6 +1049,24 @@ def _restore_map_provider_position(map_provider: MapProvider | None, sidecar: di
     map_state = sidecar.get("map_provider", {})
     if map_provider.strategy == "round_robin" and "index" in map_state:
         map_provider._index = int(map_state["index"])
+
+
+def _restore_matchup_state(matchup_cb, sidecar: dict) -> None:
+    """Restore the matchup curriculum from a loaded sidecar — the curriculum sibling of the
+    provider restores.
+
+    Continues the per-cell win-rate EMA + counts via the callback's
+    :meth:`~pop_trainer.rl.callbacks.MatchupSamplingCallback.restore` (matched by cell key, so a
+    changed roster / rotation keeps what still exists). A ``None`` callback (feature off), a
+    missing block, or an ``"off"`` block is a no-op — the curriculum starts fresh at the 0.5
+    prior.
+    """
+    if matchup_cb is None:
+        return
+    state = sidecar.get("matchup", {})
+    if state.get("sampling") != "winrate":
+        return
+    matchup_cb.restore(state)
 
 
 def _update_elo_from_eval(
@@ -1027,6 +1115,7 @@ def _make_sidecar_callback(
     *,
     save_freq: int,
     map_provider: MapProvider | None = None,
+    matchup_cb=None,
 ):
     """Build the SB3 callback that writes ``state.json`` in lockstep with each checkpoint.
 
@@ -1037,6 +1126,9 @@ def _make_sidecar_callback(
     positions + ELO + cfg + ``num_timesteps``. Both providers are ``None`` for ``n_envs > 1`` (the
     per-subproc providers are unreachable; the sidecar records strategy + seed from ``cfg``
     instead), and ``map_provider`` is also ``None`` when ``cfg.maps is None`` (no rotation).
+    ``matchup_cb`` (the :class:`~pop_trainer.rl.callbacks.MatchupSamplingCallback`, present only
+    when ``cfg.matchup_sampling == "winrate"``) contributes its live curriculum ``state()`` to
+    each save; ``None`` (feature off) records the off block.
     """
     from stable_baselines3.common.callbacks import BaseCallback
 
@@ -1049,6 +1141,7 @@ def _make_sidecar_callback(
             self.sidecar_path = sidecar_path
             self._provider = provider
             self._map_provider = map_provider
+            self._matchup_cb = matchup_cb
             self._elo = elo
 
         def _on_step(self) -> bool:
@@ -1062,6 +1155,7 @@ def _make_sidecar_callback(
                     cfg=cfg,
                     num_timesteps=self.num_timesteps,
                     map_provider=self._map_provider,
+                    matchup_state=None if self._matchup_cb is None else self._matchup_cb.state(),
                 )
             return True
 
@@ -1194,7 +1288,7 @@ def train_local(cfg: TrainConfig) -> Path:
     from stable_baselines3.common.callbacks import CallbackList, CheckpointCallback
     from stable_baselines3.common.utils import set_random_seed
 
-    from pop_trainer.rl.callbacks import EvalWinRateCallback
+    from pop_trainer.rl.callbacks import EvalWinRateCallback, MatchupSamplingCallback
     from pop_trainer.rl.evaluate import evaluate_winrate, format_per_map_table
 
     set_random_seed(cfg.seed)
@@ -1229,6 +1323,9 @@ def train_local(cfg: TrainConfig) -> Path:
                 "opponent_strategy": cfg.opponent_strategy,
                 "maps": None if cfg.maps is None else list(cfg.maps),
                 "map_strategy": cfg.map_strategy,
+                "matchup_sampling": cfg.matchup_sampling,
+                "matchup_floor": cfg.matchup_floor,
+                "matchup_ema_alpha": cfg.matchup_ema_alpha,
                 "seed": cfg.seed,
                 "log_dir": str(cfg.effective_log_dir),
                 "level": logging.getLevelName(cfg.log_level),
@@ -1286,6 +1383,9 @@ def train_local(cfg: TrainConfig) -> Path:
 
             elo = _initial_elo(cfg.opponents)
             reset_num_timesteps = cfg.resume is None
+            # The loaded sidecar dict, kept so the matchup callback (built AFTER the model, since
+            # it needs model.env) can restore its curriculum from it.
+            sidecar_data: dict | None = None
 
             if cfg.resume is not None:
                 # RESUME: load the latest checkpoint, restore the sidecar (provider position + ELO),
@@ -1298,10 +1398,13 @@ def train_local(cfg: TrainConfig) -> Path:
                 model = PPO.load(latest, env=vec_env)
                 sidecar_path = Path(cfg.resume) / SIDECAR_NAME
                 if sidecar_path.exists():
-                    sidecar = load_sidecar(sidecar_path)
-                    _restore_provider_position(provider, sidecar)
-                    _restore_map_provider_position(map_provider, sidecar)
-                    elo = {**elo, **{k: float(v) for k, v in sidecar.get("elo", {}).items()}}
+                    sidecar_data = load_sidecar(sidecar_path)
+                    _restore_provider_position(provider, sidecar_data)
+                    _restore_map_provider_position(map_provider, sidecar_data)
+                    elo = {
+                        **elo,
+                        **{k: float(v) for k, v in sidecar_data.get("elo", {}).items()},
+                    }
             else:
                 # FRESH: build PPO with the CnnPolicy + EncoderExtractor (it owns the checkpoint
                 # load + freeze). SB3 builds the optimizer over all policy params; freeze works via
@@ -1324,6 +1427,24 @@ def train_local(cfg: TrainConfig) -> Path:
                     max_grad_norm=cfg.max_grad_norm,
                     verbose=1,
                 )
+
+            # The matchup-sampling aggregator exists ONLY when the feature is on. It gets the
+            # SAME training vec handle the eval callback gets (model.env) as its set_attr
+            # broadcast target, and restores its curriculum from the resume sidecar so the EMA
+            # CONTINUES instead of resetting (position-exact at any n_envs — it lives here, in
+            # the main process).
+            matchup_cb = None
+            if cfg.matchup_sampling == "winrate":
+                matchup_cb = MatchupSamplingCallback(
+                    cfg.opponents,
+                    cfg.maps,
+                    floor=cfg.matchup_floor,
+                    ema_alpha=cfg.matchup_ema_alpha,
+                    training_vec=model.env,
+                    sys_logger=sys_logger,
+                )
+                if sidecar_data is not None:
+                    _restore_matchup_state(matchup_cb, sidecar_data)
 
             # Both CheckpointCallback and the sidecar ride the SAME n_envs-transformed save_freq so
             # a checkpoint + its state.json land every checkpoint_freq NUM_TIMESTEPS in lockstep at
@@ -1348,9 +1469,15 @@ def train_local(cfg: TrainConfig) -> Path:
                         name_prefix="model",
                     ),
                     _make_sidecar_callback(
-                        cfg, provider, elo, save_freq=ckpt_save_freq, map_provider=map_provider
+                        cfg,
+                        provider,
+                        elo,
+                        save_freq=ckpt_save_freq,
+                        map_provider=map_provider,
+                        matchup_cb=matchup_cb,
                     ),
                     _make_observability_callback(sys_logger, checkpoint_save_freq=ckpt_save_freq),
+                    *([matchup_cb] if matchup_cb is not None else []),
                 ]
             )
 
@@ -1412,7 +1539,9 @@ def train_local(cfg: TrainConfig) -> Path:
             )
             print(format_per_map_table(per_opponent, episodes=cfg.eval_episodes))  # noqa: T201
 
-            # Persist the final sidecar (post-learn position + the eval-updated ELO).
+            # Persist the final sidecar (post-learn position + the eval-updated ELO). The matchup
+            # kwarg is passed ONLY when the feature is on, so the flag-off call is unchanged.
+            matchup_kwargs = {} if matchup_cb is None else {"matchup_state": matchup_cb.state()}
             save_sidecar(
                 cfg.run_dir / SIDECAR_NAME,
                 provider=provider,
@@ -1420,6 +1549,7 @@ def train_local(cfg: TrainConfig) -> Path:
                 cfg=cfg,
                 num_timesteps=model.num_timesteps,
                 map_provider=map_provider,
+                **matchup_kwargs,
             )
         finally:
             # ALWAYS reap any live eval Unity instances. release() HARD-KILLS each live build via
@@ -1630,6 +1760,27 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="map rotation: round_robin (resumable) or uniform (seed-only resume).",
     )
     parser.add_argument(
+        "--matchup-sampling",
+        choices=MATCHUP_SAMPLING_CHOICES,
+        default=TrainConfig.matchup_sampling,
+        help="matchup choice per TRAINING episode: off (independent opponent/map samplers, the "
+        "default) or winrate (a joint opponent-x-map sampler weighted toward low-win-rate cells; "
+        "eval is unaffected).",
+    )
+    parser.add_argument(
+        "--matchup-floor",
+        type=float,
+        default=TrainConfig.matchup_floor,
+        help="exploration floor of the winrate sampler in [0, 1] (every cell keeps probability "
+        ">= floor / n_cells).",
+    )
+    parser.add_argument(
+        "--matchup-ema-alpha",
+        type=float,
+        default=TrainConfig.matchup_ema_alpha,
+        help="per-cell win-rate EMA weight of the newest episode, in (0, 1].",
+    )
+    parser.add_argument(
         "--eval-freq", type=int, default=10_000, help="env-steps between win-rate evals (0=off)."
     )
     parser.add_argument(
@@ -1707,6 +1858,9 @@ def main(argv: list[str] | None = None) -> Path:
         opponent_strategy=args.opponent_strategy,
         maps=maps_tuple,
         map_strategy=args.map_strategy,
+        matchup_sampling=args.matchup_sampling,
+        matchup_floor=args.matchup_floor,
+        matchup_ema_alpha=args.matchup_ema_alpha,
         eval_freq=args.eval_freq,
         eval_episodes=args.eval_episodes,
         checkpoint_freq=args.checkpoint_freq,

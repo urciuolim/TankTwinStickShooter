@@ -25,12 +25,13 @@ from __future__ import annotations
 
 import gymnasium
 import numpy as np
+import pytest
 from stable_baselines3.common.vec_env import DummyVecEnv
 
 from pop_trainer.core.state import STATE_LEN
-from pop_trainer.rl.callbacks import EvalWinRateCallback
+from pop_trainer.rl.callbacks import EvalWinRateCallback, MatchupSamplingCallback
 from pop_trainer.rl.evaluate import WIN
-from pop_trainer.rl.selfplay import OpponentProvider, SelfPlayWrapper
+from pop_trainer.rl.selfplay import MatchupProvider, OpponentProvider, SelfPlayWrapper
 
 # --- shared live-instance ledger + event trace -------------------------------------------
 
@@ -303,3 +304,224 @@ def test_eval_resets_pass_no_switch_arena_option():
     raw_envs = [w.env for w in eval_vec.envs]
     assert any(e.reset_options for e in raw_envs)  # eval did reset the eval envs
     assert all(opt is None for e in raw_envs for opt in e.reset_options)
+
+
+# --- MatchupSamplingCallback: accumulate -> fold at rollout end -> broadcast ---------------
+
+
+class _MatchupEnv(gymnasium.Env):
+    """A minimal env for wrapper construction in the broadcast tests (never stepped)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.action_space = _ACTION_SPACE
+        self.observation_space = _OBS_SPACE
+
+    def reset(self, *, seed=None, options=None):
+        return (np.zeros((1,), dtype=np.float32), {"state": _state(0.0), "map": None})
+
+    def step(self, action, opponent_action=None):
+        info = {"state": _state(1.0), "map": None}
+        return (np.zeros((1,), dtype=np.float32), 0.0, False, False, info)
+
+
+class _LoggerModel:
+    """The slice of an SB3 algorithm MatchupSamplingCallback touches: just ``.logger``."""
+
+    def __init__(self, logger) -> None:
+        self.logger = logger
+
+
+class _RecordingSysLogger:
+    """A system-logger stand-in recording every (event, detail) the callback emits."""
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, dict]] = []
+
+    def info(self, event, extra=None):
+        self.events.append((event, (extra or {}).get("detail", {})))
+
+
+def _matchup_cb(opponents=("noop", "random"), maps=None, *, alpha=0.5, floor=0.25, **kwargs):
+    cb = MatchupSamplingCallback(opponents, maps, floor=floor, ema_alpha=alpha, **kwargs)
+    cb.model = _LoggerModel(FakeLogger())
+    return cb
+
+
+def _terminal_locals(*tags):
+    """Fake SB3 rollout locals: one done lane per tag (a None tag = a done with no matchup)."""
+    dones = np.array([True] * len(tags))
+    infos = [{} if tag is None else {"matchup": tag} for tag in tags]
+    return {"dones": dones, "infos": infos}
+
+
+def test_matchup_on_step_accumulates_without_changing_distribution():
+    cb = _matchup_cb()
+    before = list(cb.distribution)
+    cb.locals = _terminal_locals({"opponent": "noop", "map": None, "outcome": 1.0})
+    assert cb._on_step() is True
+    # accumulate ONLY: the EMA and the distribution are untouched mid-rollout.
+    assert cb.win_rates == [0.5, 0.5]
+    assert cb.counts == [0, 0]
+    assert cb.distribution == before
+    assert cb._pending == [(0, 1.0)]
+
+
+def test_matchup_on_step_ignores_non_terminal_untagged_and_unknown_cells():
+    cb = _matchup_cb()
+    cb.locals = {
+        "dones": np.array([False, True, True]),
+        "infos": [
+            # not done: its tag must NOT be consumed (there should be none in practice).
+            {"matchup": {"opponent": "noop", "map": None, "outcome": 1.0}},
+            {},  # done with no matchup tag (feature-off env / eval) -> ignored
+            {"matchup": {"opponent": "not-a-cell", "map": None, "outcome": 1.0}},  # unknown cell
+        ],
+    }
+    cb._on_step()
+    assert cb._pending == []
+
+
+def test_matchup_on_step_without_locals_is_a_noop():
+    cb = _matchup_cb()
+    cb.locals = {}
+    assert cb._on_step() is True
+    assert cb._pending == []
+
+
+def test_matchup_rollout_end_folds_ema_counts_and_records_scalars():
+    cb = _matchup_cb(alpha=0.5, floor=0.25)
+    cb.locals = _terminal_locals({"opponent": "noop", "map": None, "outcome": 1.0})
+    cb._on_step()
+    cb._on_rollout_end()
+
+    # EMA fold: 0.5 * 0.5 + 0.5 * 1.0 = 0.75 for the winning cell; the other keeps the prior.
+    assert cb.win_rates == pytest.approx([0.75, 0.5])
+    assert cb.counts == [1, 0]
+    assert cb._pending == []  # consumed
+    # deficits (0.25, 0.5) -> base (1/3, 2/3); P = 0.25 * 0.5 + 0.75 * base.
+    assert cb.distribution == pytest.approx([0.375, 0.625])
+    # exactly the two aggregate scalars (never one per cell).
+    records = cb.model.logger.records
+    assert set(records) == {"matchup/distribution_entropy", "matchup/episodes"}
+    assert records["matchup/episodes"] == 1
+
+
+def test_matchup_rollout_end_broadcasts_into_providers_without_replacing_them():
+    # A real DummyVecEnv of two wrappers, each with its OWN seeded provider: the broadcast lands
+    # the SAME plain-data distribution inside both providers; neither the provider objects nor
+    # their RNG streams are replaced.
+    providers = [MatchupProvider.from_roster(("noop", "random"), None, seed=i) for i in range(2)]
+    placeholder = OpponentProvider.from_roster(["noop"], strategy="round_robin")
+
+    def _fn(i):
+        return lambda: SelfPlayWrapper(_MatchupEnv(), placeholder, matchups=providers[i])
+
+    vec = DummyVecEnv([_fn(0), _fn(1)])
+    rngs_before = [p._rng for p in providers]
+
+    cb = _matchup_cb(alpha=0.5, floor=0.25, training_vec=vec)
+    cb.locals = _terminal_locals({"opponent": "random", "map": None, "outcome": 0.0})
+    cb._on_step()
+    cb._on_rollout_end()
+
+    expected = cb.distribution
+    assert expected != pytest.approx([0.5, 0.5])  # the loss actually skewed it
+    for wrapper, provider, rng in zip(vec.envs, providers, rngs_before, strict=True):
+        assert wrapper.matchups is provider  # provider NOT replaced
+        assert provider._rng is rng  # RNG stream NOT replaced
+        assert provider.distribution == pytest.approx(expected)
+
+
+def test_matchup_training_start_broadcasts_restored_curriculum():
+    # The resume seam: freshly-built providers hold uniform; _on_training_start pushes the
+    # callback's (restored) EMA-derived distribution into them before the first rollout.
+    provider = MatchupProvider.from_roster(("noop", "random"), None, seed=0)
+    placeholder = OpponentProvider.from_roster(["noop"], strategy="round_robin")
+    vec = DummyVecEnv([lambda: SelfPlayWrapper(_MatchupEnv(), placeholder, matchups=provider)])
+
+    cb = _matchup_cb(alpha=0.5, floor=0.0, training_vec=vec)
+    cb.restore(
+        {
+            "sampling": "winrate",
+            "cells": [["noop", None], ["random", None]],
+            "win_rates": [1.0, 0.0],
+            "counts": [10, 10],
+        }
+    )
+    cb._on_training_start()
+    # deficits (0, 1) with no floor -> all probability on the losing cell.
+    assert provider.distribution == pytest.approx([0.0, 1.0])
+
+
+def test_matchup_state_restore_roundtrip_through_json():
+    import json
+
+    cb = _matchup_cb(("noop", "random"), ("Arenas/a.json",), alpha=0.5)
+    cb.locals = _terminal_locals({"opponent": "noop", "map": "Arenas/a.json", "outcome": 1.0})
+    cb._on_step()
+    cb._on_rollout_end()
+
+    # STRICT-JSON roundtrip (the sidecar path) then restore into a FRESH callback.
+    state = json.loads(json.dumps(cb.state()))
+    fresh = _matchup_cb(("noop", "random"), ("Arenas/a.json",), alpha=0.5)
+    fresh.restore(state)
+    assert fresh.win_rates == cb.win_rates
+    assert fresh.counts == cb.counts
+    assert fresh.distribution == pytest.approx(cb.distribution)
+
+
+def test_matchup_restore_matches_by_cell_key_tolerating_roster_changes():
+    state = {
+        "sampling": "winrate",
+        "cells": [["noop", None], ["random", None]],
+        "win_rates": [0.9, 0.2],
+        "counts": [5, 7],
+    }
+    # A resumed run with a CHANGED roster keeps the cells that still exist; new cells stay at
+    # the 0.5 prior.
+    cb = _matchup_cb(("random", "wall-hugger"))
+    cb.restore(state)
+    assert cb.win_rates == [0.2, 0.5]
+    assert cb.counts == [7, 0]
+
+
+def test_matchup_restore_malformed_block_is_a_noop():
+    cb = _matchup_cb()
+    cb.restore({})  # empty block
+    cb.restore({"cells": [["noop", None]], "win_rates": [0.1]})  # mismatched lengths
+    assert cb.win_rates == [0.5, 0.5]
+    assert cb.counts == [0, 0]
+
+
+def test_matchup_all_cells_won_yields_uniform_not_nan():
+    cb = _matchup_cb(alpha=1.0)
+    for _ in range(2):
+        cb.locals = _terminal_locals(
+            {"opponent": "noop", "map": None, "outcome": 1.0},
+            {"opponent": "random", "map": None, "outcome": 1.0},
+        )
+        cb._on_step()
+    cb._on_rollout_end()
+    assert cb.win_rates == [1.0, 1.0]
+    # total deficit 0 -> uniform fallback, and the recorded entropy is finite (no NaN).
+    assert cb.distribution == pytest.approx([0.5, 0.5])
+    entropy = cb.model.logger.records["matchup/distribution_entropy"]
+    assert np.isfinite(entropy)
+
+
+def test_matchup_rollout_end_logs_one_compact_summary():
+    sys_logger = _RecordingSysLogger()
+    cb = _matchup_cb(alpha=0.5, sys_logger=sys_logger, worst_k=1)
+    cb.locals = _terminal_locals({"opponent": "random", "map": None, "outcome": 0.0})
+    cb._on_step()
+    cb._on_rollout_end()
+
+    assert len(sys_logger.events) == 1  # ONE summary per rollout-boundary update
+    event, detail = sys_logger.events[0]
+    assert event == "matchup_update"
+    assert detail["new_samples"] == 1
+    assert detail["total_episodes"] == 1
+    assert np.isfinite(detail["entropy"])
+    # worst_k=1 names the single lowest-win-rate cell — the one that just lost.
+    assert detail["worst_cells"] == [{"opponent": "random", "map": None, "win_rate": 0.25}]

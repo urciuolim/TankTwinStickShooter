@@ -356,9 +356,9 @@ TensorBoard. Internals (the NO-COEXIST cycle, ELO sidecar, win-signal source of 
 
 ### Flag reference
 
-Flags (defaults shown, [`_parse_args`, `train.py:1372-1545`](../src/pop_trainer/rl/train.py)). Every
+Flags (defaults shown, [`_parse_args`, `train.py:1607-1820`](../src/pop_trainer/rl/train.py)). Every
 PPO/encoder default keeps SB3's own default exact, so a run with no new flags reproduces today's run
-bit-for-bit ([`TrainConfig`, `train.py:235-247`](../src/pop_trainer/rl/train.py)).
+bit-for-bit ([`TrainConfig`, `train.py:272-295`](../src/pop_trainer/rl/train.py)).
 
 **Run control**
 
@@ -366,13 +366,16 @@ bit-for-bit ([`TrainConfig`, `train.py:235-247`](../src/pop_trainer/rl/train.py)
 |------|---------|---------|
 | `--total-timesteps` | *(required)* | total env-steps to train |
 | `--run-dir` | *(required)* | output dir for checkpoints / sidecar / TensorBoard |
-| `--config` | `train_config.json` | game/training config forwarded to the launch (`DEFAULT_TRAIN_CONFIG`, `train.py:99`) |
+| `--config` | `train_config.json` | game/training config forwarded to the launch (`DEFAULT_TRAIN_CONFIG`, `train.py:107`) |
 | `--resume` | *(absent)* | a prior `run_dir` to resume — loads the latest `model_*.zip` + `state.json` ([see Resume](#resume)) |
 | `--seed` | `0` | master seed — threaded into SB3, the env, and the opponent provider |
 | `--opponents` | *(full roster)* | comma-separated roster selectors, validated against [`AGENT_SELECTORS`](../src/pop_trainer/agents/registry.py); unknown → exit 2 before launch |
 | `--opponent-strategy` | `round_robin` | `round_robin` (resumable) or `uniform` (seed-only resume) |
-| `--maps` | *(absent)* | per-episode arena rotation for **TRAINING** (via `switch_arena`; **eval never rotates** — see [Map rotation](#map-rotation)). **Absent** → single arena from `--config` (today's default). **No value** → the curated 10-map rotation (`core.maps.CURATED_ROTATION`). **A directory** → its sorted `*.json` configs' arena targets. **A list of arena targets** → that order, verbatim. Resolved via `resolve_map_rotation` (`train.py:1685`) |
+| `--maps` | *(absent)* | per-episode arena rotation for **TRAINING** (via `switch_arena`; **eval never rotates** — see [Map rotation](#map-rotation)). **Absent** → single arena from `--config` (today's default). **No value** → the curated 10-map rotation (`core.maps.CURATED_ROTATION`). **A directory** → its sorted `*.json` configs' arena targets. **A list of arena targets** → that order, verbatim. Resolved via `resolve_map_rotation` (`train.py:1836`) |
 | `--map-strategy` | `round_robin` | map rotation: `round_robin` (resumable at `--n-envs 1`) or `uniform` (seed-only resume) |
+| `--matchup-sampling` | `off` | matchup choice per **TRAINING** episode: `off` → the independent opponent/map samplers above (feature fully inert, behavior unchanged); `winrate` → ONE joint (opponent × map) draw weighted toward low-win-rate cells (**eval unaffected**) — see [Matchup sampling](#matchup-sampling) (`MATCHUP_SAMPLING_CHOICES`, `train.py:136`) |
+| `--matchup-floor` | `0.25` | the winrate sampler's exploration floor `eps` in `[0, 1]`: every cell keeps probability ≥ `eps / n_cells` |
+| `--matchup-ema-alpha` | `0.05` | per-cell win-rate EMA weight of the newest episode, in `(0, 1]` |
 | `--eval-freq` | `10000` | env-steps between win-rate evals (`0` = off) |
 | `--eval-episodes` | `10` | greedy episodes per opponent per eval |
 | `--checkpoint-freq` | `10000` | env-steps between checkpoints (the sidecar rides this cadence) |
@@ -382,8 +385,8 @@ bit-for-bit ([`TrainConfig`, `train.py:235-247`](../src/pop_trainer/rl/train.py)
 | Flag | Default | Meaning |
 |------|---------|---------|
 | `--n-envs` | `1` | parallel **training** envs. `1` → in-process `DummyVecEnv`; `N>1` → `SubprocVecEnv` of `N` builds, each on port `game_port + i` (`start_method="spawn"`). Eval is built at the SAME width `M==N`. See [multi-env](#multi-env-training---n-envs--1) |
-| `--port` | `50000` | base TCP port. Training block = `[port, port + n_envs - 1]` (`training_ports`, `train.py:619-621`) |
-| `--eval-port` | *(`port + n_envs`)* | base for the **eval block** `[eval_port, eval_port + n_envs - 1]`. Default = first port AFTER the training block (`effective_eval_port`, `train.py:308-318`). When set it must differ from `--port` AND not overlap the training block, else `ValueError` (`train.py:280-297`) |
+| `--port` | `50000` | base TCP port. Training block = `[port, port + n_envs - 1]` (`training_ports`, `train.py:701-703`) |
+| `--eval-port` | *(`port + n_envs`)* | base for the **eval block** `[eval_port, eval_port + n_envs - 1]`. Default = first port AFTER the training block (`effective_eval_port`, `train.py:357-367`). When set it must differ from `--port` AND not overlap the training block, else `ValueError` (`train.py:329-346`) |
 | `--frame-stack` | `1` | `VecFrameStack` depth (`1` = passthrough) |
 | `--allow-oversized` | *(off)* | skip the pre-flight rollout-buffer memory **abort** (estimate still printed; [see memory](#multi-env-training---n-envs--1)) |
 
@@ -391,10 +394,10 @@ bit-for-bit ([`TrainConfig`, `train.py:235-247`](../src/pop_trainer/rl/train.py)
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `--trunk` | `auto` | `auto` keeps the size-based selection (`gn-cnn` ≤128px frame, else `cnn`); `cnn`/`resnet`/`gn-cnn` force that trunk (`TRUNK_CHOICES`, `train.py:124`) |
+| `--trunk` | `auto` | `auto` keeps the size-based selection (`gn-cnn` ≤128px frame, else `cnn`); `cnn`/`resnet`/`gn-cnn` force that trunk (`TRUNK_CHOICES`, `train.py:132`) |
 | `--encoder-checkpoint` | `None` | optional pretrained-encoder `state_dict` for the features extractor |
 | `--freeze-encoder` | *(off)* | freeze the encoder weights during RL |
-| `--net-arch` | `[64, 64]` | policy/value MLP head; or a per-head spec `'pi=64,64:vf=64,64'` (`_parse_net_arch`, `train.py:1351-1368`) |
+| `--net-arch` | `[64, 64]` | policy/value MLP head; or a per-head spec `'pi=64,64:vf=64,64'` (`_parse_net_arch`, `train.py:1586-1605`) |
 
 **PPO hyperparameters** (all SB3-faithful defaults)
 
@@ -408,7 +411,7 @@ bit-for-bit ([`TrainConfig`, `train.py:235-247`](../src/pop_trainer/rl/train.py)
 | | | | `--max-grad-norm` | `0.5` |
 
 `--lr-schedule` is `constant` (fixed `--learning-rate`) or `linear` (decay to 0 via SB3's
-`progress_remaining`, `_resolve_learning_rate`, `train.py:805-816`). `--n-steps` is **the memory
+`progress_remaining`, `_resolve_learning_rate`, `train.py:887-899`). `--n-steps` is **the memory
 lever** at `--n-envs > 1` (the rollout buffer scales `n_steps × n_envs`).
 
 ```bash
@@ -427,7 +430,7 @@ uv run python -m pop_trainer.rl.train --total-timesteps 200000 --run-dir runs/tr
 **Not on the CLI** (use `TrainConfig` dataclass defaults — override in code): `frame_shape` (DERIVED
 from the launched config's `obs_pixels_*` via
 [`core.obs.frame_shape_from_config`](components/core.md#the-observation-resolution-contract-coreobs),
-then `validate_frame_shape`d, `train.py:1112-1119,1564-1572`) and `build_path` (→ the OS-aware
+then `validate_frame_shape`d, `train.py:1297-1304,1846`) and `build_path` (→ the OS-aware
 [`default_build_path`](../src/pop_trainer/core/launch.py)).
 
 ### Ports — running runs side by side
@@ -472,17 +475,17 @@ uv run python -m pop_trainer.rl.train \
 ```
 
 With `--port 50000 --n-envs 4`: training = `[50000, 50003]`, eval = `[50004, 50007]`
-(auto `game_port + n_envs`; `eval_ports`, `train.py:624-631`). In general at `--port P --n-envs N`:
+(auto `game_port + n_envs`; `eval_ports`, `train.py:706-713`). In general at `--port P --n-envs N`:
 training = `[P, P+N-1]`, eval = `[P+N, P+2N-1]`.
 
 > **Memory — the rollout buffer is the OOM surface.** The SB3 PPO `RolloutBuffer` stores
 > `(n_steps, n_envs, *obs_shape)` uint8 frames, so its obs cost is approximately
 > **`n_steps × n_envs × frame_bytes × frame_stack`** (`estimate_rl_memory_bytes`,
-> `train.py:387-398`). **Lowering `--n-steps` is the primary lever** (halve it → roughly halve the
+> `train.py:441-453`). **Lowering `--n-steps` is the primary lever** (halve it → roughly halve the
 > buffer at fixed `--n-envs`; this is why the 4-env example uses `--n-steps 512`).
 >
-> A **pre-flight guard** runs at startup (`check_rl_memory_budget`, `train.py:401-449`; called at
-> `train.py:1151`): it adds **~1 GB per live Unity instance** for **`n_envs`** instances (NOT
+> A **pre-flight guard** runs at startup (`check_rl_memory_budget`, `train.py:455-507`; called at
+> `train.py:1341`): it adds **~1 GB per live Unity instance** for **`n_envs`** instances (NOT
 > `n_envs + 1` — the eval and training SETS never coexist, so peak concurrent = `n_envs`), **always
 > prints the estimate**, and **aborts with exit `2` BEFORE any build launches** when the total
 > exceeds **60% of available RAM** (`MEMORY_MARGIN = 0.6`) — unless `--allow-oversized`. If it aborts:
@@ -531,6 +534,40 @@ uv run python -m pop_trainer.rl.train --total-timesteps 200000 --run-dir runs/tr
 > resume is **position-exact only at `--n-envs 1`**; at `--n-envs > 1` (per-subproc providers) or
 > `uniform`, resume **RESEEDS** the rotation — exactly like the opponent rotation.
 
+### Matchup sampling
+
+By default (`--matchup-sampling off`) the opponent and the map are sampled **independently** per
+episode (the sections above) and the feature is fully inert — behavior unchanged. `--matchup-sampling
+winrate` replaces both choices with **one joint draw** over cells = (opponent × map): each TRAINING
+episode's cell is drawn from `P(cell) = eps·uniform + (1−eps)·normalize(1 − win_rate)`, so the agent
+gets more training signal on the (opponent, map) combinations it is currently **weakest** at, while
+the `--matchup-floor` eps keeps every combination in the mix. The win-rate signal comes from TRAINING
+terminals (win = 1, loss = 0, draw/truncation = 0.5 — never a win), folded as an EMA
+(`--matchup-ema-alpha`) at rollout boundaries only; unseen cells start at the 0.5 prior (initial
+distribution exactly uniform). It also works **without `--maps`**: cells are then (opponent × boot
+arena) and no `switch_arena` is ever sent (flags at `train.py:1762-1782`).
+
+```bash
+# win-rate curriculum over 3 opponents x the curated 10 arenas
+uv run python -m pop_trainer.rl.train --total-timesteps 200000 --run-dir runs/train-matchup \
+  --opponents aggressive-coverage,wall-hugger,opponent-shadower --maps \
+  --matchup-sampling winrate
+```
+
+Watch `matchup/distribution_entropy` + `matchup/episodes` in TensorBoard, and the one-line
+`matchup_update` summary (worst-k lowest-win-rate cells + entropy) in `training-system.log`.
+
+> **EVAL IS UNAFFECTED** — the joint sampler attaches to the **training role only**; the eval
+> benchmark stays fixed-arena `round_robin` opponent pinning, comparable eval-to-eval, exactly as
+> under [map rotation](#map-rotation). Internals:
+> [rl → matchup sampling](components/rl.md#the-train_local-integrator).
+>
+> **Resume:** the curriculum is persisted in a third `matchup` sidecar block (cells + win-rate EMA +
+> counts; with the feature off the block is just `{"sampling": "off"}`). `--resume` restores it **by
+> cell key**, so a changed roster/rotation keeps the surviving cells and starts new ones at the 0.5
+> prior — and it is position-exact at ANY `--n-envs` (the EMA lives in the main process, not
+> per-subproc).
+
 ### The training topology
 
 The build launches under
@@ -546,13 +583,15 @@ env's `frame_shape` is derived from), both players AI, `game_maxTime: 60`, `play
 ### Resume
 
 `--resume <prior run_dir>` continues a previous run: it picks the **highest-step** `model_*.zip`
-([`_latest_checkpoint`, `train.py:1045-1064`](../src/pop_trainer/rl/train.py)), does `PPO.load`
-(`train.py:1197`), restores the opponent position + ELO from that dir's `state.json` sidecar
-(`train.py:1199-1202`), and continues with `reset_num_timesteps=False`. Resuming a dir with no
-parseable `model_*.zip` raises `FileNotFoundError` (`train.py:1194-1196`).
+([`_latest_checkpoint`, `train.py:1230-1253`](../src/pop_trainer/rl/train.py)), does `PPO.load`
+(`train.py:1398`), restores the opponent position + the map-rotation block + ELO from that dir's
+`state.json` sidecar (`train.py:1400-1407`) — and, when `--matchup-sampling winrate` is on, the
+`matchup` curriculum block (`train.py:1446-1447`; see [Matchup sampling](#matchup-sampling)) — and
+continues with `reset_num_timesteps=False`. Resuming a dir with no parseable `model_*.zip` raises
+`FileNotFoundError` (`train.py:1394-1397`).
 
 > **CRITICAL — sub-cadence smoke runs are NOT resumable.** `--checkpoint-freq` (default **10000**
-> env-steps; `TrainConfig.checkpoint_freq`, `train.py:230`) controls when a `model_*.zip` is written.
+> env-steps; `TrainConfig.checkpoint_freq`, `train.py:267`) controls when a `model_*.zip` is written.
 > A run whose `--total-timesteps` is **below** the checkpoint cadence writes **no intermediate
 > `model_*.zip`** — only the final `state.json` — and therefore **cannot be `--resume`d** (resume
 > needs a checkpoint zip and raises `FileNotFoundError`). For a resumable checkpoint, keep
@@ -574,7 +613,7 @@ control flow (Python off by default on any unwired path; C# gated on the build's
 |------|---------------|
 | `training-system.log` | the main process (`role=system`, `layer=train`) |
 | `env-<role>-<port>.log` | one per env connection (`role` = `train`/`eval`). SHARED by the env + protocol layers for that socket; **appends across respawns** (not suffixed per launch) |
-| `unity-<role>-<port>-<attempt>.log` | one per Unity **LAUNCH** (the build's `-logFile`), paired by `(role, port)`. The **`<attempt>` suffix** (`-0`, `-1`, …) is load-bearing: Unity truncates its `-logFile` on every launch, so a distinct file per launch means a respawn **never wipes the prior (hung) instance's C# log** (`_attempt_unity_log_path`, `train.py:473-484`) |
+| `unity-<role>-<port>-<attempt>.log` | one per Unity **LAUNCH** (the build's `-logFile`), paired by `(role, port)`. The **`<attempt>` suffix** (`-0`, `-1`, …) is load-bearing: Unity truncates its `-logFile` on every launch, so a distinct file per launch means a respawn **never wipes the prior (hung) instance's C# log** (`_attempt_unity_log_path`, `train.py:527-539`) |
 
 A **1-train + 1-eval run** (default `--n-envs 1`, ports 50000/50001) that never relaunches produces
 **5 files**:
