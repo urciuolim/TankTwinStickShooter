@@ -12,8 +12,8 @@ never woven into the PPO core. Five ideas hold the whole component together:
    `TankEnv` to SB3 as a normal 1-action gym, driving player2 behind the scenes; an optional
    `MapProvider` adds per-episode arena rotation on the **training** role only, and an optional
    `MatchupProvider` (`--matchup-sampling winrate`) replaces both per-episode choices with ONE joint
-   win-rate-weighted (opponent × map) draw — a cheap curriculum that trains hardest where the agent
-   is currently weakest.
+   (opponent × map) draw weighted by EVAL win-rate deficits — a cheap curriculum that trains hardest
+   where the periodic deterministic eval says the agent is weakest.
 4. **Eval + ELO** — a per-opponent (and, under map rotation, per-map) **win-rate** eval that runs
    periodically during training, plus the pure ELO math (a light Phase-1 sidecar today; the full
    ladder is M2).
@@ -41,7 +41,7 @@ and the `matchup` pure math) via the submodule:
 [`train.py:33-37`](../../src/pop_trainer/rl/train.py)). The new
 [`matchup.py`](../../src/pop_trainer/rl/matchup.py) is a **stdlib-only** pure-math sibling (`math`
 only; imported by `selfplay` / `callbacks` / the tests —
-[`matchup.py:25-26`](../../src/pop_trainer/rl/matchup.py)). No cycles.
+[`matchup.py:36-37`](../../src/pop_trainer/rl/matchup.py)). No cycles.
 
 ## Architecture at a glance
 
@@ -72,7 +72,8 @@ graph LR
     agents["agents.make_agent<br/>(DEFAULT_ROSTER selectors)"] -->|from_roster| prov
     maps["MapProvider<br/>round_robin / uniform<br/>(TRAIN role only)"] -.->|"sample() @reset → setdefault switch_arena"| wrap
     matchup["MatchupProvider<br/>winrate joint sampler<br/>(TRAIN role only, --matchup-sampling)"] -.->|"sample() @reset → (opponent, arena) — overrides both"| wrap
-    wrap -.->|"info['matchup'] @done (cell + outcome)"| mcb["MatchupSamplingCallback<br/>EMA fold @rollout end"]
+    wrap -.->|"info['matchup'] @done → play COUNTS only"| mcb["MatchupSamplingCallback<br/>counts @every boundary;<br/>win-rate fold @post-eval boundary"]
+    ecb["EvalWinRateCallback<br/>periodic deterministic eval"] -.->|"result_sink(eval cycle result)"| mcb
     mcb -.->|"set_attr matchup_distribution"| matchup
     wrap -->|"split_state_for_opponent(info['state'])"| flip["cached flipped p2 view"]
     flip -.->|pre-step view| opp["ScriptedOpponent.act → a2"]
@@ -136,7 +137,8 @@ trainer:
   byte-identical), a real target merges via the same caller-wins `setdefault`
   ([`selfplay.py:438-457`](../../src/pop_trainer/rl/selfplay.py)). On the episode-ending step the
   wrapper tags `info["matchup"] = {"opponent", "map", "outcome"}` — the plain-data sample the
-  aggregation callback folds; a done WITHOUT an outcome token maps to 0.5 (a draw, never a win)
+  aggregation callback COUNTS (the tag feeds the per-cell play counts only, never the win-rate
+  table); a done WITHOUT an outcome token maps to 0.5 (a draw, never a win)
   ([`selfplay.py:490-499`](../../src/pop_trainer/rl/selfplay.py)). The `matchup_distribution`
   property is the broadcast target: assigning it lands INSIDE the held provider (the provider object
   and its seeded RNG are never replaced); with `matchups=None` (the default) nothing changes — no
@@ -177,11 +179,17 @@ The winrate sampler's arithmetic lives in the **stdlib-only**
 [`matchup.py`](../../src/pop_trainer/rl/matchup.py) (unit-testable with no torch / sb3 / env
 imports): `matchup_cells` (the ONE canonical opponent-major cell enumeration every consumer derives
 from), `outcome_to_float` (`"win"` → 1.0, `"loss"` → 0.0, `"draw"` / missing / unknown → 0.5 —
-mirroring eval's never-a-win convention), `ema_update` (`(1-α)·wr + α·outcome`; unseen cells start at
-the 0.5 `INITIAL_WIN_RATE` prior), `deficit_distribution` (`P(cell) = floor·uniform +
-(1-floor)·normalize(1-wr)`; min prob ≥ `floor/n`, an all-won deficit falls back to uniform instead of
-NaN), and the observability helpers `distribution_entropy` / `worst_cells`
-([`matchup.py:57-146`](../../src/pop_trainer/rl/matchup.py)).
+mirroring eval's never-a-win convention; it scores the training terminal tag, which feeds play
+counts only), `ema_update` (`(1-α)·wr + α·measurement`; unseen cells start at the 0.5
+`INITIAL_WIN_RATE` prior), the **eval-signal feed** — `eval_cell_rates` (normalizes an
+`evaluate_winrate` result of EITHER return shape onto the sampler cells: rotation per-cell counts
+yield `wins/episodes` with zero-episode cells OMITTED so an unmeasured cell cannot move the fold;
+single-arena per-opponent rates land on the `(selector, None)` boot-arena cells) and
+`fold_eval_rates` (one eval cycle's per-cell rates EMA-folded into the win-rate table; returns a NEW
+list, unmeasured cells keep their value exactly, unknown cells are ignored) — `deficit_distribution`
+(`P(cell) = floor·uniform + (1-floor)·normalize(1-wr)`; min prob ≥ `floor/n`, an all-won deficit
+falls back to uniform instead of NaN), and the observability helpers `distribution_entropy` /
+`worst_cells` ([`matchup.py:71-210`](../../src/pop_trainer/rl/matchup.py)).
 
 ### The eval + ELO seam
 Scores a trained policy by **win-rate** (fraction of greedy episodes won), broken out per opponent —
@@ -233,13 +241,18 @@ and, when a map rotation is active, per map as well:
   `eval/win_rate/<selector>` + an overall `eval/win_rate` to the model's logger (→ both
   `progress.csv` and TensorBoard); with `maps` it additionally logs one per-map marginal
   `eval/win_rate/map/<short-name>` per rotation arena — all scalars pooled from the same per-cell
-  counts, never one scalar per (opponent × map) cell. Its crux is the **NO-COEXIST cycle** — see
-  below ([`callbacks.py:86-178`](../../src/pop_trainer/rl/callbacks.py)).
+  counts, never one scalar per (opponent × map) cell. An optional `result_sink` callable receives
+  each completed cycle's structured `evaluate_winrate` result — the matchup curriculum's ONLY
+  win-rate feed (`train_local` wires `MatchupSamplingCallback.submit_eval_result` here); `None`
+  (the default) leaves the logging path identical
+  ([`callbacks.py:129-134,173-178`](../../src/pop_trainer/rl/callbacks.py)). Its crux is the
+  **NO-COEXIST cycle** — see below
+  ([`callbacks.py:94-244`](../../src/pop_trainer/rl/callbacks.py)).
 - **[`elo.py`](../../src/pop_trainer/rl/elo.py)** — pure ELO math (`import math` only): `elo_prob`
   (logistic, base 10, /400) and `elo_change` (per-side rounded deltas that need not sum to zero).
   Wired into the integrator as a light from-eval sidecar update only — under map rotation it
   consumes the **pooled per-opponent marginals**
-  ([`train.py:1552-1560`](../../src/pop_trainer/rl/train.py)); the full ELO ladder over a
+  ([`train.py:1581-1589`](../../src/pop_trainer/rl/train.py)); the full ELO ladder over a
   frozen-self population is **M2 work** ([`elo.py:11-28`](../../src/pop_trainer/rl/elo.py)).
 
 ### The `train_local` integrator
@@ -247,7 +260,7 @@ and, when a map rotation is active, per map as well:
 [`TrainConfig`](../../src/pop_trainer/rl/train.py) is the frozen, validated run spec (topology,
 encoder wiring, roster, eval/checkpoint cadence, resume, and PPO hyperparameters — every default
 keeps SB3's own default exact); [`train_local(cfg)`](../../src/pop_trainer/rl/train.py) runs (or
-resumes) and returns `cfg.run_dir` ([`train.py:163-427,1264-1608`](../../src/pop_trainer/rl/train.py)).
+resumes) and returns `cfg.run_dir` ([`train.py:165-444,1284-1637`](../../src/pop_trainer/rl/train.py)).
 The full operator CLI lives in the [runbook §5](../runbook.md#5-run-rl-training) — the key
 behaviours:
 
@@ -256,20 +269,20 @@ behaviours:
   **disjoint** eval block, default `game_port + n_envs` onward. `__post_init__` rejects an overlapping
   eval block. [`build_vec_env`](../../src/pop_trainer/rl/train.py) builds
   `VecMonitor(VecFrameStack({Dummy,Subproc}VecEnv([SelfPlayWrapper(TankEnv)])))` either way; only the
-  training stack is monitored ([`train.py:710-722,782-875,1381-1385`](../../src/pop_trainer/rl/train.py)).
+  training stack is monitored ([`train.py:727-740,799-893,1401-1405`](../../src/pop_trainer/rl/train.py)).
 - **The policy.** `PPO("CnnPolicy", ...)` with `policy_kwargs` carrying
   `features_extractor_class=EncoderExtractor` + the `{checkpoint, freeze, trunk}` kwargs and an
   explicit `net_arch`; built fresh on a clean run or `PPO.load`-ed on resume. The PPO
   hyperparameters (`learning_rate` with an optional `linear` decay schedule, `n_steps`, `batch_size`,
-  …) are all parameterized ([`_build_policy_kwargs`, `train.py:878-893`](../../src/pop_trainer/rl/train.py),
-  [`train.py:1423-1444`](../../src/pop_trainer/rl/train.py)).
+  …) are all parameterized ([`_build_policy_kwargs`, `train.py:895-910`](../../src/pop_trainer/rl/train.py),
+  [`train.py:1425-1464`](../../src/pop_trainer/rl/train.py)).
 - **The live-launch seam (the crux).** `TankEnv` does NOT launch Unity; the live `connection_factory`
   is **re-derived here from `core.launch`** (never imported from `data`), parameterized per port, with
   the `Popen` stashed on the `Connection` so the env's injected `reap=_terminate` hook hard-kills its
   own build on `release` / the kill-old-first reconnect. Each launch points Unity's `-logFile` at a
   distinct per-attempt path so a respawn never truncates a prior (hung) log
-  ([`_live_connection_factory_for_port`, `train.py:545-601`](../../src/pop_trainer/rl/train.py);
-  [`_build_base_env`, `train.py:603-638`](../../src/pop_trainer/rl/train.py)).
+  ([`_live_connection_factory_for_port`, `train.py:562-618`](../../src/pop_trainer/rl/train.py);
+  [`_build_base_env`, `train.py:620-655`](../../src/pop_trainer/rl/train.py)).
 - **Checkpoint / resume / sidecar.** SB3's `CheckpointCallback` writes `model_<steps>_steps.zip`; a
   sidecar callback rides the **same cadence** to write `run_dir/state.json` (opponent-provider
   position, per-selector ELO, `cfg.to_dict()`, `num_timesteps`). The **map rotation rides the same
@@ -278,81 +291,111 @@ behaviours:
   it records the `round_robin` index for a position-exact resume; at `n_envs > 1` (or `uniform`) the
   block records strategy + seed so resume RESEEDS — per-subproc providers are seeded
   `cfg.seed + offset`, mirroring opponents. `--resume` loads the max-step zip + restores both blocks
-  ([`save_sidecar` / `_map_provider_state`, `train.py:932-1000`](../../src/pop_trainer/rl/train.py),
-  [`_restore_map_provider_position`, `train.py:1048-1061`](../../src/pop_trainer/rl/train.py),
-  [`_latest_checkpoint`, `train.py:1239-1262`](../../src/pop_trainer/rl/train.py),
-  [`train.py:1405-1422,1580-1591`](../../src/pop_trainer/rl/train.py)). The **matchup curriculum
+  ([`save_sidecar` / `_map_provider_state`, `train.py:949-1018`](../../src/pop_trainer/rl/train.py),
+  [`_restore_map_provider_position`, `train.py:1067-1079`](../../src/pop_trainer/rl/train.py),
+  [`_latest_checkpoint`, `train.py:1259-1282`](../../src/pop_trainer/rl/train.py),
+  [`train.py:1425-1442,1609-1620`](../../src/pop_trainer/rl/train.py)). The **matchup curriculum
   rides a third `matchup` block**: with the feature off it records `{"sampling": "off"}` (mirroring
-  the map block's `{"maps": null}`); with it on the callback's `state()` (cells + win-rate EMA +
-  counts) is persisted verbatim and `--resume` restores it **by cell key** — roster/rotation-tolerant
-  (surviving cells continue, new cells start at the 0.5 prior) and position-exact at ANY `n_envs`,
-  because the EMA lives in the main process
-  ([`_matchup_state_block`, `train.py:1003-1020`](../../src/pop_trainer/rl/train.py);
-  [`_restore_matchup_state`, `train.py:1063-1078`](../../src/pop_trainer/rl/train.py);
-  [`callbacks.py:299-328`](../../src/pop_trainer/rl/callbacks.py)).
+  the map block's `{"maps": null}`); with it on the callback's `state()` (cells + the eval-fed
+  win-rate table + training play counts, marked `signal: "eval"`) is persisted verbatim and
+  `--resume` restores it **by cell key** — roster/rotation-tolerant (surviving cells continue, new
+  cells start at the 0.5 prior) and position-exact at ANY `n_envs`, because the table lives in the
+  main process. An OLDER sidecar without the `signal` field (its table was fed from training
+  outcomes) restores fine: its values decay out over the first few eval folds (EMA-blended, not
+  overwritten)
+  ([`_matchup_state_block`, `train.py:1021-1039`](../../src/pop_trainer/rl/train.py);
+  [`_restore_matchup_state`, `train.py:1082-1098`](../../src/pop_trainer/rl/train.py);
+  [`callbacks.py:336-371`](../../src/pop_trainer/rl/callbacks.py)).
 - **Map rotation — the FREE-RUNNING provider is TRAINING-only; eval covers the rotation via PINNED
   phases (load-bearing invariant).** A free-running `MapProvider` is attached ONLY when
   `cfg.maps is not None` AND `role == ROLE_TRAIN`; the eval vec is built `role=ROLE_EVAL`, so its
   wrappers are constructed `maps=None` and no construction-time provider ever rotates an eval env
-  ([`_make_self_play_env`'s role gate, `train.py:689-707`](../../src/pop_trainer/rl/train.py)). The
+  ([`_make_self_play_env`'s role gate, `train.py:706-716`](../../src/pop_trainer/rl/train.py)). The
   eval map schedule is owned entirely by `evaluate_winrate` instead: ONE arena pinned per
   (opponent, map) phase (a single-map provider set via `vec.set_attr`), injected as
   `reset(options={"switch_arena": ...})` — the build handles `switch_arena` only while `!ingame`,
   and a reset-option switch lands exactly there, so the **deliberate, pinned, phase-scoped**
   switching at reset is safe
   ([`_eval_phase_vec`, `evaluate.py:185-212`](../../src/pop_trainer/rl/evaluate.py);
-  [`callbacks.py:188-197`](../../src/pop_trainer/rl/callbacks.py)). The historical bug (commit
+  [`callbacks.py:208-217`](../../src/pop_trainer/rl/callbacks.py)). The historical bug (commit
   `c84a28e`) was different in kind: eval envs then carried a FREE-RUNNING rotation that switched to
   an arbitrary arena at every vec auto-reset — unaccounted by the eval math and racing an in-flight
   episode — and that uncontrolled path stays forbidden. Without `--maps`, eval sends **no**
   `switch_arena` at all (plain `reset()`s, byte-identical to the single-arena eval); with it, the
   integrator hands the TRAINING rotation to the eval callback so eval covers the same arenas
-  training plays ([`train.py:1470-1483`](../../src/pop_trainer/rl/train.py)). The default config is
+  training plays ([`train.py:1496-1512`](../../src/pop_trainer/rl/train.py)). The default config is
   still single-arena; rotation is opt-in via `--maps`.
-- **Matchup sampling (`--matchup-sampling winrate`) — a win-rate curriculum, TRAINING-only, default
-  `off`.** With `off` (the default) the feature is fully inert: no `MatchupProvider`, no callback, no
-  new info keys — the independent opponent/map samplers behave exactly as above
-  ([`MATCHUP_SAMPLING_CHOICES`, `train.py:135-137`](../../src/pop_trainer/rl/train.py)). With
-  `winrate` each TRAINING wrapper gets a `MatchupProvider` over `cfg.opponents × (cfg.maps or the
-  boot arena)`, seeded per-subproc like its siblings — the eval wrappers NEVER get one (the same
-  role gate as the map provider, [`train.py:700-706`](../../src/pop_trainer/rl/train.py)) — and ONE
-  main-process [`MatchupSamplingCallback`](../../src/pop_trainer/rl/callbacks.py) closes the loop:
-  `_on_step` only ACCUMULATES the terminal `info["matchup"]` tags (the distribution never changes
-  mid-rollout); `_on_rollout_end` folds them into the per-cell win-rate EMA (`--matchup-ema-alpha`,
-  default `0.05`), recomputes `P(cell) = eps·uniform + (1−eps)·normalize(1−wr)` (`--matchup-floor`
-  eps, default `0.25`), and BROADCASTS the plain-data distribution to every worker via
-  `set_attr("matchup_distribution", ...)` — the same delegation path eval uses to re-pin opponents;
-  `_on_training_start` broadcasts once up-front (the resume seam)
-  ([`callbacks.py:227-393`](../../src/pop_trainer/rl/callbacks.py); wiring at
-  [`train.py:1451-1462,1498`](../../src/pop_trainer/rl/train.py)). Observability is ONE compact
-  `matchup_update` summary per boundary (the worst-k lowest-win-rate cells + distribution entropy +
-  sample counts) plus two TB scalars, `matchup/distribution_entropy` and `matchup/episodes` — never
-  one scalar per cell ([`callbacks.py:362-392`](../../src/pop_trainer/rl/callbacks.py)). **Eval is
-  unaffected** — the eval wrappers never get a `MatchupProvider`, and eval episodes never feed the
-  win-rate EMA (the `info["matchup"]` tags come from TRAINING terminals only); the eval schedule is
-  owned by the eval seam itself (pinned per-map phases under `--maps`, the boot arena without it).
-  Verified live (the gated smoke:
-  `SubprocVecEnv`, `n_envs=2`, 3 opponents × the curated 10 maps): entropy decreased strictly off
-  uniform at every 512-step rollout boundary, workers switched among 8 distinct arenas, the
-  lowest-win-rate cells received the highest episode counts, and the `off` run produced zero matchup
-  artifacts (sidecar `{"sampling": "off"}`).
+- **Matchup sampling (`--matchup-sampling winrate`) — an EVAL-fed win-rate curriculum,
+  TRAINING-only, default `off`.** With `off` (the default) the feature is fully inert: no
+  `MatchupProvider`, no callback, no new info keys — the independent opponent/map samplers behave
+  exactly as above ([`MATCHUP_SAMPLING_CHOICES`, `train.py:135-138`](../../src/pop_trainer/rl/train.py)).
+  With `winrate` each TRAINING wrapper gets a `MatchupProvider` over `cfg.opponents × (cfg.maps or
+  the boot arena)`, seeded per-subproc like its siblings — the eval wrappers NEVER get one (the same
+  role gate as the map provider, [`train.py:717-723`](../../src/pop_trainer/rl/train.py)) — and ONE
+  main-process [`MatchupSamplingCallback`](../../src/pop_trainer/rl/callbacks.py) closes the loop
+  with **two strictly separated data flows**
+  ([`callbacks.py:247-463`](../../src/pop_trainer/rl/callbacks.py); wiring at
+  [`train.py:1473-1484,1490-1527`](../../src/pop_trainer/rl/train.py)):
+  - **`win_rates` — what EVAL measured.** The per-cell win-rate table is fed ONLY from the periodic
+    deterministic eval: after each eval cycle `EvalWinRateCallback` hands the structured
+    `evaluate_winrate` result to `MatchupSamplingCallback.submit_eval_result` (the `result_sink`
+    wired in `train_local`). At that SAME rollout boundary the callback normalizes it onto the
+    sampler cells (`eval_cell_rates`), EMA-folds it into the table (`fold_eval_rates`,
+    `--matchup-ema-alpha`, default `0.4` — sized for per-eval-cycle folds of ~10-episode cell
+    estimates; a per-episode-scale alpha like the old 0.05 would leave the curriculum near its
+    prior for ~20 eval cycles), recomputes `P(cell) = eps·uniform + (1−eps)·normalize(1−wr)`
+    (`--matchup-floor` eps, default `0.25`), BROADCASTS the plain-data distribution to every worker
+    via `set_attr("matchup_distribution", ...)` — the same delegation path eval uses to re-pin
+    opponents — and logs ONE `matchup_update` summary. The same-boundary guarantee is the
+    `CallbackList` ORDER: `EvalWinRateCallback` runs FIRST, the matchup callback LAST
+    ([`train.py:1490-1527`](../../src/pop_trainer/rl/train.py);
+    [`callbacks.py:373-383,417-441`](../../src/pop_trainer/rl/callbacks.py)). The distribution is
+    UNIFORM until the first eval cycle (every cell starts at the 0.5 prior) and FROZEN between
+    eval cycles — no fold, no broadcast, no log at a non-eval boundary; `_on_training_start`
+    broadcasts once up-front (the resume seam,
+    [`callbacks.py:390-397`](../../src/pop_trainer/rl/callbacks.py)).
+  - **`counts` — what TRAINING played.** `_on_step` only ACCUMULATES the terminal `info["matchup"]`
+    tags (the distribution never changes mid-rollout) and `_on_rollout_end` folds them into the
+    per-cell play counts at EVERY boundary — pure observability of what the sampler actually
+    sampled. Training terminal outcomes NEVER move `win_rates`
+    ([`callbacks.py:399-415,426-428`](../../src/pop_trainer/rl/callbacks.py)). Rationale: the
+    training-side EMA measured the STOCHASTIC rollout policy, which at high entropy inverts against
+    the deterministic eval (training reported a noop win-rate near 0.9 while eval said ~0.1),
+    steering the curriculum away from the policy's real weaknesses; eval measures the deterministic
+    policy the run is judged on.
+
+  Because the signal is eval, the mode REQUIRES eval enabled: config validation rejects
+  `matchup_sampling="winrate"` with `eval_freq <= 0`
+  ([`train.py:340-345`](../../src/pop_trainer/rl/train.py)). Observability is ONE compact
+  `matchup_update` summary per POST-EVAL boundary (the worst-k lowest-win-rate cells + distribution
+  entropy + eval folds / cells measured + play counts) plus two TB scalars,
+  `matchup/distribution_entropy` and `matchup/episodes` — never one scalar per cell
+  ([`callbacks.py:440-463`](../../src/pop_trainer/rl/callbacks.py)). **The coupling is ONE-WAY:
+  eval steers training, the sampler never touches eval** — the eval wrappers have no
+  `MatchupProvider`, and the eval schedule is owned by the eval seam itself (pinned per-map phases
+  under `--maps`, the boot arena without it). Verified live (the gated run: 8 rollout boundaries
+  spanning 2 eval cycles): the fold + broadcast fired at exactly the 2 post-eval boundaries and the
+  table was byte-identical across the 6 non-eval boundaries; the distribution was uniform before
+  the first fold; counts accumulated at every boundary; the EMA arithmetic was exact
+  (0.5 → 0.3 → 0.18 at alpha 0.4 against an all-zero eval); exit 0, with zero `recv_timeout`s
+  across 72 eval resets.
 - **Observability logging** — purely additive. `train_local` wires `core.logging_setup` for a
   per-process structured-JSONL trail (`training-system.log` + per-env / per-launch Unity logs under
   `run_dir/logs`); `--debug` (or `POP_LOG_LEVEL`) is the single INFO→DEBUG switch. It does NOT touch
   the wire, state layout, or control flow. Reading guide: [runbook → Observability
-  logs](../runbook.md#observability-logs) ([`train.py:683,1321-1349`](../../src/pop_trainer/rl/train.py)).
+  logs](../runbook.md#observability-logs) ([`train.py:700,1341-1369`](../../src/pop_trainer/rl/train.py)).
 
 > **NOTE — the `train_local` docstring is stale.** The docstring at
-> [`train.py:1269-1271`](../../src/pop_trainer/rl/train.py) still calls the eval env "ALWAYS-SINGLE
+> [`train.py:1289-1291`](../../src/pop_trainer/rl/train.py) still calls the eval env "ALWAYS-SINGLE
 > (`single=True`)"; the shipped code at
-> [`train.py:1381-1385`](../../src/pop_trainer/rl/train.py) builds an `M == n_envs` parallel eval vec.
+> [`train.py:1401-1405`](../../src/pop_trainer/rl/train.py) builds an `M == n_envs` parallel eval vec.
 > This page documents the **code's** behaviour.
 
 ### The NO-COEXIST eval cycle + multi-env lifecycle
 The training builds and the eval builds share the **same RAM budget** (`M_eval == N_train`), so they
 are **time-multiplexed** — at any instant the run holds EITHER the training set OR the eval set, never
 both. At each eval boundary [`EvalWinRateCallback._run_eval_cycle`](../../src/pop_trainer/rl/callbacks.py)
-runs a load-bearing sequence ([`callbacks.py:180-224`](../../src/pop_trainer/rl/callbacks.py)):
+runs a load-bearing sequence ([`callbacks.py:200-244`](../../src/pop_trainer/rl/callbacks.py)):
 
 1. **Tear down ALL training** instances (`training_vec.env_method("release")` — hard-kill each Unity
    child, frees its port; worker processes stay alive).
@@ -364,12 +407,12 @@ runs a load-bearing sequence ([`callbacks.py:180-224`](../../src/pop_trainer/rl/
 At `n_envs > 1` the training vec is a `SubprocVecEnv` of one build per training port, with
 `start_method="spawn"` (required — no fork/forkserver). Each subproc builds its OWN seeded
 `OpponentProvider` inside the spawned process via picklable closures
-([`_env_factories_for_ports` / `build_vec_env`, `train.py:725-734,864-868`](../../src/pop_trainer/rl/train.py)). A pre-flight memory guard
+([`_env_factories_for_ports` / `build_vec_env`, `train.py:742-777,871-885`](../../src/pop_trainer/rl/train.py)). A pre-flight memory guard
 sizes the PPO `RolloutBuffer` + ~1 GB per live Unity instance and charges **`n_envs`** instances (not
 `n_envs + 1`, because the eval and training sets never coexist), aborting before launch if over 60 %
 of available RAM unless `--allow-oversized`
-([`check_rl_memory_budget`, `train.py:459-507`](../../src/pop_trainer/rl/train.py)). Both env sets are
-reaped via a nested `try/finally` on any exit ([`train.py:1592-1606`](../../src/pop_trainer/rl/train.py)).
+([`check_rl_memory_budget`, `train.py:476-528`](../../src/pop_trainer/rl/train.py)). Both env sets are
+reaped via a nested `try/finally` on any exit ([`train.py:1621-1635`](../../src/pop_trainer/rl/train.py)).
 This survives — but does NOT fix — the intermittent multi-env C# reset-region stall; it recovers from
 it via [`TankEnv`'s lazy-launch / `release` / kill-old-first
 reconnect](env.md#instance-lifecycle-lazy-launch--release--kill-old-first-reconnect). Operator detail:
@@ -392,7 +435,7 @@ env `frame_shape` is derived + validated from —
   applies, [`state.py:178-185`](../../src/pop_trainer/core/state.py)) and
   `core.maps.resolve_map_rotation` (the single source resolving a `--maps` flag value to arena targets
   — used by `MapProvider.from_curated` and the CLI, [`selfplay.py:41`](../../src/pop_trainer/rl/selfplay.py),
-  [`train.py:64,1878`](../../src/pop_trainer/rl/train.py)); plus `core.launch` /
+  [`train.py:64,1909`](../../src/pop_trainer/rl/train.py)); plus `core.launch` /
   `core.protocol.Connection` / `core.config` / `core.obs` / `core.logging_setup` for the integrator's
   re-derived live launch ([`train.py:52-70`](../../src/pop_trainer/rl/train.py)).
 - **[env](env.md)** — the symmetric pure-transport `TankEnv` the wrapper wraps and drives via

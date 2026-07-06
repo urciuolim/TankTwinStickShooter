@@ -133,7 +133,8 @@ LR_SCHEDULES = ("constant", "linear")
 TRUNK_CHOICES = ("auto", "cnn", "resnet", "gn-cnn")
 
 # Valid matchup-sampling modes: "off" (the default — the independent opponent/map samplers,
-# byte-identical to today) or "winrate" (the joint deficit-weighted (opponent x map) sampler).
+# byte-identical to today) or "winrate" (the joint deficit-weighted (opponent x map) sampler,
+# driven by EVALUATION win-rates — requires eval enabled).
 MATCHUP_SAMPLING_CHOICES = ("off", "winrate")
 
 # The explicit policy/value MLP-head default. SB3 silently uses [64, 64] when net_arch is unset;
@@ -200,11 +201,19 @@ class TrainConfig:
         matchup_sampling: ``"off"`` (the default — the independent opponent/map samplers pick
             each episode's matchup, byte-identical to today) or ``"winrate"`` (a JOINT sampler
             over cells = opponents x (maps or the boot arena) picks it, weighted by the per-cell
-            win-rate deficit the :class:`~pop_trainer.rl.callbacks.MatchupSamplingCallback`
-            aggregates from TRAINING episodes). Training-only; eval never uses it.
+            win-rate deficit). The win-rate signal is EVALUATION: each periodic eval cycle's
+            deterministic per-cell results feed the
+            :class:`~pop_trainer.rl.callbacks.MatchupSamplingCallback` table (training terminal
+            outcomes feed only the play counts — the stochastic training win-rate can invert
+            against the deterministic eval at high entropy, steering the curriculum away from
+            the real weakness). Requires ``eval_freq > 0``; the sampler steers training only,
+            eval never uses it.
         matchup_floor: the exploration floor ``eps`` of the winrate sampler, in ``[0, 1]``
             (every cell keeps probability >= ``eps / n_cells``).
-        matchup_ema_alpha: the per-cell win-rate EMA weight of the newest episode, in ``(0, 1]``.
+        matchup_ema_alpha: the per-cell win-rate EMA weight of the newest EVAL CYCLE's rate, in
+            ``(0, 1]``. The default 0.4 is sized for per-eval-cycle folds of ~10-episode cell
+            estimates (a few cycles dominate the table); a per-episode-scale alpha like 0.05
+            would leave the curriculum stuck near its prior for ~20 eval cycles.
         eval_freq: env-steps between periodic win-rate evals (``>= 0``; ``0`` disables).
         eval_episodes: greedy episodes per opponent per eval.
         checkpoint_freq: env-steps between checkpoints (``> 0``; the sidecar rides this cadence).
@@ -262,10 +271,12 @@ class TrainConfig:
     maps: tuple[str, ...] | None = None
     map_strategy: str = "round_robin"
     # Win-rate matchup sampling: "off" keeps the independent samplers (today's behavior exactly);
-    # "winrate" activates the joint (opponent x map) deficit sampler + its aggregation callback.
+    # "winrate" activates the joint (opponent x map) deficit sampler, driven by EVAL win-rates
+    # (so it requires eval_freq > 0). The alpha default is per-eval-cycle-scale (see the class
+    # docstring).
     matchup_sampling: str = "off"
     matchup_floor: float = 0.25
-    matchup_ema_alpha: float = 0.05
+    matchup_ema_alpha: float = 0.4
     eval_freq: int = 10_000
     eval_episodes: int = 10
     checkpoint_freq: int = 10_000
@@ -326,6 +337,12 @@ class TrainConfig:
             raise ValueError(f"matchup_ema_alpha must be in (0, 1], got {self.matchup_ema_alpha}")
         if self.eval_freq < 0:
             raise ValueError(f"eval_freq must be >= 0, got {self.eval_freq}")
+        if self.matchup_sampling == "winrate" and self.eval_freq <= 0:
+            raise ValueError(
+                "matchup_sampling='winrate' requires periodic evaluation (eval_freq > 0): the "
+                "curriculum's win-rate signal comes from eval cycles, so with eval disabled the "
+                "sampling distribution would never update"
+            )
         if self.checkpoint_freq <= 0:
             raise ValueError(f"checkpoint_freq must be > 0, got {self.checkpoint_freq}")
         if len(self.frame_shape) != 3 or self.frame_shape[2] != 3:
@@ -959,9 +976,10 @@ def save_sidecar(
     ``{"maps": null}`` — there is no rotation to resume.
 
     The MATCHUP curriculum rides a third block (``matchup``): ``matchup_state`` is the
-    :meth:`~pop_trainer.rl.callbacks.MatchupSamplingCallback.state` plain dict (cells + win-rate
-    EMA + counts — position-exact at ANY n_envs, because the EMA lives in the main process).
-    With the feature off the block records ``{"sampling": "off"}`` (mirroring ``{"maps": null}``).
+    :meth:`~pop_trainer.rl.callbacks.MatchupSamplingCallback.state` plain dict (cells + the
+    eval-fed win-rate table + training play counts — position-exact at ANY n_envs, because the
+    table lives in the main process; ``signal: "eval"`` marks the win-rate feed). With the
+    feature off the block records ``{"sampling": "off"}`` (mirroring ``{"maps": null}``).
     """
     if provider is None:
         provider_state: dict = {"strategy": cfg.opponent_strategy, "seed": cfg.seed}
@@ -1014,6 +1032,7 @@ def _matchup_state_block(matchup_state: dict | None, cfg: TrainConfig) -> dict:
     if matchup_state is None:
         return {
             "sampling": cfg.matchup_sampling,
+            "signal": "eval",
             "floor": cfg.matchup_floor,
             "ema_alpha": cfg.matchup_ema_alpha,
         }
@@ -1064,11 +1083,12 @@ def _restore_matchup_state(matchup_cb, sidecar: dict) -> None:
     """Restore the matchup curriculum from a loaded sidecar — the curriculum sibling of the
     provider restores.
 
-    Continues the per-cell win-rate EMA + counts via the callback's
+    Continues the per-cell win-rate table + play counts via the callback's
     :meth:`~pop_trainer.rl.callbacks.MatchupSamplingCallback.restore` (matched by cell key, so a
-    changed roster / rotation keeps what still exists). A ``None`` callback (feature off), a
-    missing block, or an ``"off"`` block is a no-op — the curriculum starts fresh at the 0.5
-    prior.
+    changed roster / rotation keeps what still exists; a block without the ``signal`` field —
+    an older, training-fed sidecar — restores fine and is overwritten by the next eval folds).
+    A ``None`` callback (feature off), a missing block, or an ``"off"`` block is a no-op — the
+    curriculum starts fresh at the 0.5 prior.
     """
     if matchup_cb is None:
         return
@@ -1445,9 +1465,11 @@ def train_local(cfg: TrainConfig) -> Path:
 
             # The matchup-sampling aggregator exists ONLY when the feature is on. It gets the
             # SAME training vec handle the eval callback gets (model.env) as its set_attr
-            # broadcast target, and restores its curriculum from the resume sidecar so the EMA
-            # CONTINUES instead of resetting (position-exact at any n_envs — it lives here, in
-            # the main process).
+            # broadcast target, and restores its curriculum from the resume sidecar so the
+            # win-rate table CONTINUES instead of resetting (position-exact at any n_envs — it
+            # lives here, in the main process). Its win-rate signal is EVAL: the eval callback
+            # below hands each cycle's result to submit_eval_result; training terminals feed
+            # only the play counts.
             matchup_cb = None
             if cfg.matchup_sampling == "winrate":
                 matchup_cb = MatchupSamplingCallback(
@@ -1465,6 +1487,10 @@ def train_local(cfg: TrainConfig) -> Path:
             # a checkpoint + its state.json land every checkpoint_freq NUM_TIMESTEPS in lockstep at
             # any n_envs (see _checkpoint_save_freq).
             ckpt_save_freq = _checkpoint_save_freq(cfg)
+            # ORDER IS LOAD-BEARING: EvalWinRateCallback FIRST and matchup_cb LAST, so at a
+            # shared rollout boundary the eval cycle completes (and submits its result) BEFORE
+            # the matchup callback folds + broadcasts — the curriculum updates at the same
+            # boundary the eval ran at, never mid-rollout.
             callbacks = CallbackList(
                 [
                     EvalWinRateCallback(
@@ -1480,6 +1506,9 @@ def train_local(cfg: TrainConfig) -> Path:
                         # time-multiplexes the two SETS so no eval/training instance coexists.
                         eval_env=eval_vec_env,
                         training_vec=model.env,
+                        # The matchup curriculum's ONLY win-rate feed: each eval cycle's
+                        # structured result, handed explicitly (never via wrapper infos).
+                        result_sink=(None if matchup_cb is None else matchup_cb.submit_eval_result),
                     ),
                     CheckpointCallback(
                         save_freq=ckpt_save_freq,
@@ -1803,8 +1832,9 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         choices=MATCHUP_SAMPLING_CHOICES,
         default=TrainConfig.matchup_sampling,
         help="matchup choice per TRAINING episode: off (independent opponent/map samplers, the "
-        "default) or winrate (a joint opponent-x-map sampler weighted toward low-win-rate cells; "
-        "eval is unaffected).",
+        "default) or winrate (a joint opponent-x-map sampler weighted toward low-EVAL-win-rate "
+        "cells; the signal is the periodic deterministic eval, so it requires --eval-freq > 0; "
+        "eval itself is unaffected).",
     )
     parser.add_argument(
         "--matchup-floor",
@@ -1817,7 +1847,8 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--matchup-ema-alpha",
         type=float,
         default=TrainConfig.matchup_ema_alpha,
-        help="per-cell win-rate EMA weight of the newest episode, in (0, 1].",
+        help="per-cell win-rate EMA weight of the newest EVAL CYCLE's rate, in (0, 1] "
+        "(default sized for per-eval-cycle folds of ~10-episode cell estimates).",
     )
     parser.add_argument(
         "--eval-freq", type=int, default=10_000, help="env-steps between win-rate evals (0=off)."

@@ -2,8 +2,16 @@
 
 The ``--matchup-sampling winrate`` curriculum replaces the two independent per-episode samplers
 (opponent rotation + map rotation) with ONE joint sampler over cells = (opponent selector x arena
-target). This module holds the sampler's arithmetic as pure functions so the unit suite exercises
-it with no torch / sb3 / env imports:
+target). The per-cell WIN-RATE SIGNAL is EVALUATION: each periodic eval cycle's deterministic
+per-cell results are folded into the win-rate table. Training terminal outcomes never move the
+win-rates — they feed only the per-cell play COUNTS (observability of what the sampler actually
+played). Rationale: a training-side win-rate measures the STOCHASTIC policy, and at high entropy
+it inverts against the deterministic eval (training can report a noop win-rate near 0.9 while
+eval reports near 0.1), steering the curriculum away from the real weakness; eval measures the
+deterministic policy the run is actually judged on.
+
+This module holds the sampler's arithmetic as pure functions so the unit suite exercises it with
+no torch / sb3 / env imports:
 
 * :func:`matchup_cells` — the canonical CELL ENUMERATION (opponent-major cross product). Every
   consumer (the per-env :class:`~pop_trainer.rl.selfplay.MatchupProvider`, the main-process
@@ -12,15 +20,18 @@ it with no torch / sb3 / env imports:
 * :func:`outcome_to_float` — the outcome convention (mirrors eval's win logic in
   ``rl.evaluate``): ``"win"`` -> 1.0, ``"loss"`` -> 0.0, ``"draw"`` -> 0.5, and a done WITHOUT an
   outcome token (truncation / time-limit / lost connection) or an unknown token -> 0.5 (a draw,
-  never a win), so a degenerate episode cannot inflate a cell's win-rate.
-* :func:`ema_update` — the per-cell win-rate EMA fold, ``wr <- (1 - alpha) * wr + alpha *
-  outcome``. Unseen cells start at :data:`INITIAL_WIN_RATE` (0.5).
+  never a win). Carried in the training terminal ``info["matchup"]`` tag.
+* :func:`ema_update` — one EMA fold, ``value <- (1 - alpha) * value + alpha * measurement``.
+  Unseen cells start at :data:`INITIAL_WIN_RATE` (0.5).
+* :func:`eval_cell_rates` / :func:`fold_eval_rates` — the eval-signal feed: normalize an
+  ``evaluate_winrate`` structured result (either return shape) into per-cell rates, then fold
+  ONE eval cycle's rates into the win-rate table (zero-episode / unmeasured cells unchanged).
 * :func:`deficit_distribution` — ``P(cell) = floor * uniform + (1 - floor) *
   normalize(deficit)`` with ``deficit(cell) = 1 - wr(cell)``. The floor guarantees every cell
   keeps being sampled (min prob >= ``floor / n_cells``); an all-zero deficit (every cell fully
   won) falls back to uniform instead of dividing by zero.
 * :func:`distribution_entropy` / :func:`worst_cells` — observability helpers for the compact
-  rollout-boundary summary line.
+  post-eval summary line.
 
 Boundary: stdlib only (``math``); imported by ``rl.selfplay`` / ``rl.callbacks`` / the tests. No
 cycles, nothing from ``data`` / ``pretraining``.
@@ -29,13 +40,15 @@ cycles, nothing from ``data`` / ``pretraining``.
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 __all__ = [
     "INITIAL_WIN_RATE",
     "matchup_cells",
     "outcome_to_float",
     "ema_update",
+    "eval_cell_rates",
+    "fold_eval_rates",
     "deficit_distribution",
     "distribution_entropy",
     "worst_cells",
@@ -50,7 +63,8 @@ Cell = tuple[str, str | None]
 INITIAL_WIN_RATE = 0.5
 
 # The outcome tokens TankEnv.step surfaces in info["outcome"] on TERMINAL steps, mapped to the
-# scalar the EMA folds. Anything else (missing / unknown) maps to the draw value 0.5.
+# scalar the terminal info["matchup"] tag carries. Anything else (missing / unknown) maps to the
+# draw value 0.5.
 _OUTCOME_FLOATS = {"win": 1.0, "loss": 0.0, "draw": 0.5}
 
 
@@ -73,12 +87,12 @@ def matchup_cells(opponents: Sequence[str], maps: Sequence[str] | None = None) -
 
 
 def outcome_to_float(token: str | None) -> float:
-    """Map a terminal ``info["outcome"]`` token to the scalar the win-rate EMA folds (PURE).
+    """Map a terminal ``info["outcome"]`` token to a plain scalar for the matchup tag (PURE).
 
     ``"win"`` -> 1.0, ``"loss"`` -> 0.0, ``"draw"`` -> 0.5. A ``None`` token — a done step WITHOUT
     an outcome (truncation / time-limit / lost connection) — and any unknown token map to 0.5:
-    the same never-a-win convention eval uses (``rl.evaluate`` records such episodes as draws),
-    so a degenerate episode can neither inflate nor crater a cell's win-rate.
+    the same never-a-win convention eval uses (``rl.evaluate`` records such episodes as draws).
+    The tag is observability of what training played; it never feeds the win-rate table.
     """
     return _OUTCOME_FLOATS.get(token, 0.5)
 
@@ -86,12 +100,62 @@ def outcome_to_float(token: str | None) -> float:
 def ema_update(win_rate: float, outcome: float, alpha: float) -> float:
     """One exponential-moving-average fold: ``(1 - alpha) * win_rate + alpha * outcome`` (PURE).
 
-    ``alpha`` in ``(0, 1]`` is the smoothing weight of the newest episode; ``alpha == 1`` replaces
-    the running value outright.
+    ``alpha`` in ``(0, 1]`` is the smoothing weight of the newest measurement; ``alpha == 1``
+    replaces the running value outright.
     """
     if not 0.0 < alpha <= 1.0:
         raise ValueError(f"alpha must be in (0, 1], got {alpha}")
     return (1.0 - alpha) * win_rate + alpha * outcome
+
+
+def eval_cell_rates(
+    result: Mapping[tuple[str, str], tuple[int, int]] | Mapping[str, float],
+) -> dict[Cell, float]:
+    """Normalize an ``evaluate_winrate`` structured result into per-cell win-rates (PURE).
+
+    ``rl.evaluate.evaluate_winrate`` returns one of two shapes; both normalize onto the SAME
+    :data:`Cell` keys :func:`matchup_cells` enumerates (the eval and the sampler share the
+    ``cfg.opponents`` x ``cfg.maps`` strings):
+
+    * rotation eval (``maps`` given): per-cell counts ``{(selector, arena): (wins, episodes)}``
+      — each cell with ``episodes > 0`` yields ``wins / episodes``; a zero-episode cell was NOT
+      measured this cycle and is OMITTED so it cannot move the fold;
+    * single-arena eval (``maps=None``): per-opponent rates ``{selector: rate}`` — each rate
+      lands on the degenerate boot-arena cell ``(selector, None)``.
+    """
+    rates: dict[Cell, float] = {}
+    for key, value in result.items():
+        if isinstance(key, tuple):
+            selector, arena = key
+            wins, episodes = value
+            if episodes > 0:
+                rates[(selector, arena)] = wins / episodes
+        else:
+            rates[(key, None)] = float(value)
+    return rates
+
+
+def fold_eval_rates(
+    win_rates: Sequence[float],
+    cells: Sequence[Cell],
+    cell_rates: Mapping[Cell, float],
+    alpha: float,
+) -> list[float]:
+    """Fold ONE eval cycle's per-cell rates into the win-rate table (PURE; returns a NEW list).
+
+    Per cell measured this cycle: ``wr <- (1 - alpha) * wr + alpha * rate``
+    (:func:`ema_update`). Cells absent from ``cell_rates`` (zero-episode / unmeasured) keep
+    their value exactly. Rates keyed by a cell NOT in ``cells`` are ignored (tolerates a
+    roster / rotation mismatch, mirroring the sidecar restore).
+    """
+    if len(cells) != len(win_rates):
+        raise ValueError(
+            f"cells and win_rates must have equal length, got {len(cells)} != {len(win_rates)}"
+        )
+    return [
+        ema_update(wr, cell_rates[cell], alpha) if cell in cell_rates else wr
+        for cell, wr in zip(cells, win_rates, strict=True)
+    ]
 
 
 def deficit_distribution(win_rates: Sequence[float], floor: float) -> list[float]:
@@ -136,7 +200,7 @@ def worst_cells(
     """The ``k`` cells with the LOWEST win-rate, as ``(cell, win_rate)`` pairs (PURE).
 
     Ties keep the enumeration order (stable sort); ``k`` larger than the cell count returns all
-    cells. This is the observability slice logged at each rollout-boundary update.
+    cells. This is the observability slice logged at each post-eval curriculum update.
     """
     if len(cells) != len(win_rates):
         raise ValueError(

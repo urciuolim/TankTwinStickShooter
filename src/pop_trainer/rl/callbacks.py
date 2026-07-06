@@ -13,12 +13,19 @@ scalars and the overall become marginals over maps, all POOLED from the same per
 they reconcile; no per-(opponent x map) cell scalar is ever emitted.
 
 Also ships :class:`MatchupSamplingCallback` (the ``--matchup-sampling winrate`` main-process
-half): it accumulates the ``info["matchup"]`` cell/outcome tags the training
-``SelfPlayWrapper``s emit on TERMINAL steps, folds them into a per-cell win-rate EMA at each
-ROLLOUT BOUNDARY, recomputes the deficit sampling distribution, and broadcasts the plain-data
-distribution to every training env via ``set_attr`` — the same delegation path eval uses to
-re-pin opponents. The EMA matrix lives HERE (one process), so it is position-exact at any
-``n_envs`` and is what the sidecar persists/restores across ``--resume``.
+half). Its win-rate SIGNAL is EVALUATION: after each eval cycle, ``EvalWinRateCallback`` hands
+the cycle's structured ``evaluate_winrate`` result to the matchup callback (the ``result_sink``
+wiring in ``rl.train.train_local``), which folds the per-cell rates into its win-rate table at
+the SAME rollout boundary (the eval callback runs FIRST in the ``CallbackList``, the matchup
+callback LAST), recomputes the deficit sampling distribution, and broadcasts the plain-data
+distribution to every training env via ``set_attr``. Training terminal outcomes (the
+``info["matchup"]`` tags) feed only the per-cell play COUNTS — observability of what the sampler
+actually played — never the win-rates. Rationale: a training-side win-rate measures the
+STOCHASTIC policy, and at high entropy it inverts against the deterministic eval (training can
+report a noop win-rate near 0.9 while eval reports near 0.1), steering the curriculum away from
+the real weakness; eval measures the deterministic policy the run is judged on. The win-rate
+table lives HERE (one process), so it is position-exact at any ``n_envs`` and is what the
+sidecar persists/restores across ``--resume``.
 
 THE INVARIANT (enforced structurally): NO eval Unity instance ever coexists with a training Unity
 instance. The training builds and the eval builds use the SAME RAM budget (``M_eval == N_train``),
@@ -68,7 +75,8 @@ from pop_trainer.rl.matchup import (
     INITIAL_WIN_RATE,
     deficit_distribution,
     distribution_entropy,
-    ema_update,
+    eval_cell_rates,
+    fold_eval_rates,
     matchup_cells,
     worst_cells,
 )
@@ -76,7 +84,7 @@ from pop_trainer.rl.selfplay import DEFAULT_ROSTER
 
 if TYPE_CHECKING:
     import logging
-    from collections.abc import Sequence
+    from collections.abc import Callable, Mapping, Sequence
 
     from stable_baselines3.common.vec_env import VecEnv
 
@@ -118,6 +126,11 @@ class EvalWinRateCallback(BaseCallback):
             Torn down (``env_method("release")``) BEFORE eval instances spawn and respawned
             (``reset()``) AFTER eval. Passed in explicitly rather than via ``self.model.get_env()``
             so the handle is unambiguous.
+        result_sink: optional callable receiving each completed eval cycle's structured
+            ``evaluate_winrate`` result. This is the matchup curriculum's win-rate feed:
+            ``train_local`` wires :meth:`MatchupSamplingCallback.submit_eval_result` here when
+            ``--matchup-sampling winrate`` is on. ``None`` (the default) changes nothing —
+            the logging path is identical either way.
         verbose: SB3 verbosity passed to ``BaseCallback``.
     """
 
@@ -130,6 +143,7 @@ class EvalWinRateCallback(BaseCallback):
         seed: int | None = None,
         eval_env: VecEnv | None = None,
         training_vec: VecEnv | None = None,
+        result_sink: Callable[[Mapping], None] | None = None,
         verbose: int = 0,
     ):
         super().__init__(verbose)
@@ -140,6 +154,7 @@ class EvalWinRateCallback(BaseCallback):
         self.seed = seed
         self.eval_env = eval_env
         self.training_vec = training_vec
+        self.result_sink = result_sink
         # Timestep of the last eval; the FIRST boundary past eval_freq fires.
         self._last_eval_timestep = 0
 
@@ -156,6 +171,11 @@ class EvalWinRateCallback(BaseCallback):
         self._last_eval_timestep = self.num_timesteps
 
         result = self._run_eval_cycle()
+        if self.result_sink is not None:
+            # Hand the cycle's structured result to the matchup curriculum (its ONLY win-rate
+            # feed). The fold + broadcast happen at THIS same rollout boundary: the matchup
+            # callback runs after this one in train_local's CallbackList.
+            self.result_sink(result)
         if self.maps is None:
             # Single-arena eval: result is the per-selector win-rate dict, logged exactly as
             # before (no per-map scalar exists to emit).
@@ -225,43 +245,56 @@ class EvalWinRateCallback(BaseCallback):
 
 
 class MatchupSamplingCallback(BaseCallback):
-    """Aggregate training-episode outcomes per (opponent x map) cell and steer the joint sampler.
+    """Steer the joint (opponent x map) sampler from EVAL win-rates; count training episodes.
 
     The main-process half of ``--matchup-sampling winrate``. The per-env
     :class:`~pop_trainer.rl.selfplay.MatchupProvider`s draw each episode's (opponent, arena) cell
-    from a distribution this callback owns:
+    from a distribution this callback owns. Two strictly separated data flows:
 
-    * ``_on_step`` CONSUMES the ``info["matchup"]`` tags the training ``SelfPlayWrapper``s emit
-      on terminal steps (read from ``self.locals`` dones + infos) and accumulates them —
-      accumulate ONLY, the distribution never changes mid-rollout;
-    * ``_on_rollout_end`` folds the accumulated (cell, outcome) samples into the per-cell
-      win-rate EMA (:func:`~pop_trainer.rl.matchup.ema_update`; unseen cells start at the 0.5
-      prior), recomputes ``P(cell) = floor * uniform + (1 - floor) * normalize(1 - wr)``
-      (:func:`~pop_trainer.rl.matchup.deficit_distribution`), and BROADCASTS the plain-data
+    * ``win_rates`` — WHAT EVAL MEASURED. :meth:`submit_eval_result` (wired as
+      :class:`EvalWinRateCallback`'s ``result_sink`` in ``train_local``) queues each completed
+      eval cycle's structured ``evaluate_winrate`` result; ``_on_rollout_end`` folds the queued
+      per-cell rates into the win-rate table (:func:`~pop_trainer.rl.matchup.fold_eval_rates`),
+      recomputes ``P(cell) = floor * uniform + (1 - floor) * normalize(1 - wr)``
+      (:func:`~pop_trainer.rl.matchup.deficit_distribution`), BROADCASTS the plain-data
       distribution to every training env via ``training_vec.set_attr("matchup_distribution",
-      ...)`` — the same delegation path eval uses to re-pin opponents. Only the distribution
-      travels: each worker's provider (and its seeded RNG stream) is never replaced;
-    * ``_on_training_start`` broadcasts once up-front so a ``--resume``-restored EMA reaches the
-      freshly-built (uniform-initialized) providers before the first rollout.
+      ...)``, records the SB3 scalars, and logs ONE ``matchup_update`` summary. Because the eval
+      callback runs FIRST in the ``CallbackList`` and this one LAST, the fold lands at the SAME
+      rollout boundary the eval cycle completed at — never mid-rollout. Between eval cycles the
+      distribution is FROZEN: no fold, no broadcast, no log. Before the first eval cycle every
+      cell sits at the 0.5 prior, so the distribution is exactly uniform.
+    * ``counts`` — WHAT TRAINING PLAYED. ``_on_step`` consumes the ``info["matchup"]`` tags the
+      training ``SelfPlayWrapper``s emit on terminal steps and ``_on_rollout_end`` folds them
+      into the per-cell play counts at every boundary — pure observability of what the sampler
+      actually sampled. Training outcomes NEVER move ``win_rates``: the training-side win-rate
+      measures the STOCHASTIC policy, and at high entropy it inverts against the deterministic
+      eval (training can report a noop win-rate near 0.9 while eval reports near 0.1), steering
+      the curriculum away from the real weakness.
 
-    The EMA matrix lives HERE, in one process, so it is position-exact at ANY ``n_envs`` (the
+    ``_on_training_start`` broadcasts once up-front so a ``--resume``-restored table reaches the
+    freshly-built (uniform-initialized) providers before the first rollout.
+
+    The win-rate table lives HERE, in one process, so it is position-exact at ANY ``n_envs`` (the
     per-env sampling RNGs remain per-subproc and reseed on resume, like the existing providers).
     :meth:`state` / :meth:`restore` are the sidecar seam: a plain-JSON dict of cells, win-rates,
-    and sample counts that continues the curriculum across a resume.
+    and play counts that continues the curriculum across a resume.
 
-    Observability: at each rollout-boundary update ONE compact summary lands on the system
-    logger (the ``worst_k`` lowest-win-rate cells + the distribution entropy + sample counts),
-    plus two aggregate SB3 scalars (``matchup/distribution_entropy``, ``matchup/episodes``) —
-    never one scalar per cell.
+    Observability: at each post-eval update ONE compact summary lands on the system logger (the
+    ``worst_k`` lowest-win-rate cells + the distribution entropy + play counts), plus two
+    aggregate SB3 scalars (``matchup/distribution_entropy``, ``matchup/episodes``) — never one
+    scalar per cell.
 
     Args:
         opponents: the roster selector strings (the cell rows).
         maps: the arena rotation (the cell columns), or ``None`` for boot-arena cells.
         floor: the exploration floor ``eps`` in ``[0, 1]`` (min cell prob ``floor / n_cells``).
-        ema_alpha: the EMA weight of the newest episode, in ``(0, 1]``.
+        ema_alpha: the EMA weight of the newest eval cycle's per-cell rate, in ``(0, 1]``. The
+            default 0.4 is sized for per-EVAL-CYCLE folds of ~10-episode cell estimates (a few
+            cycles dominate the table); a per-episode-scale alpha like 0.05 would need ~20 eval
+            cycles to move a cell off its prior.
         training_vec: the TRAINING vec env handle (the integrator passes ``model.env``); the
             ``set_attr`` broadcast target. ``None`` skips broadcasting (pure aggregation).
-        sys_logger: optional system logger for the rollout-boundary summary record.
+        sys_logger: optional system logger for the post-eval summary record.
         worst_k: how many lowest-win-rate cells the summary names.
         verbose: SB3 verbosity passed to ``BaseCallback``.
     """
@@ -272,7 +305,7 @@ class MatchupSamplingCallback(BaseCallback):
         maps: Sequence[str] | None = None,
         *,
         floor: float = 0.25,
-        ema_alpha: float = 0.05,
+        ema_alpha: float = 0.4,
         training_vec: VecEnv | None = None,
         sys_logger: logging.Logger | None = None,
         worst_k: int = 5,
@@ -288,18 +321,27 @@ class MatchupSamplingCallback(BaseCallback):
         self.training_vec = training_vec
         self.sys_logger = sys_logger
         self.worst_k = worst_k
-        # Terminal samples accumulated within the CURRENT rollout: (cell index, outcome float).
-        self._pending: list[tuple[int, float]] = []
+        # Cell indices of the training episodes terminated within the CURRENT rollout (feeds
+        # counts only).
+        self._pending: list[int] = []
+        # Normalized per-cell rate dicts of the eval cycles completed since the last fold
+        # (feeds win_rates; normally at most one — eval runs at the same boundary cadence).
+        self._pending_eval: list[dict] = []
 
     @property
     def distribution(self) -> list[float]:
-        """The current sampling distribution over :attr:`cells` (recomputed from the EMA)."""
+        """The current sampling distribution over :attr:`cells` (from the win-rate table)."""
         return deficit_distribution(self.win_rates, self.floor)
 
     def state(self) -> dict:
-        """The plain-JSON resumable state the sidecar persists (cells + EMA + counts + config)."""
+        """The plain-JSON resumable state the sidecar persists (cells + win-rates + counts).
+
+        ``signal: "eval"`` marks the win-rate feed so a sidecar reader can tell the table holds
+        deterministic eval measurements; :meth:`restore` tolerates its absence.
+        """
         return {
             "sampling": "winrate",
+            "signal": "eval",
             "floor": float(self.floor),
             "ema_alpha": float(self.ema_alpha),
             "cells": [[selector, arena] for selector, arena in self.cells],
@@ -308,11 +350,12 @@ class MatchupSamplingCallback(BaseCallback):
         }
 
     def restore(self, state: dict) -> None:
-        """Continue a persisted curriculum: restore each cell's EMA + count by cell key.
+        """Continue a persisted curriculum: restore each cell's win-rate + count by cell key.
 
         Matching is by cell tag, so a resume with a changed roster / rotation keeps the cells
         that still exist and leaves new cells at the 0.5 prior. A malformed / empty block is a
-        no-op.
+        no-op. A block without the ``signal`` field (an older sidecar whose table was fed from
+        training outcomes) restores fine — the next eval folds overwrite it.
         """
         cells = state.get("cells") or []
         win_rates = state.get("win_rates") or []
@@ -327,13 +370,25 @@ class MatchupSamplingCallback(BaseCallback):
             if cell in saved:
                 self.win_rates[i], self.counts[i] = saved[cell]
 
+    def submit_eval_result(self, result: Mapping) -> None:
+        """Queue one completed eval cycle's structured ``evaluate_winrate`` result (the signal).
+
+        Called by :class:`EvalWinRateCallback` (the ``result_sink`` wiring) right after each
+        eval cycle. The result is normalized to per-cell rates here
+        (:func:`~pop_trainer.rl.matchup.eval_cell_rates` handles both return shapes — per-cell
+        counts under a map rotation, per-opponent rates onto ``(selector, None)`` boot-arena
+        cells without one) and folded at the next ``_on_rollout_end`` — the same boundary, given
+        the ``CallbackList`` order — so the distribution never changes mid-rollout.
+        """
+        self._pending_eval.append(eval_cell_rates(result))
+
     def _broadcast(self) -> None:
         """Push the current distribution into every training env's provider (plain data only)."""
         if self.training_vec is not None:
             self.training_vec.set_attr("matchup_distribution", self.distribution)
 
     def _on_training_start(self) -> None:
-        """Sync the providers to the callback's EMA before the first rollout (the resume seam).
+        """Sync the providers to the callback's table before the first rollout (the resume seam).
 
         On a fresh run this re-sends the uniform distribution the providers already hold (a
         no-op in effect); after a ``--resume`` restore it is what carries the persisted
@@ -342,7 +397,7 @@ class MatchupSamplingCallback(BaseCallback):
         self._broadcast()
 
     def _on_step(self) -> bool:
-        """Accumulate terminal (cell, outcome) samples — NEVER change the distribution here."""
+        """Accumulate terminal training-episode cells — NEVER change the distribution here."""
         dones = self.locals.get("dones")
         infos = self.locals.get("infos")
         if dones is None or infos is None:
@@ -356,16 +411,31 @@ class MatchupSamplingCallback(BaseCallback):
             index = self._cell_index.get((tag.get("opponent"), tag.get("map")))
             if index is None:
                 continue
-            self._pending.append((index, float(tag.get("outcome", 0.5))))
+            self._pending.append(index)
         return True
 
     def _on_rollout_end(self) -> None:
-        """Fold the rollout's samples into the EMA, broadcast the new distribution, log ONE line."""
-        new_samples = len(self._pending)
-        for index, outcome in self._pending:
-            self.win_rates[index] = ema_update(self.win_rates[index], outcome, self.ema_alpha)
+        """Fold counts every boundary; fold + broadcast win-rates ONLY after an eval cycle.
+
+        The play counts absorb the rollout's terminal tags unconditionally (cheap
+        observability). The win-rate table, the distribution broadcast, the SB3 scalars, and
+        the one-line ``matchup_update`` summary move ONLY when an eval cycle completed at this
+        boundary (the eval callback ran first and queued its result); otherwise the
+        distribution stays frozen exactly as the workers last received it.
+        """
+        for index in self._pending:
             self.counts[index] += 1
         self._pending.clear()
+
+        if not self._pending_eval:
+            return
+
+        cells_measured = 0
+        for cell_rates in self._pending_eval:
+            cells_measured += len(cell_rates)
+            self.win_rates = fold_eval_rates(self.win_rates, self.cells, cell_rates, self.ema_alpha)
+        eval_folds = len(self._pending_eval)
+        self._pending_eval.clear()
 
         distribution = self.distribution
         self._broadcast()
@@ -380,7 +450,8 @@ class MatchupSamplingCallback(BaseCallback):
                 extra={
                     "detail": {
                         "num_timesteps": self.num_timesteps,
-                        "new_samples": new_samples,
+                        "eval_folds": eval_folds,
+                        "cells_measured": cells_measured,
                         "total_episodes": sum(self.counts),
                         "entropy": entropy,
                         "worst_cells": [

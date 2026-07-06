@@ -1566,17 +1566,33 @@ def test_restore_map_provider_position_uniform_and_none_noop(tmp_path):
 
 def test_trainconfig_matchup_defaults_off(tmp_path):
     # BACKWARD-COMPAT: the default config keeps matchup sampling OFF with the CTO-set knobs.
+    # The alpha default is 0.4 — sized for per-EVAL-CYCLE folds of ~10-episode cell estimates
+    # (the old per-episode-scale 0.05 would leave the table near its prior for ~20 cycles).
     cfg = _cfg(tmp_path)
     assert cfg.matchup_sampling == "off"
     assert cfg.matchup_floor == 0.25
-    assert cfg.matchup_ema_alpha == 0.05
+    assert cfg.matchup_ema_alpha == 0.4
     d = cfg.to_dict()
     assert d["matchup_sampling"] == "off"
     assert d["matchup_floor"] == 0.25
-    assert d["matchup_ema_alpha"] == 0.05
+    assert d["matchup_ema_alpha"] == 0.4
     import json
 
     json.dumps(d)
+
+
+def test_trainconfig_winrate_requires_eval_enabled(tmp_path):
+    # The curriculum's win-rate signal is EVAL: with eval disabled the distribution would
+    # never update, so the config is rejected up-front.
+    with pytest.raises(ValueError, match="eval_freq"):
+        _cfg(tmp_path, matchup_sampling="winrate", eval_freq=0)
+
+
+def test_trainconfig_winrate_accepts_eval_enabled(tmp_path):
+    cfg = _cfg(tmp_path, matchup_sampling="winrate", eval_freq=3000)
+    assert cfg.matchup_sampling == "winrate"
+    # eval off with the sampler OFF stays valid (the guard binds only to winrate).
+    assert _cfg(tmp_path, eval_freq=0).eval_freq == 0
 
 
 @pytest.mark.parametrize(
@@ -1666,8 +1682,9 @@ def test_sidecar_matchup_state_roundtrips(tmp_path):
     cfg = _cfg(tmp_path, matchup_sampling="winrate", opponents=("noop", "random"))
     state = {
         "sampling": "winrate",
+        "signal": "eval",
         "floor": 0.25,
-        "ema_alpha": 0.05,
+        "ema_alpha": 0.4,
         "cells": [["noop", None], ["random", None]],
         "win_rates": [0.75, 0.5],
         "counts": [3, 1],
@@ -1687,16 +1704,18 @@ def test_sidecar_matchup_state_roundtrips(tmp_path):
 
 def test_matchup_state_block_config_fallback_when_state_missing(tmp_path):
     # Flag on but no callback state at the save site -> the config-only view (still describes
-    # the run; nothing position-exact to persist).
+    # the run; nothing position-exact to persist). It carries the signal marker too.
     cfg = _cfg(tmp_path, matchup_sampling="winrate", matchup_floor=0.3, matchup_ema_alpha=0.1)
     block = _matchup_state_block(None, cfg)
-    assert block == {"sampling": "winrate", "floor": 0.3, "ema_alpha": 0.1}
+    assert block == {"sampling": "winrate", "signal": "eval", "floor": 0.3, "ema_alpha": 0.1}
 
 
-def test_restore_matchup_state_continues_the_ema(tmp_path):
+def test_restore_matchup_state_continues_the_table(tmp_path):
     from pop_trainer.rl.callbacks import MatchupSamplingCallback
 
-    cb = MatchupSamplingCallback(("noop", "random"), None, floor=0.25, ema_alpha=0.05)
+    cb = MatchupSamplingCallback(("noop", "random"), None, floor=0.25, ema_alpha=0.4)
+    # An OLD sidecar block (no "signal" field — a training-fed table): restores fine; the
+    # next eval folds overwrite it.
     sidecar = {
         "matchup": {
             "sampling": "winrate",
@@ -1740,6 +1759,7 @@ def test_sidecar_callback_includes_live_matchup_state(tmp_path):
     sidecar_cb._on_step()
     loaded = load_sidecar(cfg.run_dir / "state.json")
     assert loaded["matchup"]["sampling"] == "winrate"
+    assert loaded["matchup"]["signal"] == "eval"
     assert loaded["matchup"]["win_rates"] == [0.75, 0.5]
     assert loaded["matchup"]["counts"] == [1, 0]
 
@@ -1748,7 +1768,7 @@ def test_parse_args_matchup_defaults_off():
     args = _parse_args(["--total-timesteps", "1000", "--run-dir", "out"])
     assert args.matchup_sampling == "off"
     assert args.matchup_floor == 0.25
-    assert args.matchup_ema_alpha == 0.05
+    assert args.matchup_ema_alpha == 0.4  # the CLI default reads from TrainConfig
 
 
 def test_parse_args_matchup_winrate_with_knobs():
@@ -1807,7 +1827,25 @@ def test_main_matchup_omitted_stays_off(tmp_path, monkeypatch):
     cfg = captured["cfg"]
     assert cfg.matchup_sampling == "off"
     assert cfg.matchup_floor == 0.25
-    assert cfg.matchup_ema_alpha == 0.05
+    assert cfg.matchup_ema_alpha == 0.4
+
+
+def test_main_winrate_without_eval_rejected(tmp_path, monkeypatch):
+    # The CLI surfaces the winrate-requires-eval validation before training starts.
+    _capture_cfg(monkeypatch)
+    with pytest.raises(ValueError, match="eval_freq"):
+        main(
+            [
+                "--total-timesteps",
+                "1000",
+                "--run-dir",
+                str(tmp_path),
+                "--matchup-sampling",
+                "winrate",
+                "--eval-freq",
+                "0",
+            ]
+        )
 
 
 @pytest.mark.parametrize(

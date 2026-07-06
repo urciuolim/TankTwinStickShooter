@@ -358,9 +358,9 @@ win-signal source of truth) live in
 
 ### Flag reference
 
-Flags (defaults shown, [`_parse_args`, `train.py:1645-1861`](../src/pop_trainer/rl/train.py)). Every
+Flags (defaults shown, [`_parse_args`, `train.py:1674-1892`](../src/pop_trainer/rl/train.py)). Every
 PPO/encoder default keeps SB3's own default exact, so a run with no new flags reproduces today's run
-bit-for-bit ([`TrainConfig`, `train.py:276-299`](../src/pop_trainer/rl/train.py)).
+bit-for-bit ([`TrainConfig`, `train.py:287-310`](../src/pop_trainer/rl/train.py)).
 
 **Run control**
 
@@ -373,12 +373,12 @@ bit-for-bit ([`TrainConfig`, `train.py:276-299`](../src/pop_trainer/rl/train.py)
 | `--seed` | `0` | master seed — threaded into SB3, the env, and the opponent provider |
 | `--opponents` | *(full roster)* | comma-separated roster selectors, validated against [`AGENT_SELECTORS`](../src/pop_trainer/agents/registry.py); unknown → exit 2 before launch |
 | `--opponent-strategy` | `round_robin` | `round_robin` (resumable) or `uniform` (seed-only resume) |
-| `--maps` | *(absent)* | per-episode arena rotation for **TRAINING** (via `switch_arena`), and **eval covers the same rotation** (episodes spread across the maps, per-map win-rates in TensorBoard — see [Map rotation](#map-rotation)). **Absent** → single arena from `--config` (today's default). **No value** → the curated 10-map rotation (`core.maps.CURATED_ROTATION`). **A directory** → its sorted `*.json` configs' arena targets. **A list of arena targets** → that order, verbatim. Resolved via `resolve_map_rotation` (`train.py:1878`) |
+| `--maps` | *(absent)* | per-episode arena rotation for **TRAINING** (via `switch_arena`), and **eval covers the same rotation** (episodes spread across the maps, per-map win-rates in TensorBoard — see [Map rotation](#map-rotation)). **Absent** → single arena from `--config` (today's default). **No value** → the curated 10-map rotation (`core.maps.CURATED_ROTATION`). **A directory** → its sorted `*.json` configs' arena targets. **A list of arena targets** → that order, verbatim. Resolved via `resolve_map_rotation` (`train.py:1909`) |
 | `--map-strategy` | `round_robin` | map rotation: `round_robin` (resumable at `--n-envs 1`) or `uniform` (seed-only resume) |
-| `--matchup-sampling` | `off` | matchup choice per **TRAINING** episode: `off` → the independent opponent/map samplers above (feature fully inert, behavior unchanged); `winrate` → ONE joint (opponent × map) draw weighted toward low-win-rate cells (**eval unaffected**) — see [Matchup sampling](#matchup-sampling) (`MATCHUP_SAMPLING_CHOICES`, `train.py:137`) |
+| `--matchup-sampling` | `off` | matchup choice per **TRAINING** episode: `off` → the independent opponent/map samplers above (feature fully inert, behavior unchanged); `winrate` → ONE joint (opponent × map) draw weighted toward the cells the periodic **deterministic eval** wins least (the signal is EVAL, so it **requires `--eval-freq > 0`**; eval itself unaffected) — see [Matchup sampling](#matchup-sampling) (`MATCHUP_SAMPLING_CHOICES`, `train.py:138`) |
 | `--matchup-floor` | `0.25` | the winrate sampler's exploration floor `eps` in `[0, 1]`: every cell keeps probability ≥ `eps / n_cells` |
-| `--matchup-ema-alpha` | `0.05` | per-cell win-rate EMA weight of the newest episode, in `(0, 1]` |
-| `--eval-freq` | `10000` | env-steps between win-rate evals (`0` = off) |
+| `--matchup-ema-alpha` | `0.4` | per-cell win-rate EMA weight of the newest **eval cycle's** per-cell rate, in `(0, 1]` (default sized for per-eval-cycle folds of ~10-episode cell estimates) |
+| `--eval-freq` | `10000` | env-steps between win-rate evals (`0` = off; must be `> 0` when `--matchup-sampling winrate`) |
 | `--eval-episodes` | `10` | greedy episodes per opponent per eval; with `--maps`, spread **deterministically** across the rotation maps (`episode_spread` floor/ceil quotas summing to exactly N — e.g. 100 episodes / 10 maps = 10 per (opponent, map) cell; total eval cost unchanged) |
 | `--checkpoint-freq` | `10000` | env-steps between checkpoints (the sidecar rides this cadence) |
 
@@ -387,8 +387,8 @@ bit-for-bit ([`TrainConfig`, `train.py:276-299`](../src/pop_trainer/rl/train.py)
 | Flag | Default | Meaning |
 |------|---------|---------|
 | `--n-envs` | `1` | parallel **training** envs. `1` → in-process `DummyVecEnv`; `N>1` → `SubprocVecEnv` of `N` builds, each on port `game_port + i` (`start_method="spawn"`). Eval is built at the SAME width `M==N`. See [multi-env](#multi-env-training---n-envs--1) |
-| `--port` | `50000` | base TCP port. Training block = `[port, port + n_envs - 1]` (`training_ports`, `train.py:710-712`) |
-| `--eval-port` | *(`port + n_envs`)* | base for the **eval block** `[eval_port, eval_port + n_envs - 1]`. Default = first port AFTER the training block (`effective_eval_port`, `train.py:361-371`). When set it must differ from `--port` AND not overlap the training block, else `ValueError` (`train.py:333-350`) |
+| `--port` | `50000` | base TCP port. Training block = `[port, port + n_envs - 1]` (`training_ports`, `train.py:727-729`) |
+| `--eval-port` | *(`port + n_envs`)* | base for the **eval block** `[eval_port, eval_port + n_envs - 1]`. Default = first port AFTER the training block (`effective_eval_port`, `train.py:378-388`). When set it must differ from `--port` AND not overlap the training block, else `ValueError` (`train.py:350-367`) |
 | `--frame-stack` | `1` | `VecFrameStack` depth (`1` = passthrough) |
 | `--allow-oversized` | *(off)* | skip the pre-flight rollout-buffer memory **abort** (estimate still printed; [see memory](#multi-env-training---n-envs--1)) |
 
@@ -399,7 +399,7 @@ bit-for-bit ([`TrainConfig`, `train.py:276-299`](../src/pop_trainer/rl/train.py)
 | `--trunk` | `auto` | `auto` keeps the size-based selection (`gn-cnn` ≤128px frame, else `cnn`); `cnn`/`resnet`/`gn-cnn` force that trunk (`TRUNK_CHOICES`, `train.py:133`) |
 | `--encoder-checkpoint` | `None` | optional pretrained-encoder `state_dict` for the features extractor |
 | `--freeze-encoder` | *(off)* | freeze the encoder weights during RL |
-| `--net-arch` | `[64, 64]` | policy/value MLP head; or a per-head spec `'pi=64,64:vf=64,64'` (`_parse_net_arch`, `train.py:1624-1643`) |
+| `--net-arch` | `[64, 64]` | policy/value MLP head; or a per-head spec `'pi=64,64:vf=64,64'` (`_parse_net_arch`, `train.py:1653-1672`) |
 
 **PPO hyperparameters** (all SB3-faithful defaults)
 
@@ -413,7 +413,7 @@ bit-for-bit ([`TrainConfig`, `train.py:276-299`](../src/pop_trainer/rl/train.py)
 | | | | `--max-grad-norm` | `0.5` |
 
 `--lr-schedule` is `constant` (fixed `--learning-rate`) or `linear` (decay to 0 via SB3's
-`progress_remaining`, `_resolve_learning_rate`, `train.py:896-907`). `--n-steps` is **the memory
+`progress_remaining`, `_resolve_learning_rate`, `train.py:913-924`). `--n-steps` is **the memory
 lever** at `--n-envs > 1` (the rollout buffer scales `n_steps × n_envs`).
 
 ```bash
@@ -432,7 +432,7 @@ uv run python -m pop_trainer.rl.train --total-timesteps 200000 --run-dir runs/tr
 **Not on the CLI** (use `TrainConfig` dataclass defaults — override in code): `frame_shape` (DERIVED
 from the launched config's `obs_pixels_*` via
 [`core.obs.frame_shape_from_config`](components/core.md#the-observation-resolution-contract-coreobs),
-then `validate_frame_shape`d, `train.py:1312-1319,1888`) and `build_path` (→ the OS-aware
+then `validate_frame_shape`d, `train.py:1332-1339,1919`) and `build_path` (→ the OS-aware
 [`default_build_path`](../src/pop_trainer/core/launch.py)).
 
 ### Ports — running runs side by side
@@ -477,17 +477,17 @@ uv run python -m pop_trainer.rl.train \
 ```
 
 With `--port 50000 --n-envs 4`: training = `[50000, 50003]`, eval = `[50004, 50007]`
-(auto `game_port + n_envs`; `eval_ports`, `train.py:715-722`). In general at `--port P --n-envs N`:
+(auto `game_port + n_envs`; `eval_ports`, `train.py:732-740`). In general at `--port P --n-envs N`:
 training = `[P, P+N-1]`, eval = `[P+N, P+2N-1]`.
 
 > **Memory — the rollout buffer is the OOM surface.** The SB3 PPO `RolloutBuffer` stores
 > `(n_steps, n_envs, *obs_shape)` uint8 frames, so its obs cost is approximately
 > **`n_steps × n_envs × frame_bytes × frame_stack`** (`estimate_rl_memory_bytes`,
-> `train.py:445-456`). **Lowering `--n-steps` is the primary lever** (halve it → roughly halve the
+> `train.py:462-474`). **Lowering `--n-steps` is the primary lever** (halve it → roughly halve the
 > buffer at fixed `--n-envs`; this is why the 4-env example uses `--n-steps 512`).
 >
-> A **pre-flight guard** runs at startup (`check_rl_memory_budget`, `train.py:459-507`; called at
-> `train.py:1356`): it adds **~1 GB per live Unity instance** for **`n_envs`** instances (NOT
+> A **pre-flight guard** runs at startup (`check_rl_memory_budget`, `train.py:476-528`; called at
+> `train.py:1376`): it adds **~1 GB per live Unity instance** for **`n_envs`** instances (NOT
 > `n_envs + 1` — the eval and training SETS never coexist, so peak concurrent = `n_envs`), **always
 > prints the estimate**, and **aborts with exit `2` BEFORE any build launches** when the total
 > exceeds **60% of available RAM** (`MEMORY_MARGIN = 0.6`) — unless `--allow-oversized`. If it aborts:
@@ -554,11 +554,25 @@ episode (the sections above) and the feature is fully inert — behavior unchang
 winrate` replaces both choices with **one joint draw** over cells = (opponent × map): each TRAINING
 episode's cell is drawn from `P(cell) = eps·uniform + (1−eps)·normalize(1 − win_rate)`, so the agent
 gets more training signal on the (opponent, map) combinations it is currently **weakest** at, while
-the `--matchup-floor` eps keeps every combination in the mix. The win-rate signal comes from TRAINING
-terminals (win = 1, loss = 0, draw/truncation = 0.5 — never a win), folded as an EMA
-(`--matchup-ema-alpha`) at rollout boundaries only; unseen cells start at the 0.5 prior (initial
-distribution exactly uniform). It also works **without `--maps`**: cells are then (opponent × boot
-arena) and no `switch_arena` is ever sent (flags at `train.py:1801-1821`).
+the `--matchup-floor` eps keeps every combination in the mix.
+
+**The win-rate signal is the periodic deterministic EVAL.** After each eval cycle, that cycle's
+per-cell greedy win-rates are EMA-folded into the sampler's table (`--matchup-ema-alpha`, default
+`0.4` — sized for per-eval-cycle folds of ~10-episode cell estimates) and the new distribution is
+broadcast to the workers, all at that same rollout boundary. What to expect when operating it:
+
+- the distribution is **uniform until the first eval cycle** (every cell starts at the 0.5 prior)
+  and **frozen between eval cycles** — it moves only at post-eval boundaries;
+- **training outcomes do NOT move the win-rates** — they feed only the per-cell play **counts**
+  (`counts` = what training played; `win_rates` = what eval measured). The stochastic rollout
+  policy's win-rate can invert against the deterministic eval at high entropy, so eval is the
+  signal the curriculum trusts;
+- because the signal is eval, `--matchup-sampling winrate` **requires eval enabled**: combining it
+  with `--eval-freq 0` is rejected at config validation, before any build launches
+  (`train.py:340-345`).
+
+It also works **without `--maps`**: cells are then (opponent × boot arena) and no `switch_arena` is
+ever sent (flags at `train.py:1830-1852`).
 
 ```bash
 # win-rate curriculum over 3 opponents x the curated 10 arenas
@@ -568,19 +582,22 @@ uv run python -m pop_trainer.rl.train --total-timesteps 200000 --run-dir runs/tr
 ```
 
 Watch `matchup/distribution_entropy` + `matchup/episodes` in TensorBoard, and the one-line
-`matchup_update` summary (worst-k lowest-win-rate cells + entropy) in `training-system.log`.
+`matchup_update` summary (worst-k lowest-win-rate cells + entropy + eval folds) in
+`training-system.log` — both are emitted only at **post-eval** rollout boundaries.
 
-> **EVAL IS UNAFFECTED** — the joint sampler attaches to the **training role only**, and eval
-> episodes never feed the matchup EMA (it folds TRAINING terminals only). The eval benchmark keeps
-> its own deterministic schedule — `round_robin` opponent pinning on the fixed boot arena, or the
-> pinned per-map phases under [map rotation](#map-rotation) — comparable eval-to-eval. Internals:
+> **EVAL IS UNAFFECTED — the coupling is one-way.** The joint sampler attaches to the **training
+> role only**; the eval benchmark keeps its own deterministic schedule — `round_robin` opponent
+> pinning on the fixed boot arena, or the pinned per-map phases under [map rotation](#map-rotation)
+> — comparable eval-to-eval. Eval results steer training; the sampler never steers eval. Internals:
 > [rl → matchup sampling](components/rl.md#the-train_local-integrator).
 >
-> **Resume:** the curriculum is persisted in a third `matchup` sidecar block (cells + win-rate EMA +
-> counts; with the feature off the block is just `{"sampling": "off"}`). `--resume` restores it **by
-> cell key**, so a changed roster/rotation keeps the surviving cells and starts new ones at the 0.5
-> prior — and it is position-exact at ANY `--n-envs` (the EMA lives in the main process, not
-> per-subproc).
+> **Resume:** the curriculum is persisted in a third `matchup` sidecar block (cells + the eval-fed
+> win-rate table + play counts, marked `signal: "eval"`; with the feature off the block is just
+> `{"sampling": "off"}`). `--resume` restores it **by cell key**, so a changed roster/rotation keeps
+> the surviving cells and starts new ones at the 0.5 prior — and it is position-exact at ANY
+> `--n-envs` (the table lives in the main process, not per-subproc). An older sidecar whose table
+> was fed from training outcomes (no `signal` field) restores fine — its values decay out over the
+> first few eval folds (EMA-blended, not overwritten).
 
 ### The training topology
 
@@ -597,15 +614,15 @@ env's `frame_shape` is derived from), both players AI, `game_maxTime: 60`, `play
 ### Resume
 
 `--resume <prior run_dir>` continues a previous run: it picks the **highest-step** `model_*.zip`
-([`_latest_checkpoint`, `train.py:1239-1262`](../src/pop_trainer/rl/train.py)), does `PPO.load`
-(`train.py:1413`), restores the opponent position + the map-rotation block + ELO from that dir's
-`state.json` sidecar (`train.py:1414-1422`) — and, when `--matchup-sampling winrate` is on, the
-`matchup` curriculum block (`train.py:1461-1462`; see [Matchup sampling](#matchup-sampling)) — and
+([`_latest_checkpoint`, `train.py:1259-1282`](../src/pop_trainer/rl/train.py)), does `PPO.load`
+(`train.py:1433`), restores the opponent position + the map-rotation block + ELO from that dir's
+`state.json` sidecar (`train.py:1434-1442`) — and, when `--matchup-sampling winrate` is on, the
+`matchup` curriculum block (`train.py:1483-1484`; see [Matchup sampling](#matchup-sampling)) — and
 continues with `reset_num_timesteps=False`. Resuming a dir with no parseable `model_*.zip` raises
-`FileNotFoundError` (`train.py:1409-1412`).
+`FileNotFoundError` (`train.py:1428-1432`).
 
 > **CRITICAL — sub-cadence smoke runs are NOT resumable.** `--checkpoint-freq` (default **10000**
-> env-steps; `TrainConfig.checkpoint_freq`, `train.py:271`) controls when a `model_*.zip` is written.
+> env-steps; `TrainConfig.checkpoint_freq`, `train.py:282`) controls when a `model_*.zip` is written.
 > A run whose `--total-timesteps` is **below** the checkpoint cadence writes **no intermediate
 > `model_*.zip`** — only the final `state.json` — and therefore **cannot be `--resume`d** (resume
 > needs a checkpoint zip and raises `FileNotFoundError`). For a resumable checkpoint, keep
@@ -627,7 +644,7 @@ control flow (Python off by default on any unwired path; C# gated on the build's
 |------|---------------|
 | `training-system.log` | the main process (`role=system`, `layer=train`) |
 | `env-<role>-<port>.log` | one per env connection (`role` = `train`/`eval`). SHARED by the env + protocol layers for that socket; **appends across respawns** (not suffixed per launch) |
-| `unity-<role>-<port>-<attempt>.log` | one per Unity **LAUNCH** (the build's `-logFile`), paired by `(role, port)`. The **`<attempt>` suffix** (`-0`, `-1`, …) is load-bearing: Unity truncates its `-logFile` on every launch, so a distinct file per launch means a respawn **never wipes the prior (hung) instance's C# log** (`_attempt_unity_log_path`, `train.py:531-543`) |
+| `unity-<role>-<port>-<attempt>.log` | one per Unity **LAUNCH** (the build's `-logFile`), paired by `(role, port)`. The **`<attempt>` suffix** (`-0`, `-1`, …) is load-bearing: Unity truncates its `-logFile` on every launch, so a distinct file per launch means a respawn **never wipes the prior (hung) instance's C# log** (`_attempt_unity_log_path`, `train.py:548-560`) |
 
 A **1-train + 1-eval run** (default `--n-envs 1`, ports 50000/50001) that never relaunches produces
 **5 files**:
