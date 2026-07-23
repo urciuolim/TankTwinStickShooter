@@ -344,6 +344,21 @@ def run(cfg: TrainConfig) -> dict:
     total_steps = len(train_loader)
     loss_trajectory: list[dict[str, float]] = []
     val_trajectory: list[dict] = []
+    out_dir = Path(cfg.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    def _save_checkpoint(path: Path) -> None:
+        torch.save(
+            {
+                "encoder_state_dict": model.encoder.state_dict(),
+                "decoder_state_dict": model.state_dict(),
+                "norm_stats": splits.stats.to_json(),
+                "grid_extent": splits.extent.to_json(),
+                "config": _config_json(cfg),
+            },
+            path,
+        )
+
     for epoch in range(cfg.epochs):
         train_sampler.set_epoch(epoch)
         reporter.epoch_start(epoch + 1, total_steps)
@@ -385,6 +400,13 @@ def run(cfg: TrainConfig) -> dict:
                 flush=True,
             )
 
+        # Per-epoch checkpoint with a unique name, saved BEFORE the post-training calibration so a
+        # long run yields a usable encoder every epoch even if a later step fails. Same payload as
+        # the final checkpoint.pt; the model card is written once at the end.
+        ckpt_path = out_dir / f"checkpoint_epoch{epoch:03d}.pt"
+        _save_checkpoint(ckpt_path)
+        print(f"[ckpt] epoch {epoch} -> {ckpt_path.name}", file=sys.stderr, flush=True)
+
     val_preds, val_targets = _accumulate(model, val_loader, device)
     test_preds, test_targets = _accumulate(model, test_loader, device)
     val_metrics = (
@@ -403,18 +425,7 @@ def run(cfg: TrainConfig) -> dict:
 
     presence_calibration = _calibrate_presence(val_preds, val_targets, test_preds, test_targets)
 
-    out_dir = Path(cfg.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "encoder_state_dict": model.encoder.state_dict(),
-            "decoder_state_dict": model.state_dict(),
-            "norm_stats": splits.stats.to_json(),
-            "grid_extent": splits.extent.to_json(),
-            "config": _config_json(cfg),
-        },
-        out_dir / "checkpoint.pt",
-    )
+    _save_checkpoint(out_dir / "checkpoint.pt")
     _write_model_card(out_dir, model, cfg, device, h, w, pos_weight, val_metrics, test_metrics)
 
     record = {

@@ -299,10 +299,20 @@ the square gn-cnn cell, [`profile.py:106-113`](../../src/pop_trainer/pretraining
 
 ## The artifacts
 
-`run` writes three files into `--out`
-([`train.py:413-445,646-665`](../../src/pop_trainer/pretraining/train.py)):
+`run` saves a **checkpoint after every epoch** and writes three end-of-run files into `--out`
+([`train.py:350-360,403-408,428-448,602-669`](../../src/pop_trainer/pretraining/train.py)):
 
-- **`checkpoint.pt`** — the encoder `state_dict` + the full decoder state + the TRAIN-fit
+- **`checkpoint_epochNNN.pt`** (`checkpoint_epoch000.pt`, `checkpoint_epoch001.pt`, …) — a
+  per-epoch checkpoint saved after **EVERY epoch**, BEFORE the end-of-run eval / presence
+  calibration, so a long run leaves a usable encoder for each completed epoch even if a later
+  step fails or the run is interrupted. **Identical payload to `checkpoint.pt`**: both are
+  written by the single `_save_checkpoint` helper
+  ([`train.py:350-360`](../../src/pop_trainer/pretraining/train.py)), so the two can never
+  drift. The zero-padded epoch number keeps the names unique (and sorted), and cannot collide
+  with `checkpoint.pt`; a `[ckpt]` line per epoch goes to stderr
+  ([`train.py:403-408`](../../src/pop_trainer/pretraining/train.py)).
+- **`checkpoint.pt`** — the FINAL checkpoint (same payload, written after training + calibration
+  via the same helper): the encoder `state_dict` + the full decoder state + the TRAIN-fit
   `norm_stats` + `grid_extent` + the run config. The **encoder is the reusable artifact** the
   downstream RL phase and the ablation sweep consume; the heads in the checkpoint are disposable.
 - **`results.json`** — strict-JSON (`json.dump(..., allow_nan=False)`, NaN/Inf sanitized): per-group
@@ -354,7 +364,9 @@ Not via imports — it produces on-disk artifacts (see [the artifacts](#the-arti
 
 - A **trained encoder checkpoint** (`checkpoint.pt`) — the **reusable artifact** the downstream
   RL phase and the ablation sweep consume. The heads in the checkpoint are disposable; the
-  encoder is the payload.
+  encoder is the payload. (Per-epoch `checkpoint_epochNNN.pt` snapshots with the SAME payload are
+  saved every epoch, so any completed epoch's encoder is also consumable — see
+  [the artifacts](#the-artifacts).)
 - A strict-JSON **`results.json`** record (per-group metrics for both families, the loss / val
   trajectories, the presence calibration, the norm stats + grid extent) — the per-cell record for
   the sweep.
@@ -377,7 +389,7 @@ graph TD
     dec -->|embed.detach| pr["embed-probe heads<br/>(encoder frozen)"]
     sp --> cl["combined_loss<br/>(encoder + spatial + heatmap CE)"]
     pr --> pl["probe_loss (probe only)"]
-    cl --> ckpt["checkpoint.pt (encoder artifact)"]
+    cl --> ckpt["checkpoint.pt (encoder artifact)<br/>+ checkpoint_epochNNN.pt per epoch"]
     cl --> res["results.json (both families)"]
     pl --> res
     cl --> card["model_card.json"]
