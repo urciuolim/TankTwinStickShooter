@@ -18,9 +18,10 @@ So per player: 6 floats of tank state (pos/vec/aim 2D each) + 5 bullets * 4 floa
 P1 bullet fields start at index 6 (``range(6, 26, 4)``); P2 bullet fields start at
 index 32 (``range(32, 52, 4)``).
 
-An ABSENT bullet is signalled by a sentinel: its ``pos_x`` is set to ``-100``. Because
-that is well off-board and negative, consumers test ``pos_x >= 0`` (or
-:func:`bullet_present`) and skip absent bullets.
+An ABSENT bullet is signalled by a sentinel: its ``pos_x`` is set to ``-100``. The board
+itself spans NEGATIVE x (the arena is centered on the origin), so absent is detected by the
+``-100`` sentinel, NOT by the sign of ``pos_x``: consumers test ``pos_x > -50``
+(:func:`bullet_present`) and skip absent bullets.
 
 The accessors are pure and accept ANY indexable sequence (a Python list or a numpy
 array) — numpy is NOT required to read the schema. The perspective transforms
@@ -69,7 +70,8 @@ BULLET_START = (
     PLAYER_2 * PLAYER_STRIDE + BULLET_BLOCK_OFFSET,
 )
 
-# An absent bullet's pos_x is set to this sentinel; consumers skip when pos_x < 0.
+# An absent bullet's pos_x is set to this sentinel; consumers detect absent via the sentinel
+# (test pos_x > -50, see bullet_present), NOT by the sign of pos_x (the board spans negative x).
 ABSENT_BULLET_SENTINEL = -100.0
 
 
@@ -127,20 +129,26 @@ def bullet_field_indices(player: int) -> range:
     return range(start, start + NUM_BULLETS * BULLET_STRIDE, BULLET_STRIDE)
 
 
-def bullet_present(pos_x) -> bool:
-    """Whether a bullet slot is occupied: ``True`` iff its ``pos_x`` is on-board (>= 0).
+def bullet_present(pos_x):
+    """Whether a bullet slot is occupied: ``True`` iff its ``pos_x`` is NOT the absent sentinel.
 
-    The absent-bullet sentinel sets ``pos_x`` to :data:`ABSENT_BULLET_SENTINEL` (-100),
-    so any negative ``pos_x`` marks an empty slot.
+    Absent is detected by the :data:`ABSENT_BULLET_SENTINEL` (-100) sentinel, NOT by the sign
+    of ``pos_x`` — the board itself spans negative x, so a negative ``pos_x`` is a real on-board
+    bullet. The test ``pos_x > -50`` (``ABSENT_BULLET_SENTINEL / 2``) cleanly separates the
+    arena (min x ~ -8) from the sentinel and is robust to float noise.
+
+    Accepts a scalar OR a numpy array: numpy ``>`` is element-wise, so this returns a Python
+    ``bool`` for a Python-float scalar, a ``np.bool_`` for a numpy scalar, and a bool-array for
+    an array input.
     """
-    return pos_x >= 0
+    return pos_x > ABSENT_BULLET_SENTINEL / 2
 
 
 def iter_bullets(state, player: int, *, include_absent: bool = False):
     """Yield ``(pos_x, pos_y, vec_x, vec_y)`` for each of ``player``'s bullet slots.
 
-    By default absent slots (``pos_x`` < 0, the sentinel) are skipped via the
-    :func:`bullet_present` rule. Pass ``include_absent=True`` to yield all five raw records.
+    By default absent slots (the ``-100`` sentinel) are skipped via the :func:`bullet_present`
+    rule. Pass ``include_absent=True`` to yield all five raw records.
     """
     for i in bullet_field_indices(player):
         pos_x = state[i + BULLET_POS_X]

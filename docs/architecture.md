@@ -8,7 +8,7 @@ The cross-component class-to-class interaction map for the built + GO'd slice of
 `models` imports nothing internal (a leaf alongside `core`). The full direction:
 
 ```
-core  ←  { models, env, agents, data }  ←  play
+core  ←  { models, env, agents, data }  ←  { play, rl, pretraining }
 ```
 
 - [core](components/core.md) — stdlib + numpy only; imports nothing internal (now incl. the
@@ -22,14 +22,16 @@ core  ←  { models, env, agents, data }  ←  play
   its RL-player factory, never `pop_trainer.rl`).
 - [rl](components/rl.md) — imports `core`, `env`, `models`, `agents` (+ torch / gymnasium / numpy /
   stable-baselines3).
+- [pretraining](components/pretraining.md) — imports `core`, `models`, `data` (+ torch, numpy);
+  nothing from `env` / `rl` (the on-disk dataset decouples it from the live engine).
 - [utils](components/utils.md) — a **leaf SINK**: it MAY import `core` / `models` / `rl` (+ sb3 /
   torch), but **nothing in `pop_trainer` imports it**, so it can never create a cycle.
 
-No import cycles: `data` and `play` sit at the top, `core` at the bottom, `models` off to the
-side, `utils` off to the side as a one-way sink. `play` is a LEAF (imported by nothing); its only
-relaxation is the lazy **direct `stable_baselines3` import** inside its RL-player factory (no edge to
-`pop_trainer.rl` at all), so it adds no cycle. (`pretraining` / `eval` / `population` / `deployment` /
-`imitation` are not built yet and are omitted.)
+No import cycles: `data` / `play` / `rl` / `pretraining` sit at the top, `core` at the bottom,
+`models` off to the side, `utils` off to the side as a one-way sink. `play` is a LEAF (imported by
+nothing); its only relaxation is the lazy **direct `stable_baselines3` import** inside its RL-player
+factory (no edge to `pop_trainer.rl` at all), so it adds no cycle. (`eval` / `population` /
+`deployment` / `imitation` are not built yet and are omitted.)
 
 ## Class-to-class interaction map
 
@@ -72,6 +74,13 @@ graph TD
         Collect["collect.py<br/>run_episode / collect_to_shards /<br/>resolve_map_tag / collect_parallel"]
         Shards["shards.py / schema.py"]
         Readers["readers.py<br/>split_groups / build_index"]
+    end
+
+    subgraph pretraining["pretraining (single-frame decoder harness)"]
+        Decoder["decoder.py<br/>StateDecoder = Encoder +<br/>spatial heads + detached probe"]
+        Targets["targets.py / losses.py / metrics.py<br/>(per-group target / loss / metric)"]
+        DecodeDS["dataset.py<br/>DecodeDataset / build_splits"]
+        TrainCLI["train.py / profile.py (CLI)"]
     end
 
     Play["play.py<br/>run_play_episode / main<br/>(human / rule-based / rl:&lt;ckpt&gt;)"]
@@ -137,6 +146,15 @@ graph TD
     ModelInfo -.->|"PPO.load + .encoder.trunk (by attr)"| rl
     ModelInfo -.->|names the active trunk class| Encoder
 
+    %% pretraining wiring (offline; decoupled from env by the dataset)
+    TrainCLI --> Decoder
+    TrainCLI --> DecodeDS
+    Decoder -->|"features (spatial heads) +<br/>embed.detach (probe)"| Encoder
+    Decoder --> Targets
+    DecodeDS -->|"reuses DatasetIndex.split<br/>(map-aware)"| Readers
+    DecodeDS --> Targets
+    Targets --> State
+
     classDef root fill:#d4edda,stroke:#28a745;
     class core root;
 ```
@@ -177,13 +195,22 @@ graph TD
   each sample's `map_id` from the arena Unity **echoed** (the F5 tag-from-echo), decoded through the
   `maps.json` sidecar / `map_index`. See
   [data](components/data.md#the-rotation-scheduler--tag-from-echo).
-- **`models` is detached** from the live loop today — it's the shared vision backbone, and the
-  deployable ONNX artifact. Its trunks are named by architecture (`cnn` / `resnet` / `gn-cnn`); the
-  small-frame `gn-cnn` (DreamerV3-style GroupNorm CNN) survives ≤128px frames where the `cnn`
-  stride-4 stem collapses. The seam to consume it now exists: [`rl`](components/rl.md)'s
+- **`models` is detached** from the live loop — it's the shared vision backbone consumed on BOTH
+  arms, and the deployable ONNX artifact. Its trunks are named by architecture
+  (`cnn` / `resnet` / `gn-cnn`); the small-frame `gn-cnn` (DreamerV3-style GroupNorm CNN) survives
+  ≤128px frames where the `cnn` stride-4 stem collapses. Online: [`rl`](components/rl.md)'s
   `EncoderExtractor` wraps the `Encoder` and reads its `embed` flat embedding as the SB3 policy /
   value feature extractor, **auto-selecting the trunk by obs resolution** (or honoring an explicit
-  `--trunk` override). The future `pretraining` (which reads `Encoder.features`) is still unbuilt.
+  `--trunk` override). Offline: [`pretraining`](components/pretraining.md)'s `StateDecoder` reads
+  `Encoder.features` for the spatial heads that train the encoder.
+- **`pretraining` is the offline arm.** `StateDecoder` wraps a `build_encoder` [`Encoder`](components/models.md)
+  and decodes the 52-float state from one frame: the **spatial heads** read `Encoder.features`
+  (grad flows to the encoder — the artifact trains here) while the **detached embed-probe**
+  reads `Encoder.embed.detach()` (encoder-frozen, measuring how much state survives pooling).
+  `DecodeDataset` streams [`data`](components/data.md)'s decode-v1 shards and **reuses**
+  `DatasetIndex.split` (map-aware, no reimplementation); targets are carved via the
+  [`core.state`](components/core.md) named accessors. It imports nothing from `env` / `rl` — the
+  dataset decouples it from the live engine. See [pretraining](components/pretraining.md).
 - **The observation-resolution seam (`core.obs`).** The env's pixel `frame_shape` is the ONE
   source of truth derived from the launched config's `obs_pixels_width/height` via
   `core.obs.frame_shape_from_config` — every live entry (`play` / `rl.train` / the collection

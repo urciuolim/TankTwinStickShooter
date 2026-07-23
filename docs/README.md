@@ -13,14 +13,16 @@ end to end via the [runbook](runbook.md).
 ## What's here today
 
 The built + GO'd slice of the target architecture. The dependency direction is
-**`core ← {models, env, data, agents} ← {play, rl}`** — `core` is the dependency-free root and every
-component points inward toward it; [utils](components/utils.md) hangs off the side as a one-way sink
-(nothing imports it). The online-RL component [rl](components/rl.md) is the **built** `train_local`
-integrator (encoder + self-play + eval/ELO seams, CLI-parameterized PPO). `core` now also owns the
+**`core ← {models, env, data, agents} ← {play, rl, pretraining}`** — `core` is the dependency-free
+root and every component points inward toward it; [utils](components/utils.md) hangs off the side as
+a one-way sink (nothing imports it). The online-RL component [rl](components/rl.md) is the **built**
+`train_local` integrator (encoder + self-play + eval/ELO seams, CLI-parameterized PPO). The offline
+arm [pretraining](components/pretraining.md) is the **built** single-frame decoder harness (a
+supervised inverse-renderer that trains the reusable encoder artifact). `core` now also owns the
 **observation-resolution contract** ([`core.obs`](components/core.md#the-observation-resolution-contract-coreobs)):
 the env's pixel `frame_shape` is derived from the launched game config, the single source of truth
-shared with the Unity build. (`pretraining` / `eval` / `population` / `deployment` / `imitation` are
-namespace placeholders, not yet built — not documented here.)
+shared with the Unity build. (`eval` / `population` / `deployment` / `imitation` are namespace
+placeholders, not yet built — not documented here.)
 
 ## Component map at a glance
 
@@ -33,6 +35,7 @@ graph TD
     data["data<br/>dataset pipeline"]
     play["play<br/>runnable entry point<br/>(human / rule-based / rl:&lt;ckpt&gt;)"]
     rl["rl<br/>online RL (SB3) — encoder + self-play seams"]
+    pretraining["pretraining<br/>single-frame decoder harness<br/>(trains the encoder artifact)"]
     utils["utils<br/>CLI sink (model_info)"]
     unity["Unity sim<br/>(length-prefixed control + pixel frames)"]
 
@@ -50,6 +53,9 @@ graph TD
     rl -.->|SelfPlayWrapper wraps| env
     rl -.->|make_agent roster| agents
     rl -.->|"split_state_for_opponent + obs"| core
+    pretraining --> core
+    pretraining --> models
+    pretraining --> data
     utils -.->|"reads SB3 ckpt + trunk"| rl
     env <-->|socket| unity
 
@@ -63,8 +69,10 @@ attribute-only edges. `models` imports nothing internal — it only shares `core
 (`cnn` / `gn-cnn`) by the obs resolution or honoring an explicit `--trunk`. `rl` spans four internal
 deps: beyond `models`, its self-play seam wraps `env` (`SelfPlayWrapper`) and reuses `agents`
 (`make_agent` roster) + `core` (`split_state_for_opponent` + `obs`); it imports nothing from `data`
-or `pretraining`. [utils](components/utils.md) is a one-way sink — it loads an `rl` checkpoint and
-names the active `models` trunk, but nothing imports it, so it can never form a cycle.
+or `pretraining`. [pretraining](components/pretraining.md) is the offline arm — it imports `core` /
+`models` / `data` (it streams `data`'s shards and trains the `models` encoder), nothing from `env`
+or `rl`. [utils](components/utils.md) is a one-way sink — it loads an `rl` checkpoint and names the
+active `models` trunk, but nothing imports it, so it can never form a cycle.
 
 ## Navigation index
 
@@ -77,6 +85,7 @@ names the active `models` trunk, but nothing imports it, so it can never form a 
 | [data](components/data.md) | The dataset pipeline: a multi-worker collection CLI (`collect_runner`) → `(frame, state, action)` samples → shards → map-aware splits. |
 | [play](components/play.md) | `python -m pop_trainer.play` — launch the live build and play one episode with any pairing of human / rule-based / trained `rl:<ckpt>` players. |
 | [rl](components/rl.md) | Online RL (SB3 PPO); the `train_local` integrator over the encoder seam (`EncoderExtractor`, trunk auto-selected by obs size or `--trunk`), the self-play opponent seam, and the eval+ELO seam — fully CLI-parameterized PPO. |
+| [pretraining](components/pretraining.md) | The single-frame decoder harness: a supervised inverse-renderer that decodes the 52-float state from one pixel frame (`StateDecoder` = encoder + spatial heads + detached embed-probe), training the reusable encoder artifact. |
 | [utils](components/utils.md) | A leaf CLI toolbox (a one-way sink). First tool: `python -m pop_trainer.utils.model_info <ckpt>` inspects a trained PPO checkpoint — obs/action spaces, the active encoder trunk, id-deduped param counts. |
 
 - [Architecture](architecture.md) — the cross-component class-to-class interaction map.

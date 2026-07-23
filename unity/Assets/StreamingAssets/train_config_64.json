@@ -12,7 +12,7 @@
     "ai_async": false,
     "ai_actionFreq": 10,
     "ai_fixedDeltaTime": 0.02,
-    "player_maxHealth": 3,
+    "player_maxHealth": 1,
     "player_randomStart": true,
     "player_x_spawn_lim": 0.5,
     "player_y_spawn_lim": 1.0,

@@ -25,10 +25,18 @@ import pytest
 from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack, VecMonitor
 
 from pop_trainer.agents import AGENT_SELECTORS
+from pop_trainer.core.logging_setup import ROLE_EVAL, ROLE_TRAIN
+from pop_trainer.core.maps import CURATED_ROTATION
 from pop_trainer.core.protocol import Connection
 from pop_trainer.env.tank_env import TankEnv
 from pop_trainer.rl.extractor import EncoderExtractor
-from pop_trainer.rl.selfplay import DEFAULT_ROSTER, OpponentProvider, SelfPlayWrapper
+from pop_trainer.rl.selfplay import (
+    DEFAULT_ROSTER,
+    MapProvider,
+    MatchupProvider,
+    OpponentProvider,
+    SelfPlayWrapper,
+)
 from pop_trainer.rl.train import (
     BASE_ELO,
     DEFAULT_NET_ARCH,
@@ -45,9 +53,12 @@ from pop_trainer.rl.train import (
     _live_connection_factory_for_port,
     _make_self_play_env,
     _make_sidecar_callback,
+    _matchup_state_block,
     _parse_args,
     _parse_net_arch,
     _resolve_learning_rate,
+    _restore_map_provider_position,
+    _restore_matchup_state,
     _restore_provider_position,
     _terminate,
     _training_env_factories,
@@ -949,10 +960,17 @@ def test_resume_restores_provider_and_elo_with_mocked_ppo_load(tmp_path, monkeyp
     real_save = train_mod.save_sidecar
     final_elo: dict = {}
 
-    def _capture_save(path, *, provider, elo, cfg, num_timesteps):
+    def _capture_save(path, *, provider, elo, cfg, num_timesteps, map_provider=None):
         final_elo.clear()
         final_elo.update(elo)
-        real_save(path, provider=provider, elo=elo, cfg=cfg, num_timesteps=num_timesteps)
+        real_save(
+            path,
+            provider=provider,
+            elo=elo,
+            cfg=cfg,
+            num_timesteps=num_timesteps,
+            map_provider=map_provider,
+        )
 
     monkeypatch.setattr(train_mod, "save_sidecar", _capture_save)
 
@@ -1290,3 +1308,557 @@ def test_to_dict_roundtrips_new_fields_at_defaults(tmp_path):
     import json
 
     json.dumps(d)
+
+
+# --- 7. map rotation: config, CLI, wiring, eval-never-rotates, sidecar ------------------------
+
+_ARENAS = ("Arenas/a.json", "Arenas/b.json", "Arenas/c.json")
+
+
+def test_trainconfig_maps_default_is_none(tmp_path):
+    # BACKWARD-COMPAT: the default config carries no rotation (single-arena = today's behavior).
+    cfg = _cfg(tmp_path)
+    assert cfg.maps is None
+    assert cfg.map_strategy == "round_robin"
+    d = cfg.to_dict()
+    assert d["maps"] is None
+    assert d["map_strategy"] == "round_robin"
+    import json
+
+    json.dumps(d)
+
+
+def test_trainconfig_maps_to_dict_roundtrips_tuple(tmp_path):
+    cfg = _cfg(tmp_path, maps=_ARENAS, map_strategy="uniform")
+    d = cfg.to_dict()
+    assert d["maps"] == list(_ARENAS)
+    assert d["map_strategy"] == "uniform"
+    import json
+
+    json.dumps(d)
+
+
+def test_trainconfig_rejects_unknown_map_strategy(tmp_path):
+    with pytest.raises(ValueError, match="unknown map_strategy"):
+        _cfg(tmp_path, map_strategy="bogus")
+
+
+def test_make_self_play_env_attaches_map_provider_only_for_training_role(tmp_path):
+    # TRAINING role with cfg.maps set -> the wrapper carries a seeded MapProvider; EVAL role -> None
+    # (eval must NOT rotate). This is the single rule guaranteeing eval sends no switch_arena.
+    cfg = _cfg(tmp_path, maps=_ARENAS)
+    train_wrapper = _make_self_play_env(
+        cfg, cfg.game_port, connection_factory=_stub_factory, role=ROLE_TRAIN
+    )
+    eval_wrapper = _make_self_play_env(
+        cfg, cfg.effective_eval_port, connection_factory=_stub_factory, role=ROLE_EVAL
+    )
+    assert isinstance(train_wrapper.maps, MapProvider)
+    assert train_wrapper.maps.maps == list(_ARENAS)
+    assert eval_wrapper.maps is None  # eval NEVER rotates
+
+
+def test_make_self_play_env_no_map_provider_when_maps_none(tmp_path):
+    # cfg.maps None (default) -> even the TRAINING wrapper carries maps=None (single-arena).
+    cfg = _cfg(tmp_path)
+    wrapper = _make_self_play_env(
+        cfg, cfg.game_port, connection_factory=_stub_factory, role=ROLE_TRAIN
+    )
+    assert wrapper.maps is None
+
+
+def test_build_vec_env_training_carries_map_provider_eval_does_not(tmp_path):
+    # The TRAINING vec (role=train) wrapper holds a MapProvider; the EVAL vec (role=eval) wrapper
+    # holds None. This is the seam guaranteeing eval does not rotate at the vec level.
+    cfg = _cfg(tmp_path, maps=_ARENAS, game_port=55000)
+    train_vec = build_vec_env(
+        cfg, port=cfg.game_port, role=ROLE_TRAIN, connection_factory=_stub_factory
+    )
+    eval_vec = build_vec_env(
+        cfg, port=cfg.effective_eval_port, role=ROLE_EVAL, connection_factory=_stub_factory
+    )
+    try:
+        train_wrapper = _find_selfplay_wrapper(train_vec)
+        eval_wrapper = _find_selfplay_wrapper(eval_vec)
+        assert isinstance(train_wrapper.maps, MapProvider)
+        assert eval_wrapper.maps is None
+    finally:
+        train_vec.close()
+        eval_vec.close()
+
+
+def test_build_vec_env_multi_env_training_carries_per_subproc_map_providers(tmp_path):
+    # At n_envs>1 each TRAINING subproc gets its OWN seeded MapProvider (the per-subproc seam,
+    # mirroring the opponent provider). Asserted on the DummyVecEnv-of-stubs path (no subprocs).
+    cfg = _cfg(tmp_path, maps=_ARENAS, game_port=56000, n_envs=3)
+    vec = build_vec_env(cfg, port=cfg.game_port, connection_factory_for_port=_stub_factory_for_port)
+    try:
+        inner = vec.venv
+        for w in inner.envs:
+            assert isinstance(w.maps, MapProvider)
+            assert w.maps.maps == list(_ARENAS)
+    finally:
+        vec.close()
+
+
+def test_build_vec_env_no_map_provider_when_maps_absent(tmp_path):
+    # No cfg.maps -> the TRAINING wrapper carries maps=None (byte-identical to today: no rotation).
+    cfg = _cfg(tmp_path, game_port=57000)
+    vec = build_vec_env(cfg, port=cfg.game_port, role=ROLE_TRAIN, connection_factory=_stub_factory)
+    try:
+        assert _find_selfplay_wrapper(vec).maps is None
+    finally:
+        vec.close()
+
+
+def test_parse_args_maps_absent_is_none():
+    # --maps ABSENT -> args.maps None (resolve_map_rotation -> None -> single-arena).
+    args = _parse_args(["--total-timesteps", "1000", "--run-dir", "out"])
+    assert args.maps is None
+    assert args.map_strategy == "round_robin"
+
+
+def test_parse_args_maps_no_value_is_empty_list():
+    # --maps with NO value -> [] (nargs="*"), which resolve_map_rotation maps to the curated set.
+    args = _parse_args(["--total-timesteps", "1000", "--run-dir", "out", "--maps"])
+    assert args.maps == []
+
+
+def test_parse_args_maps_explicit_list_in_order():
+    args = _parse_args(
+        [
+            "--total-timesteps",
+            "1000",
+            "--run-dir",
+            "out",
+            "--maps",
+            "Arenas/x.json",
+            "Arenas/y.json",
+        ]
+    )
+    assert args.maps == ["Arenas/x.json", "Arenas/y.json"]
+
+
+def test_parse_args_bad_map_strategy_exits():
+    with pytest.raises(SystemExit) as exc:
+        _parse_args(["--total-timesteps", "1000", "--run-dir", "out", "--map-strategy", "bogus"])
+    assert exc.value.code == 2
+
+
+def test_main_maps_absent_leaves_cfg_maps_none(tmp_path, monkeypatch):
+    # BACKWARD-COMPAT: no --maps -> cfg.maps None (single-arena; no switch_arena ever sent).
+    captured = _capture_cfg(monkeypatch)
+    main(["--total-timesteps", "1000", "--run-dir", str(tmp_path)])
+    cfg = captured["cfg"]
+    assert cfg.maps is None
+    assert cfg.map_strategy == "round_robin"
+
+
+def test_main_maps_no_value_resolves_curated_rotation(tmp_path, monkeypatch):
+    # --maps with no value -> the curated 10-map rotation, as a tuple on cfg.maps.
+    captured = _capture_cfg(monkeypatch)
+    main(["--total-timesteps", "1000", "--run-dir", str(tmp_path), "--maps"])
+    cfg = captured["cfg"]
+    assert cfg.maps == CURATED_ROTATION
+
+
+def test_main_maps_explicit_list_threads_in_order(tmp_path, monkeypatch):
+    captured = _capture_cfg(monkeypatch)
+    main(
+        [
+            "--total-timesteps",
+            "1000",
+            "--run-dir",
+            str(tmp_path),
+            "--maps",
+            "Arenas/x.json",
+            "Arenas/y.json",
+            "--map-strategy",
+            "uniform",
+        ]
+    )
+    cfg = captured["cfg"]
+    assert cfg.maps == ("Arenas/x.json", "Arenas/y.json")
+    assert cfg.map_strategy == "uniform"
+
+
+def test_sidecar_map_provider_round_robin_roundtrips(tmp_path):
+    # n_envs==1 position-exact resume: the live MapProvider's _index round-trips through the
+    # separate map_provider block (the opponent provider block is untouched).
+    cfg = _cfg(tmp_path, maps=_ARENAS)
+    provider = OpponentProvider.from_roster(cfg.opponents, "round_robin", seed=cfg.seed)
+    map_provider = MapProvider(cfg.maps, "round_robin", seed=cfg.seed)
+    map_provider.sample()
+    map_provider.sample()
+    assert map_provider._index == 2
+
+    path = tmp_path / "state.json"
+    save_sidecar(
+        path,
+        provider=provider,
+        elo=_initial_elo(cfg.opponents),
+        cfg=cfg,
+        num_timesteps=4096,
+        map_provider=map_provider,
+    )
+    loaded = load_sidecar(path)
+    assert loaded["map_provider"]["strategy"] == "round_robin"
+    assert loaded["map_provider"]["index"] == 2
+    # the opponent provider block is independent (not overloaded).
+    assert "index" in loaded["provider"]
+
+
+def test_sidecar_map_provider_none_at_multi_env_records_strategy_and_seed(tmp_path):
+    # n_envs>1: the per-subproc map providers are unreachable -> map_provider=None records the
+    # strategy + seed from cfg so resume reseeds (approximate phase, like uniform).
+    cfg = _cfg(tmp_path, maps=_ARENAS, map_strategy="uniform", seed=21)
+    path = tmp_path / "state.json"
+    save_sidecar(
+        path,
+        provider=None,
+        elo=_initial_elo(cfg.opponents),
+        cfg=cfg,
+        num_timesteps=512,
+        map_provider=None,
+    )
+    loaded = load_sidecar(path)
+    assert loaded["map_provider"]["strategy"] == "uniform"
+    assert loaded["map_provider"]["seed"] == 21
+    assert "index" not in loaded["map_provider"]
+
+
+def test_sidecar_map_provider_block_is_null_when_no_rotation(tmp_path):
+    # cfg.maps None (single-arena) -> the map_provider block is {"maps": null} (nothing to resume).
+    cfg = _cfg(tmp_path)
+    path = tmp_path / "state.json"
+    save_sidecar(
+        path,
+        provider=None,
+        elo=_initial_elo(cfg.opponents),
+        cfg=cfg,
+        num_timesteps=8,
+        map_provider=None,
+    )
+    loaded = load_sidecar(path)
+    assert loaded["map_provider"] == {"maps": None}
+
+
+def test_restore_map_provider_position_round_robin(tmp_path):
+    cfg = _cfg(tmp_path, maps=_ARENAS)
+    map_provider = MapProvider(cfg.maps, "round_robin", seed=cfg.seed)
+    assert map_provider._index == 0
+    sidecar = {"map_provider": {"strategy": "round_robin", "index": 5}}
+    _restore_map_provider_position(map_provider, sidecar)
+    assert map_provider._index == 5
+
+
+def test_restore_map_provider_position_uniform_and_none_noop(tmp_path):
+    cfg = _cfg(tmp_path, maps=_ARENAS, map_strategy="uniform")
+    map_provider = MapProvider(cfg.maps, "uniform", seed=cfg.seed)
+    _restore_map_provider_position(map_provider, {"map_provider": {"strategy": "uniform"}})
+    assert map_provider._index == 0
+    # a None provider (n_envs>1 / single-arena) restore is a no-op (no crash).
+    _restore_map_provider_position(None, {"map_provider": {"strategy": "round_robin", "index": 9}})
+
+
+# --- 8. matchup sampling: config, wiring, sidecar, CLI -----------------------------------------
+
+
+def test_trainconfig_matchup_defaults_off(tmp_path):
+    # BACKWARD-COMPAT: the default config keeps matchup sampling OFF with the CTO-set knobs.
+    # The alpha default is 0.4 — sized for per-EVAL-CYCLE folds of ~10-episode cell estimates
+    # (the old per-episode-scale 0.05 would leave the table near its prior for ~20 cycles).
+    cfg = _cfg(tmp_path)
+    assert cfg.matchup_sampling == "off"
+    assert cfg.matchup_floor == 0.25
+    assert cfg.matchup_ema_alpha == 0.4
+    d = cfg.to_dict()
+    assert d["matchup_sampling"] == "off"
+    assert d["matchup_floor"] == 0.25
+    assert d["matchup_ema_alpha"] == 0.4
+    import json
+
+    json.dumps(d)
+
+
+def test_trainconfig_winrate_requires_eval_enabled(tmp_path):
+    # The curriculum's win-rate signal is EVAL: with eval disabled the distribution would
+    # never update, so the config is rejected up-front.
+    with pytest.raises(ValueError, match="eval_freq"):
+        _cfg(tmp_path, matchup_sampling="winrate", eval_freq=0)
+
+
+def test_trainconfig_winrate_accepts_eval_enabled(tmp_path):
+    cfg = _cfg(tmp_path, matchup_sampling="winrate", eval_freq=3000)
+    assert cfg.matchup_sampling == "winrate"
+    # eval off with the sampler OFF stays valid (the guard binds only to winrate).
+    assert _cfg(tmp_path, eval_freq=0).eval_freq == 0
+
+
+@pytest.mark.parametrize(
+    ("field", "bad"),
+    [
+        ("matchup_sampling", "bogus"),
+        ("matchup_floor", -0.1),
+        ("matchup_floor", 1.1),
+        ("matchup_ema_alpha", 0.0),
+        ("matchup_ema_alpha", 1.5),
+        ("matchup_ema_alpha", -0.5),
+    ],
+)
+def test_trainconfig_matchup_validation_rejects(tmp_path, field, bad):
+    with pytest.raises(ValueError):
+        _cfg(tmp_path, **{field: bad})
+
+
+def test_trainconfig_with_matchup_fields_pickles(tmp_path):
+    # Spawn safety: the frozen cfg (captured by the SubprocVecEnv factory closures) must pickle
+    # with the new fields present.
+    import pickle
+
+    cfg = _cfg(tmp_path, matchup_sampling="winrate", matchup_floor=0.1, matchup_ema_alpha=0.2)
+    clone = pickle.loads(pickle.dumps(cfg))
+    assert clone == cfg
+    assert clone.matchup_sampling == "winrate"
+
+
+def test_make_self_play_env_attaches_matchup_provider_only_for_training_role(tmp_path):
+    # winrate + TRAIN role -> a seeded MatchupProvider over opponents x maps; EVAL role -> None
+    # (eval keeps plain resets + round_robin pinning); flag off -> None (byte-identical wiring).
+    cfg = _cfg(tmp_path, maps=_ARENAS, matchup_sampling="winrate", opponents=("noop", "random"))
+    train_wrapper = _make_self_play_env(
+        cfg, cfg.game_port, connection_factory=_stub_factory, role=ROLE_TRAIN
+    )
+    eval_wrapper = _make_self_play_env(
+        cfg, cfg.effective_eval_port, connection_factory=_stub_factory, role=ROLE_EVAL
+    )
+    assert isinstance(train_wrapper.matchups, MatchupProvider)
+    assert train_wrapper.matchups.cells == [
+        (sel, arena) for sel in ("noop", "random") for arena in _ARENAS
+    ]
+    assert eval_wrapper.matchups is None  # eval NEVER gets the joint sampler
+
+
+def test_make_self_play_env_no_matchup_provider_when_flag_off(tmp_path):
+    cfg = _cfg(tmp_path, maps=_ARENAS)  # matchup_sampling defaults to "off"
+    wrapper = _make_self_play_env(
+        cfg, cfg.game_port, connection_factory=_stub_factory, role=ROLE_TRAIN
+    )
+    assert wrapper.matchups is None
+
+
+def test_make_self_play_env_matchup_cells_boot_arena_when_maps_absent(tmp_path):
+    # No map rotation -> cells span opponents x {boot arena} (None) — opponent-only priority,
+    # no switch_arena ever injected.
+    cfg = _cfg(tmp_path, matchup_sampling="winrate", opponents=("noop", "random"))
+    wrapper = _make_self_play_env(
+        cfg, cfg.game_port, connection_factory=_stub_factory, role=ROLE_TRAIN
+    )
+    assert wrapper.matchups.cells == [("noop", None), ("random", None)]
+
+
+def test_build_vec_env_multi_env_carries_per_subproc_matchup_providers(tmp_path):
+    # Each per-env factory builds its OWN seeded provider inside the (would-be) subprocess.
+    cfg = _cfg(tmp_path, maps=_ARENAS, matchup_sampling="winrate", game_port=58000, n_envs=3)
+    vec = build_vec_env(cfg, port=cfg.game_port, connection_factory_for_port=_stub_factory_for_port)
+    try:
+        providers = [w.matchups for w in vec.venv.envs]
+        assert all(isinstance(p, MatchupProvider) for p in providers)
+        assert len({id(p) for p in providers}) == 3  # one provider per env, not shared
+    finally:
+        vec.close()
+
+
+def test_sidecar_matchup_block_off_by_default(tmp_path):
+    # Flag off -> the block records the off state (mirroring {"maps": null}).
+    cfg = _cfg(tmp_path)
+    path = tmp_path / "state.json"
+    save_sidecar(path, provider=None, elo=_initial_elo(cfg.opponents), cfg=cfg, num_timesteps=8)
+    loaded = load_sidecar(path)
+    assert loaded["matchup"] == {"sampling": "off"}
+
+
+def test_sidecar_matchup_state_roundtrips(tmp_path):
+    cfg = _cfg(tmp_path, matchup_sampling="winrate", opponents=("noop", "random"))
+    state = {
+        "sampling": "winrate",
+        "signal": "eval",
+        "floor": 0.25,
+        "ema_alpha": 0.4,
+        "cells": [["noop", None], ["random", None]],
+        "win_rates": [0.75, 0.5],
+        "counts": [3, 1],
+    }
+    path = tmp_path / "state.json"
+    save_sidecar(
+        path,
+        provider=None,
+        elo=_initial_elo(cfg.opponents),
+        cfg=cfg,
+        num_timesteps=512,
+        matchup_state=state,
+    )
+    loaded = load_sidecar(path)
+    assert loaded["matchup"] == state
+
+
+def test_matchup_state_block_config_fallback_when_state_missing(tmp_path):
+    # Flag on but no callback state at the save site -> the config-only view (still describes
+    # the run; nothing position-exact to persist). It carries the signal marker too.
+    cfg = _cfg(tmp_path, matchup_sampling="winrate", matchup_floor=0.3, matchup_ema_alpha=0.1)
+    block = _matchup_state_block(None, cfg)
+    assert block == {"sampling": "winrate", "signal": "eval", "floor": 0.3, "ema_alpha": 0.1}
+
+
+def test_restore_matchup_state_continues_the_table(tmp_path):
+    from pop_trainer.rl.callbacks import MatchupSamplingCallback
+
+    cb = MatchupSamplingCallback(("noop", "random"), None, floor=0.25, ema_alpha=0.4)
+    # An OLD sidecar block (no "signal" field — a training-fed table): restores fine; the
+    # next eval folds overwrite it.
+    sidecar = {
+        "matchup": {
+            "sampling": "winrate",
+            "cells": [["noop", None], ["random", None]],
+            "win_rates": [0.9, 0.1],
+            "counts": [4, 6],
+        }
+    }
+    _restore_matchup_state(cb, sidecar)
+    assert cb.win_rates == [0.9, 0.1]
+    assert cb.counts == [4, 6]
+
+
+def test_restore_matchup_state_noop_cases(tmp_path):
+    from pop_trainer.rl.callbacks import MatchupSamplingCallback
+
+    # None callback (feature off) -> no crash.
+    _restore_matchup_state(None, {"matchup": {"sampling": "winrate"}})
+    # an "off" block / a missing block leaves the fresh prior untouched.
+    cb = MatchupSamplingCallback(("noop",), None)
+    _restore_matchup_state(cb, {"matchup": {"sampling": "off"}})
+    _restore_matchup_state(cb, {})
+    assert cb.win_rates == [0.5]
+    assert cb.counts == [0]
+
+
+def test_sidecar_callback_includes_live_matchup_state(tmp_path):
+    # The per-checkpoint sidecar rides the callback's LIVE curriculum state.
+    from pop_trainer.rl.callbacks import MatchupSamplingCallback
+
+    cfg = _cfg(tmp_path, matchup_sampling="winrate", opponents=("noop", "random"))
+    cfg.run_dir.mkdir(parents=True)
+    matchup_cb = MatchupSamplingCallback(("noop", "random"), None, floor=0.25, ema_alpha=0.5)
+    matchup_cb.win_rates = [0.75, 0.5]
+    matchup_cb.counts = [1, 0]
+    sidecar_cb = _make_sidecar_callback(
+        cfg, None, _initial_elo(cfg.opponents), save_freq=1, matchup_cb=matchup_cb
+    )
+    sidecar_cb.n_calls = 1
+    sidecar_cb.num_timesteps = 1
+    sidecar_cb._on_step()
+    loaded = load_sidecar(cfg.run_dir / "state.json")
+    assert loaded["matchup"]["sampling"] == "winrate"
+    assert loaded["matchup"]["signal"] == "eval"
+    assert loaded["matchup"]["win_rates"] == [0.75, 0.5]
+    assert loaded["matchup"]["counts"] == [1, 0]
+
+
+def test_parse_args_matchup_defaults_off():
+    args = _parse_args(["--total-timesteps", "1000", "--run-dir", "out"])
+    assert args.matchup_sampling == "off"
+    assert args.matchup_floor == 0.25
+    assert args.matchup_ema_alpha == 0.4  # the CLI default reads from TrainConfig
+
+
+def test_parse_args_matchup_winrate_with_knobs():
+    args = _parse_args(
+        [
+            "--total-timesteps",
+            "1000",
+            "--run-dir",
+            "out",
+            "--matchup-sampling",
+            "winrate",
+            "--matchup-floor",
+            "0.1",
+            "--matchup-ema-alpha",
+            "0.2",
+        ]
+    )
+    assert args.matchup_sampling == "winrate"
+    assert args.matchup_floor == 0.1
+    assert args.matchup_ema_alpha == 0.2
+
+
+def test_parse_args_bad_matchup_choice_exits():
+    with pytest.raises(SystemExit) as exc:
+        _parse_args(
+            ["--total-timesteps", "1000", "--run-dir", "out", "--matchup-sampling", "bogus"]
+        )
+    assert exc.value.code == 2
+
+
+def test_main_threads_matchup_flags_into_config(tmp_path, monkeypatch):
+    captured = _capture_cfg(monkeypatch)
+    main(
+        [
+            "--total-timesteps",
+            "1000",
+            "--run-dir",
+            str(tmp_path),
+            "--matchup-sampling",
+            "winrate",
+            "--matchup-floor",
+            "0.5",
+            "--matchup-ema-alpha",
+            "0.1",
+        ]
+    )
+    cfg = captured["cfg"]
+    assert cfg.matchup_sampling == "winrate"
+    assert cfg.matchup_floor == 0.5
+    assert cfg.matchup_ema_alpha == 0.1
+
+
+def test_main_matchup_omitted_stays_off(tmp_path, monkeypatch):
+    captured = _capture_cfg(monkeypatch)
+    main(["--total-timesteps", "1000", "--run-dir", str(tmp_path)])
+    cfg = captured["cfg"]
+    assert cfg.matchup_sampling == "off"
+    assert cfg.matchup_floor == 0.25
+    assert cfg.matchup_ema_alpha == 0.4
+
+
+def test_main_winrate_without_eval_rejected(tmp_path, monkeypatch):
+    # The CLI surfaces the winrate-requires-eval validation before training starts.
+    _capture_cfg(monkeypatch)
+    with pytest.raises(ValueError, match="eval_freq"):
+        main(
+            [
+                "--total-timesteps",
+                "1000",
+                "--run-dir",
+                str(tmp_path),
+                "--matchup-sampling",
+                "winrate",
+                "--eval-freq",
+                "0",
+            ]
+        )
+
+
+@pytest.mark.parametrize(
+    ("flag", "value", "message"),
+    [
+        ("--matchup-floor", "1.5", "matchup_floor"),
+        ("--matchup-floor", "-0.1", "matchup_floor"),
+        ("--matchup-ema-alpha", "0", "matchup_ema_alpha"),
+        ("--matchup-ema-alpha", "2", "matchup_ema_alpha"),
+    ],
+)
+def test_main_matchup_out_of_range_knobs_rejected(tmp_path, monkeypatch, flag, value, message):
+    # Range validation lives in TrainConfig.__post_init__; the CLI surfaces it before training.
+    _capture_cfg(monkeypatch)
+    with pytest.raises(ValueError, match=message):
+        main(["--total-timesteps", "1000", "--run-dir", str(tmp_path), flag, value])

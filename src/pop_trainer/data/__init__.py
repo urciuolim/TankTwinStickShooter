@@ -27,8 +27,10 @@ Modules:
   identifiable.
 * :mod:`pop_trainer.data.describe` — stdlib-only CLI to add / list a manifest's free-form
   descriptions (delegates to :func:`manifest.add_description`).
+* :mod:`pop_trainer.data.shuffle` — reproducible, split-respecting, out-of-core two-pass
+  bucketed shuffle of a dataset into a new row-permuted dataset (+ data-card manifest).
 """
 
-from pop_trainer.data import collect, describe, manifest, readers, schema, shards
+from pop_trainer.data import collect, describe, manifest, readers, schema, shards, shuffle
 
-__all__ = ["schema", "shards", "readers", "collect", "manifest", "describe"]
+__all__ = ["schema", "shards", "readers", "collect", "manifest", "describe", "shuffle"]

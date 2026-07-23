@@ -19,18 +19,28 @@ Coverage:
    reset to all-True.
 3. THE INVARIANT: no eval instance coexists with a training instance (shared ledger).
 4. per-opponent ``eval/win_rate/<sel>`` keys (and overall ``eval/win_rate``) are logged + dumped.
+5. rotation eval (``maps=...``): one ``eval/win_rate/map/<short>`` scalar per MAP (never per
+   cell); phase resets carry the pinned ``switch_arena``; without ``maps`` NO map scalar exists
+   and no ``switch_arena`` is ever sent (byte-identical fallback).
+6. the eval->matchup handoff: ``result_sink`` receives each completed cycle's structured
+   ``evaluate_winrate`` result (both return shapes); it is never called when eval is not due.
+7. the matchup curriculum contract: training terminal tags move ``counts`` but NEVER
+   ``win_rates``; the win-rate table, the broadcast, the scalars, and the ``matchup_update``
+   summary move ONLY after a submitted eval result (frozen between eval cycles); wrapper infos
+   never feed the table.
 """
 
 from __future__ import annotations
 
 import gymnasium
 import numpy as np
+import pytest
 from stable_baselines3.common.vec_env import DummyVecEnv
 
 from pop_trainer.core.state import STATE_LEN
-from pop_trainer.rl.callbacks import EvalWinRateCallback
+from pop_trainer.rl.callbacks import EvalWinRateCallback, MatchupSamplingCallback
 from pop_trainer.rl.evaluate import WIN
-from pop_trainer.rl.selfplay import OpponentProvider, SelfPlayWrapper
+from pop_trainer.rl.selfplay import MatchupProvider, OpponentProvider, SelfPlayWrapper
 
 # --- shared live-instance ledger + event trace -------------------------------------------
 
@@ -159,7 +169,7 @@ class FakeModel:
         return np.zeros((batch, 5), dtype=np.float32), None
 
 
-def _make(eval_freq, eval_episodes, opponents, m=1):
+def _make(eval_freq, eval_episodes, opponents, m=1, maps=None, result_sink=None):
     """Build a wired callback + model + logger + shared ledger/trace over an M-wide eval vec."""
     ledger: set = set()
     trace: list = []
@@ -171,8 +181,10 @@ def _make(eval_freq, eval_episodes, opponents, m=1):
         eval_freq=eval_freq,
         eval_episodes=eval_episodes,
         opponents=opponents,
+        maps=maps,
         eval_env=eval_vec,
         training_vec=training_vec,
+        result_sink=result_sink,
     )
     cb.model = model
     cb.num_timesteps = model.num_timesteps
@@ -293,13 +305,465 @@ def test_logs_per_opponent_and_overall_win_rate_keys():
 
 
 def test_eval_resets_pass_no_switch_arena_option():
-    # rotation suppression: NEVER send switch_arena on any eval reset.
+    # the no-rotation fallback: NEVER send switch_arena on any eval reset when maps is None.
     cb, model, logger, training_vec, eval_vec, _ledger, trace = _make(100, 2, ("noop",))
     model.num_timesteps = cb.num_timesteps = 100
 
     cb._on_rollout_end()
 
-    # every raw eval-env reset during eval passed options=None (no switch_arena -> no desync).
+    # every raw eval-env reset during eval passed options=None (plain handshake, byte-identical).
     raw_envs = [w.env for w in eval_vec.envs]
     assert any(e.reset_options for e in raw_envs)  # eval did reset the eval envs
     assert all(opt is None for e in raw_envs for opt in e.reset_options)
+    # and the eval wrappers' maps attr was never pinned.
+    assert all(w.maps is None for w in eval_vec.envs)
+
+
+def test_no_rotation_records_no_map_scalars():
+    cb, model, logger, training_vec, eval_vec, _ledger, trace = _make(100, 2, ("noop", "random"))
+    model.num_timesteps = cb.num_timesteps = 100
+
+    cb._on_rollout_end()
+
+    assert not any(key.startswith("eval/win_rate/map/") for key in logger.records)
+
+
+# --- 5. rotation eval: per-map scalars + pinned switch_arena ------------------------------
+
+_EVAL_MAPS = ("Arenas/a.json", "Arenas/b.json")
+
+
+def test_rotation_eval_logs_one_scalar_per_map_with_short_names():
+    cb, model, logger, training_vec, eval_vec, _ledger, trace = _make(
+        100, 2, ("noop", "random"), maps=_EVAL_MAPS
+    )
+    model.num_timesteps = cb.num_timesteps = 100
+
+    cb._on_rollout_end()
+
+    # exactly one scalar per MAP (short tag names), never one per (opponent x map) cell.
+    map_keys = sorted(k for k in logger.records if k.startswith("eval/win_rate/map/"))
+    assert map_keys == ["eval/win_rate/map/a", "eval/win_rate/map/b"]
+    # always-win eval stubs -> every marginal is 1.0 and they all reconcile.
+    assert logger.records["eval/win_rate/map/a"] == 1.0
+    assert logger.records["eval/win_rate/map/b"] == 1.0
+    assert logger.records["eval/win_rate/noop"] == 1.0
+    assert logger.records["eval/win_rate/random"] == 1.0
+    assert logger.records["eval/win_rate"] == 1.0
+    assert logger.dumps == [100]
+
+
+def test_rotation_eval_resets_carry_the_pinned_switch_arena():
+    cb, model, logger, training_vec, eval_vec, _ledger, trace = _make(
+        100, 2, ("noop",), maps=_EVAL_MAPS
+    )
+    model.num_timesteps = cb.num_timesteps = 100
+
+    cb._on_rollout_end()
+
+    # every eval reset carried a pinned rotation arena, and both arenas were visited.
+    raw_envs = [w.env for w in eval_vec.envs]
+    opts = [opt for e in raw_envs for opt in e.reset_options]
+    assert opts and all(opt is not None and opt.get("switch_arena") in _EVAL_MAPS for opt in opts)
+    assert {opt["switch_arena"] for opt in opts} == set(_EVAL_MAPS)
+
+
+def test_rotation_eval_preserves_the_no_coexist_invariant():
+    # The teardown -> eval -> respawn cycle is unchanged by the map phases (the ledger would
+    # raise if a pinned-arena reset ever overlapped a live training instance).
+    cb, model, logger, training_vec, eval_vec, ledger, trace = _make(
+        100, 4, ("noop", "random"), m=2, maps=_EVAL_MAPS
+    )
+    model.num_timesteps = cb.num_timesteps = 100
+    cb._on_rollout_end()
+    assert ledger == {"train"}
+
+
+# --- 6. the eval -> matchup result handoff -------------------------------------------------
+
+
+def test_result_sink_receives_the_per_opponent_result_without_maps():
+    received: list = []
+    cb, model, *_ = _make(100, 2, ("noop", "random"), result_sink=received.append)
+    model.num_timesteps = cb.num_timesteps = 100
+
+    cb._on_rollout_end()
+
+    # maps=None -> evaluate_winrate's per-opponent rate dict (always-win stubs -> 1.0 each),
+    # handed to the sink STRUCTURED — never via wrapper terminal infos.
+    assert received == [{"noop": 1.0, "random": 1.0}]
+
+
+def test_result_sink_receives_per_cell_counts_with_maps():
+    received: list = []
+    cb, model, *_ = _make(100, 2, ("noop",), maps=_EVAL_MAPS, result_sink=received.append)
+    model.num_timesteps = cb.num_timesteps = 100
+
+    cb._on_rollout_end()
+
+    assert received == [{("noop", "Arenas/a.json"): (1, 1), ("noop", "Arenas/b.json"): (1, 1)}]
+
+
+def test_result_sink_not_called_when_eval_not_due():
+    received: list = []
+    cb, model, *_ = _make(1000, 1, ("noop",), result_sink=received.append)
+    model.num_timesteps = cb.num_timesteps = 999  # one short of eval_freq
+
+    cb._on_rollout_end()
+
+    assert received == []
+
+
+def test_no_result_sink_keeps_the_logging_path_identical():
+    cb, model, logger, *_ = _make(100, 1, ("noop",))  # result_sink omitted (the default)
+    model.num_timesteps = cb.num_timesteps = 100
+    cb._on_rollout_end()
+    assert logger.records["eval/win_rate/noop"] == 1.0
+
+
+# --- 7. MatchupSamplingCallback: eval feeds win_rates; training tags feed counts -----------
+
+
+class _MatchupEnv(gymnasium.Env):
+    """A minimal env for wrapper construction in the broadcast tests (never stepped)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.action_space = _ACTION_SPACE
+        self.observation_space = _OBS_SPACE
+
+    def reset(self, *, seed=None, options=None):
+        return (np.zeros((1,), dtype=np.float32), {"state": _state(0.0), "map": None})
+
+    def step(self, action, opponent_action=None):
+        info = {"state": _state(1.0), "map": None}
+        return (np.zeros((1,), dtype=np.float32), 0.0, False, False, info)
+
+
+class _LoggerModel:
+    """The slice of an SB3 algorithm MatchupSamplingCallback touches: just ``.logger``."""
+
+    def __init__(self, logger) -> None:
+        self.logger = logger
+
+
+class _RecordingSysLogger:
+    """A system-logger stand-in recording every (event, detail) the callback emits."""
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, dict]] = []
+
+    def info(self, event, extra=None):
+        self.events.append((event, (extra or {}).get("detail", {})))
+
+
+class _RecordingVec:
+    """A vec-env stand-in recording ``set_attr`` calls (the broadcast-cadence probe)."""
+
+    def __init__(self) -> None:
+        self.num_envs = 1
+        self.set_attr_calls: list[tuple[str, list]] = []
+
+    def set_attr(self, name, value, indices=None):
+        self.set_attr_calls.append((name, value))
+
+
+def _matchup_cb(opponents=("noop", "random"), maps=None, *, alpha=0.5, floor=0.25, **kwargs):
+    cb = MatchupSamplingCallback(opponents, maps, floor=floor, ema_alpha=alpha, **kwargs)
+    cb.model = _LoggerModel(FakeLogger())
+    return cb
+
+
+def _terminal_locals(*tags):
+    """Fake SB3 rollout locals: one done lane per tag (a None tag = a done with no matchup)."""
+    dones = np.array([True] * len(tags))
+    infos = [{} if tag is None else {"matchup": tag} for tag in tags]
+    return {"dones": dones, "infos": infos}
+
+
+def test_matchup_on_step_accumulates_without_changing_distribution():
+    cb = _matchup_cb()
+    before = list(cb.distribution)
+    cb.locals = _terminal_locals({"opponent": "noop", "map": None, "outcome": 1.0})
+    assert cb._on_step() is True
+    # accumulate ONLY: the table and the distribution are untouched mid-rollout.
+    assert cb.win_rates == [0.5, 0.5]
+    assert cb.counts == [0, 0]
+    assert cb.distribution == before
+    assert cb._pending == [0]
+
+
+def test_matchup_on_step_ignores_non_terminal_untagged_and_unknown_cells():
+    cb = _matchup_cb()
+    cb.locals = {
+        "dones": np.array([False, True, True]),
+        "infos": [
+            # not done: its tag must NOT be consumed (there should be none in practice).
+            {"matchup": {"opponent": "noop", "map": None, "outcome": 1.0}},
+            {},  # done with no matchup tag (feature-off env / eval) -> ignored
+            {"matchup": {"opponent": "not-a-cell", "map": None, "outcome": 1.0}},  # unknown cell
+        ],
+    }
+    cb._on_step()
+    assert cb._pending == []
+
+
+def test_matchup_on_step_without_locals_is_a_noop():
+    cb = _matchup_cb()
+    cb.locals = {}
+    assert cb._on_step() is True
+    assert cb._pending == []
+
+
+def test_matchup_distribution_is_uniform_before_the_first_eval_cycle():
+    # All cells sit at the 0.5 prior until an eval cycle is folded — even across rollout
+    # boundaries with training terminals in between.
+    cb = _matchup_cb(("noop", "random"), ("Arenas/a.json", "Arenas/b.json"))
+    assert cb.distribution == pytest.approx([0.25] * 4)
+    cb.locals = _terminal_locals({"opponent": "noop", "map": "Arenas/a.json", "outcome": 1.0})
+    cb._on_step()
+    cb._on_rollout_end()
+    assert cb.distribution == pytest.approx([0.25] * 4)
+
+
+def test_training_terminal_tags_move_counts_but_never_win_rates():
+    # counts = what training played; win_rates = what eval measured. Training tags — win, loss,
+    # or draw — move ONLY the counts; the table stays at the prior with no eval result.
+    cb = _matchup_cb(alpha=0.5)
+    cb.locals = _terminal_locals(
+        {"opponent": "noop", "map": None, "outcome": 1.0},
+        {"opponent": "random", "map": None, "outcome": 0.0},
+        {"opponent": "noop", "map": None, "outcome": 0.5},
+    )
+    cb._on_step()
+    cb._on_rollout_end()
+    assert cb.counts == [2, 1]
+    assert cb.win_rates == [0.5, 0.5]
+    assert cb.distribution == pytest.approx([0.5, 0.5])
+
+
+def test_wrapper_terminal_infos_never_feed_the_win_rate_table():
+    # The table's ONLY feed is the structured eval result via submit_eval_result. An eval-style
+    # untagged terminal info (eval wrappers carry no MatchupProvider, so no "matchup" tag)
+    # moves nothing at all — not counts, not win_rates.
+    cb = _matchup_cb()
+    cb.locals = {
+        "dones": np.array([True]),
+        "infos": [{"outcome": WIN, "state": _state(1.0)}],  # a typical eval terminal info
+    }
+    assert cb._on_step() is True
+    assert cb._pending == []
+    cb._on_rollout_end()
+    assert cb.win_rates == [0.5, 0.5]
+    assert cb.counts == [0, 0]
+
+
+def test_rollout_end_without_eval_result_is_frozen():
+    # Between eval cycles the distribution is FROZEN: no fold, no broadcast, no SB3 scalars,
+    # no matchup_update log — the counts fold is the only movement.
+    vec = _RecordingVec()
+    sys_logger = _RecordingSysLogger()
+    cb = _matchup_cb(training_vec=vec, sys_logger=sys_logger)
+    cb.locals = _terminal_locals({"opponent": "noop", "map": None, "outcome": 1.0})
+    cb._on_step()
+    cb._on_rollout_end()
+    assert cb.counts == [1, 0]
+    assert vec.set_attr_calls == []  # no broadcast
+    assert cb.model.logger.records == {}  # no scalars
+    assert sys_logger.events == []  # no matchup_update
+
+
+def test_submitted_eval_result_folds_win_rates_and_records_scalars():
+    # The eval feed: per-cell counts fold as wins/episodes with the EMA alpha; zero-episode
+    # cells stay put; the two aggregate scalars are recorded (never one per cell).
+    cb = _matchup_cb(("noop", "random"), ("Arenas/a.json",), alpha=0.5, floor=0.25)
+    cb.submit_eval_result({("noop", "Arenas/a.json"): (1, 1), ("random", "Arenas/a.json"): (0, 2)})
+    cb._on_rollout_end()
+
+    # folds: 0.5*0.5 + 0.5*1.0 = 0.75 and 0.5*0.5 + 0.5*0.0 = 0.25.
+    assert cb.win_rates == pytest.approx([0.75, 0.25])
+    assert cb._pending_eval == []  # consumed
+    # deficits (0.25, 0.75) -> base (0.25, 0.75); P = 0.25 * 0.5 + 0.75 * base.
+    assert cb.distribution == pytest.approx([0.3125, 0.6875])
+    records = cb.model.logger.records
+    assert set(records) == {"matchup/distribution_entropy", "matchup/episodes"}
+    assert records["matchup/episodes"] == 0  # no training episodes played yet
+
+
+def test_submitted_per_opponent_result_folds_onto_boot_arena_cells():
+    # maps=None: evaluate_winrate returns {selector: rate}; each rate folds onto the
+    # degenerate (selector, None) cell.
+    cb = _matchup_cb(alpha=0.5)
+    cb.submit_eval_result({"noop": 1.0, "random": 0.0})
+    cb._on_rollout_end()
+    assert cb.win_rates == pytest.approx([0.75, 0.25])
+
+
+def test_eval_zero_episode_cells_leave_their_win_rate_unchanged():
+    cb = _matchup_cb(("noop",), ("Arenas/a.json", "Arenas/b.json"), alpha=0.5)
+    cb.submit_eval_result({("noop", "Arenas/a.json"): (0, 1), ("noop", "Arenas/b.json"): (0, 0)})
+    cb._on_rollout_end()
+    assert cb.win_rates == pytest.approx([0.25, 0.5])  # the (0, 0) cell stays at the prior
+
+
+def test_matchup_broadcast_happens_only_after_eval_cycles():
+    vec = _RecordingVec()
+    cb = _matchup_cb(training_vec=vec)
+    cb._on_training_start()  # the resume-seam broadcast (always fires once up-front)
+    cb._on_rollout_end()  # boundary WITHOUT an eval cycle -> frozen
+    cb.submit_eval_result({"noop": 1.0, "random": 0.0})
+    cb._on_rollout_end()  # boundary right after an eval cycle -> fold + broadcast
+    cb._on_rollout_end()  # frozen again
+    names = [name for name, _value in vec.set_attr_calls]
+    assert names == ["matchup_distribution", "matchup_distribution"]
+    # the post-eval broadcast carries the folded distribution, not the uniform prior.
+    assert vec.set_attr_calls[1][1] == pytest.approx(cb.distribution)
+    assert vec.set_attr_calls[1][1] != pytest.approx([0.5, 0.5])
+
+
+def test_matchup_eval_fold_broadcasts_into_providers_without_replacing_them():
+    # A real DummyVecEnv of two wrappers, each with its OWN seeded provider: the post-eval
+    # broadcast lands the SAME plain-data distribution inside both providers; neither the
+    # provider objects nor their RNG streams are replaced.
+    providers = [MatchupProvider.from_roster(("noop", "random"), None, seed=i) for i in range(2)]
+    placeholder = OpponentProvider.from_roster(["noop"], strategy="round_robin")
+
+    def _fn(i):
+        return lambda: SelfPlayWrapper(_MatchupEnv(), placeholder, matchups=providers[i])
+
+    vec = DummyVecEnv([_fn(0), _fn(1)])
+    rngs_before = [p._rng for p in providers]
+
+    cb = _matchup_cb(alpha=0.5, floor=0.25, training_vec=vec)
+    cb.submit_eval_result({"noop": 1.0, "random": 0.0})
+    cb._on_rollout_end()
+
+    expected = cb.distribution
+    assert expected != pytest.approx([0.5, 0.5])  # the eval loss actually skewed it
+    for wrapper, provider, rng in zip(vec.envs, providers, rngs_before, strict=True):
+        assert wrapper.matchups is provider  # provider NOT replaced
+        assert provider._rng is rng  # RNG stream NOT replaced
+        assert provider.distribution == pytest.approx(expected)
+
+
+def test_eval_callback_handoff_folds_at_the_same_boundary():
+    # The train_local wiring end-to-end: EvalWinRateCallback runs its cycle and submits the
+    # result via result_sink; the matchup callback (later in the CallbackList) folds it at the
+    # SAME rollout boundary.
+    matchup = _matchup_cb(("noop", "random"), alpha=0.5)
+    eval_cb, model, *_ = _make(100, 2, ("noop", "random"), result_sink=matchup.submit_eval_result)
+    model.num_timesteps = eval_cb.num_timesteps = 100
+
+    eval_cb._on_rollout_end()  # the eval cycle (always-win stubs -> rate 1.0 per opponent)
+    matchup._on_rollout_end()  # the fold at the same boundary
+
+    assert matchup.win_rates == pytest.approx([0.75, 0.75])
+
+
+def test_matchup_training_start_broadcasts_restored_curriculum():
+    # The resume seam: freshly-built providers hold uniform; _on_training_start pushes the
+    # callback's (restored) table-derived distribution into them before the first rollout.
+    provider = MatchupProvider.from_roster(("noop", "random"), None, seed=0)
+    placeholder = OpponentProvider.from_roster(["noop"], strategy="round_robin")
+    vec = DummyVecEnv([lambda: SelfPlayWrapper(_MatchupEnv(), placeholder, matchups=provider)])
+
+    cb = _matchup_cb(alpha=0.5, floor=0.0, training_vec=vec)
+    cb.restore(
+        {
+            "sampling": "winrate",
+            "cells": [["noop", None], ["random", None]],
+            "win_rates": [1.0, 0.0],
+            "counts": [10, 10],
+        }
+    )
+    cb._on_training_start()
+    # deficits (0, 1) with no floor -> all probability on the losing cell.
+    assert provider.distribution == pytest.approx([0.0, 1.0])
+
+
+def test_matchup_state_restore_roundtrip_through_json():
+    import json
+
+    cb = _matchup_cb(("noop", "random"), ("Arenas/a.json",), alpha=0.5)
+    # win_rates move via the eval feed; counts via the training tags.
+    cb.submit_eval_result({("noop", "Arenas/a.json"): (1, 1)})
+    cb.locals = _terminal_locals({"opponent": "noop", "map": "Arenas/a.json", "outcome": 1.0})
+    cb._on_step()
+    cb._on_rollout_end()
+
+    # STRICT-JSON roundtrip (the sidecar path) then restore into a FRESH callback.
+    state = json.loads(json.dumps(cb.state()))
+    assert state["signal"] == "eval"  # the new-shape marker
+    fresh = _matchup_cb(("noop", "random"), ("Arenas/a.json",), alpha=0.5)
+    fresh.restore(state)
+    assert fresh.win_rates == cb.win_rates
+    assert fresh.counts == cb.counts
+    assert fresh.distribution == pytest.approx(cb.distribution)
+
+
+def test_matchup_restore_tolerates_an_old_sidecar_without_signal():
+    # An older sidecar's block (training-fed table, no "signal" field) restores fine; the next
+    # eval fold simply overwrites the restored values.
+    state = {
+        "sampling": "winrate",
+        "cells": [["noop", None], ["random", None]],
+        "win_rates": [0.9, 0.2],
+        "counts": [5, 7],
+    }
+    cb = _matchup_cb()
+    cb.restore(state)
+    assert cb.win_rates == [0.9, 0.2]
+    assert cb.counts == [5, 7]
+
+
+def test_matchup_restore_matches_by_cell_key_tolerating_roster_changes():
+    state = {
+        "sampling": "winrate",
+        "cells": [["noop", None], ["random", None]],
+        "win_rates": [0.9, 0.2],
+        "counts": [5, 7],
+    }
+    # A resumed run with a CHANGED roster keeps the cells that still exist; new cells stay at
+    # the 0.5 prior.
+    cb = _matchup_cb(("random", "wall-hugger"))
+    cb.restore(state)
+    assert cb.win_rates == [0.2, 0.5]
+    assert cb.counts == [7, 0]
+
+
+def test_matchup_restore_malformed_block_is_a_noop():
+    cb = _matchup_cb()
+    cb.restore({})  # empty block
+    cb.restore({"cells": [["noop", None]], "win_rates": [0.1]})  # mismatched lengths
+    assert cb.win_rates == [0.5, 0.5]
+    assert cb.counts == [0, 0]
+
+
+def test_matchup_all_cells_won_yields_uniform_not_nan():
+    cb = _matchup_cb(alpha=1.0)
+    cb.submit_eval_result({"noop": 1.0, "random": 1.0})
+    cb._on_rollout_end()
+    assert cb.win_rates == [1.0, 1.0]
+    # total deficit 0 -> uniform fallback, and the recorded entropy is finite (no NaN).
+    assert cb.distribution == pytest.approx([0.5, 0.5])
+    entropy = cb.model.logger.records["matchup/distribution_entropy"]
+    assert np.isfinite(entropy)
+
+
+def test_matchup_post_eval_update_logs_one_compact_summary():
+    sys_logger = _RecordingSysLogger()
+    cb = _matchup_cb(alpha=0.5, sys_logger=sys_logger, worst_k=1)
+    cb.locals = _terminal_locals({"opponent": "random", "map": None, "outcome": 0.0})
+    cb._on_step()
+    cb.submit_eval_result({"noop": 1.0, "random": 0.0})
+    cb._on_rollout_end()
+
+    assert len(sys_logger.events) == 1  # ONE summary per post-eval update
+    event, detail = sys_logger.events[0]
+    assert event == "matchup_update"
+    assert detail["eval_folds"] == 1
+    assert detail["cells_measured"] == 2
+    assert detail["total_episodes"] == 1  # the one training episode played
+    assert np.isfinite(detail["entropy"])
+    # worst_k=1 names the single lowest-win-rate cell — the one eval measured at 0.0.
+    assert detail["worst_cells"] == [{"opponent": "random", "map": None, "win_rate": 0.25}]

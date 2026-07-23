@@ -15,8 +15,10 @@ trainer rather than woven into the PPO core. This Phase-1 slice ships:
   :class:`~pop_trainer.rl.selfplay.Opponent` are the player2 wrapper + its protocol, resolving the
   canonical ``agents`` selectors via :func:`pop_trainer.agents.make_agent`.
 * the eval + ELO seam: :func:`~pop_trainer.rl.evaluate.evaluate_winrate` plays greedy episodes vs.
-  each opponent in a roster and returns a per-opponent win-rate; ``win_rate`` is the pure counting
-  helper; :class:`~pop_trainer.rl.callbacks.EvalWinRateCallback` logs that win-rate periodically at
+  each opponent in a roster and returns a per-opponent win-rate (or, with a map rotation,
+  per-(opponent x map) cell counts that pool into reconciling per-opponent / per-map / overall
+  marginals); ``win_rate`` is the pure counting helper;
+  :class:`~pop_trainer.rl.callbacks.EvalWinRateCallback` logs those win-rates periodically at
   rollout boundaries; :mod:`~pop_trainer.rl.elo` holds the pure ELO math.
 
 * the integrator (:mod:`~pop_trainer.rl.train`): :class:`~pop_trainer.rl.train.TrainConfig` +

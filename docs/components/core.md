@@ -252,6 +252,8 @@ Every other component depends on `core`:
 - [play](play.md) — `protocol.Connection` / `WallLayout`, `config.EnvConfig`, `agent.Agent`,
   `state.split_state_for_opponent` / `flip_frame_perspective`, `obs.frame_shape_from_config`, and
   `launch` (`build_launch_cmd` / `connect`).
+- [pretraining](pretraining.md) — `state` (the named accessors / index constants + `bullet_present`)
+  to carve the per-group decode targets from the 52-float wire state (`targets.py:36`).
 - [utils](utils.md) — no direct `core` import today; a leaf sink reaching the stack's artifacts by
   attribute.
 

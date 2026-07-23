@@ -5,10 +5,18 @@ Operational guide for agents on the Tank Twin Stick Shooter revival. Load-bearin
 ## What this is
 Unity 6.5 (2D twin-stick tank game) as the simulator + a Python 3.12 reinforcement-learning driver (Stable-Baselines3 PPO, population-based self-play) over a TCP-JSON protocol. Milestones: M0 playable game (two humans, Xbox pads + shared keyboard) → M1 single-agent PPO → M2 population training. Cluster target: GCP.
 
+## Communication (YOU MUST)
+Write plainly and professionally. Do NOT use Bay Area / startup-tech colloquialisms or jargon — e.g. "footgun," "table stakes," "boil the ocean," "happy path," "low-hanging fruit." Say what you mean in direct, literal terms ("an easy default mistake," not "footgun"). Applies to ALL agent output: chat, PR descriptions, docs, and commit messages.
+
 ## Environment (YOU MUST)
 - Always use an isolated venv (managed by `uv`); NEVER the system Python. Python 3.12.
 - Cross-platform: no `fork`/`forkserver` (use `spawn` on Windows); no `os.system("zip"/"rm"/"cp"/"mv")` (use stdlib `zipfile`/`shutil`/`pathlib`); build commands with `subprocess` arg-lists, not shell strings.
 - Unity 6.5 editor: `C:\Program Files\Unity\Hub\Editor\6000.5.0f1\Editor\Unity.exe`. Headless: `-batchmode -quit -accept-apiupdate -logFile -`.
+
+## Compute / GPU execution (YOU MUST)
+- **Run torch work on the local CUDA GPU (RTX 4090).** Any torch work that trains/backprops or benchmarks GPU compute — full runs, sweeps, smokes, *and* throwaway diagnostics — MUST run on CUDA. Pass `--device cuda` (or `--device auto`, which detects CUDA first). MPS/CPU is a last resort, used only when **no** CUDA is available, and you MUST say so out loud when you fall back. Example: `uv run python -m pop_trainer.pretraining.train --epochs 8 --device cuda`.
+- **Never hardcode `torch.device('cuda')`** (or `'mps'`/`'cpu'`). Use `resolve_device()` / `--device auto`, which honors the `TT_DEVICE` env override. Hardcoding the device is what once stranded a diagnostic on MPS while the GPU sat idle.
+- **Carry this into delegations.** When you spawn a subagent that will touch torch, put the CUDA rule (`--device cuda`) in its task prompt — do NOT tell it to "smoke on cpu/mps."
 
 ## Project gotchas (an agent that only reads code will miss these)
 - JSON consumed by Python must be STRICT (no trailing commas / leading-dot floats). Unity's Newtonsoft tolerates them; Python's `json` will not.
@@ -25,7 +33,6 @@ Unity 6.5 (2D twin-stick tank game) as the simulator + a Python 3.12 reinforceme
 ## Repo etiquette
 - One concern per change; branch-per-task (`unity/…`, `python/…`, `fix/…`, `protocol/…`); keep it reversible.
 - Verify every new dependency exists on PyPI and pin it (lockfile). Never commit secrets / GCP keys.
-- End commit messages with: `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`.
 - Definition of Done: `@docs/definition-of-done.md`. "Done" = a check passed, not "looks done."
 
 ## The gate is NOT optional (YOU MUST)

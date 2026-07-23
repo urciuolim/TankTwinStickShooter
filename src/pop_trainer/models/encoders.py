@@ -8,10 +8,11 @@ experiment:
 
 * a **trunk** (a :class:`Trunk`) — a fully-convolutional spatial-map producer that turns an
   NCHW RGB frame into a ``(B, C, h, w)`` feature map. Three are provided: :class:`CnnTrunk`
-  (a strided conv stack) and :class:`ResNetTrunk` (a residual conv stack), both of which
-  downsample the input EARLY via a stem BEFORE the main body so the conv stack and the
-  exported ONNX graph stay CPU-cheap on the 640x360 (HxW = 360x640) canonical frame; and
-  :class:`GroupNormCNN` (a gently-strided GroupNorm + SiLU stack) for SMALL frames.
+  (a strided conv stack, the Nature-DQN lineage) and :class:`ResNetTrunk` (a residual conv
+  stack, the IMPALA lineage), both of which downsample the input EARLY via a stem BEFORE the
+  main body so the conv stack and the exported ONNX graph stay CPU-cheap on the 640x360
+  (HxW = 360x640) canonical frame; and :class:`GroupNormCNN` (a gently-strided GroupNorm +
+  SiLU stack) for SMALL frames.
 * a **pooling** (a :class:`Pooling`) — collapses the trunk's spatial map into the flat
   ``(B, D)`` embedding. Two are provided: :class:`GlobalAveragePool` (GAP — param-cheap but
   position-lossy) and :class:`Flatten` (position-preserving but large).
@@ -214,6 +215,10 @@ class ResNetTrunk(Trunk):
     ``False`` is the same conv stack without the add. ``blocks_per_stage`` sets the per-stage
     block depth. Both leave the channel widths and stage count unchanged, so they isolate the
     residual structure as an ablation.
+
+    Architecture: the IMPALA residual CNN (Espeholt et al. 2018, "IMPALA", arXiv:1802.01561) --
+    channel widths [16, 32, 32], each stage ``conv -> maxpool -> 2 residual blocks`` -- plus our
+    early 4x stem for the 640x360 frame. A standard pixel-RL encoder (e.g. Procgen, Cobbe 2020).
     """
 
     def __init__(

@@ -54,7 +54,12 @@ def test_sentinel_and_presence_helper():
     assert S.bullet_present(0.0) is True
     assert S.bullet_present(5.0) is True
     assert S.bullet_present(S.ABSENT_BULLET_SENTINEL) is False
-    assert S.bullet_present(-0.1) is False
+    # A bullet at x=-0.1 is a real on-board bullet: the board spans negative x.
+    assert S.bullet_present(-0.1) is True
+    # Left-half on-board bullet (arena min x ~ -8) is present.
+    assert S.bullet_present(-7.9) is True
+    # Between the board and the sentinel: still the absent side of the -50 threshold.
+    assert S.bullet_present(-60.0) is False
 
 
 def test_iter_bullets_skips_absent_by_default():

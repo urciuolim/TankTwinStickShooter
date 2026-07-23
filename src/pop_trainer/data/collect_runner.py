@@ -712,6 +712,17 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         choices=sorted(MAP_CONFIGS),
         help="single-map (no-rotation) config; the boot + only arena when --maps is absent",
     )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help=(
+            "override the BOOT config (obs resolution + initial arena) the build launches on; "
+            "the env frame_shape is derived from its obs_pixels_* (so a 64x64 config yields a "
+            "(64, 64, 3) env). Absent -> the --map default config. Composes with --maps: "
+            "switch_arena rotation is unchanged."
+        ),
+    )
     parser.add_argument("--episodes", type=int, default=1, help="episodes PER worker")
     parser.add_argument(
         "--max-steps",
@@ -776,7 +787,8 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     """Build the specs from the CLI and drive :func:`collect.collect_parallel`; print a summary.
 
-    Resolves the boot config + the pairing set, validates the build / config exist, builds the
+    Resolves the boot config (``--config`` override else the ``--map`` default) + the pairing set,
+    validates the build / config exist, builds the
     per-worker round-robin specs, runs the PRE-FLIGHT MEMORY GUARD (always printing the peak-buffer
     estimate at startup; aborting before launch when the estimate blows the budget unless
     ``--allow-oversized``), writes the maps-list sidecar (int -> arena path) per worker out dir AND
@@ -786,7 +798,10 @@ def main(argv: list[str] | None = None) -> int:
     Returns ``0`` on success, ``2`` on a missing build / config OR a pre-flight memory abort.
     """
     args = _parse_args(argv)
-    config = MAP_CONFIGS[args.map]
+    # The boot config (obs resolution + initial arena): --config overrides the --map default. The
+    # frame_shape derives from it (build_specs), so --config a 64x64 config -> a (64, 64, 3) env;
+    # arena rotation via --maps/switch_arena is unchanged either way.
+    config = args.config if args.config is not None else MAP_CONFIGS[args.map]
 
     if not args.exe.exists():
         print(f"error: build not found at {args.exe}", file=sys.stderr)

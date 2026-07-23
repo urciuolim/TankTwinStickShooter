@@ -2,8 +2,9 @@
 
 Reusable **torch model definitions** — the ablation-ready vision encoders, and *nothing else*. The
 encoder is the single standardized vision module the whole stack shares: the [rl](rl.md) policy reads
-its flat embedding, the future `pretraining` heads will read its spatial map, and Unity-Sentis runs
-its exported ONNX graph at deploy. Definitions only — no training loops, no losses, no datasets.
+its flat embedding, the [pretraining](pretraining.md) heads read its spatial map (and *train* it), and
+Unity-Sentis runs its exported ONNX graph at deploy. Definitions only — no training loops, no losses,
+no datasets.
 
 **Boundary:** `models` is a leaf — torch is allowed, but **nothing internal is imported** (it doesn't
 even need [core](core.md)). It shares `core`'s dependency-free position; its consumers build on it. No
@@ -77,17 +78,21 @@ Nothing internal — just `torch` (a leaf alongside [core](core.md))
   embedding as the SB3 policy/value feature extractor (it owns the `state_dict` load + freeze; there
   is no `models.from_pretrained`). **Built** — the M1 trainer
   ([`extractor.py:95-99`](../../src/pop_trainer/rl/extractor.py)).
+- [pretraining](pretraining.md) — the single-frame decoder reads `Encoder.features` for its
+  encoder-training spatial heads and `Encoder.embed` (detached) for the pooling probe, via
+  `build_encoder` / `EncoderConfig`. **Built** — it is the first real consumer that *trains* this
+  encoder.
 - [utils](utils.md) — `model_info` names the active trunk by reaching the loaded policy's
   `.encoder.trunk.__class__.__name__` (by attribute, not import).
-- *(Future `pretraining` reads `Encoder.features` for the supervised-decode heads.)*
 - Unity-Sentis runs the exported ONNX graph at deploy.
 
 ## Where it sits in the run
 
-Off to the side of the live loop today: the encoder is the standardized vision backbone the RL phase
-already shares (via [rl](rl.md)'s `EncoderExtractor`) and the future pretraining phase will share too,
-plus the deployable ONNX artifact. It consumes the pixel frames that [env](env.md) produces and
-[data](data.md) records.
+Off to the side of the live loop: the encoder is the standardized vision backbone shared on BOTH
+arms — the RL phase (via [rl](rl.md)'s `EncoderExtractor`) and the offline pretraining phase (via
+[pretraining](pretraining.md)'s `StateDecoder`, which is what *trains* it) — plus the deployable ONNX
+artifact. It consumes the pixel frames that [env](env.md) produces and [data](data.md) records (the
+pretraining harness streams that recorded corpus).
 
 ---
 [← back to index](../README.md)

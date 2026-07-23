@@ -303,9 +303,11 @@ an **empty list**, so older datasets stay readable AND annotatable
 
 On-disk `.npz` shard artifacts + the `maps.json` sidecar + the run-root
 [`manifest.json`](#the-run-root-manifestjson-dataset-fingerprint) fingerprint — **not** via imports.
-Nothing in `src/pop_trainer` imports `data` today; the future `pretraining` streams the shards via the
-[`schema`](#dataschema--the-on-disk-record-contract) for the supervised-decode training, and the
-manifest is the dataset's identity card for whoever later consumes / compares the corpus.
+Nothing in `src/pop_trainer` imports `data`; the consumer reads its artifacts off disk:
+[pretraining](pretraining.md) streams the decode-v1 shards (via `readers.DatasetIndex` + the
+map-aware `split`, the [`schema`](#dataschema--the-on-disk-record-contract) array names, and
+`shards`) to train the single-frame decoder — the first real consumer of the corpus. The manifest is
+the dataset's identity card for whoever later consumes / compares the corpus.
 
 ## Where it sits in the run
 

@@ -225,6 +225,89 @@ def test_build_specs_rotation_mode_switches_and_indexes():
             assert plan.intended_map_id == spec.map_index[plan.switch_arena]
 
 
+# --- --config boot-config override (obs resolution; e.g. 64x64) --------------------------
+
+
+def _write_config(path, *, width, height):
+    """Write a minimal obs_pixels-enabled game config at ``path`` (strict JSON)."""
+    import json
+
+    path.write_text(
+        json.dumps(
+            {
+                "arena_path": "Arenas/custom1.json",
+                "obs_pixels": True,
+                "obs_pixels_width": width,
+                "obs_pixels_height": height,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_build_specs_config_override_sets_boot_config_and_derives_64_frame_shape(tmp_path):
+    # --config <a 64x64 config>: the resolved boot config is THAT file and the env frame_shape is
+    # derived from its obs_pixels_* (64, 64, 3), with no hand-synced constant.
+    cfg = _write_config(tmp_path / "train_config_64.json", width=64, height=64)
+    specs = _build(config=cfg, workers=1)
+    extra = specs[0].extra
+    assert extra["config"] == str(cfg)
+    assert tuple(extra["frame_shape"]) == (64, 64, 3)
+
+
+def test_build_specs_config_override_composes_with_maps_rotation(tmp_path):
+    # --config is the BOOT config (obs resolution + initial arena); --maps switch_arena rotation is
+    # unchanged. The build boots on the 64x64 config (frame_shape 64) while the arena rotates.
+    cfg = _write_config(tmp_path / "train_config_64.json", width=64, height=64)
+    arenas = ["Arenas/center_block.json", "Arenas/empty.json"]
+    specs = _build(config=cfg, map_values=arenas, episodes=4, workers=2)
+    for spec in specs:
+        assert spec.extra["config"] == str(cfg)
+        assert tuple(spec.extra["frame_shape"]) == (64, 64, 3)
+        for plan in spec.episode_plan:
+            assert plan.switch_arena in {"Arenas/center_block.json", "Arenas/empty.json"}
+
+
+def test_no_config_path_still_resolves_the_map_default():
+    # Without --config the boot config is the _MAP_CONFIGS default (today's byte-identical path):
+    # the parsed --config is None and main resolves it to MAP_CONFIGS[--map].
+    args = R._parse_args(["--out-dir", "out"])
+    assert args.config is None
+    resolved = args.config if args.config is not None else R.MAP_CONFIGS[args.map]
+    assert resolved == R.MAP_CONFIGS["custom1"]
+
+
+def test_config_flag_parses_to_the_given_path():
+    # --config <path> is parsed and (in main) overrides the --map default boot config.
+    args = R._parse_args(["--out-dir", "out", "--config", "some/train_config_64.json"])
+    resolved = args.config if args.config is not None else R.MAP_CONFIGS[args.map]
+    assert resolved == args.config
+    assert str(args.config) == str(R.Path("some/train_config_64.json"))
+
+
+def test_shipped_train_config_64_derives_64_frame_shape():
+    # The shipped --config target for a 64x64 dataset derives a (64, 64, 3) env (the doc command).
+    cfg = R._STREAMING_ASSETS / "train_config_64.json"
+    if not cfg.exists():
+        pytest.skip("train_config_64.json not present")
+    specs = R.build_specs(
+        map_values=None,
+        pairings=[("aggressive-coverage", "opponent-shadower")],
+        map_name="custom1",
+        config=cfg,
+        exe=R.DEFAULT_EXE,
+        episodes=1,
+        max_steps=800,
+        out_dir="out",
+        workers=1,
+        base_port=50000,
+        seed=0,
+    )
+    assert specs[0].extra["config"] == str(cfg)
+    assert tuple(specs[0].extra["frame_shape"]) == (64, 64, 3)
+
+
 # --- selector surface --------------------------------------------------------------------
 
 
