@@ -9,7 +9,7 @@ A 2021 Unity 2D twin-stick tank game **reinforcement-learning research environme
 
 ## What this is
 
-The game runs as a **Python-clocked simulator**: Unity renders and steps the physics, while Python supplies both players' actions each frame and reads back a 640×360 pixel frame plus a 52-float game state. That makes it a clean RL gym — train a policy on pixels (CnnPolicy), with the state vector as a supervised-decode objective.
+The game runs as a **Python-clocked simulator**: Unity renders and steps the physics, while Python supplies both players' actions each frame and reads back a pixel frame (resolution is config-driven — 640×360 by default; the current experiments train on 64×64) plus a 52-float game state. That makes it a clean RL gym — train a policy on pixels (CnnPolicy), with the state vector as a supervised-decode objective.
 
 The training stack (`src/pop_trainer/`) is rebuilt component-by-component, each independently gated:
 
@@ -20,7 +20,8 @@ The training stack (`src/pop_trainer/`) is rebuilt component-by-component, each 
 | `agents` | map-aware coverage policies (+ a random baseline) that drive data collection |
 | `models` | composable, ablation-ready vision encoders (ONNX / Unity-Sentis-clean) |
 | `data` | a multi-worker collection runner — parallel builds, **map + pairing rotation**, echo-tagged shards |
-| `rl` | **end-to-end PPO on pixels** — `EncoderExtractor`, a self-play opponent seam, eval + ELO, multi-env (`SubprocVecEnv`), checkpoint/resume |
+| `pretraining` | **supervised encoder pretraining** — decode the 52-float state from single real frames (heatmap + soft-argmax heads); per-epoch checkpoints; the trained encoder feeds `rl` |
+| `rl` | **end-to-end PPO on pixels** — pretrained-encoder load (frozen or warm-start), map rotation in training, a **win-rate (opponent × map) curriculum fed from evaluation**, per-map eval win rates in TensorBoard, self-play opponent seam, ELO, multi-env (`SubprocVecEnv`), checkpoint/resume |
 | `play` | launch the live build and play one episode — any pairing of human, rule-based, or a trained `rl:<ckpt>` agent |
 
 ### Multi-map data collection
@@ -39,8 +40,14 @@ uv sync                                          # Python 3.12 env (managed by u
 # build the Unity game -> unity/build/TankTwinStickShooter.exe  (see docs/runbook.md)
 uv run python -m pop_trainer.play                # watch / play one episode (human, rule-based, or rl:<ckpt>)
 uv run python -m pop_trainer.data.collect_runner --out-dir runs/demo --maps   # collect a rotating dataset
+uv run python -m pop_trainer.pretraining.train \
+  --data datasets/<shards> --trunk gn-cnn --resolution 64 --device cuda \
+  --out runs/decode                                # pretrain a vision encoder (state decoding)
 uv run python -m pop_trainer.rl.train \
-  --config unity/Assets/StreamingAssets/train_config.json --run-dir runs/train   # train a PPO agent on pixels
+  --config unity/Assets/StreamingAssets/train_config_64.json \
+  --encoder-checkpoint runs/decode/encoder.pt --trunk gn-cnn \
+  --maps --matchup-sampling winrate --run-dir runs/train \
+  --total-timesteps 20000000                       # PPO on pixels with the pretrained encoder
 ```
 
 Full setup, the component map, and the class-to-class architecture live in **[`docs/`](docs/README.md)**.
@@ -51,4 +58,4 @@ This revival is developed by a team of AI coding subagents — research, enginee
 
 ## Status
 
-**M0** — playable two-human game ✅ · **M1** — single-agent PPO on real pixels: **end-to-end training stack landed + running** (hyperparameter tuning + a pretrained encoder next) · **M2** — population-based self-play (next). Target training cluster: GCP.
+**M0** — playable two-human game ✅ · **M1** — single-agent PPO on real pixels: **full stack landed** — pretrained 64×64 gn-cnn encoder, map rotation, an eval-driven (opponent × map) curriculum, per-map evaluation; a frozen-vs-warm-start encoder A/B is training to 20M steps now · **M2** — population-based self-play (next). Target training cluster: GCP.
